@@ -1,0 +1,138 @@
+# Explicit (normalization) rules: AWS SSM Parameter Store -> explicit edges.
+# Adapter emits raw records from ssm:DescribeParameters (+ ssm:GetResourcePolicies,
+# ram:ListResources); these rules translate them into common explicit edges.
+#
+# NOTE ON VALUES: collectors normalize from DescribeParameters METADATA
+# (Name, Type, KeyId, Tier, Policies) and effective-permission analysis — they do
+# NOT call ssm:GetParameter with WithDecryption. CanReadSecret/CanWrite come from
+# the permission evaluator (EFFECTIVE actions), not from reading plaintext.
+# See providers/aws/ssm-params.md §20.
+
+rules:
+
+  # Only SecureString parameters are Secret nodes. String/StringList are config.
+  - id: aws-ssm-params-securestring-node
+    emits: ContainsSecret
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::SSM::Parameter", field: "Type"}
+    where: ["Type == SecureString"]
+    emit:
+      target_type: Secret
+      source: "<parameter node (Storage/Data view)>"
+      target: "<Secret node for this SecureString>"
+      api_source: "ssm:DescribeParameters"
+      evidence_field: "Type"
+      narrative: "{param.name} is a SecureString parameter storing encrypted secret material."
+
+  # Record the SecureString -> KMS key linkage that gates decryption (key_permission).
+  # NOTE (edges.yaml conformance): this is NOT an AttachedTo edge. AttachedTo's
+  # source set is [NetworkInterface, BlockStorage, ManagedIdentity, IAMPolicy] and
+  # target set is [Compute, VirtualNetwork, Identity] — neither Secret (source) nor
+  # EncryptionKey (target) is admissible, so an AttachedTo emit would be rejected by
+  # the graph loader. Per providers/aws/ssm-params.md §17, the SecureString->CMK
+  # linkage is "represented via the derived rules' where-clause key lookup rather
+  # than a first-class edge." We therefore expose the KeyId as a NODE PROPERTY
+  # (?param.kms_key) that the derived rules' optional [?principal, CanDecrypt, ?key]
+  # lookup consumes to evaluate the key_permission gate. No structural edge is emitted.
+  - id: aws-ssm-params-securestring-key
+    # Not an edge: records a node property, because no admissible edge exists for the
+    # Secret->EncryptionKey wrapping link (AttachedTo does not admit those classes).
+    # `sets_node_property` is consumed by the derived rules' key_permission lookup,
+    # NOT emitted to the graph — so it is intentionally absent from the edge vocabulary.
+    sets_node_property: kms_key
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::SSM::Parameter", field: "KeyId"}
+    where: ["Type == SecureString"]
+    emit:
+      target: "<Secret node for this SecureString>"
+      property: "kms_key"
+      value: "<EncryptionKey node id/ARN for KeyId (defaults to alias/aws/ssm when absent)>"
+      api_source: "ssm:DescribeParameters"
+      evidence_field: "KeyId"
+      narrative: "{param.name} is encrypted with KMS key {value} (decrypt gates read; consumed by the derived key_permission lookup, not a graph edge)."
+
+  # CanReadSecret from EFFECTIVE ssm:GetParameter / GetParameters / GetParameterHistory
+  # on the scope. GetParameterHistory (§8, §14.3) is a distinct credential-access
+  # vector: it returns prior parameter versions (up to 100), so a "rotated-out" but
+  # still-valid SecureString credential remains readable through it.
+  #
+  # key_permission gate lives HERE (edges.yaml lists key_permission in
+  # CanReadSecret.conditions): the explicit normalizer is the owner of the gate. For a
+  # SecureString encrypted with the AWS-managed alias/aws/ssm key, same-account SSM read
+  # implies decrypt -> ACTIVE. For a customer-managed CMK, decrypt must be separately
+  # confirmed (CanDecrypt on ?param.kms_key) -> CONDITIONAL(key_permission).
+  - id: aws-ssm-params-can-read-secret
+    emits: CanReadSecret
+    applies_to: [aws]
+    match_effective_permission:
+      action: ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParameterHistory"]
+      resource_type: "AWS::SSM::Parameter"
+    where: ["target parameter Type == SecureString"]
+    emit:
+      target_type: Secret
+      source: "<principal>"
+      target: "<Secret node for the SecureString>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParameterHistory", "kms:Decrypt"]
+      conditions: [key_permission]
+      state_logic: >-
+        if ?param.kms_key is the AWS-managed alias/aws/ssm (or its key ARN) and
+        principal.account == param.account: ACTIVE (same-account SSM read implies
+        decrypt on the AWS-managed key);
+        elif principal has CanDecrypt on ?param.kms_key (the CMK): ACTIVE;
+        else: CONDITIONAL(key_permission)
+      false_positive_note: >-
+        Only SecureString parameters are Secret nodes. For a CMK-encrypted SecureString,
+        ssm:GetParameter[s]/GetParameterHistory alone is NOT enough: without kms:Decrypt
+        on that customer-managed key the caller receives ciphertext only ->
+        CONDITIONAL(key_permission). Only the AWS-managed alias/aws/ssm key makes
+        same-account decrypt implicit. GetParameterHistory additionally exposes
+        rotated-out versions whose credentials may still authenticate.
+      narrative: "{principal.name} can read SecureString {param.name} (ssm:GetParameter[s] / ssm:GetParameterHistory with WithDecryption + kms:Decrypt on {param.kms_key})."
+
+  # CanReadSecret via recursive path read (broadens to a whole subtree).
+  - id: aws-ssm-params-can-read-secret-by-path
+    emits: CanReadSecret
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ssm:GetParametersByPath"
+      resource_type: "AWS::SSM::Parameter"
+    where:
+      - "the granted resource prefix is an ancestor of a SecureString parameter's name"
+    emit:
+      source: "<principal>"
+      target: "<Secret node for each in-scope descendant SecureString>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ssm:GetParametersByPath"]
+      narrative: "{principal.name} can recursively read SecureStrings under a path (ssm:GetParametersByPath), including {param.name}."
+
+  # CanWrite (tamper) from EFFECTIVE ssm:PutParameter.
+  - id: aws-ssm-params-can-write
+    emits: CanWrite
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ssm:PutParameter"
+      resource_type: "AWS::SSM::Parameter"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<parameter node>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ssm:PutParameter"]
+      narrative: "{principal.name} can overwrite parameter {param.name} (ssm:PutParameter, Overwrite)."
+
+  # Cross-account share (advanced tier) via RAM / resource policy -> read-only trust.
+  - id: aws-ssm-params-cross-account-share
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::SSM::Parameter", field: "ResourcePolicy"}
+    where:
+      - "Tier == Advanced"
+      - "a RAM resource share or resource policy names a principal/account/OU outside the owning account"
+    emit:
+      source: "<parameter resource policy / RAM share>"
+      target: "<consumer account / OU / external principal>"
+      api_source: "ssm:GetResourcePolicies | ram:ListResources"
+      evidence_field: "ResourcePolicy / RAM resourceShareArn"
+      narrative: "{param.name} is shared (read-only) with account {account} via AWS RAM."

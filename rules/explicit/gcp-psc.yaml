@@ -1,0 +1,172 @@
+# Normalizing GCP Private Service Connect (PSC) into explicit edges.
+# The collector emits raw API records for:
+#   compute.forwardingRules (purpose=PRIVATE_SERVICE_CONNECT)
+#   compute.serviceAttachments
+# These rules translate them to common explicit edges (schema/edges.yaml).
+# They do not combine edges — that is the job of /rules/derived/gcp/psc.yaml.
+#
+# Permissions referenced:
+#   https://cloud.google.com/compute/docs/access/iam
+#   https://cloud.google.com/vpc/docs/private-service-connect
+
+rules:
+
+  # --- Structural placement: PSC forwarding rule in its subnet ---------------
+  - id: gcp-psc-forwarding-rule-located-in
+    emits: LocatedIn
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/ForwardingRule"
+      field: "subnetwork"
+    where:
+      - "forwardingRule.purpose == PRIVATE_SERVICE_CONNECT"
+    emit:
+      source_type: PrivateEndpoint
+      target_type: Network
+      source: "<PSC ForwardingRule node>"
+      target: "<Subnet node referenced by forwardingRule.subnetwork>"
+      api_source: "compute.forwardingRules.get (aggregatedList)"
+      evidence_field: "subnetwork"
+      narrative: >-
+        PSC consumer endpoint {forwarding_rule.name} is placed in subnet
+        {subnet.name} (forwardingRule.subnetwork).
+
+  # --- Target reference: forwarding rule.target -> Service Attachment URI -----
+  # NOTE: no valid schema edge connects PrivateEndpoint (ForwardingRule) ->
+  # PrivateEndpoint (ServiceAttachment) for the RoutesTo, AttachedTo, or
+  # ContainsResourceReference edge types. The target URI is recorded as a
+  # NODE PROPERTY on the ForwardingRule node and consumed by the derived rule
+  # gcp-psc-private-reach-producer (which matches the full chain as a
+  # match_record). No explicit graph edge is emitted from this rule.
+  - id: gcp-psc-forwarding-rule-target-ref
+    emits: null                # evidence-only; emits no edge
+    kind: evidence
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/ForwardingRule"
+      field: "target"
+    where:
+      - "forwardingRule.purpose == PRIVATE_SERVICE_CONNECT"
+    record:
+      on_node: "<PSC ForwardingRule node>"
+      field: "psc_target"
+      value: "<forwardingRule.target URI: serviceAttachments/... OR all-apis/vpc-sc>"
+      api_source: "compute.forwardingRules.get"
+      evidence_field: "target"
+      note: >-
+        Evidence for the derived rules gcp-psc-private-reach-google-apis and
+        gcp-psc-private-reach-producer: the target field determines whether this
+        forwarding rule points to a Google API bundle or a producer Service Attachment.
+        No RoutesTo edge is emitted because PrivateEndpoint is not a valid RoutesTo
+        source per schema/edges.yaml (source: [Route, Subnet, TransitGateway]).
+
+  # --- Network placement: forwarding rule located in its consumer VPC --------
+  # AttachedTo source must be [NetworkInterface, BlockStorage, ManagedIdentity, IAMPolicy]
+  # (per schema/edges.yaml) — PrivateEndpoint/ForwardingRule is not valid there.
+  # Use LocatedIn (source: ["*"], target: [AdministrativeBoundary, Network]) instead,
+  # because placement in a VPC is a LocatedIn relationship.
+  - id: gcp-psc-forwarding-rule-located-in-network
+    emits: LocatedIn
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/ForwardingRule"
+      field: "network"
+    where:
+      - "forwardingRule.purpose == PRIVATE_SERVICE_CONNECT"
+    emit:
+      source_type: PrivateEndpoint
+      target_type: VirtualNetwork
+      source: "<PSC ForwardingRule node>"
+      target: "<VirtualNetwork node referenced by forwardingRule.network>"
+      api_source: "compute.forwardingRules.get"
+      evidence_field: "network"
+      narrative: >-
+        PSC consumer endpoint {forwarding_rule.name} is placed in VPC
+        {network.name} (forwardingRule.network).
+
+  # --- Service Attachment IAM allow policy -> HasPolicy ----------------------
+  - id: gcp-psc-service-attachment-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/ServiceAttachment"
+      field: "connectionPreference"
+    emit:
+      source_type: PrivateEndpoint
+      target_type: Policy
+      source: "<ServiceAttachment node>"
+      target: "<ResourcePolicy node for this ServiceAttachment>"
+      api_source: "compute.serviceAttachments.get"
+      evidence_field: "connectionPreference | consumerAcceptLists"
+      narrative: >-
+        {service_attachment.name} has a connection policy
+        (connectionPreference={value}, consumerAcceptLists={list}).
+
+  # --- Service Attachment cross-project trust (ACCEPT_MANUAL) ----------------
+  - id: gcp-psc-service-attachment-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/ServiceAttachment"
+      field: "consumerAcceptLists[].projectIdOrNum"
+    where:
+      - "connectionPreference == ACCEPT_MANUAL"
+      - "consumerAcceptLists[].projectIdOrNum is different from the producer project"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<producer project>"
+      target: "<allowed consumer project>"
+      api_source: "compute.serviceAttachments.get"
+      evidence_field: "consumerAcceptLists[].projectIdOrNum"
+      narrative: >-
+        Service Attachment {service_attachment.name} explicitly allows consumer project
+        {consumer_project} to connect (ACCEPT_MANUAL, consumerAcceptLists).
+
+  # --- ACCEPT_AUTOMATIC Service Attachment cross-project trust ----------------
+  - id: gcp-psc-service-attachment-auto-accept
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/ServiceAttachment"
+      field: "connectionPreference"
+      value: "ACCEPT_AUTOMATIC"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<producer project>"
+      target: "<ExternalIdentity: any consumer project>"
+      api_source: "compute.serviceAttachments.get"
+      evidence_field: "connectionPreference"
+      narrative: >-
+        Service Attachment {service_attachment.name} uses ACCEPT_AUTOMATIC, implicitly
+        trusting any consumer project that can reference its URI.
+
+  # --- Delete a PSC consumer endpoint (destructive: disruption) ----
+  - id: gcp-psc-delete-endpoint
+    emits: CanDelete
+    applies_to: [gcp]
+    description: >-
+      An identity with compute.forwardingRules.delete on a PSC consumer endpoint
+      (forwarding rule with purpose=PRIVATE_SERVICE_CONNECT) can remove it. This is a
+      destructive capability that disrupts private connectivity to the producer service,
+      purely an availability impact rather than privilege escalation or data access.
+    match_effective_permission:
+      action: "compute.forwardingRules.delete"
+      resource_type: "compute.googleapis.com/ForwardingRule"
+    where:
+      - "target forwardingRule has purpose=PRIVATE_SERVICE_CONNECT"
+    emit:
+      source_type: Identity
+      target_type: PrivateEndpoint
+      source: "<principal>"
+      target: "<PSC consumer forwarding rule>"
+      permissions:
+        - "compute.forwardingRules.delete"
+      conditions: [iam_permission]
+      api_source: "compute.forwardingRules.delete (effective permission)"
+      evidence_field: "iam.compute.forwardingRules.delete"
+      narrative: >-
+        {principal.name} can delete PSC consumer forwarding rule {forwarding_rule.name}
+        (compute.forwardingRules.delete), disrupting private connectivity to the
+        producer service {service_attachment.name}.

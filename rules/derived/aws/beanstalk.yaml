@@ -1,0 +1,349 @@
+# AWS Elastic Beanstalk (aws:beanstalk) — Phase 4 compute execution rules
+# ---------------------------------------------------------------------------
+# Beanstalk is a PaaS orchestrator: attacker code runs on the underlying EC2
+# instances, which ExecuteAs the environment's INSTANCE PROFILE role and expose
+# it via IMDS. Beanstalk itself acts through a separate SERVICE ROLE. Both are
+# attached at Create/UpdateEnvironment and both require iam:PassRole.
+#
+# Every rule emits a COMMON edge from schema/edges.yaml. Permissions listed are
+# the EFFECTIVE actions the evaluator must confirm on the given resource scope
+# before the edge is emitted. Honor the Beanstalk condition keys
+# (elasticbeanstalk:InApplication / FromApplicationVersion /
+# FromConfigurationTemplate / FromEnvironment / FromSolutionStack / FromPlatform)
+# and the iam:PassRole PassedToService scoping — they populate ?target.
+#
+# All action identifiers are from the AWS Service Authorization Reference for
+# Elastic Beanstalk.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 4-compute-serverless
+applies_to: [aws]
+
+rules:
+
+  # --- ExecutesAs: environment runs on EC2 under the instance profile --------
+  - id: aws-beanstalk-env-executes-as-instance-profile
+    emits: ExecutesAs
+    description: "Beanstalk environment provisions EC2 instances that run as the instance profile role."
+    match_record:
+      resource_type: "AWS::ElasticBeanstalk::Environment"
+      field: "OptionSettings[aws:autoscaling:launchconfiguration:IamInstanceProfile]"
+    emit:
+      source_type: Compute
+      source: "<Elastic Beanstalk environment>"
+      target: "<instance profile role>"
+      narrative: "{environment.name} runs its application code on EC2 instances that execute as {role.name} (instance profile)."
+
+  - id: aws-beanstalk-env-executes-as-service-role
+    emits: ExecutesAs
+    description: "Beanstalk service acts as the environment service role."
+    match_record:
+      resource_type: "AWS::ElasticBeanstalk::Environment"
+      field: "OptionSettings[aws:elasticbeanstalk:environment:ServiceRole]"
+    emit:
+      source_type: Compute
+      source: "<Elastic Beanstalk environment>"
+      target: "<service role>"
+      false_positive_note: "The service role is NOT where attacker payload runs; only the instance profile executes uploaded code. Do not chain CanModifyCode into the service role."
+      narrative: "{environment.name} is managed by the Elastic Beanstalk service acting as {role.name} (service role)."
+
+  # --- CanPassIdentity: PassRole for instance profile / service role ---------
+  - id: aws-beanstalk-pass-role
+    emits: CanPassIdentity
+    match_effective_permission: {action: "iam:PassRole", resource_type: "AWS::IAM::Role"}
+    where:
+      - "role trust allows ec2.amazonaws.com OR elasticbeanstalk.amazonaws.com"
+      - "iam:PassedToService condition (if present) includes ec2.amazonaws.com / elasticbeanstalk.amazonaws.com"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<IAM role passable to Beanstalk/EC2>"
+      permissions: ["iam:PassRole"]
+      conditions: [role_compatibility, condition_expression]
+      false_positive_note: "PassRole alone is not execution. Honor iam:PassedToService: a role passable only to another service (e.g. lambda) yields no Beanstalk execution. Pair with a Create/UpdateEnvironment or CreateApplicationVersion capability."
+      narrative: "{principal.name} can pass {role.name} to Elastic Beanstalk/EC2 (iam:PassRole)."
+
+  # --- CanAttachIdentity: set/replace the identity an environment runs as ----
+  - id: aws-beanstalk-attach-identity
+    emits: CanAttachIdentity
+    description: "Set or replace the instance profile / service role on an environment via option settings."
+    match_effective_permission: {action: "elasticbeanstalk:UpdateEnvironment", resource_type: "AWS::ElasticBeanstalk::Environment"}
+    where:
+      - "?principal has iam:PassRole for the chosen instance-profile/service role (see aws-beanstalk-pass-role)"
+      - "honor elasticbeanstalk:FromEnvironment / InApplication condition scoping"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Elastic Beanstalk environment>"
+      permissions: ["elasticbeanstalk:UpdateEnvironment", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      note: "Chains to CanExecuteAs(chosen role) once a deploy/restart re-provisions instances."
+      narrative: "{principal.name} can change the instance profile / service role of {environment.name} (elasticbeanstalk:UpdateEnvironment + iam:PassRole)."
+
+  # --- CanModifyCode: register+deploy an attacker source bundle --------------
+  - id: aws-beanstalk-modify-code-version
+    emits: CanModifyCode
+    description: "Register a new application version (S3 source bundle) and deploy it to an environment."
+    match_effective_permission: {action: "elasticbeanstalk:CreateApplicationVersion", resource_type: "AWS::ElasticBeanstalk::Application"}
+    where:
+      - "?principal also has elasticbeanstalk:UpdateEnvironment to deploy the version"
+      - "?principal can write the S3 source-bundle object (s3:PutObject on the bundle key) OR supplies its own bucket"
+      - "honor elasticbeanstalk:InApplication / FromApplicationVersion scoping"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Elastic Beanstalk environment>"
+      permissions: ["elasticbeanstalk:CreateApplicationVersion", "elasticbeanstalk:UpdateEnvironment", "s3:PutObject"]
+      conditions: [iam_permission, trigger_exists]
+      state_logic: |
+        if principal_has("elasticbeanstalk:UpdateEnvironment") on ?environment or trigger_exists(?environment): ACTIVE
+        else: POTENTIAL(trigger_exists)
+        # Staging a version (CreateApplicationVersion alone) is NOT execution.
+        # It only becomes execution when it can be deployed via UpdateEnvironment
+        # or a CanTrigger redeploy path (RestartAppServer/RebuildEnvironment).
+      false_positive_note: "CreateApplicationVersion without UpdateEnvironment (or a redeploy trigger) stages code but does not deploy it; emit POTENTIAL/CONDITIONAL(trigger_exists) until a deploy/restart path exists. .ebextensions in the bundle run as root at deploy time."
+      narrative: "{principal.name} can deploy an attacker-controlled source bundle to {environment.name} (elasticbeanstalk:CreateApplicationVersion + UpdateEnvironment), running arbitrary code on its instances."
+
+  # --- CanModifyConfiguration -----------------------------------------------
+  - id: aws-beanstalk-modify-configuration
+    emits: CanModifyConfiguration
+    description: "Change environment option settings (identity binding, env vars, platform hooks)."
+    match_effective_permission: {action: "elasticbeanstalk:UpdateEnvironment", resource_type: "AWS::ElasticBeanstalk::Environment"}
+    optional_permission: ["elasticbeanstalk:UpdateConfigurationTemplate", "elasticbeanstalk:CreateConfigurationTemplate"]
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Elastic Beanstalk environment>"
+      permissions: ["elasticbeanstalk:UpdateEnvironment"]
+      conditions: [iam_permission]
+      note: "UpdateConfigurationTemplate/CreateConfigurationTemplate are optional stage-then-apply paths (see optional_permission); they are not required for the edge and are kept out of the required permissions list."
+      narrative: "{principal.name} can modify {environment.name} option settings including its IAM identity binding (elasticbeanstalk:UpdateEnvironment)."
+
+  # --- CanDeploy: create a new environment in an application -----------------
+  - id: aws-beanstalk-deploy
+    emits: CanDeploy
+    match_effective_permission: {action: "elasticbeanstalk:CreateEnvironment", resource_type: "AWS::ElasticBeanstalk::Application"}
+    where:
+      - "honor elasticbeanstalk:InApplication / FromApplicationVersion / FromSolutionStack / FromPlatform scoping"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Elastic Beanstalk application>"
+      permissions: ["elasticbeanstalk:CreateEnvironment"]
+      note: "Combine with CanPassIdentity to realize CanCreateWorkloadAs."
+      narrative: "{principal.name} can create a new environment in {application.name} (elasticbeanstalk:CreateEnvironment)."
+
+  # --- CanTrigger: force re-execution of deploy hooks ------------------------
+  - id: aws-beanstalk-trigger-redeploy
+    emits: CanTrigger
+    description: "Restart/rebuild re-runs deploy hooks (.ebextensions) on the instances."
+    match_effective_permission: {action: "elasticbeanstalk:RestartAppServer", resource_type: "AWS::ElasticBeanstalk::Environment"}
+    optional_permission: "elasticbeanstalk:RebuildEnvironment"
+    emit:
+      target_type: Compute
+      source: "<principal>"
+      target: "<Elastic Beanstalk environment>"
+      permissions: ["elasticbeanstalk:RestartAppServer"]
+      conditions: [iam_permission]
+      note: "elasticbeanstalk:RebuildEnvironment is an optional stronger trigger (see optional_permission) that re-provisions instances; RestartAppServer only re-runs deploy hooks on existing instances."
+      narrative: "{principal.name} can restart/rebuild {environment.name} (elasticbeanstalk:RestartAppServer), re-running its deploy hooks."
+
+  # --- ExposesCredential: IMDS on the underlying EC2 instances --------------
+  # Two distinct edges per schema/edges.yaml: ExposesCredential is the leak FACT
+  # (Compute exposes the role via IMDS); CanRetrieveToken is the token-mint
+  # CAPABILITY. providers/aws/beanstalk.md sections 8/17/18 document both.
+  - id: aws-beanstalk-imds-exposes-credential
+    emits: ExposesCredential
+    description: "Beanstalk EC2 instances leak the instance profile creds via IMDS (169.254.169.254)."
+    match:
+      - [ ?environment, ExecutesAs, ?role ]
+    where:
+      - "node_type(?environment) == ApplicationPlatform (Beanstalk environment backed by EC2)"
+      - "?role is the INSTANCE PROFILE role (not the service role)"
+    emit:
+      source: "<Elastic Beanstalk environment>"
+      target: "<instance profile role>"
+      state_logic: "CONDITIONAL(trigger_exists|network_reachability) by default -- becomes ACTIVE only when a companion CanExecuteAs(?principal, ?role) edge exists (on-host code exec achieved) or a reachable SSRF path is confirmed with IMDS hardening unknown. This explicit exposure fact must not assert ACTIVE on unproven code execution."
+      conditions: [network_reachability, service_state]
+      false_positive_note: "This is the leak fact only. IMDSv2 with hop-limit 1 blocks most SSRF-to-credential abuse; on-host code exec still works. Mark SSRF-only paths CONDITIONAL when instance metadata hardening is unknown. Only meaningful once an inbound execution edge (CanExecuteAs/CanModifyCode) or a reachable SSRF into the app exists."
+      narrative: "{environment.name} exposes {role.name} credentials via the EC2 instance metadata service (IMDS)."
+
+  - id: aws-beanstalk-imds-token
+    emits: CanRetrieveToken
+    description: "Code on a Beanstalk instance (or SSRF against the app) reads the instance profile creds from IMDS."
+    match:
+      - [ ?environment, ExecutesAs, ?role ]
+    where:
+      - "node_type(?environment) == ApplicationPlatform (Beanstalk environment backed by EC2)"
+      - "?role is the INSTANCE PROFILE role (not the service role)"
+    emit:
+      source: "<Elastic Beanstalk environment>"
+      target: "<instance profile role>"
+      state_logic: "CONDITIONAL(trigger_exists|network_reachability) by default -- becomes ACTIVE only when a companion CanExecuteAs(?principal, ?role) edge exists (on-host code exec) or a reachable SSRF path is confirmed with IMDS hardening unknown. The explicit edge cannot itself know code exec was achieved, so it stays CONDITIONAL until a realizing edge is present."
+      conditions: [network_reachability, service_state]
+      false_positive_note: "IMDSv2 with hop-limit 1 blocks most SSRF-to-credential abuse; on-host code exec still works. Mark SSRF-only paths CONDITIONAL when instance metadata hardening is unknown."
+      narrative: "{environment.name} exposes {role.name} credentials via the EC2 instance metadata service (IMDS)."
+
+  # --- ExposedToInternet: web-tier ELB is internet-facing by default --------
+  - id: aws-beanstalk-web-tier-public
+    emits: ExposedToInternet
+    description: "WebServer-tier environments front instances with an internet-facing ELB by default."
+    match_record:
+      resource_type: "AWS::ElasticBeanstalk::Environment"
+      field: "Tier.Name == WebServer"
+    where:
+      - "load balancer scheme is internet-facing (option aws:ec2:vpc:ELBScheme != internal)"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<Elastic Beanstalk environment>"
+      target: "<AnonymousIdentity>"
+      state_logic: "ACTIVE if ELBScheme is internet-facing; CONDITIONAL if scheme unknown; not emitted for Worker tier"
+      false_positive_note: "Worker-tier environments have no public ELB. Do not emit for internal-scheme load balancers."
+      narrative: "{environment.name} is reachable from the internet via its web-tier load balancer."
+
+  # --- CanAdminister: full control over the application / platform ----------
+  - id: aws-beanstalk-admin
+    emits: CanAdminister
+    description: "Full control over an Elastic Beanstalk application (elasticbeanstalk:* or the admin managed policy)."
+    match_effective_permission: {action: "elasticbeanstalk:*", resource_type: "AWS::ElasticBeanstalk::Application"}
+    where:
+      - "?principal holds elasticbeanstalk:* on the application, OR the managed policy AdministratorAccess-AWSElasticBeanstalk, OR the combination elasticbeanstalk:UpdateEnvironment + elasticbeanstalk:UpdateApplicationVersion + elasticbeanstalk:CreateConfigurationTemplate"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Elastic Beanstalk application>"
+      permissions: ["elasticbeanstalk:*"]
+      conditions: [iam_permission]
+      note: "CanAdminister implies CanModifyCode/CanModifyConfiguration/CanDeploy/CanAttachIdentity on the application's environments; the CanExecuteAs derivations still require a compatible iam:PassRole for the instance profile."
+      false_positive_note: "elasticbeanstalk:* alone still does not yield CanExecuteAs without iam:PassRole for a role whose iam:PassedToService admits Beanstalk/EC2. Honor the elasticbeanstalk:InApplication/FromApplication* condition keys before claiming account-wide admin."
+      narrative: "{principal.name} has administrative control over Elastic Beanstalk application {application.name} (elasticbeanstalk:* / AdministratorAccess-AWSElasticBeanstalk)."
+
+  # --- ExposesCredential: plaintext secrets in environment configuration -----
+  - id: aws-beanstalk-config-secrets
+    emits: ExposesCredential
+    description: "Environment option settings / environment properties often store plaintext secrets readable via DescribeConfigurationSettings."
+    match_effective_permission: {action: "elasticbeanstalk:DescribeConfigurationSettings", resource_type: "AWS::ElasticBeanstalk::Environment"}
+    where:
+      - "environment properties / option settings contain plaintext credential material (DB passwords, API keys)"
+    emit:
+      source: "<Elastic Beanstalk environment>"
+      target: "<credential material in environment properties>"
+      state_logic: "CONDITIONAL(iam_permission) -- becomes ACTIVE only when environment properties actually contain credential material; low confidence recon-grade edge."
+      conditions: [iam_permission]
+      false_positive_note: "DescribeConfigurationSettings is recon; most environment properties are not secrets. Only emit when a value pattern-matches credential material. RequestEnvironmentInfo/RetrieveEnvironmentInfo log bundling is a related recon-grade exposure path."
+      narrative: "{environment.name} may expose plaintext credentials stored in its environment properties (elasticbeanstalk:DescribeConfigurationSettings)."
+
+# ===========================================================================
+# DERIVED CanExecuteAs / CanCreateWorkloadAs derivations
+# (match already-emitted common edges; run to fixpoint)
+# ===========================================================================
+derived_rules:
+
+  - id: aws-beanstalk-execute-as-via-version
+    emits: CanExecuteAs
+    description: "Deploy attacker code to an existing environment -> run as its instance profile."
+    applies_to: [aws]
+    match:
+      - [ ?principal, CanModifyCode, ?environment ]
+      - [ ?environment, ExecutesAs, ?role ]
+    where:
+      - "node_type(?environment) == ApplicationPlatform"
+      - "?role is the instance profile role"
+    optional:
+      - [ ?principal, CanTrigger, ?environment ]
+    emit:
+      source: ?principal
+      target: ?role
+      state_logic: |
+        if matched(optional[0]) or trigger_exists(?environment): ACTIVE
+        else: CONDITIONAL(trigger_exists)
+      conditions_from: [ ?environment, ?role ]
+      confidence: "min(contributing_confidences) * rule_prior"
+      weight: "sum(contributing_weights) + emits.base_weight"
+      permissions: "union(contributing.permissions)"
+      derived_from: [ "<CanModifyCode edge_id>", "<ExecutesAs edge_id>" ]
+      evidence:
+        narrative_template: >
+          {principal.name} can execute as {role.name} because it can deploy an
+          attacker-controlled source bundle to {environment.name}
+          (via {perm:CanModifyCode}), which runs its instances as {role.name}{if optional[0]: ", and can restart/rebuild it to force redeploy"}.
+
+  - id: aws-beanstalk-execute-as-via-config
+    emits: CanExecuteAs
+    description: "Swap in a more-privileged instance profile on an existing environment, then trigger a deploy."
+    applies_to: [aws]
+    match:
+      - [ ?principal, CanAttachIdentity, ?environment ]
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "node_type(?environment) == ApplicationPlatform"
+      - "role_compatible(?role, elasticbeanstalk/ec2)"
+    optional:
+      - [ ?principal, CanTrigger, ?environment ]
+    emit:
+      source: ?principal
+      target: ?role
+      state_logic: |
+        if matched(optional[0]) and trigger_action_replaces_instances(?environment): ACTIVE
+        else: CONDITIONAL(trigger_exists)
+        # Changing the IamInstanceProfile option only takes effect once new
+        # instances are provisioned with it. A plain RestartAppServer restarts
+        # the app-server process on EXISTING instances that still carry the old
+        # instance profile, so it does NOT realize this edge. The ACTIVE branch
+        # requires elasticbeanstalk:RebuildEnvironment (or an instance-replacement
+        # / rolling-update deploy / ASG instance replacement) -- not a bare restart.
+      conditions_from: [ ?environment, ?role ]
+      permissions: "union(contributing.permissions)"
+      derived_from: [ "<CanAttachIdentity edge_id>", "<CanPassIdentity edge_id>" ]
+      false_positive_note: "Requires iam:PassRole with PassedToService admitting elasticbeanstalk.amazonaws.com/ec2.amazonaws.com for ?role; a role passable only to another service (e.g. lambda) yields no execution. UpdateEnvironment alone does not swap the instance profile without the matching PassRole. Additionally, RestartAppServer alone does not re-provision instances with the new profile -- an environment rebuild / instance replacement is required to realize execution as ?role."
+      evidence:
+        narrative_template: >
+          {principal.name} can execute as {role.name} by setting it as the
+          instance profile of {environment.name}
+          (via {perm:CanAttachIdentity} + iam:PassRole) and rebuilding/replacing
+          instances so new ones launch under {role.name}.
+
+  - id: aws-beanstalk-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new environment bound to a privileged instance profile."
+    applies_to: [aws]
+    match:
+      - [ ?principal, CanDeploy, ?application ]
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "role_compatible(?role, elasticbeanstalk/ec2)"
+    emit:
+      source: ?principal
+      target: ?role
+      state_logic: "ACTIVE"
+      conditions_from: [ ?role ]
+      permissions: "union(contributing.permissions)"
+      derived_from: [ "<CanDeploy edge_id>", "<CanPassIdentity edge_id>" ]
+      false_positive_note: "Requires iam:PassRole PassedToService admitting Beanstalk/EC2 for ?role; otherwise the new environment cannot be created with that role."
+      evidence:
+        narrative_template: >
+          {principal.name} can create a new Elastic Beanstalk environment in
+          {application.name} bound to {role.name}
+          (elasticbeanstalk:CreateEnvironment + iam:PassRole), executing code as {role.name}.
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw config -> explicit edges) belong in
+# rules/explicit/aws-beanstalk.yaml. The ExecutesAs / ExposedToInternet /
+# CanRetrieveToken producers above (match_record based) are the explicit-edge
+# generators and should be moved there when that file is created; they are kept
+# here for a self-contained service definition.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: if an SCP or permission boundary denies any
+# elasticbeanstalk:* or iam:PassRole action above at the effective scope, the
+# evaluator still emits the edge with state: BLOCKED and denied_by=<SCP arn>, so
+# the UI can explain why the otherwise-present path does not work. Likewise, if
+# a Beanstalk condition key (InApplication/FromEnvironment/...) or the
+# iam:PassedToService condition excludes the target, emit the edge scoped to the
+# permitted set only (never widen to Resource:* on a scoped grant).
+# ---------------------------------------------------------------------------

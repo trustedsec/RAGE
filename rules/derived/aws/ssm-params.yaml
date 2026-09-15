@@ -1,0 +1,270 @@
+# AWS SSM Parameter Store — Derived attack-path rules (Phase 5 — credential access)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (the Secret node per SecureString, CanReadSecret from effective ssm:GetParameter*,
+# CanWrite from ssm:PutParameter, CanDecrypt from kms:Decrypt on the parameter's
+# KMS key, CrossAccountTrust from a RAM/resource-policy share) lives in
+# /rules/explicit/aws-ssm-params.yaml; these rules combine those explicit facts
+# into credential-access and escalation capabilities.
+#
+# Core Phase-5 invariant (the key_permission gate):
+#   CanReadSecret on a SecureString parameter is ACTIVE only if the caller can
+#   decrypt its value. SecureString is KMS-encrypted:
+#     - default AWS managed key alias/aws/ssm  -> decrypt implicit for a same-account
+#       principal holding the ssm read action  -> ACTIVE.
+#     - customer managed CMK (--key-id)        -> also needs kms:Decrypt on that CMK
+#       -> CONDITIONAL(key_permission) until confirmed.
+#   Without decryption the API returns ciphertext only (NOT the secret).
+#
+# Credential pivot: SecureString values commonly hold DB passwords / API keys /
+# tokens -> CredentialsFor(secret -> target identity). This completes the
+# Phase-4 -> Phase-5 chain: CanExecuteAs(role) -> CanReadSecret(param) ->
+# CredentialsFor(target).
+#
+# Permissions are the EFFECTIVE actions the permission evaluator must confirm on
+# the given resource scope. State defaults to ACTIVE; an unmet condition yields
+# CONDITIONAL/POTENTIAL; an explicit deny/SCP/boundary yields BLOCKED.
+#
+# Docs:
+#  - https://docs.aws.amazon.com/systems-manager/latest/userguide/systems-manager-parameter-store.html
+#  - https://docs.aws.amazon.com/systems-manager/latest/userguide/param-create-cli.html (SecureString + KMS)
+#  - https://docs.aws.amazon.com/systems-manager/latest/userguide/parameter-store-shared-parameters.html (RAM/CMK share)
+#  - https://docs.aws.amazon.com/kms/latest/APIReference/API_Decrypt.html
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 5-credential-access
+applies_to: [aws]
+
+rules:
+
+  # --- The key_permission gate on CanReadSecret lives in the EXPLICIT file ----
+  # emitsConformant fix: CanReadSecret is nature: explicit in schema/edges.yaml, and
+  # edges.yaml already lists key_permission in CanReadSecret.conditions. The former
+  # derived rules `aws-ssm-params-read-securestring` and
+  # `aws-ssm-params-read-securestring-by-path` did NOT synthesize a new edge type from a
+  # multi-edge chain — they re-asserted the explicit CanReadSecret already produced by
+  # the explicit rules (aws-ssm-params-can-read-secret /
+  # aws-ssm-params-can-read-secret-by-path) merely to attach the key_permission
+  # state_logic. A derived file must not re-emit an explicit edge, so the gate has been
+  # moved onto its rightful owner, the explicit normalizer
+  # (rules/explicit/aws-ssm-params.yaml::aws-ssm-params-can-read-secret[-by-path]),
+  # which now carries conditions: [key_permission] and the ACTIVE/CONDITIONAL
+  # state_logic. The by-path fan-out (one GetParametersByPath grant -> one CanReadSecret
+  # per in-scope descendant SecureString) is likewise emitted by the explicit by-path
+  # rule. No derived CanReadSecret edge is emitted here; the credential-access chain
+  # below (CredentialsFor -> CanEscalateTo / CanEnterAccount) consumes the explicit
+  # CanReadSecret as an input.
+
+  # --- SecureString value is a credential for a target -----------------------
+  - id: aws-ssm-params-securestring-credentials-for
+    emits: CredentialsFor
+    description: "A SecureString parameter's value authenticates as the target identity/service."
+    match:
+      - [ ?param, ContainsSecret, ?secret ]
+      # ?target MUST be bound by a real match/optional term, not prose. The heuristic
+      # (name/tag/description signal, or an IaC/connection-string resolution) is
+      # normalized upstream into a structured ContainsResourceReference edge from the
+      # Secret/param to the resolved target; we JOIN it here so ?target is a concrete
+      # graph node. Without this term the rule was not mechanically evaluable and
+      # downstream [?param, CredentialsFor, ?target] matches inherited an unbound target.
+      - [ ?secret, ContainsResourceReference, ?target ]
+    where:
+      - "node_class(?param) == Secret"
+      - "?param.origin_service == aws:ssm-params"
+      - "?param.parameter_type == SecureString"
+      - "node_class(?target) in [Identity, Data]"        # CredentialsFor target set
+      - "the ContainsResourceReference carries a credential-resolution signal (name/tag/description heuristic e.g. password|db|api-key|token|/rds/, or a resolved IaC/connection-string reference); signal_strength scales confidence"
+    emit:
+      source: ?param
+      target: ?target
+      permissions: []
+      conditions: []
+      state_logic: "ACTIVE (zero-cost fact once the value is read); confidence scaled by signal strength"
+      confidence: "0.6 * signal_strength"
+      derived_from: [ "<ContainsSecret edge_id>", "<ContainsResourceReference edge_id>" ]
+      note: >-
+        Nature deviation (documented, per lambda.yaml's CreateFunction~CanDeploy fold):
+        CredentialsFor is nature: explicit in schema/edges.yaml, but this instance is a
+        HEURISTIC derivation — the target binding depends on a name/tag/description
+        signal or a resolved reference, not on a directly observed authentication record.
+        It therefore lives in the derived file at reduced confidence. When a reference is
+        resolved with high certainty (e.g. a connection string naming an RDS instance),
+        the same edge may instead be emitted by the explicit normalizer; graph consumers
+        keying strictly on explicit CredentialsFor should also accept this derived one.
+      false_positive_note: >-
+        Requires a concrete ContainsResourceReference binding from the SecureString to
+        ?target — never assert a specific target from a bare SecureString or from prose.
+        With only a weak/absent signal (no ContainsResourceReference), prefer the generic
+        aws-ssm-params-exposes-credential (ExposesCredential) instead of a targeted
+        CredentialsFor. This edge is zero-cost for path-finding; its value comes from a
+        preceding CanReadSecret.
+      narrative: >-
+        The SecureString {param.name} holds a credential for {target.name};
+        reading it lets the holder authenticate as {target.name}.
+
+  # --- Reading the parameter yields the credential (generic) -----------------
+  - id: aws-ssm-params-exposes-credential
+    emits: ExposesCredential
+    description: "A SecureString parameter exposes credential material to any reader."
+    match:
+      - [ ?param, ContainsSecret, ?secret ]
+    where:
+      - "node_class(?param) == Secret"
+      - "?param.origin_service == aws:ssm-params"
+      - "?param.parameter_type == SecureString"
+      # Target-set conformance: ExposesCredential.target is [Credential, Identity].
+      # ContainsSecret.target is [Secret, Credential]; only emit when ?secret is in the
+      # Credential bucket (subtypes Credential/Password/APIKey/AccessKey/Token/
+      # ConnectionString/Certificate). A bare subtype 'Secret'/'GenericSecret' is a
+      # Secret-class node NOT in the target set -> skip it here and rely on the generic
+      # ContainsSecret structural edge instead of an out-of-set ExposesCredential.
+      - "credential_bucket(?secret) == Credential  # subtype in {Credential,Password,APIKey,AccessKey,Token,ConnectionString,Certificate}"
+    emit:
+      source: ?param
+      target: ?secret
+      permissions: []
+      conditions: []
+      state_logic: "ACTIVE — expresses that reading the SecureString equals holding the credential"
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "<ContainsSecret edge_id>" ]
+      false_positive_note: >-
+        Not an escalation by itself; it states that a reader of this SecureString holds
+        the credential it contains. Path value comes from a contributing CanReadSecret.
+        Do not emit for String/StringList parameters. Do not emit when ?secret's subtype
+        is the generic 'Secret'/'GenericSecret' (a Secret-class node), since that is not
+        in ExposesCredential's [Credential, Identity] target set.
+      narrative: >-
+        {param.name} exposes the credential material it stores to any principal
+        able to read it.
+
+  # --- Escalation roll-up when the credential's target is more privileged -----
+  - id: aws-ssm-params-escalate-via-secret
+    emits: CanEscalateTo
+    description: "Reading a SecureString that holds creds for a more-privileged identity is escalation."
+    match:
+      - [ ?principal, CanReadSecret, ?param ]
+      - [ ?param,     CredentialsFor, ?target ]
+    where:
+      - "node_class(?param) == Secret"
+      - "?param.origin_service == aws:ssm-params"
+      - "?target.privilege_level > ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?target
+      permissions: ["ssm:GetParameter", "kms:Decrypt"]
+      conditions: [key_permission]
+      state_logic: >-
+        inherit the state of the contributing CanReadSecret (ACTIVE or
+        CONDITIONAL(key_permission)); only emit when ?target is strictly more privileged
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanReadSecret edge_id>", "<CredentialsFor edge_id>" ]
+      false_positive_note: >-
+        Only emit when the credential's target identity is strictly more privileged than
+        the reader; a lateral same-privilege credential is not escalation. Inherits the
+        key_permission gate: if CanReadSecret is CONDITIONAL(key_permission), so is this.
+      narrative: >-
+        {principal.name} can escalate to {target.name} by reading credentials stored
+        in the SecureString {param.name}.
+
+  # --- Cross-account RAM-shared SecureString -> account entry -----------------
+  - id: aws-ssm-params-cross-account-read
+    emits: CanEnterAccount
+    description: "A consumer reads a RAM-shared SecureString whose creds grant the owning account."
+    match:
+      - [ ?consumer, CanReadSecret, ?param ]
+      - [ ?param,    CredentialsFor, ?target ]
+      # Actually JOIN the CrossAccountTrust listed in derived_from instead of asserting
+      # the RAM share in prose. This is the explicit aws-ssm-params-cross-account-share
+      # edge: [?share (param resource policy / RAM share), CrossAccountTrust,
+      # ?consumerAccount]. ?share is scoped to ?param (advanced-tier resource policy);
+      # ?consumerAccount is ?consumer's Account boundary. Binding it here makes the
+      # contributing edge a real graph join, not prose.
+      - [ ?share, CrossAccountTrust, ?consumerAccount ]
+    where:
+      - "node_class(?param) == Secret"
+      - "?param.origin_service == aws:ssm-params"
+      - "?param.tier == Advanced"
+      - "?consumer.account != ?param.account"
+      - "?share is the resource policy / RAM share OF ?param (the share grants ?consumer read on ?param)"
+      - "?consumerAccount == ?consumer.account  # the trust names the consumer's account"
+      - "?target resolves to an identity/resource in ?param.account (CredentialsFor target lives in the owning account)"
+      - "?owningAccount is the Account boundary node that Contains ?param (i.e. the node whose id == ?param.account); bind it as the emit target"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?consumer
+      # CanEnterAccount.target MUST be a concrete Account boundary node, not a string.
+      # Bind the owning-account node resolved above (?param's Account boundary), never a
+      # '<account of ?param>' placeholder — the resolver must supply the real Account id.
+      target: ?owningAccount
+      permissions: ["ssm:GetParameter", "kms:Decrypt"]
+      conditions: [resource_policy, key_permission]
+      state_logic: >-
+        if the CrossAccountTrust (RAM/resource-policy) grant is confirmed AND
+        (SecureString CMK is shared to ?consumer via the KMS key policy AND ?consumer has
+        kms:Decrypt): ACTIVE; else CONDITIONAL(resource_policy, key_permission)
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<CanReadSecret edge_id>", "<CredentialsFor edge_id>", "<CrossAccountTrust (aws-ssm-params-cross-account-share) edge_id>" ]
+      false_positive_note: >-
+        Cross-account read is ADVANCED-tier only and READ-ONLY. Critically, the default
+        AWS-managed alias/aws/ssm key CANNOT be shared cross-account — a shareable
+        SecureString MUST use a customer-managed CMK that is ALSO shared via the KMS key
+        policy AND the consumer must hold kms:Decrypt on it; until confirmed, emit
+        CONDITIONAL(key_permission). Requires the resolved credential to actually
+        authenticate in the owning account (CredentialsFor -> owning-account identity),
+        not merely be read.
+      narrative: >-
+        {consumer.name} (account {consumer.account}) can read the shared SecureString
+        {param.name} and use its credentials to gain a foothold in account {param.account}.
+
+  # --- Tamper / config poisoning (feeds cross-service execution) -------------
+  - id: aws-ssm-params-tamper
+    emits: CanWrite
+    description: "Overwrite a parameter's value (ssm:PutParameter Overwrite) to poison consumers."
+    match:
+      - [ ?principal, CanWrite, ?param ]
+    where:
+      - "node_class(?param) in [Secret, Data]"
+      - "?param.origin_service == aws:ssm-params"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?param
+      permissions: ["ssm:PutParameter"]
+      conditions: [iam_permission]
+      state_logic: >-
+        overwriting an EXISTING parameter requires ssm:PutParameter WITH Overwrite=true
+        on the parameter scope -> ACTIVE only if that Overwrite-permitting grant holds,
+        else CONDITIONAL(iam_permission); creating a NEW parameter at an unused name needs
+        ssm:PutParameter WITHOUT Overwrite -> ACTIVE for the create-side poisoning of a
+        not-yet-existent name a consumer will resolve. Onward execution impact is a
+        separate, cross-service derivation (POTENTIAL until a concrete consumer reference
+        is observed).
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanWrite(ssm:PutParameter) explicit edge_id>" ]
+      false_positive_note: >-
+        Requires ssm:PutParameter with Overwrite on the parameter scope (creating a NEW
+        parameter needs no Overwrite; changing an existing one does). Tamper is only an
+        escalation when a downstream service actually resolves the parameter (AMI ID,
+        image tag, endpoint, ECS/CodeBuild secret/env reference) — that execution step is
+        owned by the consuming service's rules and is POTENTIAL until the reference is
+        proven. Not walked as escalation on its own. SCP denying ssm:PutParameter -> BLOCKED.
+      narrative: >-
+        {principal.name} can overwrite the parameter {param.name} (ssm:PutParameter,
+        Overwrite=true), poisoning any service that resolves it.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP / permission boundary denying ssm:GetParameter / ssm:GetParameters /
+#    ssm:GetParametersByPath at the effective scope -> emit CanReadSecret BLOCKED
+#    with denied_by=<SCP arn/statement>.
+#  - A CMK key policy (and IAM) that does not admit the caller for kms:Decrypt ->
+#    CanReadSecret on that SecureString is CONDITIONAL(key_permission) or BLOCKED.
+#  - An SCP denying ssm:PutParameter blocks aws-ssm-params-tamper.
+#  - String / StringList parameters are NOT Secret nodes: none of these rules apply
+#    to them (see providers/aws/ssm-params.md §22).
+# ---------------------------------------------------------------------------

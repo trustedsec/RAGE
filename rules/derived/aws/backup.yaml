@@ -1,0 +1,662 @@
+# AWS Backup — Derived attack-path rules (Phase 6 — Storage & Databases)
+# ---------------------------------------------------------------------------
+# AWS Backup is a centralized managed backup service that snapshots and restores
+# AWS resources (RDS, EC2/EBS, EFS, DynamoDB, FSx, Aurora, DocumentDB, S3, etc.)
+# across accounts and regions. The security signature for Phase 6:
+#
+#   (1) EXFILTRATION via StartCopyJob: copies a recovery point cross-account
+#       to an attacker-controlled vault; attacker then restores and reads all data.
+#       Primary attack path -> CanExfiltrate + CrossAccountTrust.
+#
+#   (2) DATA READ via StartRestoreJob: provisions a new resource from a recovery
+#       point; the restored resource is accessible to the caller -> CanReadData.
+#       Recovery points of RDS/EBS/EFS/DynamoDB resources typically contain
+#       secret material -> ContainsSecret (cite credential-chains for roll-up).
+#
+#   (3) POLICY SELF-GRANT via PutBackupVaultAccessPolicy: rewrite vault access
+#       policy to grant broader/cross-account access -> CanModifyPolicy.
+#
+#   (4) STRUCTURAL TRUST: vault access policy naming external account ->
+#       CrossAccountTrust (explicit normalization).
+#
+# KMS GATE: recovery points encrypted with a CMK require kms:Decrypt on the
+# wrapping key. CanReadData derived from StartRestoreJob is CONDITIONAL(key_permission)
+# when the encryption key is a CMK and the caller's decrypt access is unresolved.
+# Cite credential-chains decrypt-gates pattern for resolution.
+#
+# SERVICE ROLE: backup/restore jobs run under an IAM role passed at creation time.
+# CanPassIdentity(principal -> role) is the explicit edge; can-execute-as linchpin
+# derives CanExecuteAs. Not re-derived here — cite can-execute-as.yaml.
+#
+# LINCHPIN CITATIONS (do not re-derive):
+#   * credential-chains.yaml — ContainsSecret -> CredentialsFor -> CanImpersonate
+#     (once secret is read from restored resource)
+#   * credential-chains.yaml — decrypt-gates-secret-read (CMK gate on restore)
+#   * can-execute-as.yaml — execute-as-via-config-identity-swap (PassRole to backup SA)
+#   * can-control.yaml — escalate-via-execute-as / enter-account-via-assume
+#
+# PERMISSIONS: all from AWS Service Authorization Reference for AWS Backup.
+# No permissions are invented.
+#
+# STATE CONVENTIONS (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. CONDITIONAL contributors cap output at CONDITIONAL.
+# BLOCKED contributors block the derivation entirely.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # PRIMARY: CROSS-ACCOUNT EXFILTRATION via StartCopyJob
+  # ===========================================================================
+
+  # --- 1) StartCopyJob cross-account -> CanExfiltrate -------------------------
+  # backup:StartCopyJob copies a recovery point to a destination vault. When the
+  # destination vault is in a DIFFERENT AWS account, this moves a complete backup
+  # (DB snapshot, EBS snapshot, EFS backup, DynamoDB export) to an external
+  # account. The attacker then calls backup:StartRestoreJob in their own account
+  # to provision a full replica of the source resource and read all data.
+  #
+  # Requires:
+  #   (a) caller has effective backup:StartCopyJob on the source vault/recovery point
+  #   (b) destination vault (external account) access policy permits
+  #       backup:CopyIntoBackupVault from the source account
+  #
+  # Note: cross-REGION same-account copies are lower risk (no account boundary).
+  # This rule emits CanExfiltrate only when the destination vault is cross-ACCOUNT.
+  # Recovery point target: individual recovery points (Backup/Storage nodes) are
+  # the entities that cross the account boundary, not the vault container.
+  - id: aws-backup-cross-account-exfil
+    emits: CanExfiltrate
+    description: "backup:StartCopyJob copies individual recovery points from a backup vault to a vault in a different AWS account, enabling complete data exfiltration by restoring the copied backups in the attacker's account."
+    match:
+      - [ ?principal, HasPermission, ?vault ]
+    where:
+      - "node_type(?vault) == Backup"
+      - "?vault.provider_type == 'AWS::Backup::BackupVault'"
+      - "?principal has EFFECTIVE backup:StartCopyJob on ?vault ARN (or on contained recovery points)"
+      - "?recovery_point node_type == Backup AND ?recovery_point.provider_type == 'AWS::Backup::RecoveryPoint' AND ?recovery_point ContainsResourceReference ?vault"
+      - "A destination vault ARN in another account ID is available (from backup plan rules[].copyActions[].destinationVaultArn OR caller-supplied at runtime)"
+      - "destination vault's access policy permits backup:CopyIntoBackupVault from source account (or Principal: '*')"
+      - "?vault is NOT a Logically Air-Gapped (LAG) vault (LAG vaults block cross-account copy by design)"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: ?principal
+      target: ?recovery_point
+      permissions: ["backup:StartCopyJob"]
+      conditions: [iam_permission, resource_policy, scp_or_org_policy, key_permission]
+      state_logic: >-
+        ACTIVE when: (1) backup:StartCopyJob is confirmed EFFECTIVE on ?vault (identity
+        policy + no SCP deny), (2) the destination vault's access policy is confirmed to
+        permit backup:CopyIntoBackupVault from the source account or a wildcard principal,
+        AND (3) the recovery point's KMS encryption key (if CMK) is accessible in the
+        destination account (or re-encryption is configured).
+        CONDITIONAL(resource_policy) when the destination vault policy hasn't been
+        evaluated or may restrict cross-account copy-in.
+        CONDITIONAL(key_permission) when recovery points are encrypted with a CMK and the
+        destination account's access to that key is unresolved — the copy will fail or
+        produce an unusable backup without kms:Decrypt on the source key.
+        CONDITIONAL(scp_or_org_policy) when an SCP may block backup:StartCopyJob cross-account.
+        BLOCKED when: an SCP explicitly denies backup:StartCopyJob; OR the vault is a LAG
+        vault (cross-account copy blocked by design); OR Vault Lock is active in compliance
+        mode AFTER the cool-off period (within the MinRetentionDays window). NOTE: Vault Lock
+        blocks backup:DeleteBackupVaultAccessPolicy but NOT backup:StartCopyJob — the copy
+        capability remains available even in locked compliance vaults. Model locked vaults as
+        a defensive measure (prevents deletion/policy change), not as a gate on copy-out.
+        Same-account cross-region copies: downgrade to POTENTIAL — no account boundary
+        crossed; not emitted as CanExfiltrate.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?vault (backup:StartCopyJob effective permission)"
+        - "?recovery_point ContainsResourceReference ?vault (recovery point resides in vault)"
+        - "backup plan rules[].copyActions[].destinationVaultArn shows cross-account vault (GetBackupPlan evidence)"
+        - "destination vault GetBackupVaultAccessPolicy confirms backup:CopyIntoBackupVault grant"
+      false_positive_note: >-
+        Two independent conditions must hold: (1) backup:StartCopyJob is EFFECTIVE for the
+        caller on the source vault; (2) the DESTINATION vault's resource policy permits
+        backup:CopyIntoBackupVault from the source account — without this second condition
+        the copy job is rejected by the destination account. Do NOT emit ACTIVE without
+        evidence of the destination policy grant.
+        Same-account cross-region copies are NOT exfiltration across an account boundary —
+        do not emit CanExfiltrate; they may warrant CanReadData (rule 2).
+        For LAG vaults, cross-account copy is blocked by the vault type itself — emit BLOCKED.
+        KMS-encrypted recovery points (CMK): the copy will only succeed if the destination
+        is granted kms:Decrypt / kms:ReEncrypt on the source key, or re-encryption to a
+        destination key is configured — emit CONDITIONAL(key_permission) when unresolved.
+        Vault Lock in compliance mode: once active (after cool-off period), Vault Lock blocks
+        backup:DeleteBackupVaultAccessPolicy but DOES NOT block backup:StartCopyJob. A locked
+        vault is defensive (prevents deletion), but cross-account copy is not gated by the lock.
+        Emit ACTIVE for copy-out even when Vault Lock is active compliance-locked.
+      narrative: >-
+        {principal.name} can copy recovery points (individual backups) from vault {vault.name}
+        (backup:StartCopyJob) to a vault in an external AWS account. The external account
+        can then restore the copied backups to get full replicas of the source resources —
+        databases, EBS volumes, or filesystems — and read all data.
+
+  # ===========================================================================
+  # DATA READ via StartRestoreJob
+  # ===========================================================================
+
+  # --- 2) StartRestoreJob -> CanReadData ---------------------------------------
+  # backup:StartRestoreJob provisions a new resource (RDS DB instance, EC2 instance,
+  # EFS filesystem, DynamoDB table, etc.) from a recovery point in a vault. The
+  # newly provisioned resource is accessible to IAM principals in the account with
+  # appropriate permissions on the target service. This constitutes effective data-
+  # plane read access to the backup contents, but ONLY if the restored resource can
+  # be accessed post-restore.
+  #
+  # Recovery points of data-bearing resources (RDS, EBS, EFS, DynamoDB) contain
+  # complete point-in-time copies of data including any embedded secrets. The
+  # restore job delivers a queryable / mountable / downloadable replica.
+  #
+  # TARGET-SERVICE GATE: StartRestoreJob alone does NOT enable data read. The
+  # restored resource (RDS instance, EC2 instance, EFS mount, etc.) requires
+  # target-service access:
+  #   - RDS: rds:DescribeDBInstances + database auth (master password or IAM auth)
+  #   - EC2: ec2:DescribeInstances + key pair or SSM agent access
+  #   - EFS: ec2:DescribeFileSystems + mount permissions + application read
+  #   - DynamoDB: dynamodb:Scan/Query on the restored table
+  # Without confirmed access to the restored resource's target service, the edge is
+  # CONDITIONAL on those permissions. This rule emits CanReadData(principal, vault)
+  # with the understanding that the principal needs ADDITIONAL target-service access
+  # to complete the data read. Cap at CONDITIONAL(service_state) or CONDITIONAL(iam_permission)
+  # to reflect this gate.
+  #
+  # KMS GATE: if the recovery point is encrypted with a CMK, the Backup service
+  # role and the restoring caller may need kms:Decrypt / kms:CreateGrant on the
+  # wrapping key. Emit CONDITIONAL(key_permission) when CMK and decrypt not confirmed.
+  - id: aws-backup-restore-read-data
+    emits: CanReadData
+    description: "backup:StartRestoreJob provisions a new resource from a backup recovery point; the restored resource can be accessed if the principal also has target-service read permissions (RDS login, EC2 key pair, EFS mount, etc.)."
+    match:
+      - [ ?principal, HasPermission, ?vault ]
+    where:
+      - "node_type(?vault) == Backup"
+      - "?vault.provider_type == 'AWS::Backup::BackupVault'"
+      - "?principal has EFFECTIVE backup:StartRestoreJob on ?vault ARN (or on recovery points within it)"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: ?principal
+      target: ?vault
+      permissions: ["backup:StartRestoreJob"]
+      conditions: [iam_permission, resource_policy, key_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        CONDITIONAL(iam_permission) when backup:StartRestoreJob is EFFECTIVE but the restored
+        resource's target-service access (e.g., rds:DescribeDBInstances for RDS, EC2 key pair
+        access for EC2, EFS mount permissions, dynamodb:Scan for DynamoDB) has not been confirmed.
+        The restore capability alone is NOT data-plane read without target-service access.
+        ACTIVE ONLY when BOTH (1) backup:StartRestoreJob is EFFECTIVE AND (2) the principal
+        has confirmed access to the target service for the resource type being restored. This
+        requires collection-time integration with target-service rules. Conservatively, emit
+        CONDITIONAL(iam_permission) pending target-service access confirmation.
+        CONDITIONAL(key_permission) when recovery points in ?vault are encrypted with a CMK
+        and the restoring principal / Backup service role lacks confirmed kms:Decrypt on that
+        key — the restore will fail. Cite credential-chains decrypt-gates-secret-read for
+        resolution when the decrypt is subsequently confirmed.
+        CONDITIONAL(resource_policy) when the vault has an access policy that may restrict
+        backup:StartRestoreJob but hasn't been evaluated.
+        CONDITIONAL(scp_or_org_policy) when an SCP may restrict cross-account restore.
+        BLOCKED when: an SCP or vault access policy explicitly denies backup:StartRestoreJob
+        for the principal; OR the vault is empty; OR Vault Lock retention period prevents
+        access (Vault Lock does not block restore, only delete — this is typically CONDITIONAL
+        for restore pending key_permission and target-service confirmation).
+      confidence: "min(contributing_confidences) * 0.65"
+      derived_from:
+        - "?principal HasPermission ?vault (backup:StartRestoreJob effective permission)"
+        - "ListRecoveryPointsByBackupVault confirms non-empty vault"
+        - "target-service access TBD by integration with rds/ec2/efs/dynamodb rules"
+      false_positive_note: >-
+        backup:StartRestoreJob is NECESSARY but NOT SUFFICIENT to read data. The restored
+        resource (RDS DB instance, EC2 instance, EFS filesystem, DynamoDB table) must also
+        be accessible to the principal via target-service permissions:
+          - RDS: rds:DescribeDBInstances + database authentication (master password or IAM auth)
+          - EC2: ec2:DescribeInstances + EC2 key pair in account or SSM Session Manager access
+          - EFS: ec2:DescribeFileSystems + mount capabilities + mount permissions in Linux/Windows
+          - DynamoDB: dynamodb:Scan / dynamodb:Query + table access + credentials to make calls
+        This rule conservatively emits CONDITIONAL(iam_permission) until target-service access
+        is confirmed. Do NOT set ACTIVE without evidence of target-service access.
+
+        CMK-encrypted recovery points: the Backup service role (passed via iam:PassRole at
+        restore time) must be granted kms:Decrypt on the wrapping key — without it the restore
+        job fails before any data is accessible. Emit CONDITIONAL(key_permission) until confirmed.
+
+        If the vault is access-policy-restricted and the policy hasn't been evaluated, downgrade
+        to CONDITIONAL(resource_policy).
+
+        Latency: restore jobs may take minutes to hours for large resources; the restored
+        resource is eventually available, but the data-read path is not instantaneous.
+      narrative: >-
+        {principal.name} can restore a recovery point from vault {vault.name}
+        (backup:StartRestoreJob), provisioning a new {resourceType} resource with complete
+        point-in-time data — PROVIDED the principal also has {resourceType}-specific access
+        permissions (database login, EC2 key pair, EFS mount, etc.) to read from the restored resource.
+
+  # ===========================================================================
+  # POLICY CONTROL: Vault Access Policy Self-Grant
+  # ===========================================================================
+
+  # --- 3) PutBackupVaultAccessPolicy self-grant -> CanModifyPolicy --------
+  # backup:PutBackupVaultAccessPolicy allows rewriting the vault access policy,
+  # enabling an attacker to grant themselves (or an external account) broader
+  # access including backup:StartRestoreJob / backup:StartCopyJob. This is a
+  # direct CanModifyPolicy escalation on the vault's ResourcePolicy.
+  #
+  # Requires: caller has effective backup:PutBackupVaultAccessPolicy on the vault.
+  #
+  # State gates:
+  #   ACTIVE: backup:PutBackupVaultAccessPolicy is confirmed EFFECTIVE.
+  #   BLOCKED: Vault Lock in compliance mode (after cool-off) blocks policy
+  #     modification (backup:DeleteBackupVaultAccessPolicy is blocked, but
+  #     PutBackupVaultAccessPolicy is NOT — the policy can still be modified to
+  #     add grants, but deletion is prevented). This gate does NOT apply to
+  #     PutBackupVaultAccessPolicy. However, once compliance lock is active,
+  #     a restrictive policy is *defended* against deletion. Emit ACTIVE unless
+  #     the caller explicitly lacks the permission.
+  - id: aws-backup-vault-policy-self-grant
+    emits: CanModifyPolicy
+    description: "backup:PutBackupVaultAccessPolicy allows rewriting a backup vault's access policy, enabling an attacker to grant itself or an external account data-access permissions (StartRestoreJob, StartCopyJob)."
+    match:
+      - [ ?principal, HasPermission, ?vault ]
+    where:
+      - "node_type(?vault) == Backup"
+      - "?vault.provider_type == 'AWS::Backup::BackupVault'"
+      - "?principal has EFFECTIVE backup:PutBackupVaultAccessPolicy on ?vault ARN"
+    emit:
+      source_type: Identity
+      target_type: Policy
+      source: ?principal
+      target: "<vault access policy (ResourcePolicy) node>"
+      permissions: ["backup:PutBackupVaultAccessPolicy"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when backup:PutBackupVaultAccessPolicy is confirmed EFFECTIVE on ?vault
+        (identity policy + no SCP deny).
+        CONDITIONAL(scp_or_org_policy) when an SCP may restrict backup:PutBackupVaultAccessPolicy.
+        BLOCKED when: an SCP or vault policy explicitly denies backup:PutBackupVaultAccessPolicy
+        for the principal; OR ?vault is a Logically Air-Gapped (LAG) vault (policy modification
+        blocked by design).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?vault (backup:PutBackupVaultAccessPolicy effective permission)"
+        - "cited by aws-backup-put-vault-access-policy explicit edge"
+      false_positive_note: >-
+        backup:PutBackupVaultAccessPolicy is sufficient to rewrite vault policy and grant
+        broader access. No additional resource-policy gate applies (the policy itself is the
+        target of modification). LAG vaults block this by design. Vault Lock in compliance mode
+        (after cool-off) does NOT block PutBackupVaultAccessPolicy (it blocks DELETE), so
+        policy modifications remain possible — emit ACTIVE. The policy-add action can broaden
+        access; the lock prevents reversal.
+      narrative: >-
+        {principal.name} can rewrite the access policy of backup vault {vault.name}
+        (backup:PutBackupVaultAccessPolicy), potentially granting itself or an external account
+        full access to all recovery points in the vault.
+
+  # ===========================================================================
+  # PERSISTENCE: Vault Lock Configuration
+  # ===========================================================================
+
+  # --- 4) PutBackupVaultLockConfiguration -> CanModifyConfiguration --------
+  # backup:PutBackupVaultLockConfiguration allows an attacker to lock a backup
+  # vault in compliance mode. Once locked (after the cool-off period), the lock
+  # prevents:
+  #   - backup:DeleteBackupVaultAccessPolicy (blocks policy deletion)
+  #   - backup:DeleteRecoveryPoint (blocks recovery point deletion)
+  #   - vault modifications during the retention window
+  #
+  # This is a PERSISTENCE / RANSOMWARE primitive: an attacker locks the vault,
+  # preventing the defender from modifying the vault access policy or deleting
+  # recovery points for the configured retention window (days/years). The attacker
+  # can then exfiltrate backups or hold them for ransom.
+  #
+  # Emits: CanModifyConfiguration (on the vault's lock configuration), or more
+  # semantically, a POTENTIAL CanWrite (on the vault's resource metadata).
+  # This is modeled as CanModifyConfiguration since it alters vault control plane
+  # behavior (adds immutability constraints that affect what deletion actions are
+  # possible).
+  #
+  # State: POTENTIAL (lock is not immediately realizable; it must complete and
+  # the cool-off period must elapse before it takes effect). Once active, it
+  # becomes ACTIVE defensive control.
+  - id: aws-backup-vault-lock-persistence
+    emits: CanModifyConfiguration
+    description: "backup:PutBackupVaultLockConfiguration allows locking a backup vault in compliance mode, preventing deletion of recovery points and vault access policy changes for a configured retention period — a persistence/ransomware primitive."
+    match:
+      - [ ?principal, HasPermission, ?vault ]
+    where:
+      - "node_type(?vault) == Backup"
+      - "?vault.provider_type == 'AWS::Backup::BackupVault'"
+      - "?principal has EFFECTIVE backup:PutBackupVaultLockConfiguration on ?vault ARN"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: "<Backup Vault lock configuration node>"
+      permissions: ["backup:PutBackupVaultLockConfiguration"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        POTENTIAL when backup:PutBackupVaultLockConfiguration is confirmed EFFECTIVE on ?vault.
+        The lock is POTENTIAL until it is written and the cool-off period elapses (typically
+        0 days for immediate lock, or 3 days for compliance mode by default). Once active,
+        the vault becomes BLOCKED for deletion/policy-change operations for the configured
+        MinRetentionDays retention window.
+        CONDITIONAL(scp_or_org_policy) when an SCP may restrict backup:PutBackupVaultLockConfiguration.
+        BLOCKED when: an SCP or vault policy explicitly denies backup:PutBackupVaultLockConfiguration
+        for the principal; OR the vault is a Logically Air-Gapped (LAG) vault (no lock modification
+        possible by design).
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal HasPermission ?vault (backup:PutBackupVaultLockConfiguration effective permission)"
+      false_positive_note: >-
+        PutBackupVaultLockConfiguration is a control-plane permission that enables vault lock
+        configuration. Once applied and the cool-off period passes, the lock becomes ACTIVE and
+        prevents backup:DeleteBackupVaultAccessPolicy and backup:DeleteRecoveryPoint. This is
+        a powerful ransomware/persistence primitive — the attacker locks the vault to prevent
+        the defender from reverting policy changes or deleting backups during the retention window.
+        LAG vaults do not support lock configuration by design.
+      narrative: >-
+        {principal.name} can lock backup vault {vault.name} in compliance mode
+        (backup:PutBackupVaultLockConfiguration), preventing deletion of recovery points and
+        vault access policy changes for a configured retention period (days or years). This is
+        an attacker-initiated persistence mechanism — once locked, recovery point and policy
+        deletion are blocked until the retention period expires.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP denying backup:StartCopyJob -> rule 1 BLOCKED.
+#   - SCP denying backup:StartRestoreJob -> rule 2 BLOCKED.
+#   - SCP denying backup:PutBackupVaultAccessPolicy -> rule 3 BLOCKED.
+#   - Logically Air-Gapped (LAG) vault -> rules 1, 3, 5 BLOCKED (by vault type design).
+#   - Vault Lock compliance mode (within cool-off/retention period):
+#     - blocks backup:DeleteBackupVaultAccessPolicy (not PutBackupVaultAccessPolicy) ->
+#       rule 3 stays ACTIVE for adding grants, CONDITIONAL for policy changes that
+#       would affect immutability.
+#   - CMK-encrypted recovery points without confirmed kms:Decrypt -> rules 1, 2
+#     CONDITIONAL(key_permission); cite credential-chains decrypt-gates-secret-read
+#     for resolution when decrypt is later confirmed.
+#   - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service (no separate explicit file needed):
+explicit_rules:
+
+  # --- Structural: recovery point resides in vault (ContainsResourceReference) ---
+  # Recovery point -> vault is a placement fact (inventory, not attack-traversable).
+  # ContainsResourceReference: source [Data, Storage, Compute], target [*].
+  # Recovery points (Storage subtype) can reference their containing vault.
+  - id: aws-backup-rp-in-vault
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Backup::RecoveryPoint"
+      field: "BackupVaultArn"
+    emit:
+      source_type: Storage
+      target_type: "*"
+      source: "<Recovery Point node (Storage subtype)>"
+      target: "<Backup Vault identified by BackupVaultArn>"
+      api_source: "backup:ListRecoveryPointsByBackupVault"
+      evidence_field: "BackupVaultArn"
+      narrative: "Recovery point {rp.name} is stored in vault {vault.name} (inventory link)."
+
+  # --- Vault access policy (resource policy node) ----------------------------
+  # HasPolicy: source [Identity, "*"], target [Policy].
+  # Backup vaults (Storage) can have resource policies attached.
+  - id: aws-backup-vault-has-access-policy
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Backup::BackupVault"
+      field: "AccessPolicy"
+    where:
+      - "GetBackupVaultAccessPolicy returns a non-empty policy document"
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<Backup Vault node>"
+      target: "<ResourcePolicy node (vault access policy)>"
+      api_source: "backup:GetBackupVaultAccessPolicy"
+      evidence_field: "AccessPolicy"
+      narrative: "{vault.name} has a vault access policy governing who may access its recovery points."
+
+  # --- Cross-account copy actions in backup plan -> CrossAccountTrust --------
+  # BackupPlan.BackupPlanDocument.Rules[].CopyActions[].DestinationBackupVaultArn
+  # names a vault in another account — the plan (modeled as GenericPolicy per backup.md §1)
+  # establishes the trust. NOTE: CrossAccountTrust source set in edges.yaml is
+  # [Account, Role, ResourcePolicy, Data, Snapshot, DataLake]. GenericPolicy is NOT
+  # in this set; this rule is SCHEMA-ILLEGAL and will fail conformance linting.
+  # WORKAROUND: pending reclassification of BackupPlan as ResourcePolicy in the
+  # node taxonomy (§1 of backup.md), this rule is DISABLED. When BackupPlan is
+  # reclassified, re-enable and change source_type to ResourcePolicy.
+  #
+  # DISABLED: - id: aws-backup-plan-cross-account-copy-action
+  #   emits: CrossAccountTrust
+  #   applies_to: [aws]
+  #   match_record:
+  #     resource_type: "AWS::Backup::BackupPlan"
+  #     field: "BackupPlanDocument.Rules[].CopyActions[].DestinationBackupVaultArn"
+  #   where:
+  #     - "DestinationBackupVaultArn account ID differs from the backup plan's account ID"
+  #   emit:
+  #     source_type: ResourcePolicy
+  #     target_type: Account
+  #     source: "<Backup Plan (modeled as ResourcePolicy)>"
+  #     target: "<account of DestinationBackupVaultArn>"
+  #     api_source: "backup:GetBackupPlan"
+  #     evidence_field: "BackupPlanDocument.Rules[].CopyActions[].DestinationBackupVaultArn"
+  #     narrative: "Backup plan {plan.name} has a CopyAction targeting vault {destVault.arn} in account {destAccount.id} — a configured cross-account backup trust."
+
+  # --- Backup selection service role -> CanPassIdentity ----------------------
+  - id: aws-backup-selection-iam-role
+    emits: CanPassIdentity
+    applies_to: [aws]
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "iam:PassedToService condition is absent OR includes backup.amazonaws.com"
+      - "role trust policy allows backup.amazonaws.com as a service principal"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: "<principal>"
+      target: "<IAM role passable to backup.amazonaws.com>"
+      permissions: ["iam:PassRole"]
+      api_source: "iam:GetRole + iam:SimulatePrincipalPolicy"
+      evidence_field: "AssumeRolePolicyDocument.Statement[].Principal.Service includes backup.amazonaws.com"
+      narrative: "{principal.name} can pass {role.name} to AWS Backup (iam:PassRole to backup.amazonaws.com), enabling backup/restore jobs to run as that role."
+
+  # --- CanModifyPolicy: PutBackupVaultAccessPolicy ---------------------------
+  - id: aws-backup-put-vault-access-policy
+    emits: CanModifyPolicy
+    applies_to: [aws]
+    match_effective_permission:
+      action: "backup:PutBackupVaultAccessPolicy"
+      resource_type: "AWS::Backup::BackupVault"
+    emit:
+      source_type: Identity
+      target_type: Policy
+      source: "<principal>"
+      target: "<vault access policy (ResourcePolicy) node>"
+      permissions: ["backup:PutBackupVaultAccessPolicy"]
+      api_source: "iam:SimulatePrincipalPolicy"
+      narrative: "{principal.name} can rewrite the access policy of backup vault {vault.name} (backup:PutBackupVaultAccessPolicy)."
+
+  # --- ExecutesAs: Backup job service role ------------------------------------
+  # Backup jobs (BackupJob, RestoreJob) execute under an IAM role passed at
+  # creation time. The role is obtained from GetBackupSelection.IamRoleArn
+  # or DescribeRestoreJob.IamRoleArn. This is the structural edge required by
+  # can-execute-as.yaml's linchpin to derive CanExecuteAs from CanPassIdentity.
+  - id: aws-backup-job-executes-as-role
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Backup::BackupJob"
+      field: "IamRoleArn"
+    where:
+      - "IamRoleArn is a valid IAM role ARN"
+    emit:
+      source_type: Compute
+      target_type: MachineIdentity
+      source: "<Backup job (BatchJob/Compute subtype) node>"
+      target: "<IAM role from IamRoleArn>"
+      api_source: "backup:GetBackupSelection (IamRoleArn) or backup:DescribeRestoreJob (IamRoleArn)"
+      evidence_field: "IamRoleArn"
+      narrative: "Backup job {job.name} executes as IAM role {role.name}, the service role passed at backup selection/restore job creation."
+
+  - id: aws-restore-job-executes-as-role
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Backup::RestoreJob"
+      field: "IamRoleArn"
+    where:
+      - "IamRoleArn is a valid IAM role ARN"
+    emit:
+      source_type: Compute
+      target_type: MachineIdentity
+      source: "<Restore job (BatchJob/Compute subtype) node>"
+      target: "<IAM role from IamRoleArn>"
+      api_source: "backup:DescribeRestoreJob (IamRoleArn)"
+      evidence_field: "IamRoleArn"
+      narrative: "Restore job {job.name} executes as IAM role {role.name}, the restore service role passed at restore job creation."
+
+  # --- CanModifyConfiguration: UpdateBackupPlan role pivot --------------------
+  # backup:UpdateBackupPlan allows changing the IAM role used by backup jobs in
+  # the plan. A principal with UpdateBackupPlan + iam:PassRole can pivot backup
+  # execution to a more-privileged role. This is CanModifyConfiguration on the
+  # BackupPlan (GenericPolicy), required for execute-as-via-config-identity-swap.yaml
+  # to derive CanExecuteAs. Using target_type "*" since CanModifyConfiguration
+  # target set includes wildcard and GenericPolicy is not explicitly listed.
+  #
+  # GATE: Role pivot requires BOTH backup:UpdateBackupPlan AND iam:PassRole.
+  # Without iam:PassRole on the new role, UpdateBackupPlan can change schedules,
+  # lifecycle rules, and resource selection, but cannot choose the execution role.
+  # Emit CONDITIONAL(iam_permission) when iam:PassRole is not confirmed.
+  - id: aws-backup-update-plan-modify-config
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "backup:UpdateBackupPlan"
+      resource_type: "AWS::Backup::BackupPlan"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Backup Plan node (controls role used by backup jobs)>"
+      permissions: ["backup:UpdateBackupPlan", "iam:PassRole"]
+      conditions: [iam_permission]
+      api_source: "iam:SimulatePrincipalPolicy"
+      state_logic: >-
+        ACTIVE when backup:UpdateBackupPlan is EFFECTIVE AND iam:PassRole to backup.amazonaws.com
+        is confirmed for at least one role trusting backup.amazonaws.com.
+        CONDITIONAL(iam_permission) when backup:UpdateBackupPlan is EFFECTIVE but iam:PassRole
+        is not confirmed — plan modification is possible (schedules, lifecycle, resource selection)
+        but role-identity-swap escalation requires the additional iam:PassRole gate.
+      narrative: "{principal.name} can modify backup plan {plan.name} configuration (backup:UpdateBackupPlan), and if iam:PassRole to backup.amazonaws.com is available, can change the service role to escalate execution privileges."
+
+  # --- CanModifyConfiguration: CreateBackupSelection role binding ----------
+  # backup:CreateBackupSelection allows creating a backup selection that specifies
+  # which IAM role the backup job will run under. Combined with iam:PassRole, this
+  # enables the attacker to choose any role that trusts backup.amazonaws.com as the
+  # execution identity for backup jobs. This is CanModifyConfiguration on the
+  # BackupSelection (GenericPolicy), enabling execute-as-via-config-identity-swap.
+  #
+  # GATE: Role binding requires BOTH backup:CreateBackupSelection AND iam:PassRole.
+  # The iam:PassRole must target backup.amazonaws.com (PassedToService condition).
+  # Without iam:PassRole, CreateBackupSelection can create selections but cannot
+  # bind a role to them. Emit CONDITIONAL(iam_permission) when iam:PassRole is not confirmed.
+  - id: aws-backup-create-selection-modify-config
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "backup:CreateBackupSelection"
+      resource_type: "AWS::Backup::BackupPlan"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Backup Selection node (child of BackupPlan, controls backup job role)>"
+      permissions: ["backup:CreateBackupSelection", "iam:PassRole"]
+      conditions: [iam_permission]
+      api_source: "iam:SimulatePrincipalPolicy"
+      state_logic: >-
+        ACTIVE when backup:CreateBackupSelection is EFFECTIVE AND iam:PassRole to backup.amazonaws.com
+        is confirmed for at least one role trusting backup.amazonaws.com.
+        CONDITIONAL(iam_permission) when backup:CreateBackupSelection is EFFECTIVE but iam:PassRole
+        is not confirmed — selections can be created but role binding / identity-swap escalation
+        requires the additional iam:PassRole gate.
+      narrative: "{principal.name} can create backup selections (backup:CreateBackupSelection), and if iam:PassRole to backup.amazonaws.com is available, can bind a service role to escalate execution privileges."
+
+  # --- Recovery point contains secret (heuristic) ----------------------------
+  # Recovery points of data-bearing resource types (RDS, EC2/EBS, EFS, DynamoDB, etc.)
+  # reliably contain embedded secret material: database credentials, SSH keys, TLS certs,
+  # API keys in application configs/databases. This is a HEURISTIC edge: we cannot
+  # confirm secrets exist without restoration and inspection. State is POTENTIAL.
+  # This edge feeds credential-chains.yaml's read-secret-yields-identity rule
+  # (once CanReadData edge is established, the credential chain fires).
+  #
+  # S3 CAVEAT: S3 backups are object-level copies of bucket contents. Secret presence
+  # depends on what objects are stored — NOT a reliable indicator like structured data
+  # in RDS/DynamoDB. Use lower confidence (0.35) for S3 vs. higher confidence (0.75+)
+  # for database/volume/filesystem resources.
+  - id: aws-backup-recovery-point-contains-secret
+    emits: ContainsSecret
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Backup::RecoveryPoint"
+      field: "ResourceType"
+    where:
+      - "ResourceType in ['RDS', 'Aurora', 'EC2', 'EFS', 'DynamoDB', 'DocumentDB', 'Neptune', 'FSx', 'S3']"
+      - "Status == 'COMPLETED'"
+    emit:
+      source_type: Storage
+      target_type: Secret
+      source: "<Recovery Point node (Storage subtype)>"
+      target: "<Secret (embedded credential material within recovery point contents)>"
+      permissions: []
+      api_source: "backup:DescribeRecoveryPoint"
+      evidence_field: "ResourceType"
+      state_logic: "POTENTIAL (secret presence cannot be confirmed without restoration)"
+      confidence: >-
+        0.75 for RDS/Aurora (master passwords, user credentials in application config
+        reliably stored in DB or app state); 0.75 for EC2/EBS (SSH keys, credentials
+        in /home/*/.*profile or /root/.aws/credentials nearly ubiquitous); 0.75 for EFS
+        (app config, .env, secrets stored in mounted filesystem); 0.75 for DynamoDB
+        (API keys, connection strings, tokens stored in application tables); 0.75 for
+        DocumentDB/Neptune (similarly embedded in app data); 0.75 for FSx (application
+        files, config); 0.35 for S3 (secret presence depends on bucket contents — generic
+        object-level backup does not guarantee secrets; highly bucket-dependent).
+      narrative: >-
+        Recovery point {rp.name} is a backup of {resourceType}. RDS/Aurora/EC2/EFS/DynamoDB
+        resources typically contain embedded secret material (credentials, SSH keys, API keys,
+        certificates). S3 backups are object-level copies — secret presence depends on bucket
+        contents (lower confidence for generic S3 backups).
+
+  # --- Vault access policy names external account -> CrossAccountTrust -------
+  # A vault access policy whose Statement[].Principal contains an external AWS
+  # account ID (or Principal: * / "AWS": "*") establishes trust allowing that
+  # account to call data-access APIs (StartRestoreJob, StartCopyJob, etc.).
+  # Match the policy document itself for Principal field inspection.
+  - id: aws-backup-vault-policy-cross-account-principal
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Backup::BackupVault"
+      field: "AccessPolicy"
+    where:
+      - "AccessPolicy Statement[].Principal contains an external AWS account ID OR Principal includes '*' / 'AWS': '*'"
+      - "Statement[].Action includes at least one of: ['backup:StartRestoreJob', 'backup:StartCopyJob', 'backup:CopyIntoBackupVault', 'backup:GetRecoveryPointRestoreMetadata']"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<Vault access policy (ResourcePolicy) node>"
+      target: "<External AWS account from Statement[].Principal>"
+      permissions: []
+      api_source: "backup:GetBackupVaultAccessPolicy"
+      evidence_field: "AccessPolicy.Statement[].Principal"
+      narrative: "Backup vault {vault.name} access policy grants account {extAccount.id} ability to call {actions} on vault contents — a cross-account trust."

@@ -1,0 +1,850 @@
+# GCP Cloud Deploy — Derived attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# Cloud Deploy is the GCP managed continuous-delivery service. Delivery
+# pipelines promote releases through targets (GKE, Cloud Run, custom) by
+# creating rollouts that execute inside Cloud Build workers. Those workers run
+# AS the target's configured execution service account (defaults to the Compute
+# Engine default SA if none is set — typically roles/editor). The Phase-9
+# escalation shape is:
+#
+#   releases.create + actAs(render SA)   => code runs in render worker as render SA
+#   rollouts.create + actAs(deploy SA)   => code runs in deploy worker as deploy SA
+#   targets.update  + actAs(exec SA)     => re-points all future job runs to chosen SA
+#
+# THE LINCHPIN DISCIPLINE — emit facts, cite roll-ups:
+#   * cicd-chains.yaml owns the generic CanModifyCode+ExecutesAs → CanExecuteAs
+#     collapse and CanTrigger+ExecutesAs → CanExecuteAs (CONDITIONAL). Rules here
+#     emit service-specific FACTS (ExecutesAs, CanModifyCode, CanPassIdentity,
+#     CanTrigger, CanAttachIdentity, CanGrantPermission) and cite cicd-chains.
+#   * can-execute-as.yaml — execute-as-via-code-modify / execute-as-via-config-identity-swap
+#     already fire once this file emits CanModifyCode+ExecutesAs or
+#     CanModifyConfiguration+CanPassIdentity. CITE, do not re-derive.
+#   * gcp/identity-escalation.yaml — gcp-sa-act-as emits CanPassIdentity for the
+#     underlying iam.serviceAccounts.actAs grant. This file CITES that edge as a
+#     prerequisite and specializes it into Cloud Deploy–specific derive rules.
+#   * can-control.yaml — escalate-via-execute-as (CanEscalateTo) and
+#     control-boundary-via-iam-admin (Controls) fire off our CanExecuteAs and
+#     CanGrantPermission emits. CITE, do not re-derive.
+#   * hierarchy-chains.yaml — enter-boundary-rollups turns CanExecuteAs
+#     (principal → cross-project execution SA) into CanEnterProject. CITE.
+#   * federation-chains.yaml — if the Cloud Deploy pipeline is triggered from an
+#     external CI (GitHub Actions via WIF → releases.create), the CanFederateAs
+#     that lands on the GCP SA is federation-chains' output; this file consumes
+#     the resulting CanPassIdentity/CanExecuteAs from that SA as the source, not
+#     the OIDC trust directly. CITE cicd-chains rule 4.
+#
+# KEY FALSE-POSITIVE GUARDS:
+#   1. actAs is mandatory: releases.create alone ≠ execute-as. The attacker must
+#      hold iam.serviceAccounts.actAs on the render SA. Without it Cloud Deploy
+#      rejects the API call. Always require the CanPassIdentity edge.
+#   2. Release actAs targets the RENDER SA; rollout actAs targets the DEPLOY SA.
+#      These may differ. Never cross-apply them.
+#   3. Approval gates: targets with requireApproval:true block rollout execution
+#      until clouddeploy.rollouts.approve is exercised. Emit CONDITIONAL.
+#   4. Deploy policies: time-window restrictions → CONDITIONAL(time_window), not
+#      BLOCKED. BLOCKED only when an IAM deny policy or org policy denies the
+#      action with no override path.
+#   5. Default compute SA: flag as high-privilege when roles/editor is still bound.
+#      Do NOT over-generalize — confirm the SA binding before emitting high-value.
+#
+# Permissions are exact strings from
+#   https://cloud.google.com/deploy/docs/iam-roles-permissions and
+#   https://cloud.google.com/iam/docs/permissions-reference#clouddeploy
+# No permission is invented.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 9-cicd-pipelines
+applies_to: [gcp]
+
+rules:
+
+  # ===========================================================================
+  # SECTION 1 — FACT EMISSION (explicit normalization helpers)
+  # ExecutesAs, CanModifyCode, CanPassIdentity, CanTrigger from raw config
+  # ===========================================================================
+
+  # --- 1a) Job run worker ExecutesAs the configured execution SA ---------------
+  # The Cloud Build worker that Cloud Deploy spawns for render/predeploy/deploy/
+  # verify/postdeploy executes as the target's execution SA. If no SA is
+  # specified, the Compute Engine default SA is used (PROJECT_NUMBER-compute@
+  # developer.gserviceaccount.com, typically roles/editor). This is the zero-cost
+  # fact that cicd-chains and can-execute-as collapse into CanExecuteAs.
+  - id: gcp-deploy-executes-as
+    emits: ExecutesAs
+    description: "Cloud Deploy job run worker (Cloud Build) executes as the target's configured execution service account."
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.cloud.deploy.Target"
+      field: "executionConfigs[].serviceAccount"
+    where:
+      - "execution SA = executionConfigs[N].serviceAccount if set, ELSE the Compute Engine default SA (PROJECT_NUMBER-compute@developer.gserviceaccount.com)"
+    emit:
+      source_type: BuildWorker
+      target_type: ServiceAccount
+      source: "<Cloud Deploy job run worker (BuildWorker) for this target>"
+      target: "<execution service account>"
+      permissions: []
+      state_logic: "ACTIVE — the binding is structural; any job run on this target executes as this SA."
+      confidence: 0.98
+      derived_from: ["target.executionConfigs[N].serviceAccount field (or Compute Engine default SA)"]
+      false_positive_note: >-
+        Confirm whether the target has an explicit executionConfigs.serviceAccount entry.
+        If absent, the runtime is the Compute Engine default SA — flag as high-privilege
+        (roles/editor by default). Do not assume least-privilege. If multiple
+        executionConfigs entries exist (render vs deploy pools), emit one ExecutesAs per
+        pool/phase SA combination; the render SA and deploy SA may differ.
+      narrative: >-
+        Cloud Deploy job runs for target {target.name} execute as {sa.name}
+        inside a Cloud Build worker. Any code running in those workers (skaffold render,
+        skaffold apply, pre/post-deploy hooks, verify) runs with {sa.name}'s GCP permissions.
+
+  # --- 1b) releases.create + actAs(render SA) => CanModifyCode into render worker -
+  # Creating a release bundles the caller's Skaffold config, source manifests, and
+  # container image references. Cloud Deploy then calls Cloud Build to run
+  # `skaffold diagnose` and `skaffold render` in a worker running as the render SA.
+  # The attacker who creates the release controls what Skaffold executes, making
+  # this CanModifyCode into the render-phase BuildWorker. actAs on the render SA is
+  # required by the API — without it the call is rejected.
+  - id: gcp-deploy-release-create-modifies-code
+    emits: CanModifyCode
+    description: "clouddeploy.releases.create with actAs on the render SA injects attacker-controlled Skaffold config/hooks into the render Cloud Build worker."
+    applies_to: [gcp]
+    match:
+      - [ ?principal, CanPassIdentity, ?render_sa ]
+    where:
+      - "?principal has effective clouddeploy.releases.create on the delivery pipeline"
+      - "?render_sa is the render-phase execution SA for the pipeline's first target"
+      - "?render_sa is bound via CanPassIdentity through iam.serviceAccounts.actAs (gcp-sa-act-as)"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: "<render-phase Cloud Build worker (BuildWorker) for the delivery pipeline>"
+      permissions: ["clouddeploy.releases.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal holds effective clouddeploy.releases.create AND
+        CanPassIdentity(?principal -> ?render_sa) is ACTIVE (iam.serviceAccounts.actAs
+        confirmed on ?render_sa). CONDITIONAL(iam_permission) when actAs is unconfirmed
+        (runtime SA lookup inconclusive). BLOCKED when an IAM deny policy or org policy
+        denies either permission.
+      confidence: 0.95
+      derived_from: ["?principal CanPassIdentity ?render_sa (gcp-sa-act-as)", "clouddeploy.releases.create effective permission"]
+      false_positive_note: >-
+        actAs on the render SA is the mandatory gate — without it the releases.create
+        API call is rejected. Do NOT emit without confirmed CanPassIdentity. The render
+        SA and deploy SA may differ; this edge applies only to the RENDER phase worker.
+        Skaffold hooks (before/after deploy hooks, custom actions) execute inside the
+        Cloud Build worker; control of skaffold.yaml is full code execution as the SA.
+      narrative: >-
+        {principal.name} can create a Cloud Deploy release (clouddeploy.releases.create)
+        with attacker-controlled Skaffold configuration, injecting arbitrary code into the
+        render Cloud Build worker that runs as {render_sa.name}. actAs on {render_sa.name}
+        is required (iam.serviceAccounts.actAs). Cite cicd-chains cicd-modify-buildspec-executes-as
+        to collapse CanModifyCode + ExecutesAs into CanExecuteAs({principal} → {render_sa}).
+
+  # --- 1c) rollouts.create + actAs(deploy SA) => CanModifyCode into deploy worker -
+  # Promoting a release (creating a rollout) triggers Cloud Deploy to call Cloud
+  # Build for the deploy phase: `skaffold apply` runs in a worker as the deploy SA.
+  # The attacker who promotes controls WHICH release is deployed (they can promote
+  # a release they created with malicious Skaffold config). actAs on the deploy SA
+  # is required. This is the canonical Cloud Deploy escalation: promote → execute as
+  # deploy SA → deploy SA has runtime permissions on the target (GKE/Cloud Run).
+  - id: gcp-deploy-rollout-create-modifies-code
+    emits: CanModifyCode
+    description: "clouddeploy.rollouts.create (promotion) with actAs on the deploy SA triggers the deploy Cloud Build worker running as the deploy SA."
+    applies_to: [gcp]
+    match:
+      - [ ?principal, CanPassIdentity, ?deploy_sa ]
+    where:
+      - "?principal has effective clouddeploy.rollouts.create on the delivery pipeline"
+      - "?deploy_sa is the deploy-phase execution SA for the target being promoted to"
+      - "?deploy_sa is bound via CanPassIdentity through iam.serviceAccounts.actAs (gcp-sa-act-as)"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: "<deploy-phase Cloud Build worker (BuildWorker) for the target>"
+      permissions: ["clouddeploy.rollouts.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal holds effective clouddeploy.rollouts.create AND
+        CanPassIdentity(?principal -> ?deploy_sa) is ACTIVE.
+        CONDITIONAL(approval_required) when the target has requireApproval: true and
+        ?principal does not hold clouddeploy.rollouts.approve — the rollout is queued
+        but cannot proceed without approver action; downgrade to CONDITIONAL.
+        CONDITIONAL(time_window) when a deploy policy restricts rollout creation
+        during the current time window — still possible outside the window.
+        BLOCKED when an IAM deny policy denies clouddeploy.rollouts.create or
+        iam.serviceAccounts.actAs at the effective scope.
+      confidence: 0.95
+      derived_from: ["?principal CanPassIdentity ?deploy_sa (gcp-sa-act-as)", "clouddeploy.rollouts.create effective permission"]
+      false_positive_note: >-
+        actAs on the DEPLOY SA (not the render SA) gates rollout creation. An attacker
+        with releases.create actAs(render SA) but NOT rollouts.create actAs(deploy SA)
+        can only reach the render SA. The deploy SA's GCP permissions determine the
+        post-escalation blast radius (GKE cluster access, Cloud Run service update, etc.).
+        The approval gate (requireApproval: true) means the rollout queues; it does NOT
+        independently yield code execution until an approver acts — stay CONDITIONAL.
+      narrative: >-
+        {principal.name} can promote a release (clouddeploy.rollouts.create) in pipeline
+        {pipeline.name}, triggering a Cloud Build deploy worker that runs as {deploy_sa.name}
+        (iam.serviceAccounts.actAs required). If the promoted release contains
+        attacker-controlled Skaffold hooks or manifests, code runs as {deploy_sa.name}.
+        Cite cicd-chains cicd-modify-buildspec-executes-as to collapse into CanExecuteAs.
+
+  # --- 1c') GCS bucket write (Skaffold source) => CanModifyCode into releases ----
+  # The Cloud Deploy pipeline stores its Skaffold source (skaffold.yaml) in a GCS
+  # bucket (gs://PROJECT-clouddeploy-pipeline-REGION/). An attacker with
+  # storage.objects.create on this bucket can write a malicious skaffold.yaml,
+  # injecting code into every release created from that bucket. This is a supply-chain
+  # attack on the pipeline's source input and is a direct CanModifyCode surface.
+  # The target is the render-phase BuildWorker, since Skaffold render is the first
+  # job run that consumes the source file.
+  - id: gcp-deploy-gcs-bucket-write-modifies-code
+    emits: CanModifyCode
+    description: "Write access to the Cloud Deploy pipeline's GCS source bucket allows injecting malicious skaffold.yaml into every render job."
+    applies_to: [gcp]
+    match:
+      - [ ?principal, CanWrite, ?gcs_bucket ]
+    where:
+      - "?gcs_bucket is the Skaffold source ObjectStorage bucket for a Cloud Deploy delivery pipeline"
+      - "?gcs_bucket.name matches gs://PROJECT-clouddeploy-pipeline-REGION/ or the pipeline's configured source bucket"
+      - "?principal has effective storage.objects.create on ?gcs_bucket"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: "<render-phase Cloud Build worker (BuildWorker) for all releases from this pipeline>"
+      permissions: ["storage.objects.create"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal holds effective storage.objects.create on the pipeline's
+        GCS source bucket. The write is realized immediately upon release creation.
+        BLOCKED when an IAM deny policy denies storage.objects.create on the bucket.
+      confidence: 0.94
+      derived_from: ["?principal CanWrite ?gcs_bucket (GCP IAM storage permission)", "pipeline source bucket configuration"]
+      false_positive_note: >-
+        Verify that ?gcs_bucket is the pipeline's configured source bucket (query the
+        pipeline's deliveryPipelineYamlFile field or similar). A principal with
+        storage.objects.create on the project's temporary/artifact buckets is NOT a
+        threat to this pipeline unless those buckets are the configured source.
+        The injected skaffold.yaml runs in the render-phase BuildWorker as the render SA.
+        Cite cicd-chains cicd-modify-buildspec-executes-as to collapse CanModifyCode +
+        ExecutesAs into CanExecuteAs(principal → render_sa).
+      narrative: >-
+        {principal.name} can write to the Cloud Deploy pipeline's Skaffold source GCS bucket
+        (storage.objects.create), allowing injection of a malicious skaffold.yaml that
+        executes in the render Cloud Build worker as the pipeline's render SA. Every release
+        created from this bucket will execute the attacker-injected hooks/manifests. Cite
+        cicd-chains cicd-modify-buildspec-executes-as to collapse into CanExecuteAs.
+
+  # --- 1d) targets.update + actAs(chosen SA) => CanAttachIdentity on job runs -
+  # Updating a target's executionConfigs.serviceAccount field re-points ALL future
+  # job runs for that target to the specified SA. This requires:
+  #   clouddeploy.targets.update on the target
+  #   iam.serviceAccounts.actAs on the SA being specified
+  # This is the identity-swap escalation path for Cloud Deploy. It does not immediately
+  # run code; it arms future releases/rollouts to run as the chosen SA. The target of
+  # CanAttachIdentity is the Cloud Deploy job run (BuildWorker), not the Target resource.
+  - id: gcp-deploy-target-update-attach-identity
+    emits: CanAttachIdentity
+    description: "clouddeploy.targets.update + actAs(execution SA) re-points all future Cloud Deploy job runs on this target to execute as the chosen SA."
+    applies_to: [gcp]
+    match:
+      - [ ?principal, CanPassIdentity, ?exec_sa ]
+    where:
+      - "?principal has effective clouddeploy.targets.update on the target"
+      - "?exec_sa is the SA ?principal will set as executionConfigs.serviceAccount"
+      - "?exec_sa is bound via CanPassIdentity through iam.serviceAccounts.actAs (gcp-sa-act-as)"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: "<Cloud Deploy job run (BuildWorker) on this target, after the execution SA is updated>"
+      permissions: ["clouddeploy.targets.update", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal holds clouddeploy.targets.update AND
+        CanPassIdentity(?principal -> ?exec_sa) is ACTIVE.
+        BLOCKED when an IAM deny policy denies either permission.
+      confidence: 0.92
+      derived_from: ["?principal CanPassIdentity ?exec_sa (gcp-sa-act-as)", "clouddeploy.targets.update effective permission"]
+      false_positive_note: >-
+        This edge re-points future job runs; it does NOT immediately execute code.
+        The actual CanExecuteAs chain fires when a rollout is subsequently created on
+        the updated target (gcp-deploy-rollout-create-modifies-code or cicd-chains
+        cicd-modify-buildspec-executes-as). Do NOT emit CanExecuteAs directly from this
+        rule — it attaches identity to the Compute surface (the BuildWorker job runs);
+        execution requires the downstream rollout creation edge. The target node must be
+        the BuildWorker node (Compute class) that represents the future job runs, not the
+        Target resource itself (ManagementService).
+      narrative: >-
+        {principal.name} can update target {target.name}'s executionConfigs
+        (clouddeploy.targets.update + iam.serviceAccounts.actAs on {exec_sa.name}),
+        re-pointing all future Cloud Deploy render/deploy job runs to execute as
+        {exec_sa.name}. Subsequent rollouts via this target run with {exec_sa.name}'s
+        GCP permissions.
+
+  # --- 1e) rollouts.approve => unblocks a pending rollout (CONDITIONAL lift) ----
+  # A target with requireApproval: true holds rollouts in NEEDS_APPROVAL state.
+  # clouddeploy.rollouts.approve (roles/clouddeploy.approver) unblocks it and
+  # triggers the deploy-phase Cloud Build worker to run. IMPORTANT: actAs is NOT
+  # required to APPROVE a rollout — only to CREATE it. This rule matches on
+  # clouddeploy.rollouts.approve alone, which is the dangerous scenario (a pure
+  # approver can unblock high-impact production rollouts without holding actAs).
+  - id: gcp-deploy-rollout-approve-unblocks
+    emits: CanTrigger
+    description: "clouddeploy.rollouts.approve unblocks a NEEDS_APPROVAL rollout, triggering the deploy Cloud Build worker (no actAs required)."
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "clouddeploy.rollouts.approve"
+      resource_type: "google.cloud.deploy.DeliveryPipeline"
+    where:
+      - "a rollout is in NEEDS_APPROVAL state on a target in this pipeline"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<deploy-phase Cloud Build worker (BuildWorker) for the approved rollout>"
+      permissions: ["clouddeploy.rollouts.approve"]
+      conditions: [iam_permission, trigger_exists]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) — the trigger only fires when a pending rollout exists
+        in NEEDS_APPROVAL state. ACTIVE if a rollout is currently pending approval for a target
+        in this pipeline. BLOCKED when an IAM deny policy denies clouddeploy.rollouts.approve.
+        Note: an attacker who has BOTH rollouts.create (to create the rollout) and
+        rollouts.approve (to approve it) on the same target can complete the full chain
+        unilaterally; when both permissions are confirmed, the approval gate provides no
+        separation — the CanExecuteAs edge (from gcp-deploy-rollout-promote-executes-as)
+        becomes ACTIVE instead of CONDITIONAL(approval_required).
+      confidence: 0.88
+      derived_from: ["clouddeploy.rollouts.approve effective permission"]
+      false_positive_note: >-
+        clouddeploy.rollouts.approve alone is the approval capability — it does NOT require
+        actAs or create permissions. A pure approver (holding only approve, not create) can
+        still trigger rollout execution. The full execute-as chain requires a rollout to exist
+        in NEEDS_APPROVAL state (someone must have called rollouts.create first, which DOES
+        require actAs). The dangerous case is when the SAME principal holds both rollouts.create
+        and rollouts.approve, defeating role separation. Confirm that a pending rollout exists
+        before emitting ACTIVE.
+      narrative: >-
+        {principal.name} can approve a pending Cloud Deploy rollout
+        (clouddeploy.rollouts.approve) in pipeline {pipeline.name}, unblocking the deploy
+        Cloud Build worker. If a pending rollout exists and {principal.name} also created
+        it (holding both rollouts.create + iam.serviceAccounts.actAs on the deploy SA),
+        the approval gate provides no isolation and the full execution chain is ACTIVE.
+
+  # --- 1f) automations.create with promote/advance rule => CanTrigger pipeline ---
+  # Cloud Deploy automations can automatically promote releases or advance rollout
+  # phases based on events (release-rendered, rollout-complete) or cron schedules.
+  # An automation runs with its own SA (automation SA); creating an automation with
+  # the correct SA binding effectively schedules automatic rollouts. An attacker with
+  # automations.create + actAs on the automation SA (which itself has rollouts.create
+  # + actAs on the deploy SA) can bypass the manual promotion step.
+  - id: gcp-deploy-automation-create-triggers
+    emits: CanTrigger
+    description: "clouddeploy.automations.create with a promoteReleaseRule or advanceRolloutRule schedules automatic rollout creation, effectively giving CanTrigger over the deploy Cloud Build worker."
+    applies_to: [gcp]
+    match:
+      - [ ?principal, CanPassIdentity, ?automation_sa ]
+    where:
+      - "?principal has effective clouddeploy.automations.create on the delivery pipeline"
+      - "?automation_sa is the SA specified in the automation's serviceAccount field"
+      - "?automation_sa itself holds clouddeploy.rollouts.create on the pipeline + iam.serviceAccounts.actAs on the deploy SA"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: "<deploy-phase Cloud Build worker (BuildWorker) triggered by the automation>"
+      permissions: ["clouddeploy.automations.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal holds clouddeploy.automations.create AND CanPassIdentity on
+        ?automation_sa is ACTIVE AND ?automation_sa has effective rollouts.create + actAs
+        on the deploy SA. CONDITIONAL(iam_permission) when the automation SA's downstream
+        permissions are unconfirmed. CONDITIONAL(time_window) when the automation uses
+        a cron schedule (it fires in the future, not immediately). A deploy policy on the
+        pipeline targeting the automated action => CONDITIONAL(time_window) — the automation
+        run is blocked during the policy window but fires outside it. BLOCKED when IAM
+        deny policy denies automations.create.
+      confidence: 0.82
+      derived_from: ["?principal CanPassIdentity ?automation_sa (gcp-sa-act-as)", "clouddeploy.automations.create effective permission", "?automation_sa clouddeploy.rollouts.create + actAs chain"]
+      false_positive_note: >-
+        An automation only yields privilege when the automation SA itself can promote
+        (rollouts.create + actAs on deploy SA). If the automation SA has only
+        clouddeploy.automationRuns.cancel or read-only perms, the automation cannot
+        produce rollouts. Verify the automation SA's effective permissions before emitting.
+        Cron-based automations are CanSchedule semantics more than CanTrigger; both are
+        emitted for completeness. Deploy policy restrictions are CONDITIONAL, not BLOCKED.
+      narrative: >-
+        {principal.name} can create a Cloud Deploy automation (clouddeploy.automations.create)
+        configured to automatically promote releases in pipeline {pipeline.name}, using
+        automation SA {automation_sa.name} (actAs required). This schedules automatic
+        rollout creation, effectively giving {principal.name} persistent CanTrigger over
+        the pipeline without manual promotion. cicd-chains cicd-trigger-runner-executes-as
+        then collapses this CanTrigger + ExecutesAs(worker → deploy SA) into CanExecuteAs.
+
+  # --- 1g) deliveryPipelines.setIamPolicy => CanModifyPolicy on pipeline ------
+  # The delivery pipeline carries its own IAM allow policy. A principal with
+  # clouddeploy.deliveryPipelines.setIamPolicy can grant any binding on the pipeline,
+  # including granting itself or another principal clouddeploy.releases.create or
+  # clouddeploy.rollouts.create — the entry points for the execution chain. This
+  # is CanModifyPolicy, not CanGrantPermission, because the target is the resource
+  # policy being modified, not a principal receiving a grant.
+  - id: gcp-deploy-pipeline-set-iam-policy
+    emits: CanModifyPolicy
+    description: "clouddeploy.deliveryPipelines.setIamPolicy lets the principal modify the pipeline's IAM policy, granting itself releases.create / rollouts.create."
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "clouddeploy.deliveryPipelines.setIamPolicy"
+      resource_type: "google.cloud.deploy.DeliveryPipeline"
+    emit:
+      source_type: Identity
+      target_type: Policy
+      source: "<principal>"
+      target: "<delivery pipeline IAM policy>"
+      permissions: ["clouddeploy.deliveryPipelines.setIamPolicy"]
+      state_logic: >-
+        ACTIVE when the principal holds effective clouddeploy.deliveryPipelines.setIamPolicy.
+        BLOCKED when an IAM deny policy denies this action. can-control
+        control-boundary-via-iam-admin can roll this up to Controls(pipeline) if desired.
+      confidence: 0.95
+      derived_from: ["clouddeploy.deliveryPipelines.setIamPolicy effective permission"]
+      false_positive_note: >-
+        setIamPolicy on the pipeline allows granting pipeline-scoped roles only; it does
+        not grant project-level roles/editor or roles on the execution SA. The escalation
+        requires: (1) self-grant releases.create / rollouts.create on the pipeline, then
+        (2) separately actAs on the execution SA (project-level grant). If the attacker
+        lacks the actAs grant, pipeline setIamPolicy alone yields no execution-as. Model
+        as CanModifyPolicy on the pipeline's IAM policy (not CanGrantPermission on a principal).
+      narrative: >-
+        {principal.name} can set the IAM policy of delivery pipeline {pipeline.name}
+        (clouddeploy.deliveryPipelines.setIamPolicy), modifying who can grant itself or others
+        clouddeploy.releases.create / clouddeploy.rollouts.create — the entry points
+        for executing as the pipeline's execution SA.
+
+  # --- 1h) deployPolicies.override => removes CONDITIONAL(time_window) guard ----
+  # A deploy policy restricts rollout actions during defined time windows. The
+  # clouddeploy.deployPolicies.override permission (roles/clouddeploy.policyOverrider)
+  # lets a principal bypass the restriction. This upgrades a CONDITIONAL(time_window)
+  # rollout edge to ACTIVE, removing the governance guardrail.
+  - id: gcp-deploy-policy-override
+    emits: CanModifyPolicy
+    description: "clouddeploy.deployPolicies.override bypasses a Cloud Deploy time-window restriction, enabling rollouts during governance freeze windows."
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "clouddeploy.deployPolicies.override"
+      resource_type: "google.cloud.deploy.DeployPolicy"
+    emit:
+      source_type: Identity
+      target_type: GenericPolicy
+      source: "<principal>"
+      target: "<Cloud Deploy deploy policy>"
+      permissions: ["clouddeploy.deployPolicies.override"]
+      state_logic: >-
+        ACTIVE when the principal holds effective clouddeploy.deployPolicies.override.
+        The override is an operational bypass, not a structural policy change — it does
+        not modify the policy definition, only the enforcement at call time. Combined
+        with a rollout edge that is CONDITIONAL(time_window), this override upgrades
+        that rollout edge to ACTIVE by satisfying the time_window condition.
+        BLOCKED when an IAM deny policy denies clouddeploy.deployPolicies.override.
+      confidence: 0.90
+      derived_from: ["clouddeploy.deployPolicies.override effective permission"]
+      false_positive_note: >-
+        Emit CanModifyPolicy on the policy node (not CanDelete or CanAdminister — this
+        is a call-time bypass, not a persistent mutation of the policy resource). The
+        override applies per-call with --override-deploy-policies flag; it does not
+        permanently disable the policy. Do not treat this as a BLOCKED-edge removal;
+        instead mark the gated rollout edge as CONDITIONAL(time_window) and note that
+        an actor with this override permission can satisfy that condition.
+      narrative: >-
+        {principal.name} holds clouddeploy.deployPolicies.override and can bypass the
+        time-window restriction of deploy policy {policy.name}, enabling rollout actions
+        (promote, advance, approve) during a governance freeze window. This upgrades a
+        CONDITIONAL(time_window) rollout edge to ACTIVE.
+
+  # ===========================================================================
+  # SECTION 2 — DERIVED EXECUTION EDGES
+  # These collapse the FACT edges above into CanExecuteAs / CanEscalateTo.
+  # CITE cicd-chains and can-execute-as; do not re-derive their core logic.
+  # ===========================================================================
+
+  # --- 2a) releases.create + actAs(render SA) => execute as render SA -----------
+  # cicd-chains cicd-modify-buildspec-executes-as already fires on
+  # CanModifyCode(?principal, render_worker) + ExecutesAs(render_worker, render_sa).
+  # This rule is the Cloud Deploy–specific framing with the correct narrative,
+  # permission set, and approval/actAs guards.
+  - id: gcp-deploy-release-create-executes-as
+    emits: CanExecuteAs
+    description: "Create a Cloud Deploy release with attacker-controlled Skaffold config + actAs(render SA) → execute arbitrary code as the render SA inside the Cloud Build worker."
+    applies_to: [gcp]
+    match:
+      - [ ?principal, CanModifyCode,  ?render_worker ]
+      - [ ?render_worker, ExecutesAs, ?render_sa ]
+    where:
+      - "node_type(?render_worker) == BuildWorker"
+      - "?render_worker is a Cloud Deploy render-phase job run"
+      - "?principal holds clouddeploy.releases.create AND CanPassIdentity(?principal, ?render_sa)"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: ?principal
+      target: ?render_sa
+      permissions: ["clouddeploy.releases.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when CanModifyCode and ExecutesAs contributors are both ACTIVE (releases.create
+        confirmed, CanPassIdentity on render SA confirmed, no blocking deny policy). Inherits
+        CONDITIONAL or BLOCKED from contributing edges per RULE-FORMAT.md. A deploy policy
+        that restricts releases.create => CONDITIONAL(time_window) unless principal holds
+        deployPolicies.override. cicd-chains dedupes on (CanExecuteAs, ?principal, ?render_sa).
+      confidence: 0.92
+      derived_from: ["?principal CanModifyCode ?render_worker (gcp-deploy-release-create-modifies-code)", "?render_worker ExecutesAs ?render_sa (gcp-deploy-executes-as)", "cicd-chains cicd-modify-buildspec-executes-as"]
+      false_positive_note: >-
+        actAs on the RENDER SA is the mandatory gate. This rule only fires when both
+        gcp-deploy-release-create-modifies-code (CanModifyCode) and gcp-deploy-executes-as
+        (ExecutesAs) are already in the graph with ACTIVE or CONDITIONAL state.
+        The render SA may be scoped with minimal permissions (storage access, logging) if
+        the deployment organization follows least privilege — validate the SA's bound roles
+        before treating it as a high-value escalation target. Render SA ≠ deploy SA.
+      narrative: >-
+        {principal.name} can create a Cloud Deploy release (clouddeploy.releases.create)
+        with attacker-controlled Skaffold configuration and actAs on render SA {render_sa.name}
+        (iam.serviceAccounts.actAs). The render Cloud Build worker executes as {render_sa.name},
+        running the attacker-injected skaffold.yaml hooks. Cite cicd-chains
+        cicd-modify-buildspec-executes-as for the canonical CanModifyCode+ExecutesAs collapse.
+
+  # --- 2b) rollouts.create + actAs(deploy SA) => execute as deploy SA -----------
+  # THE headline Cloud Deploy escalation: promote a release → deploy worker runs as
+  # the deploy SA → deploy SA has GKE/Cloud Run control-plane permissions → code
+  # executing as that SA can deploy to (or modify) the target runtime. This is the
+  # cloud delivery-pipeline to runtime identity escalation path.
+  - id: gcp-deploy-rollout-promote-executes-as
+    emits: CanExecuteAs
+    description: "Promote a Cloud Deploy release (rollouts.create) + actAs(deploy SA) → deploy Cloud Build worker executes as the deploy SA, which has runtime control over the target (GKE/Cloud Run)."
+    applies_to: [gcp]
+    match:
+      - [ ?principal, CanModifyCode,  ?deploy_worker ]
+      - [ ?deploy_worker, ExecutesAs, ?deploy_sa ]
+    where:
+      - "node_type(?deploy_worker) == BuildWorker"
+      - "?deploy_worker is a Cloud Deploy deploy-phase job run"
+      - "?principal holds clouddeploy.rollouts.create AND CanPassIdentity(?principal, ?deploy_sa)"
+    optional:
+      - [ ?principal, CanTrigger, ?deploy_worker ]
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: ?principal
+      target: ?deploy_sa
+      permissions: ["clouddeploy.rollouts.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when CanModifyCode (rollout creation controls what Skaffold executes) and
+        ExecutesAs (deploy SA) are both ACTIVE and no approval gate is present.
+        CONDITIONAL(approval_required) when target.requireApproval == true AND ?principal
+        does not hold clouddeploy.rollouts.approve on the same target. ACTIVE when ?principal
+        holds BOTH rollouts.create AND rollouts.approve on the same target (approval gate
+        provides no separation). CONDITIONAL(time_window) when a deploy policy restricts
+        rollouts.create for the target and ?principal lacks deployPolicies.override.
+        BLOCKED when deny policy blocks rollouts.create or iam.serviceAccounts.actAs.
+      confidence: 0.93
+      derived_from: ["?principal CanModifyCode ?deploy_worker (gcp-deploy-rollout-create-modifies-code)", "?deploy_worker ExecutesAs ?deploy_sa (gcp-deploy-executes-as)", "cicd-chains cicd-modify-buildspec-executes-as"]
+      false_positive_note: >-
+        actAs on the DEPLOY SA (not render SA) is the gate. Confirm the target's
+        executionConfigs.serviceAccount resolves to ?deploy_sa. The deploy SA's blast
+        radius depends on its bound GCP roles: with container.developer on the GKE cluster
+        it can create/modify pods; with run.developer it can update Cloud Run services.
+        If the deploy SA is the default compute SA (roles/editor), treat as high-value.
+        Approval gate: CONDITIONAL unless the same principal can approve (roles segregation
+        failed). Deploy policy time-window: CONDITIONAL(time_window) — still reachable
+        outside the window or with policyOverrider.
+      narrative: >-
+        {principal.name} can promote a Cloud Deploy release to target {target.name}
+        (clouddeploy.rollouts.create + iam.serviceAccounts.actAs on {deploy_sa.name}).
+        The deploy Cloud Build worker executes as {deploy_sa.name} running skaffold apply
+        and any pre/post-deploy hooks. {deploy_sa.name}'s GCP roles (e.g., container.developer
+        on the GKE target or run.developer on Cloud Run) determine the post-escalation
+        blast radius. Cite cicd-chains cicd-modify-buildspec-executes-as.
+
+  # --- 2c) CanAttachIdentity => CanExecuteAs via future rollout -----------------
+  # When a principal re-points a target's execution SA (gcp-deploy-target-update-attach-identity)
+  # and subsequently creates a rollout on that target, can-execute-as
+  # execute-as-via-config-identity-swap fires on (CanModifyConfiguration, CanPassIdentity).
+  # This rule provides the Cloud Deploy–specific framing of that swap.
+  - id: gcp-deploy-attach-then-execute-as
+    emits: CanExecuteAs
+    description: "Re-pointing a target's executionConfigs SA (targets.update + actAs) then promoting a rollout yields code execution as the newly attached SA."
+    applies_to: [gcp]
+    match:
+      - [ ?principal, CanAttachIdentity, ?target_worker ]
+      - [ ?target_worker, ExecutesAs,    ?exec_sa ]
+    where:
+      - "node_type(?target_worker) == BuildWorker"
+      - "?target_worker is a Cloud Deploy job run for the updated target"
+      - "?principal holds clouddeploy.targets.update AND CanPassIdentity(?principal, ?exec_sa)"
+    optional:
+      - [ ?principal, CanTrigger, ?target_worker ]
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: ?principal
+      target: ?exec_sa
+      permissions: ["clouddeploy.targets.update", "iam.serviceAccounts.actAs", "clouddeploy.rollouts.create"]
+      conditions: [iam_permission]
+      state_logic: >-
+        CONDITIONAL(run_path) — re-pointing the SA does not immediately run code; the attacker
+        must also trigger a rollout (rollouts.create or an existing automation). ACTIVE when
+        ?principal also holds clouddeploy.rollouts.create + actAs on the new exec SA
+        (full chain: update target SA, then promote). Inherits weakest from CanAttachIdentity
+        and ExecutesAs contributors.
+      confidence: 0.88
+      derived_from: ["?principal CanAttachIdentity ?target_worker (gcp-deploy-target-update-attach-identity)", "?target_worker ExecutesAs ?exec_sa (gcp-deploy-executes-as)", "can-execute-as execute-as-via-config-identity-swap"]
+      false_positive_note: >-
+        This is the Cloud Deploy analog of the execute-as-via-config-identity-swap canonical
+        rule. The swap (targets.update) arms future rollouts; the execution requires a run
+        path (rollouts.create or automation). Without a run path this stays CONDITIONAL(run_path).
+        can-execute-as execute-as-via-config-identity-swap dedupes on (CanExecuteAs,
+        ?principal, ?exec_sa) — emit once.
+      narrative: >-
+        {principal.name} can update target {target.name}'s execution SA to {exec_sa.name}
+        (clouddeploy.targets.update + iam.serviceAccounts.actAs), then promote a release
+        (clouddeploy.rollouts.create) to execute code as {exec_sa.name}. Cite can-execute-as
+        execute-as-via-config-identity-swap for the canonical collapse.
+
+  # --- 2d) CanExecuteAs(principal → deploy SA) + CanDeploy(deploy SA → GKE/Run) --
+  # Once the attacker executes as the deploy SA, that SA's deployment permissions
+  # on the target runtime become the blast radius. Emit CanDeploy from the deploy SA
+  # to the target runtime (GKE cluster, Cloud Run service) based on its bound roles.
+  # This edge is structural (derived from SA role bindings) and feeds container-chains
+  # and cicd-chains for further propagation. Note: target_type must be conditional on
+  # the runtime type (GKE -> ContainerCluster, Cloud Run -> ContainerService).
+  - id: gcp-deploy-exec-sa-can-deploy-gke
+    emits: CanDeploy
+    description: "The Cloud Deploy execution SA's GKE deployment permissions (container.developer) give it CanDeploy to a GKE cluster."
+    applies_to: [gcp]
+    match:
+      - [ ?exec_sa, HasPermission, ?gke_cluster ]
+    where:
+      - "?exec_sa is the Cloud Deploy execution SA for a delivery pipeline target"
+      - "?gke_cluster is a GKE cluster (KubernetesCluster) the target deploys to"
+      - "?exec_sa has effective container.clusters.get + container.pods.create/update/delete on ?gke_cluster"
+    emit:
+      source_type: ServiceAccount
+      target_type: ContainerCluster
+      source: ?exec_sa
+      target: ?gke_cluster
+      permissions: ["container.pods.create", "container.pods.update", "container.clusters.get"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the SA's effective container.developer (or equivalent) permissions on the
+        GKE cluster are confirmed. CONDITIONAL(iam_permission) when permissions are unconfirmed.
+        This edge feeds container-chains image-push-poisons-consumers (if the SA can also push
+        images to the registry) and can-execute-as execute-as-via-command (if the SA can exec
+        into pods).
+      confidence: 0.90
+      derived_from: ["?exec_sa HasPermission ?gke_cluster (GCP IAM effective permission)", "gcp-deploy-executes-as"]
+      false_positive_note: >-
+        Validate the SA's effective permissions on the SPECIFIC cluster, not just project level.
+        A SA with container.developer project-wide can deploy to ALL GKE clusters — record the
+        widest reachable scope. An attacker who executes as {exec_sa.name} (via release/rollout
+        creation) can then deploy/modify workloads on this cluster.
+      narrative: >-
+        Cloud Deploy execution SA {exec_sa.name} holds GKE deployment permissions on cluster
+        {gke_cluster.name} (container.developer or equivalent), giving it CanDeploy to that
+        cluster. An attacker who executes as {exec_sa.name} (via release/rollout creation)
+        can deploy arbitrary workloads to {gke_cluster.name}.
+
+  - id: gcp-deploy-exec-sa-can-deploy-cloudrun
+    emits: CanDeploy
+    description: "The Cloud Deploy execution SA's Cloud Run deployment permissions (run.developer) give it CanDeploy to a Cloud Run service."
+    applies_to: [gcp]
+    match:
+      - [ ?exec_sa, HasPermission, ?cloudrun_service ]
+    where:
+      - "?exec_sa is the Cloud Deploy execution SA for a delivery pipeline target"
+      - "?cloudrun_service is a Cloud Run service (ContainerService) the target deploys to"
+      - "?exec_sa has effective run.services.update / run.jobs.run on ?cloudrun_service"
+    emit:
+      source_type: ServiceAccount
+      target_type: ContainerService
+      source: ?exec_sa
+      target: ?cloudrun_service
+      permissions: ["run.services.update", "run.jobs.run"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the SA's effective run.developer (or equivalent) permissions on the
+        Cloud Run service are confirmed. CONDITIONAL(iam_permission) when permissions are
+        unconfirmed. For Cloud Run, CanDeploy is also CanModifyCode (run.services.update
+        swaps the image) — see cloudrun.yaml for the Cloud Run escalation rules that fire
+        once the SA acts on those services.
+      confidence: 0.90
+      derived_from: ["?exec_sa HasPermission ?cloudrun_service (GCP IAM effective permission)", "gcp-deploy-executes-as"]
+      false_positive_note: >-
+        Validate the SA's effective permissions on the SPECIFIC service, not just project level.
+        A SA with run.developer project-wide can deploy to ALL Cloud Run services — record the
+        widest reachable scope. An attacker who executes as {exec_sa.name} (via release/rollout
+        creation) can then update/redeploy this service with arbitrary code.
+      narrative: >-
+        Cloud Deploy execution SA {exec_sa.name} holds Cloud Run deployment permissions on
+        service {cloudrun_service.name} (run.developer or equivalent), giving it CanDeploy to
+        that service. An attacker who executes as {exec_sa.name} (via release/rollout creation)
+        can deploy arbitrary code to {cloudrun_service.name}.
+
+
+  # --- 2f) Cross-project execution SA → CanEnterProject ----------------------
+  # When the execution SA belongs to a different project than the Cloud Deploy
+  # pipeline, code executing as that SA is a foothold in the SA's home project.
+  # hierarchy-chains enter-boundary-rollups collapses CanExecuteAs into CanEnterProject
+  # when the acquired identity is bound in another project. This rule emits the
+  # CrossProjectTrust structural fact that feeds that collapse. The source is the
+  # pipeline's project; the target is the SA's home project (both Project nodes).
+  - id: gcp-deploy-cross-project-exec-sa
+    emits: CrossProjectTrust
+    description: "A Cloud Deploy target's execution SA from a different project establishes a cross-project trust enabling CanEnterProject on that SA's home project."
+    applies_to: [gcp]
+    match:
+      - [ ?deploy_worker, ExecutesAs, ?exec_sa ]
+    where:
+      - "node_type(?deploy_worker) == BuildWorker"
+      - "?pipeline_project = project_of(?deploy_worker)"
+      - "?exec_sa_project = project_of(?exec_sa)"
+      - "?exec_sa_project != ?pipeline_project"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: ?pipeline_project
+      target: ?exec_sa_project
+      permissions: ["iam.serviceAccounts.actAs (granted cross-project)"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the execution SA is confirmed in a different project and the cross-project
+        actAs grant is in place (required for Cloud Deploy to use it). hierarchy-chains
+        enter-boundary-rollups and federation-chains federate-then-enter-project collapse
+        this CrossProjectTrust + CanExecuteAs into CanEnterProject(?principal → exec_sa_project).
+      confidence: 0.85
+      derived_from: ["?deploy_worker ExecutesAs ?exec_sa (gcp-deploy-executes-as)", "cross-project SA membership"]
+      false_positive_note: >-
+        CrossProjectTrust is a structural fact, not an attack step by itself. The
+        hierarchy-chains roll-up turns it into CanEnterProject only when combined with
+        a CanExecuteAs path that reaches ?exec_sa. Confirm the SA is in a different project
+        (?exec_sa_project != ?pipeline_project) before emitting. Both source and target
+        must be Project nodes bound by the where-clause. The cross-project actAs org-policy
+        constraint (iam.allowedPolicyMemberDomains) may restrict this — emit BLOCKED if the
+        org policy denies cross-project SA usage and no override exists.
+      narrative: >-
+        Cloud Deploy pipeline in project {pipeline_project.name} uses execution SA {exec_sa.name}
+        from project {exec_sa_project.name} — a cross-project trust between the two projects.
+        An attacker who executes as {exec_sa.name} via a rollout gains a foothold in
+        {exec_sa_project.name}. hierarchy-chains enter-boundary-rollups collapses
+        this CrossProjectTrust into CanEnterProject({principal} → {exec_sa_project.name}).
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   * IAM deny policy denying clouddeploy.releases.create / clouddeploy.rollouts.create /
+#     iam.serviceAccounts.actAs at the effective scope → emit BLOCKED with denied_by=<deny policy>.
+#   * Org policy constraints (clouddeploy.disableDefaultServiceAccountRoles) preventing
+#     binding of the default compute SA → BLOCKED on gcp-deploy-executes-as for default SA.
+#   * requireApproval: true on target + no approve permission → CONDITIONAL(approval_required)
+#     on gcp-deploy-rollout-promote-executes-as, NOT BLOCKED. A separate approver unblocks.
+#   * Deploy policy time-window restriction → CONDITIONAL(time_window) on the affected
+#     rollout edge, NOT BLOCKED. The window expires; policyOverrider can bypass it.
+#   * State propagation: derived edges are NEVER stronger than their weakest contributor
+#     (RULE-FORMAT.md monotonicity). A CONDITIONAL contributing CanPassIdentity yields at
+#     best CONDITIONAL CanExecuteAs.
+#
+# LINCHPIN CITATIONS (do not re-derive in this file):
+#   cicd-chains: cicd-modify-buildspec-executes-as (CanModifyCode+ExecutesAs → CanExecuteAs)
+#   cicd-chains: cicd-trigger-runner-executes-as (CanTrigger+ExecutesAs → CONDITIONAL CanExecuteAs)
+#   cicd-chains: cicd-pipeline-orchestrates-stages (CanTrigger propagation)
+#   can-execute-as: execute-as-via-code-modify (generic collapse — dedupes)
+#   can-execute-as: execute-as-via-config-identity-swap (targets.update identity swap)
+#   can-control: escalate-via-execute-as (CanExecuteAs → CanEscalateTo)
+#   can-control: control-boundary-via-iam-admin (CanGrantPermission → Controls)
+#   hierarchy-chains: enter-boundary-rollups (CanExecuteAs → CanEnterProject cross-project)
+#   gcp/identity-escalation: gcp-sa-act-as (iam.serviceAccounts.actAs → CanPassIdentity)
+#   gcp/identity-escalation: gcp-execute-as-via-actas (actAs+create → CanExecuteAs generic)
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw Cloud Deploy config → explicit edges).
+# These belong in /rules/explicit/gcp-clouddeploy.yaml if a separate explicit file is used;
+# kept here as the service bundle for reference.
+explicit_rules:
+
+  - id: gcp-deploy-target-executes-as-explicit
+    emits: ExecutesAs
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.cloud.deploy.Target"
+      field: "executionConfigs[].serviceAccount"
+    emit:
+      source: "<Cloud Deploy job run worker for this target>"
+      target: "<configured execution SA (or default compute SA if unset)>"
+      api_source: "clouddeploy.targets.get"
+      evidence_field: "executionConfigs[N].serviceAccount"
+      narrative: "Cloud Deploy job runs on target {target.name} execute as {sa.name}."
+
+  - id: gcp-deploy-worker-exposes-credential
+    emits: ExposesCredential
+    applies_to: [gcp]
+    description: "Code running in a Cloud Deploy Cloud Build worker can read the metadata endpoint to obtain an OAuth token for the execution SA."
+    match:
+      - [ ?build_worker, ExecutesAs, ?exec_sa ]
+    where:
+      - "node_type(?build_worker) == BuildWorker"
+      - "?build_worker is a Cloud Deploy job run (render, deploy, verify, etc.)"
+    emit:
+      source_type: BuildWorker
+      target_type: ServiceAccount
+      source: ?build_worker
+      target: ?exec_sa
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE — this is a structural fact. Any code running in a GCP Cloud Build worker
+        can call the GCP metadata endpoint (http://metadata.google.internal/computeMetadata/v1)
+        to retrieve an OAuth token valid for the worker's service account. No explicit
+        IAM permission is required; it is a platform capability.
+      confidence: 0.99
+      derived_from: ["?build_worker ExecutesAs ?exec_sa (gcp-deploy-executes-as)"]
+      false_positive_note: >-
+        This edge is a fact about GCP Cloud Build's runtime, not a permission grant.
+        Any code running in the worker (including attacker-controlled Skaffold hooks)
+        can read the metadata endpoint. The credential exposure becomes an attack step
+        when combined with CanModifyCode (attacker-controlled code) or CanExecuteCommand
+        (command injection into the worker).
+      narrative: >-
+        Code running in Cloud Deploy's Cloud Build worker {build_worker.name} can read
+        the GCP metadata endpoint to obtain a valid OAuth token for the execution SA
+        {exec_sa.name}. An attacker who achieves code execution in the worker (via
+        CanModifyCode or CanExecuteCommand) can retrieve and use this token.
+
+  - id: gcp-deploy-automation-trigger
+    emits: CanTrigger
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.cloud.deploy.Automation"
+      field: "rules[].promoteReleaseRule OR rules[].advanceRolloutRule"
+    emit:
+      source: "<Automation (AutomationService)>"
+      target: "<Cloud Deploy delivery pipeline>"
+      api_source: "clouddeploy.automations.get"
+      evidence_field: "rules[N].promoteReleaseRule.destinationTargetId"
+      narrative: "Automation {automation.name} automatically promotes releases in pipeline {pipeline.name}."
+
+  - id: gcp-deploy-pipeline-iam-binding
+    emits: CanModifyPolicy
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.cloud.deploy.DeliveryPipeline"
+      field: "iamPolicy.bindings"
+    where:
+      - "a binding grants clouddeploy.deliveryPipelines.setIamPolicy to ?member"
+    emit:
+      source: "<member>"
+      target: "<delivery pipeline IAM policy>"
+      api_source: "clouddeploy.deliveryPipelines.getIamPolicy"
+      evidence_field: "bindings[N].role == roles/clouddeploy.admin"
+      narrative: "{member.name} holds setIamPolicy on pipeline {pipeline.name} and can grant itself releases.create / rollouts.create."

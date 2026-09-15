@@ -1,0 +1,265 @@
+# GCP Cloud Run — Compute / execution attack-path rules (Phase 4)
+# ---------------------------------------------------------------------------
+# Cloud Run services/jobs/worker-pools EXECUTE AS a runtime service account
+# (default: PROJECT_NUMBER-compute@developer.gserviceaccount.com, usually
+# roles/editor). Two escalation shapes:
+#   (A) modify the code/config of an EXISTING resource -> it runs attacker code
+#       as its (pre-existing) runtime SA. Needs run.*.update; NO actAs required
+#       if the SA is unchanged.
+#   (B) create a NEW resource (or change the SA on update) bound to a chosen SA.
+#       Needs run.*.create/update + iam.serviceAccounts.actAs on that SA.
+# Completion of (A) requires the code to actually run: an invoker binding
+# (run.routes.invoke / run.jobs.run / run.jobs.runWithOverrides) or a trigger.
+#
+# Permissions are the exact run.*.verb identifiers from the Cloud Run IAM
+# permissions reference. actAs comes from the iam.serviceAccounts reference.
+# Scope discipline: ?target runtime SA is resolved from the resource's
+# effective serviceAccountName, not merely from holding run.*.update.
+# IAM deny policies are evaluated first (deny wins) -> BLOCKED edges.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 4-compute-execution
+applies_to: [gcp]
+
+rules:
+
+  # --- Code substitution on an existing resource -----------------------------
+  - id: gcp-run-update-code
+    emits: CanModifyCode
+    match_effective_permission: {action: "run.services.update", resource_type: "google.cloud.run.Service"}
+    alt_permission: "run.jobs.update"
+    where:
+      - "action is run.services.update (service) OR run.jobs.update (job) OR run.workerpools.update (worker pool) on ?resource"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Cloud Run service/job/worker-pool in scope>"
+      permissions: ["run.services.update", "run.jobs.update", "run.workerpools.update"]
+      escalation: "Deploy a new revision with an attacker-controlled container image / entrypoint."
+      false_positive_note: "run.*.update swaps the image but the resource still executes as its EXISTING runtime SA unless the SA is also changed (which needs actAs). Do not attribute an arbitrary SA."
+      narrative: "{principal.name} can update {resource.name} (run.services.update / run.jobs.update), deploying a new revision with an arbitrary container image."
+
+  - id: gcp-run-update-config
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "run.services.update", resource_type: "google.cloud.run.Service"}
+    alt_permission: "run.jobs.update"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Cloud Run service/job/worker-pool in scope>"
+      permissions: ["run.services.update", "run.jobs.update", "run.workerpools.update"]
+      escalation: "Change env vars, secret mounts, command/args, ingress, or the runtime SA on a new revision."
+      note: "Changing the runtime SA to a different SA additionally requires iam.serviceAccounts.actAs on that SA (see gcp-run-set-runtime-sa)."
+      narrative: "{principal.name} can modify the configuration of {resource.name} (run.services.update / run.jobs.update): env, secrets, command, ingress, or identity."
+
+  # --- Invoke / run (completes execution when code is attacker-controlled) ----
+  - id: gcp-run-invoke
+    emits: CanInvoke
+    match_effective_permission: {action: "run.routes.invoke", resource_type: "google.cloud.run.Service"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Cloud Run service in scope>"
+      permissions: ["run.routes.invoke"]
+      note: "Invoke alone is not execution-as; it completes an escalation only when the image was swapped (gcp-run-update-code) or via runWithOverrides."
+      target_class_note: "A Cloud Run service maps to ContainerService, which is not in schema CanInvoke.target [ServerlessFunction, API, APIGateway, Workflow]. Request-driven Cloud Run services are legitimately invokable, so ContainerService is treated as an invokable-target equivalent here; reflect by adding ContainerService to CanInvoke.target in schema/edges.yaml."
+      narrative: "{principal.name} can invoke Cloud Run service {resource.name} (run.routes.invoke)."
+
+  - id: gcp-run-jobs-run
+    emits: CanInvoke
+    match_effective_permission: {action: "run.jobs.run", resource_type: "google.cloud.run.Job"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Cloud Run job in scope>"
+      permissions: ["run.jobs.run"]
+      false_positive_note: "Plain run.jobs.run only executes the EXISTING image; it is not a standalone code-injection primitive. It completes an escalation only when the image was swapped (gcp-run-update-code)."
+      narrative: "{principal.name} can run Cloud Run job {resource.name} with its existing image (run.jobs.run)."
+
+  - id: gcp-run-jobs-run-with-overrides
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "run.jobs.runWithOverrides", resource_type: "google.cloud.run.Job"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Cloud Run job in scope>"
+      permissions: ["run.jobs.runWithOverrides"]
+      code_injection: true
+      escalation: "run.jobs.runWithOverrides lets the caller inject container command/args/env at run time -> standalone code execution as the job's SA WITHOUT a prior image swap."
+      false_positive_note: "Unlike plain run.jobs.run, runWithOverrides is a self-contained execute-as primitive: it both injects code and runs it in one call, so no separate CanModifyCode/image-swap edge is required."
+      narrative: "{principal.name} can run Cloud Run job {resource.name} with attacker-controlled command/args/env overrides (run.jobs.runWithOverrides), executing arbitrary code as the job's runtime SA."
+
+  # --- Identity attachment (actAs = GCP PassRole analog) ----------------------
+  # CanPassIdentity(principal -> SA) is emitted by the shared GCP rule
+  # gcp-sa-act-as (rules/derived/gcp/identity-escalation.yaml) on
+  # iam.serviceAccounts.actAs. Here we specialize the Cloud Run realizations.
+
+  - id: gcp-run-set-runtime-sa
+    emits: CanAttachIdentity
+    description: "Set/replace the runtime SA on a Cloud Run resource (create or update) while holding actAs on that SA."
+    match:
+      - [ "?principal", "CanPassIdentity", "?sa" ]
+    where:
+      - "?principal has effective run.services.create OR run.services.update OR run.jobs.create OR run.jobs.update OR run.workerpools.create OR run.workerpools.update"
+      - "?sa is the SA being attached as the runtime service identity (spec.serviceAccountName)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Cloud Run service/job/worker-pool>"
+      permissions: ["iam.serviceAccounts.actAs", "run.services.update", "run.services.create", "run.jobs.update", "run.jobs.create"]
+      conditions: [iam_permission]
+      false_positive_note: "actAs is the guard rail: without iam.serviceAccounts.actAs on ?sa the deploy is denied. Do not emit for an arbitrary SA the principal cannot actAs. role_compatibility is intentionally omitted: Cloud Run imposes no SA/service compatibility restriction (any SA can be a Cloud Run runtime SA), so the only load-bearing precondition is the actAs check (iam_permission)."
+      narrative: "{principal.name} can attach service account {sa.name} to Cloud Run resource {resource.name} (iam.serviceAccounts.actAs + run.*.create/update)."
+
+  # --- Derived: execution as the runtime SA ----------------------------------
+  - id: gcp-run-execute-as-via-update
+    emits: CanExecuteAs
+    description: "Modify code/config of an existing Cloud Run resource; it runs as its existing runtime SA."
+    match:
+      - [ "?principal", "CanModifyCode", "?resource" ]
+      - [ "?resource", "ExecutesAs", "?sa" ]
+    where:
+      - "node_type(?resource) in [ContainerService, ServerlessFunction]"
+      - "?sa.privilege_level >= ?principal.privilege_level"
+    optional:
+      - [ "?principal", "CanInvoke", "?resource" ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<runtime service account>"
+      state_logic: "if node_type(?resource)==ContainerService AND provider_type(?resource)==google.cloud.run.WorkerPool: ACTIVE (worker pools are pull-based and run continuously once a revision deploys — no invoke/trigger needed); elif matched(optional[0]) or trigger_exists(?resource): ACTIVE else CONDITIONAL(trigger_exists)"
+      permissions: ["run.services.update", "run.jobs.update", "run.workerpools.update", "run.routes.invoke", "run.jobs.run"]
+      conditions_from: ["?resource", "?sa"]
+      escalation: "Swap the image of a Cloud Run resource, then invoke/trigger it to run code as its runtime SA. For worker pools, deploying a malicious revision to the existing pool executes immediately (continuous pull-based execution)."
+      derived_from: ["<CanModifyCode edge_id>", "<ExecutesAs edge_id>", "<optional CanInvoke edge_id>"]
+      false_positive_note: "Target the resource's EXISTING runtime SA (often the default compute SA with roles/editor), not an arbitrary SA. If no invoker binding and no trigger exists, state is CONDITIONAL(trigger_exists) — for a public service (allUsers invoker) it is ACTIVE."
+      narrative: "{principal.name} can execute as {sa.name} by deploying a malicious revision of {resource.name} (run.services.update) and invoking it (run.routes.invoke)."
+
+  - id: gcp-run-execute-as-via-create
+    emits: CanExecuteAs
+    description: "Create a new Cloud Run resource bound to a chosen SA (actAs) and invoke/run it."
+    match:
+      - [ "?principal", "CanAttachIdentity", "?resource" ]
+      - [ "?resource", "ExecutesAs", "?sa" ]
+    where:
+      - "?principal held iam.serviceAccounts.actAs on ?sa (via CanPassIdentity) AND run.services.create OR run.jobs.create OR run.workerpools.create"
+    optional:
+      - [ "?principal", "CanInvoke", "?resource" ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<chosen runtime service account>"
+      state_logic: "if node_type(?resource)==ContainerService AND provider_type(?resource)==google.cloud.run.WorkerPool: ACTIVE (worker pools run continuously once created — no invoke/trigger needed); elif matched(optional[0]) or public service: ACTIVE; elif job AND ?principal has effective run.jobs.run on ?resource: ACTIVE (self-run) else CONDITIONAL(iam_permission)"
+      permissions: ["iam.serviceAccounts.actAs", "run.services.create", "run.jobs.create", "run.workerpools.create", "run.routes.invoke", "run.jobs.run"]
+      conditions_from: ["?resource", "?sa"]
+      escalation: "Deploy a new Cloud Run service/job/worker-pool running attacker code as a privileged SA, then invoke/run it."
+      derived_from: ["<CanAttachIdentity edge_id>", "<ExecutesAs edge_id>", "<optional CanInvoke edge_id>"]
+      false_positive_note: "Only emit for an SA the principal can actAs. run.jobs.create does NOT implicitly grant run.jobs.run (run is a separate permission, part of roles/run.invoker or roles/run.developer/run.admin); a principal with only create cannot necessarily run the job it created, so the self-run ACTIVE branch requires the principal to hold effective run.jobs.run on the created job, else CONDITIONAL(iam_permission). A worker pool runs continuously once created (ACTIVE). A service needs invoke or a trigger."
+      narrative: "{principal.name} can create a Cloud Run resource bound to {sa.name} (actAs + run.*.create) and invoke/run it, executing code as {sa.name}."
+
+  # --- Metadata token exposure inside the container --------------------------
+  - id: gcp-run-metadata-token
+    emits: CanRetrieveToken
+    description: "Code running in a Cloud Run container mints tokens for the runtime SA from the metadata server."
+    match:
+      - [ "?principal", "CanExecuteAs", "?sa" ]
+    where:
+      - "?principal reached code execution inside a Cloud Run container running as ?sa"
+    emit:
+      source: "<principal / container>"
+      target: "<runtime service account>"
+      permissions: []
+      note: "metadata endpoint: http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token (header Metadata-Flavor: Google). Also emit ExposesCredential(container -> SA)."
+      derived_from: ["<CanExecuteAs edge_id>"]
+      narrative: "Code running in {resource.name} can read the metadata server to obtain an OAuth access token for {sa.name} (ExposesCredential)."
+
+  # --- Resource-policy mutation: self-grant invoke / public exposure ---------
+  - id: gcp-run-set-iam-policy
+    emits: CanModifyPolicy
+    match_effective_permission: {action: "run.services.setIamPolicy", resource_type: "google.cloud.run.Service"}
+    alt_permission: "run.jobs.setIamPolicy"
+    where:
+      - "action is run.services.setIamPolicy OR run.jobs.setIamPolicy OR run.workerpools.setIamPolicy on ?resource"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Cloud Run service/job/worker-pool in scope>"
+      permissions: ["run.services.setIamPolicy", "run.jobs.setIamPolicy", "run.workerpools.setIamPolicy"]
+      escalation: "Grant self roles/run.invoker (completes an image-swap escalation) or bind allUsers for public exposure."
+      narrative: "{principal.name} can set the IAM policy of {resource.name} (run.services.setIamPolicy) and self-grant run.invoker or expose it publicly."
+
+  - id: gcp-run-public-invoker
+    emits: ExposedToInternet
+    description: "allUsers/allAuthenticatedUsers bound to run.invoker on a service reachable from the internet."
+    match_record: {resource_type: "google.cloud.run.Service", field: "iamPolicy.bindings"}
+    where:
+      - "a binding grants roles/run.invoker (or run.routes.invoke) to allUsers or allAuthenticatedUsers"
+      - "ingress setting permits public traffic (ingress=all) OR the Invoker IAM check is disabled"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<Cloud Run service>"
+      target: "<AnonymousIdentity>"
+      permissions: ["run.routes.invoke (allUsers)"]
+      conditions: [network_reachability]
+      false_positive_note: "Do NOT flag if ingress=internal or ingress=internal-and-cloud-load-balancing without a public LB — the allUsers binding is then not internet-reachable. Requires BOTH the public invoker binding AND public ingress."
+      narrative: "Cloud Run service {resource.name} is invokable by anyone on the internet (run.invoker bound to allUsers + public ingress)."
+
+  # --- Network egress to private resources -----------------------------------
+  - id: gcp-run-vpc-egress
+    emits: CanNetworkReach
+    description: "Cloud Run resource with Direct VPC egress / Serverless VPC Access connector can reach private targets."
+    match_record: {resource_type: "google.cloud.run.Service", field: "spec.vpcAccess"}
+    where:
+      - "resource has a Serverless VPC Access connector or Direct VPC egress configured"
+    emit:
+      source: "<Cloud Run service/job>"
+      target: "<private resource reachable via the connected subnet>"
+      conditions: [network_reachability]
+      note: "Combined with CanExecuteAs, attacker code egresses into the VPC to reach otherwise-private DBs/hosts (PrivateReachability)."
+      narrative: "{resource.name} has VPC egress and can reach private resources in the connected network."
+
+# ---------------------------------------------------------------------------
+# explicit_rules: normalization of raw Cloud Run config into explicit edges.
+# (Belongs conceptually in /rules/explicit/; kept here for the service bundle.)
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-run-executes-as
+    emits: ExecutesAs
+    match_record: {resource_type: "google.cloud.run.Service", field: "spec.template.spec.serviceAccountName"}
+    where:
+      - "runtime SA = spec.serviceAccountName if set, ELSE the Compute Engine default SA (PROJECT_NUMBER-compute@developer.gserviceaccount.com)"
+    emit:
+      source: "<Cloud Run service/job/worker-pool>"
+      target: "<runtime service account>"
+      permissions: []
+      note: "Zero-cost fact enabling CanExecuteAs derivations. Flag default compute SA as high privilege (roles/editor)."
+      narrative: "{resource.name} executes as {sa.name}."
+
+  - id: gcp-run-invoker-binding
+    emits: CanInvoke
+    match_record: {resource_type: "google.cloud.run.Service", field: "iamPolicy.bindings"}
+    where:
+      - "a binding grants roles/run.invoker (run.routes.invoke / run.jobs.run) to ?member"
+    emit:
+      source: "<member>"
+      target: "<Cloud Run service/job>"
+      permissions: ["run.routes.invoke", "run.jobs.run"]
+      target_class_note: "schema CanInvoke.target is [ServerlessFunction, API, APIGateway, Workflow]. A Cloud Run JOB maps to ServerlessFunction (valid). A Cloud Run SERVICE/WorkerPool maps to ContainerService, which is NOT currently in CanInvoke.target; request-driven Cloud Run services are legitimately invokable (run.routes.invoke), so ContainerService is treated here as an invokable-target equivalent. This mapping should be reflected by adding ContainerService to CanInvoke.target in schema/edges.yaml; until then downstream validators must permit ContainerService as a CanInvoke target for this service."
+      narrative: "{member.name} is granted run.invoker on {resource.name}."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: if an IAM deny policy denies run.*.update /
+# run.*.create / iam.serviceAccounts.actAs / run.routes.invoke at the effective
+# scope, emit the edge with state: BLOCKED and denied_by=<deny policy>, so the
+# UI explains why an otherwise-present path does not work. Org policy
+# constraints/iam.allowedPolicyMemberDomains (blocking allUsers) similarly
+# BLOCK gcp-run-public-invoker.
+# ---------------------------------------------------------------------------

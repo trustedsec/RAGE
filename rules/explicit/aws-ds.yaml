@@ -1,0 +1,350 @@
+# AWS Directory Service — Explicit normalization rules
+# Converts raw ds:DescribeDirectories / ds:DescribeTrusts / ds:ListUsers
+# API records and effective-permission facts into common explicit edges.
+# The permission evaluator emits effective-permission facts; these rules
+# translate them into CanResetCredential, CanAdminister, CanModifyTrust,
+# TrustsExternalIdentity, and MemberOf graph edges.
+#
+# Derived attack-path rules that consume these edges:
+#   /rules/derived/aws/ds.yaml
+#
+# Linchpins that consume the derived edges:
+#   /rules/derived/credential-chains.yaml  (impersonate-is-escalation)
+#   /rules/derived/federation-chains.yaml  (federation-maps-to-identity)
+
+rules:
+
+  # --- Password reset: the primary credential access edge --------------------
+  - id: aws-ds-can-reset-user-password
+    emits: CanResetCredential
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ds:ResetUserPassword"
+      resource_type: "AWS::DirectoryService::MicrosoftAD"
+    emit:
+      source_type: Identity
+      target_type: HumanIdentity
+      source: "<principal>"
+      target: "<DirectoryUser node(s) within the directory>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ds:ResetUserPassword"]
+      evidence_field: "effective ds:ResetUserPassword on directory ARN"
+      narrative: >-
+        {principal.name} holds effective ds:ResetUserPassword on Managed AD
+        directory {directory.name} and can reset the password of any user in that
+        directory, taking over their Windows-authenticated session.
+      note: >-
+        ds:ResetUserPassword is scoped to the directory ARN; it grants
+        blanket password-reset access over ALL users. When user enumeration
+        (ds:DescribeUsers / ds:ListUsers via Identity Data Access) is available,
+        emit one edge per user. Otherwise emit a single edge to the directory
+        node as the target with scope="all users in directory". Rule 1
+        aws-ds-escalate-via-domain-admin-reset narrows to domain-admin users
+        when MemberOf data is present.
+
+  # --- Password reset on AD Connector-backed directory (resets on-prem AD creds)
+  - id: aws-ds-can-reset-user-password-ad-connector
+    emits: CanResetCredential
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ds:ResetUserPassword"
+      resource_type: "AWS::DirectoryService::ADConnector"
+    emit:
+      source_type: Identity
+      target_type: HumanIdentity
+      source: "<principal>"
+      target: "<DirectoryUser node(s) within the on-prem AD behind this Connector>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ds:ResetUserPassword"]
+      evidence_field: "effective ds:ResetUserPassword on AD Connector ARN"
+      narrative: >-
+        {principal.name} holds effective ds:ResetUserPassword on AD Connector
+        {directory.name} and can reset passwords of any user in the on-prem Active
+        Directory that this Connector proxies to, via LDAP to the on-prem AD.
+      note: >-
+        AD Connector is a proxy to an on-prem AD; password resets via the Connector
+        propagate to the on-prem directory and affect real Windows-domain credentials
+        used by on-prem resources and potentially hybrid workloads. This is a
+        cross-boundary credential-reset capability (AWS control-plane to on-prem AD).
+        Emit per user if enumeration data is available; otherwise emit a blanket
+        edge to the Connector/directory node. The escalation chain (CanEscalateTo)
+        depends on the target user's group membership in the on-prem AD.
+
+  # --- Password reset on Simple AD directory --------------------------------
+  - id: aws-ds-can-reset-user-password-simple-ad
+    emits: CanResetCredential
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ds:ResetUserPassword"
+      resource_type: "AWS::DirectoryService::SimpleAD"
+    emit:
+      source_type: Identity
+      target_type: HumanIdentity
+      source: "<principal>"
+      target: "<DirectoryUser node(s) within the directory>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ds:ResetUserPassword"]
+      evidence_field: "effective ds:ResetUserPassword on Simple AD ARN"
+      narrative: >-
+        {principal.name} holds effective ds:ResetUserPassword on Simple AD directory
+        {directory.name} and can reset the password of any user in that directory,
+        taking over their session.
+      note: >-
+        Simple AD is AWS's lightweight directory without forest trusts or SSO
+        integration. Blast radius is reduced vs. Managed AD (no forest trusts, no
+        multi-domain escalation), but still grants user-credential access within
+        the Simple AD scope. Emit per user if enumeration is available; otherwise
+        blanket to the directory node. No CanEscalateTo to domain-admin roles
+        (Simple AD does not use standard AD group semantics).
+
+  # --- Administrative control over the directory (ds:* or full access policy) ----
+  # REMOVED: aws-ds-can-administer-directory previously fired on
+  # match_effective_permission: ds:ResetUserPassword alone. This over-claims
+  # administrative control: ds:ResetUserPassword is a single high-impact action
+  # that grants password-reset capability, NOT full directory administration.
+  # The edge CanAdminister is documented as "Full control (admin/owner) over a
+  # resource — implies most other capabilities on it." A principal with ONLY
+  # ds:ResetUserPassword cannot manage domain controllers, modify schema
+  # extensions, or perform other control-plane administrative operations.
+  # The correct CanResetCredential edge (emitted by aws-ds-can-reset-user-password)
+  # already captures the password-reset capability. To emit CanAdminister, the
+  # principal must hold either ds:* wildcard (true administrative access) or
+  # the AWSDirectoryServiceFullAccess managed policy. A rule keyed on ds:*
+  # or a policy-evaluator step confirming effective ds:* would be the correct
+  # vector — NOT a single action. This rule is withdrawn to prevent
+  # over-claiming administrative access from narrow permissions.
+
+  # --- Recon read of directory metadata -------------------------------------
+  - id: aws-ds-can-read-directory
+    emits: CanRead
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ds:DescribeDirectories"
+      resource_type: "AWS::DirectoryService::MicrosoftAD"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<directory node>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ds:DescribeDirectories"]
+      narrative: >-
+        {principal.name} can describe directory {directory.name}
+        (ds:DescribeDirectories) — metadata access only.
+
+  # --- Trust creation: create a new AD trust relationship -------------------
+  - id: aws-ds-can-create-trust
+    emits: CanModifyTrust
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ds:CreateTrust"
+      resource_type: "AWS::DirectoryService::MicrosoftAD"
+    emit:
+      source_type: Identity
+      target_type: TrustPolicy
+      source: "<principal>"
+      target: "<TrustPolicy node of the directory>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ds:CreateTrust"]
+      evidence_field: "effective ds:CreateTrust on directory ARN"
+      narrative: >-
+        {principal.name} can create a new Active Directory trust relationship
+        for directory {directory.name} (ds:CreateTrust), enabling cross-domain
+        authentication from a domain the attacker controls.
+      note: >-
+        Only applicable to AWS::DirectoryService::MicrosoftAD (Managed AD);
+        Simple AD does not support trust relationships; AD Connector trusts live
+        in the on-prem AD. Verify directory type before emitting.
+
+  # --- Trust modification: update an existing AD trust relationship ----------
+  - id: aws-ds-can-update-trust
+    emits: CanModifyTrust
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ds:UpdateTrust"
+      resource_type: "AWS::DirectoryService::MicrosoftAD"
+    emit:
+      source_type: Identity
+      target_type: TrustPolicy
+      source: "<principal>"
+      target: "<TrustPolicy node of the directory>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ds:UpdateTrust"]
+      evidence_field: "effective ds:UpdateTrust on directory ARN"
+      narrative: >-
+        {principal.name} can modify an existing Active Directory trust relationship
+        for directory {directory.name} (ds:UpdateTrust), altering trust direction,
+        settings, or other trust properties to compromise cross-domain access.
+      note: >-
+        Distinct from ds:CreateTrust (which creates new trusts); ds:UpdateTrust
+        allows modification of existing trusts (e.g., toggling One-Way to Two-Way,
+        altering transitivity settings). An attacker holding ONLY ds:UpdateTrust
+        cannot create trusts but can reconfigure existing ones. Coverage gap fix:
+        ds:UpdateTrust is a separate official IAM action in AWS Service
+        Authorization Reference, and principals can hold it independently.
+        Only applicable to AWS::DirectoryService::MicrosoftAD (Managed AD).
+
+  # --- Trust deletion: a destructive trust-boundary modification -----------
+  - id: aws-ds-can-delete-trust
+    emits: CanModifyTrust
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ds:DeleteTrust"
+      resource_type: "AWS::DirectoryService::MicrosoftAD"
+    emit:
+      source_type: Identity
+      target_type: TrustPolicy
+      source: "<principal>"
+      target: "<TrustPolicy node of the directory>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ds:DeleteTrust"]
+      evidence_field: "effective ds:DeleteTrust on directory ARN"
+      narrative: >-
+        {principal.name} can delete an Active Directory trust relationship
+        for directory {directory.name} (ds:DeleteTrust), removing cross-domain
+        authentication paths or disrupting guardrail trusts.
+      note: >-
+        Trust deletion is a destructive capability that impacts availability
+        (breaks cross-domain auth) but also acts as a guardrail-removal path
+        (if a trust is used to gate access, deleting it can unblock further
+        attacks). CanModifyTrust encompasses both creation (trust-addition) and
+        deletion (trust-removal). Only applicable to Managed AD. Prefer to emit
+        separately from create-trust if blast-radius analysis treats creation
+        and deletion differently.
+
+  # --- Existing trust record -> TrustsExternalIdentity -----------------------
+  - id: aws-ds-trust-record
+    emits: TrustsExternalIdentity
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::DirectoryService::MicrosoftAD"
+      field: "Trusts[].RemoteDomainName"
+    where:
+      - "TrustState == 'Verified'"
+      - "TrustDirection in ['One-Way: Trusting', 'Two-Way']"
+    emit:
+      source_type: ResourcePolicy
+      target_type: ExternalIdentity
+      source: "<ResourcePolicy node for this trust record (AD trust modeled as a ResourcePolicy artifact; generic_type ResourcePolicy, class Policy)>"
+      target: "<ExternalIdentity node for Trusts[].RemoteDomainName>"
+      api_source: "ds:DescribeTrusts"
+      evidence_field: "TrustId, RemoteDomainName, TrustType (Forest|External), TrustDirection, TrustState"
+      record_property:
+        node: "<ResourcePolicy node for this trust>"
+        key: "trust_direction"
+        value: "<TrustDirection>"
+      narrative: >-
+        Directory {directory.name} has a verified AD {trust.trust_type} trust to
+        {trust.remote_domain_name} (direction: {trust.trust_direction}); Kerberos
+        tickets from that domain are accepted by the managed domain controllers.
+      note: >-
+        Only emit when TrustDirection includes 'Trusting' — the AWS side accepts
+        tickets FROM the external domain. 'One-Way: Trusted' means AWS users can
+        authenticate INTO the external domain (not a risk to AWS resources; do not
+        emit TrustsExternalIdentity for that direction). TrustState must be
+        'Verified'; 'Failed' or 'Created' trusts are not yet functional.
+        Feeds federation-chains.yaml federation-maps-to-identity (CITED): if the
+        external domain is attacker-controlled (on-prem compromise), the trust yields
+        CanFederateAs into the AWS-managed domain. SCHEMA NOTE: The AD trust record
+        is described throughout DS docs as a TrustPolicy node
+        (AWS::DirectoryService::Trust), but TrustPolicy is NOT in
+        TrustsExternalIdentity.source set ([Role, ServiceAccount, ApplicationIdentity,
+        ResourcePolicy]). This is a schema gap: TrustPolicy should be added to
+        TrustsExternalIdentity.source. Until then, we model the trust as a
+        ResourcePolicy artifact (a policy-like document that establishes a trust).
+        This re-modeling is acceptable because the trust record does function as
+        an access-control artifact, and federation-chains correctly consumes the
+        TrustsExternalIdentity edge regardless of the source node's internal class.
+
+  # --- Enable SSO on the directory -> modify federation config ---------------
+  - id: aws-ds-can-enable-sso
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ds:EnableSso"
+      resource_type: "AWS::DirectoryService::MicrosoftAD"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<directory node (GenericManagement)>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ds:EnableSso"]
+      evidence_field: "effective ds:EnableSso on directory ARN"
+      narrative: >-
+        {principal.name} can enable Single Sign-On (SSO) for directory {directory.name}
+        (ds:EnableSso), modifying the directory's SSO client settings and federation
+        configuration (e.g., Kerberos delegation, WorkSpaces/WorkDocs SSO, SAML IdP
+        integration).
+      note: >-
+        ds:EnableSso configures the directory's browser-based SSO and federation
+        client settings; it does NOT modify the trust policy for who may assume
+        or impersonate identities. The action is a configuration change that
+        expands the federation surface, but assumes control of the IdP infrastructure
+        remains with the principal's organization. Classified as CanModifyConfiguration
+        (modifies directory config, not trust boundary) to accurately reflect the
+        capability scope. An attacker controlling the IdP infrastructure could
+        redirect authentication, but that is a downstream integration risk, not
+        a CanModifyTrust operation. Only applicable to Managed AD.
+
+  # --- Authorize a third-party app to use directory -------------------------
+  - id: aws-ds-can-authorize-application
+    emits: CanModifyTrust
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ds:AuthorizeApplication"
+      resource_type: "AWS::DirectoryService::MicrosoftAD"
+    emit:
+      source_type: Identity
+      target_type: TrustPolicy
+      source: "<principal>"
+      target: "<TrustPolicy node (or federation-config node) for the directory>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ds:AuthorizeApplication"]
+      evidence_field: "effective ds:AuthorizeApplication on directory ARN"
+      narrative: >-
+        {principal.name} can authorize a third-party application to authenticate
+        against directory {directory.name} (ds:AuthorizeApplication), granting it
+        LDAP/Kerberos access as a domain identity.
+      note: >-
+        ds:AuthorizeApplication grants a named application (identified by a service
+        principal or OAuth client) the right to act as a Kerberos/LDAP client against
+        the directory. An attacker who authorizes a malicious application becomes a
+        trust anchor for that app; the app can then authenticate to any domain-joined
+        resource using the directory's credentials. This is a Phase-2 identity-entry
+        primitive (introduce a new external identity that the directory will trust).
+        Classified as CanModifyTrust because it expands the set of principals trusted
+        to authenticate against the directory. IMPORTANT LIMITATION: the authorized
+        application receives LDAP/Kerberos client credentials only, not the ability
+        to assume or impersonate the directory's internal identities. Do NOT
+        conflate this with CanAssume or CanImpersonate — downstream consumers should
+        note that path traversal stops at Kerberos-ticket authentication, not
+        Windows-domain escalation or IAM role assumption.
+
+  # --- Directory user membership (when Identity Data Access is available) ----
+  - id: aws-ds-directory-member-of
+    emits: MemberOf
+    applies_to: [aws]
+    match_record:
+      resource_type: "ds:User"
+      field: "GroupMemberships"
+    where:
+      - "ds:EnableDirectoryDataAccess is active on the directory (IdentityDataAccessStatus == Enabled)"
+    emit:
+      source_type: HumanIdentity
+      target_type: Group
+      source: "<DirectoryUser node (HumanIdentity)>"
+      target: "<Group node (e.g. Domain Admins group node)>"
+      api_source: "ds:ListGroupsForMember | ds:DescribeUsers (Identity Data Access API)"
+      evidence_field: "GroupMemberships[].GroupId / GroupMemberships[].GroupName"
+      narrative: >-
+        Directory user {user.name} is a member of group {group.name} in directory
+        {directory.name}, inheriting that group's access to domain-joined resources.
+      note: >-
+        Identity Data Access must be enabled on the directory for these APIs to
+        return data. Without it, group membership is only obtainable via LDAP
+        (out-of-band). When membership data is unavailable, the derived rule
+        aws-ds-escalate-via-domain-admin-reset cannot fire for specific users —
+        conservatively emit a POTENTIAL edge rather than guessing. High-value
+        groups to specifically model: 'Domain Admins', 'Enterprise Admins',
+        'Schema Admins', 'BUILTIN\Administrators', 'Group Policy Creator Owners'.

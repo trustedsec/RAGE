@@ -1,0 +1,351 @@
+# GCP Cloud Logging — Derived attack-path rules (Phase 12 — security & logging)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:logging. Emits ONLY common edge types from schema/edges.yaml.
+#
+# PHASE 12 THEME — DEFENSE EVASION (dominant) + DATA (secondary):
+#
+#   (1) EVASION: deleting/disabling the _Default sink, redirecting log export,
+#       creating exclusion filters, deleting log buckets/entries, and disabling
+#       Data Access audit configs via resourcemanager setIamPolicy — produce
+#       CanModifyConfiguration (LoggingService sink/config) and CanDelete
+#       (LoggingService bucket). These are cover-tracks / weaken-defenses
+#       primitives. They do NOT grant resource access, do NOT chain to
+#       CanExecuteAs, and do NOT set BLOCKED state on downstream edges
+#       (detective controls are not preventive guardrails).
+#
+#   (2) DATA (secondary, conservative): log entries may contain sensitive
+#       request payloads with tokens, API keys, or connection strings.
+#       logging.logEntries.list / logging.privateLogEntries.list -> CanRead
+#       on the LoggingService node (recon primitive; matches CloudTrail pattern).
+#       ContainsSecret on the LoggingService node is noted as a POTENTIAL
+#       heuristic assertion for log streams known to carry credential material.
+#
+# IMPORTANT CONSTRAINTS:
+#   - _Required bucket (Admin Activity + System Event) is IMMUTABLE — no principal
+#     can delete or disable it; do NOT emit CanDelete/CanModifyConfiguration for it.
+#   - Evasion against DATA_READ/DATA_WRITE audit configs is meaningful only when
+#     the config was previously enabled (Data Access logging is opt-in by default).
+#   - logging.privateLogEntries.list is required to read Data Access log entries;
+#     logging.logEntries.list alone does not grant access to them.
+#   - Log bucket lock (locked: true) prevents deletion — BLOCKED/CONDITIONAL.
+#   - Cloud Logging has no execution identity; do not emit CanExecuteAs.
+#   - CanDelete is non-walkable (traversal: false) per edges.yaml; surface for
+#     impact/evasion analysis. CanModifyConfiguration IS walkable (base_weight: 1).
+#
+# SCHEMA CONFORMANCE NOTES:
+#   - CanModifyConfiguration target: [Compute, Messaging, Network, "*"] — LoggingService
+#     qualifies via "*". source: [Identity]. VALID.
+#   - CanDelete target: ["*"] — LoggingService qualifies. source: [Identity]. VALID.
+#   - CanRead target: ["*"] — LoggingService qualifies. source: [Identity]. VALID.
+#   - CanDeleteData target: [Storage, Data] — LoggingService (ManagementService) NOT
+#     in target set; use CanDelete instead for log-entry destruction.
+#   - CanReadData target: [Storage, Data, Messaging] — LoggingService (ManagementService)
+#     NOT in target set; use CanRead for log-read recon (matches aws/cloudtrail.yaml).
+#   - ContainsSecret source: [Storage, Data, Compute, Messaging] — LoggingService
+#     (ManagementService) NOT in source set; omit ContainsSecret as a derived edge and
+#     note the credential-exposure risk in the CanRead narrative/false_positive_note
+#     instead (credential chains are handled by credential-chains.yaml when a specific
+#     credential is observed in logs via an explicit ContainsSecret record).
+#
+# LINCHPINS CITED (not duplicated):
+#   /rules/derived/can-execute-as.yaml     — CanExecuteAs derivation (N/A for logging)
+#   /rules/derived/cicd-chains.yaml        — pipeline execution chains (N/A for logging)
+#   /rules/derived/credential-chains.yaml  — credential chains off any ContainsSecret
+#   /rules/derived/can-control.yaml        — CanEscalateTo / Controls roll-ups (N/A)
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 12-security-logging
+service: logging
+applies_to: [gcp]
+
+rules:
+
+  # --- 1) Delete or disable the _Default sink (headline evasion primitive) ---
+  - id: gcp-logging-delete-default-sink
+    emits: CanModifyConfiguration
+    description: "Delete or disable the _Default log sink, silencing all non-Required audit log delivery for the project — the headline defense-evasion primitive for GCP Cloud Logging."
+    match:
+      - [ ?principal, HasPermission, ?sink ]
+    where:
+      - "node_type(?sink) == LoggingService"
+      - "?sink.provider_type == 'google.logging.v2.LogSink'"
+      - "?sink.name ends with '/sinks/_Default' (project, folder, or org scope)"
+      - "effective_action(?principal, ?sink) includes any of ['logging.sinks.delete', 'logging.sinks.update']"
+      - "?sink is NOT _Required — _Required is system-immutable; API calls targeting it return PERMISSION_DENIED regardless of IAM"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?sink
+      permissions: ["logging.sinks.delete", "logging.sinks.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds EFFECTIVE logging.sinks.delete (removes the sink
+        entirely) OR logging.sinks.update (can set disabled: true, blank the filter, or
+        replace the destination to suppress entries) on the _Default sink, with no IAM
+        deny policy or org policy blocking the action;
+        CONDITIONAL(iam_permission) if the grant is at a broader scope (folder/org) that
+        may not resolve to this project's _Default;
+        BLOCKED if an IAM deny policy (logging.sinks.delete / logging.sinks.update) or
+        org policy constraint blocks the action at the effective scope.
+      confidence: 0.95
+      derived_from: ["HasPermission(?principal, logging.sinks.delete|logging.sinks.update, ?sink=_Default)"]
+      false_positive_note: >-
+        Do NOT emit for the _Required sink — it is system-immutable; no IAM grant allows
+        delete or disable of _Required (API returns PERMISSION_DENIED). Only the _Default
+        and custom sinks are mutable. logging.sinks.update that changes only a description
+        or label without modifying filter, destination, or disabled flag is NOT evasion —
+        scope to sink-capability-affecting updates. This is detective-control weakening
+        only: it reduces detection coverage but does NOT grant access to resources, does NOT
+        block downstream edges, and does NOT chain to privilege escalation. Never emit
+        CanExecuteAs off this edge. Note that disabling the _Default sink stops future log
+        delivery; it does not delete previously stored log bucket entries (use
+        gcp-logging-delete-log-bucket for that). _Required sinks (system immutable) must
+        never match this rule; only _Default and custom sinks are mutable.
+      narrative: >-
+        {principal.name} can delete or disable the _Default log sink for {project.name}
+        (logging.sinks.delete / logging.sinks.update), silencing Data Access, Policy
+        Denied, and other non-Required audit log delivery — a cover-tracks primitive that
+        reduces detection of subsequent attacker activity in the project. This does not
+        grant resource access.
+
+  # --- 2) Disable Data Access audit logs via auditConfig mutation (renumbered) ---
+  - id: gcp-logging-audit-config-disable
+    emits: CanModifyConfiguration
+    description: "Modify the project, folder, or org IAM policy's auditConfigs to remove DATA_READ/DATA_WRITE log types, suppressing Data Access audit log generation for targeted GCP services at the IAM policy level."
+    match:
+      - [ ?principal, HasPermission, ?resource ]
+    where:
+      - "node_type(?resource) in [Project, Organization, Folder]"
+      - "effective_action(?principal, ?resource) includes any of ['resourcemanager.projects.setIamPolicy', 'resourcemanager.organizations.setIamPolicy', 'resourcemanager.folders.setIamPolicy']"
+      - "the setIamPolicy call can modify the auditConfigs field (not just bindings[]) — remove service entries or DATA_READ/DATA_WRITE logTypes"
+      - "Data Access logging was previously ENABLED for the affected service(s) — disabling a never-enabled auditConfig is a no-op"
+    emit:
+      source_type: Identity
+      target_type: Project
+      source: ?principal
+      target: ?resource
+      permissions: ["resourcemanager.projects.setIamPolicy", "resourcemanager.organizations.setIamPolicy", "resourcemanager.folders.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if the principal holds EFFECTIVE resourcemanager.*.setIamPolicy
+        (at project/org/folder scope) and the auditConfig for one or more services includes
+        DATA_READ or DATA_WRITE log types that the principal can remove;
+        CONDITIONAL(service_state) if Data Access log types for the targeted service were
+        never enabled (evasion would be a no-op);
+        BLOCKED under an IAM deny policy or org policy restricting setIamPolicy.
+      confidence: 0.88
+      derived_from: ["HasPermission(?principal, resourcemanager.*.setIamPolicy, ?resource) + auditConfigs mutation scope"]
+      false_positive_note: >-
+        CRITICAL SCOPING: not all setIamPolicy calls touch auditConfigs — a call that
+        modifies only bindings[] without changing auditConfigs[] does NOT suppress logs.
+        Emit only when the effective call can write the auditConfigs field. Also: Admin
+        Activity and System Event logs (_Required) are ALWAYS generated regardless of
+        auditConfig; only DATA_READ / DATA_WRITE / POLICY_DENIED Data Access log types
+        are gated by auditConfigs. Data Access audit logging is opt-in by default; if
+        never enabled for a service, this is a no-op evasion. This is detective-control
+        weakening only — setIamPolicy also triggers CanGrantPermission (per
+        identity-escalation.yaml); those are separate, independently modeled edges.
+        Never chain this evasion edge to privilege escalation.
+      narrative: >-
+        {principal.name} can modify the IAM policy auditConfigs
+        (resourcemanager.*.setIamPolicy) to remove DATA_READ/DATA_WRITE entries for
+        targeted services at project/org/folder scope, silently disabling Data Access audit
+        log generation — eliminating the forensic record of read/write API calls against
+        GCS, BigQuery, Secret Manager, and other audited services. This does not affect
+        Admin Activity or System Event logs (_Required), which are always generated.
+
+  # --- 3) Create or update log exclusions (granular, stealthy evasion) -------
+  - id: gcp-logging-exclusion-evasion
+    emits: CanModifyConfiguration
+    description: "Create or update a log exclusion filter to drop matching log entries before they are stored — granular evasion for specific resource types, methods, or caller identities, while leaving the sink apparently active."
+    match:
+      - [ ?principal, HasPermission, ?log_scope ]
+    where:
+      - "node_type(?log_scope) == LoggingService"
+      - "effective_action(?principal, ?log_scope) includes any of ['logging.exclusions.create', 'logging.exclusions.update']"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?log_scope
+      permissions: ["logging.exclusions.create", "logging.exclusions.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds EFFECTIVE logging.exclusions.create or
+        logging.exclusions.update at the project/folder/org scope;
+        BLOCKED under IAM deny or org policy.
+      confidence: 0.88
+      derived_from: ["HasPermission(?principal, logging.exclusions.create|logging.exclusions.update, ?log_scope)"]
+      false_positive_note: >-
+        Log exclusions apply only to new entries — they do not retroactively delete stored
+        entries (use gcp-logging-delete-log-bucket for retroactive destruction). A broad
+        exclusion (e.g. resource.type="*") silences all log output but causes operational
+        impact (monitoring alerts, compliance failures) that may trigger independent
+        detection. An exclusion targeting only the attacker's principal email is highly
+        suspicious but requires precise knowledge of the logged identity. This is stealth
+        evasion — the sink remains IsLogging=true and active from a monitoring perspective.
+        No resource access is granted; do not chain to escalation.
+      narrative: >-
+        {principal.name} can create or update a log exclusion
+        (logging.exclusions.create / logging.exclusions.update) that drops matching audit
+        entries before they are stored. The sink remains active and no configuration alert
+        fires, making this a stealthy evasion technique for specific resources, API methods,
+        or attacker-controlled identities.
+
+  # --- 4) Delete a log bucket (destroy retained log history) -----------------
+  - id: gcp-logging-delete-log-bucket
+    emits: CanDelete
+    description: "Delete a custom or _Default log bucket (logging.buckets.delete), permanently destroying all retained log history stored in it."
+    match:
+      - [ ?principal, HasPermission, ?bucket ]
+    where:
+      - "node_type(?bucket) == LoggingService"
+      - "?bucket.provider_type == 'google.logging.v2.LogBucket'"
+      - "effective_action(?principal, ?bucket) includes 'logging.buckets.delete'"
+      - "?bucket is NOT _Required (system-immutable)"
+      - "?bucket.locked == false — a locked bucket cannot be deleted"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?bucket
+      permissions: ["logging.buckets.delete"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE if the principal holds EFFECTIVE logging.buckets.delete on the target bucket
+        AND the bucket is not locked (locked: false) AND the bucket is not _Required;
+        CONDITIONAL(service_state) if bucket lock status is unknown;
+        BLOCKED if the bucket is locked (locked: true), is _Required, or an IAM deny /
+        org policy denies logging.buckets.delete at the effective scope.
+      confidence: 0.93
+      derived_from: ["HasPermission(?principal, logging.buckets.delete, ?bucket)"]
+      false_positive_note: >-
+        _Required bucket is always BLOCKED — the API enforces immutability server-side
+        regardless of IAM grants. A bucket with locked: true cannot be deleted — BLOCKED.
+        Deleting a log bucket removes ALL stored log entries in it permanently (no soft
+        delete or recycle bin); high-impact destructive action. Note: deleting the _Default
+        bucket is distinct from deleting the _Default sink — bucket deletion removes stored
+        entries while sink deletion stops future delivery. An attacker wanting total
+        coverage needs both. This is evidence destruction, not privilege escalation; CanDelete
+        is non-walkable by default (schema traversal: false) — surfaced for impact analysis.
+      narrative: >-
+        {principal.name} can delete log bucket {bucket.name} (logging.buckets.delete),
+        permanently destroying all retained log entries stored in it — eliminating forensic
+        evidence of prior API activity across the project's retained log history.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An IAM deny policy denying logging.sinks.delete / logging.sinks.update /
+#     logging.buckets.delete / logging.exclusions.create / logging.exclusions.update
+#     / logging.logEntries.list / logging.privateLogEntries.list at the effective
+#     scope -> emit the edge with state: BLOCKED and denied_by=<deny policy>.
+#   - An org policy constraint (e.g. constraints/logging.requireBucketLock=true,
+#     constraints/logging.disableDefaultSinkCreation) may prevent sink/bucket mutation
+#     -> BLOCKED with denied_by=<org policy constraint>.
+#   - A VPC Service Controls perimeter restricting logging.googleapis.com for the
+#     caller -> BLOCKED with denied_by=<perimeter>.
+#   - _Required bucket and _Required sinks: ANY action targeting them is BLOCKED
+#     regardless of IAM grants — the API enforces immutability server-side.
+#   - A locked log bucket (locked: true): gcp-logging-delete-log-bucket -> BLOCKED
+#     with denied_by=<bucket lock>.
+#   - Evasion edges (CanModifyConfiguration / CanDelete) NEVER set BLOCKED state on
+#     downstream detective-control edges — disabling a detective control reduces
+#     detection probability, it does NOT block any access capability edge. BLOCKED state
+#     is reserved for preventive guardrails (IAM deny, org policy, VPC-SC perimeters).
+#
+# EXECUTION MODE NOTE:
+#   Cloud Logging has NO execution identity and no automation runbook / remediation
+#   that runs AS a service account. Rule (3) references setIamPolicy, which also
+#   triggers CanGrantPermission (identity-escalation.yaml) — those are independently
+#   modeled edges; this file only captures the logging-specific auditConfig evasion
+#   consequence. Never re-derive CanGrantPermission or CanModifyPolicy here.
+#
+# LINCHPIN CITATIONS:
+#   - rules/derived/can-execute-as.yaml   — Cloud Logging has NO ExecutesAs surface;
+#     no CanExecuteAs edge emitted or derivable from this service's permissions.
+#   - rules/derived/cicd-chains.yaml      — Cloud Logging is not a CI/CD runner.
+#   - rules/derived/credential-chains.yaml — credential chains off any ContainsSecret
+#     (explicit record, not derived here) observed in log entries are handled there.
+#   - rules/derived/can-control.yaml      — no admin/control escalation path from
+#     logging permissions alone; escalation from setIamPolicy is covered by
+#     identity-escalation.yaml.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw config -> explicit edges) — these are directly
+# observable from API configuration records and are implemented as match_effective_permission
+# style normalization. They feed the derived rules above via HasPermission edges.
+# No separate /rules/explicit/gcp-logging.yaml is required; explicit patterns are
+# consolidated here following the gcp/secretmanager.yaml precedent.
+explicit_rules:
+
+  - id: gcp-logging-explicit-sink-update-delete
+    emits: CanModifyConfiguration
+    applies_to: [gcp]
+    match_effective_permission:
+      action: ["logging.sinks.update", "logging.sinks.delete"]
+      resource_type: "google.logging.v2.LogSink"
+    emit:
+      source: "<principal>"
+      target: "<LogSink node>"
+      source_type: Identity
+      target_type: LoggingService
+      permissions: ["logging.sinks.update", "logging.sinks.delete"]
+      narrative: "{principal.name} can update or delete log sinks (logging.sinks.update / logging.sinks.delete), including the _Default sink — defense-evasion surface."
+
+  - id: gcp-logging-explicit-bucket-delete
+    emits: CanDelete
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "logging.buckets.delete"
+      resource_type: "google.logging.v2.LogBucket"
+    emit:
+      source: "<principal>"
+      target: "<LogBucket node>"
+      source_type: Identity
+      target_type: LoggingService
+      permissions: ["logging.buckets.delete"]
+      narrative: "{principal.name} can delete log buckets (logging.buckets.delete), destroying retained log history."
+
+  - id: gcp-logging-explicit-read-entries
+    emits: CanRead
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "logging.logEntries.list"
+      resource_type: "google.logging.v2.Log"
+    emit:
+      source: "<principal>"
+      target: "<LoggingService node>"
+      source_type: Identity
+      target_type: LoggingService
+      permissions: ["logging.logEntries.list"]
+      narrative: "{principal.name} can read log entries (logging.logEntries.list) — Admin Activity, System Event, and Policy Denied entries from {project.name}."
+
+  - id: gcp-logging-explicit-read-private-entries
+    emits: CanRead
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "logging.privateLogEntries.list"
+      resource_type: "google.logging.v2.Log"
+    emit:
+      source: "<principal>"
+      target: "<LoggingService node>"
+      source_type: Identity
+      target_type: LoggingService
+      permissions: ["logging.privateLogEntries.list"]
+      narrative: "{principal.name} can read Data Access audit log entries (logging.privateLogEntries.list) from {project.name}."
+
+  - id: gcp-logging-explicit-delete-log-entries
+    emits: CanDelete
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "logging.logs.delete"
+      resource_type: "google.logging.v2.Log"
+    emit:
+      source: "<principal>"
+      target: "<Log node>"
+      source_type: Identity
+      target_type: LoggingService
+      permissions: ["logging.logs.delete"]
+      narrative: "{principal.name} can delete log streams (logging.logs.delete), permanently destroying all entries in a specific log stream."

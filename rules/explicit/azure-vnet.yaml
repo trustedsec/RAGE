@@ -1,0 +1,192 @@
+# Azure — Virtual Network (Microsoft.Network/virtualNetworks) — Explicit normalization rules
+# ---------------------------------------------------------------------------
+# Translates raw collected Microsoft.Network ARM config into common explicit
+# edges (nature: explicit) consumed by derived rules in /rules/derived/azure/vnet.yaml.
+#
+# Covered normalization areas:
+#   1. STRUCTURAL FACTS:
+#      - Subnet located in VNet (LocatedIn)
+#      - Compute resource located in Subnet (LocatedIn)
+#      - VNet peering state (PeeredWith)
+#      - Route table routing entries (RoutesTo)
+#      - Private endpoint configuration (PrivateReachability)
+#   2. ADMINISTRATIVE CONTROL:
+#      - VNet write (CanAdminister)
+#      - NSG write (CanAdminister)
+#
+# All rules here emit nature: explicit edges only. Derived rules in
+# /rules/derived/azure/vnet.yaml consume these facts and apply additional
+# derivation logic (e.g., effective NSG rules, cross-subscription/tenant marking).
+#
+# Collection APIs:
+#   az network vnet list / az network vnet show
+#   az network vnet peering list --vnet-name <vnet>
+#   az network route-table list / az network route-table show
+#   az network route-table route list --route-table-name <rt>
+#   az network private-endpoint list / az network private-endpoint show
+#   az network nic list --query "[*].ipConfigurations[].subnet.id"
+#   az role assignment list --scope <vnet-resource-id>
+
+provider: azure
+phase: 8-networking
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # STRUCTURAL: VNet peering fact (explicit edges only)
+  # ===========================================================================
+
+  - id: azure-vnet-peering-record
+    emits: PeeredWith
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Network/virtualNetworks/virtualNetworkPeerings"
+      field: "properties"
+    where:
+      - "properties.peeringState == 'Connected'"
+      - "properties.allowVirtualNetworkAccess == true (default true)"
+    emit:
+      source_type: VirtualNetwork
+      target_type: VirtualNetwork
+      source: "<local VNet>"
+      target: "<properties.remoteVirtualNetwork.id resolved to VNet node>"
+      api_source: "Microsoft.Network/virtualNetworks/virtualNetworkPeerings GET"
+      evidence_field: "properties.peeringState + properties.remoteVirtualNetwork.id"
+      narrative: "{localVNet.name} is peered with {remoteVNet.name} (peeringState: Connected)."
+
+  # ===========================================================================
+  # STRUCTURAL: Route table routing entries (explicit edges only)
+  # ===========================================================================
+
+  - id: azure-vnet-route-record
+    emits: RoutesTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Network/routeTables/routes"
+      field: "properties"
+    where:
+      - "properties.nextHopType != 'None'"
+      - "route table has at least one associated subnet"
+    emit:
+      source_type: Route
+      target_type: Subnet
+      source: "<route table node>"
+      target: "<destination (addressPrefix) mapped to Subnet or VNet node; 'internet' sentinel if nextHopType=Internet>"
+      api_source: "Microsoft.Network/routeTables/routes GET"
+      evidence_field: "properties.addressPrefix + properties.nextHopType + properties.nextHopIpAddress"
+      narrative: "Route table {routeTable.name} routes {addressPrefix} -> {nextHopType} ({nextHopIpAddress})."
+
+  # ===========================================================================
+  # STRUCTURAL: Private endpoint makes service reachable at private IP
+  # Note: PrivateReachability source set does not include VirtualNetwork or
+  # Subnet. The derived rule must compose this from LocatedIn + PE facts.
+  # ===========================================================================
+
+  - id: azure-vnet-private-endpoint-record
+    emits: PrivateReachability
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Network/privateEndpoints"
+      field: "properties"
+    where:
+      - "properties.provisioningState == 'Succeeded'"
+      - "properties.privateLinkServiceConnections[].privateLinkServiceConnectionState.status == 'Approved'"
+      - "properties.privateDnsZoneGroups is defined (DNS resolution configured)"
+    emit:
+      source_type: PrivateEndpoint
+      target_type: PrivateEndpoint
+      source: "<private endpoint node>"
+      target: "<private endpoint node (self-edge; linked service via properties.privateLinkServiceConnections)>"
+      api_source: "Microsoft.Network/privateEndpoints GET"
+      evidence_field: "properties.subnet.id + properties.privateLinkServiceConnections + properties.privateDnsZoneGroups"
+      narrative: "Private endpoint {pe.name} makes {linkedService.name} privately reachable within VNet {vnet.name}."
+
+  # ===========================================================================
+  # STRUCTURAL: Subnet located in VNet (LocatedIn)
+  # ===========================================================================
+
+  - id: azure-vnet-subnet-located-in
+    emits: LocatedIn
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Network/virtualNetworks/subnets"
+      field: "id"
+    emit:
+      source_type: Subnet
+      target_type: VirtualNetwork
+      source: "<subnet>"
+      target: "<parent VNet>"
+      api_source: "Microsoft.Network/virtualNetworks GET (subnets array)"
+      evidence_field: "subnets[].id (parent VNet from resource id path)"
+      narrative: "Subnet {subnet.name} is located in VNet {vnet.name}."
+
+  # ===========================================================================
+  # STRUCTURAL: Compute resource located in Subnet (LocatedIn)
+  # ===========================================================================
+
+  - id: azure-vnet-resource-in-subnet
+    emits: LocatedIn
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Network/networkInterfaces"
+      field: "properties.ipConfigurations[].subnet.id"
+    emit:
+      source_type: Compute
+      target_type: Subnet
+      source: "<compute resource attached to this NIC>"
+      target: "<subnet>"
+      api_source: "Microsoft.Network/networkInterfaces GET"
+      evidence_field: "properties.ipConfigurations[].subnet.id"
+      narrative: "{resource.name} is located in subnet {subnet.name} via its NIC."
+
+  # ===========================================================================
+  # CONTROL PLANE: VNet write → CanAdminister
+  # ===========================================================================
+
+  - id: azure-vnet-contributor
+    emits: CanAdminister
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Network/virtualNetworks/write"
+      resource_type: "Microsoft.Network/virtualNetworks"
+    emit:
+      source_type: Identity
+      target_type: VirtualNetwork
+      source: "<principal>"
+      target: "<VNet>"
+      permissions: ["Microsoft.Network/virtualNetworks/write"]
+      state_logic: ACTIVE
+      api_source: "ARM RBAC effective-permission evaluation"
+      evidence_field: "Role assignment with Microsoft.Network/virtualNetworks/write action"
+      narrative: "{principal.name} has full control of VNet {target.name} (Microsoft.Network/virtualNetworks/write), including its subnets, peerings, DNS settings, and associated route tables."
+
+  # ===========================================================================
+  # CONTROL PLANE: NSG write → CanAdminister
+  # ===========================================================================
+
+  - id: azure-vnet-nsg-contributor
+    emits: CanAdminister
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Network/networkSecurityGroups/write"
+      resource_type: "Microsoft.Network/networkSecurityGroups"
+    where:
+      - "principal has networkSecurityGroups/write (covers both object-level and rule-level write)"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal>"
+      target: "<NSG>"
+      permissions: ["Microsoft.Network/networkSecurityGroups/write", "Microsoft.Network/networkSecurityGroups/securityRules/write"]
+      state_logic: ACTIVE
+      api_source: "ARM RBAC effective-permission evaluation"
+      evidence_field: "Role assignment with Microsoft.Network/networkSecurityGroups/write action"
+      narrative: "{principal.name} has full control of NSG {target.name} (networkSecurityGroups/write), enabling rule creation, deletion, and priority changes."
+
+# ---------------------------------------------------------------------------
+# Guidance: Derived rules in /rules/derived/azure/vnet.yaml consume these
+# explicit facts and emit additional derived edges (CanReachPort,
+# ExposedToInternet, CanModifyConfiguration, CrossAccountTrust,
+# CrossTenantTrust) by applying provider-specific derivation logic.
+# ---------------------------------------------------------------------------

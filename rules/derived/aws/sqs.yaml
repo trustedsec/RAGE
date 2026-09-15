@@ -1,0 +1,291 @@
+# AWS SQS — Derived attack-path rules (Phase 10 — messaging)
+# ---------------------------------------------------------------------------
+# SQS is a messaging event source. Its attack surface is the Phase-10 signature
+# primitive: a principal that can SEND to a queue that is bound (via an enabled
+# Lambda event-source-mapping) to a consumer TRIGGERS that consumer with an
+# attacker-influenced payload. messaging-chains (the Phase-10 linchpin) then
+# collapses CanWriteData + CanTrigger(queue→consumer) + ExecutesAs into
+# CanExecuteAs. This file emits only the SQS-specific FACTS; it never re-derives
+# the collapse steps already owned by the linchpins.
+#
+# WHAT THIS FILE EMITS (facts the linchpins consume):
+#   CanWriteData(principal → queue)           sqs:SendMessage granted
+#   CanReadData(principal → queue)            sqs:ReceiveMessage granted
+#   CrossAccountTrust(policy → account)       cross-account grant in queue policy
+#   ExposedToInternet(queue → AnonymousId)    Principal:* in policy, no condition
+#   CanModifyPolicy(principal → queue)        sqs:SetQueueAttributes (Policy attr)
+#
+# LINCHPINS CITED (do not duplicate):
+#   messaging-chains messaging-publish-triggers-consumer  (CanWriteData + CanTrigger → CanTrigger to consumer)
+#   messaging-chains messaging-trigger-executes-as        (CanTrigger + ExecutesAs → CanExecuteAs)
+#   credential-chains read-secret-yields-identity         (CanReadData + ContainsSecret + CredentialsFor → CanImpersonate)
+#   can-control enter-account-via-assume                  (CrossAccountTrust → CanEnterAccount)
+#
+# EXPLICIT RULES (live in /rules/explicit/aws-sqs.yaml):
+#   aws-sqs-esm-binding                       (CanTrigger: Queue → ServerlessFunction via ESM)
+#   aws-sqs-send-message                      (CanWriteData: Identity → Queue)
+#   aws-sqs-receive-message                   (CanReadData: Identity → Queue)
+#   aws-sqs-set-queue-attributes              (CanModifyPolicy: Identity → ResourcePolicy)
+#   aws-sqs-resource-policy-cross-account-send (CrossAccountTrust: ResourcePolicy → Account)
+#   aws-sqs-resource-policy-cross-account-receive (CrossAccountTrust: ResourcePolicy → Account)
+#   aws-sqs-public-send-policy                (ExposedToInternet: Queue → AnonymousIdentity)
+#   aws-sqs-queue-has-policy                  (HasPolicy: Queue → ResourcePolicy)
+#
+# All permissions are from the AWS Service Authorization Reference for SQS:
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonsqs.html
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 10-messaging
+applies_to: [aws]
+
+rules:
+
+  # --- 1) SendMessage -> CanWriteData (the publish fact) ---------------------
+  # sqs:SendMessage on a queue is the data-plane PUBLISH action: the sender
+  # writes a message (with attacker-controlled body/attributes) to the queue.
+  # messaging-chains messaging-publish-triggers-consumer consumes
+  # CanWriteData(?principal -> ?queue) + CanTrigger(?queue -> ?consumer) to
+  # derive CanTrigger(?principal -> ?consumer) — the Phase-10 trigger primitive.
+  # Explicit rule lives in /rules/explicit/aws-sqs.yaml; this is a reference for
+  # clarity on how the fact is consumed downstream.
+  - id: aws-sqs-send-message-can-write-data
+    emits: CanWriteData
+    description: "sqs:SendMessage on a queue is a data-plane publish: the principal can send attacker-influenced messages that drive event-source consumers. Consumed by messaging-chains."
+    match:
+      - match_effective_permission:
+          action: "sqs:SendMessage"
+          resource_type: "AWS::SQS::Queue"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<SQS queue node>"
+      permissions: ["sqs:SendMessage"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when effective sqs:SendMessage is granted (identity policy + queue
+        resource policy both allow; no SCP/boundary denies). CONDITIONAL(resource_policy)
+        when a resource-policy condition (aws:SourceArn, aws:SourceAccount) is present
+        that the calling principal must satisfy. BLOCKED by SCP or explicit deny in the
+        queue policy.
+      confidence: 0.97
+      derived_from: ["aws-sqs-send-message (explicit)"]
+      false_positive_note: >-
+        Both the caller's identity policy AND the queue resource policy must allow the
+        action (cross-account sends require both). Honor resource-policy conditions:
+        aws:SourceArn-scoped grants are CONDITIONAL(condition_expression). A SQS FIFO
+        queue additionally requires sqs:SendMessage with the MessageGroupId parameter;
+        absence of MessageGroupId does not affect the capability but may constrain the
+        attacker's payload structure.
+      narrative: >-
+        {principal.name} can send messages to SQS queue {queue.name}
+        (sqs:SendMessage), enabling the Phase-10 trigger chain when {queue.name} is
+        an event source for a compute consumer.
+
+  # --- 2) ReceiveMessage -> CanReadData (the data read fact) -----------------
+  # sqs:ReceiveMessage on a queue is the data-plane READ action: the principal
+  # dequeues messages. If the queue contains secrets or credentials
+  # (ContainsSecret / ContainsCredential), credential-chains
+  # read-secret-yields-identity rolls this up to CanImpersonate. The read is
+  # CONDITIONAL(key_permission) when SSE-KMS is configured — the caller also
+  # needs kms:Decrypt on the CMK.
+  - id: aws-sqs-receive-message-can-read-data
+    emits: CanReadData
+    description: "sqs:ReceiveMessage on a queue is a data-plane read; if the queue carries credentials (ContainsSecret), credential-chains derives CanImpersonate."
+    match:
+      - match_effective_permission:
+          action: "sqs:ReceiveMessage"
+          resource_type: "AWS::SQS::Queue"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<SQS queue node>"
+      permissions: ["sqs:ReceiveMessage"]
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        ACTIVE when effective sqs:ReceiveMessage is granted and (a) no SSE-KMS is
+        configured, or (b) SSE-KMS is configured AND the principal also holds
+        kms:Decrypt on the CMK (key_permission satisfied). CONDITIONAL(key_permission)
+        when SSE-KMS is set and kms:Decrypt on the CMK is not yet confirmed — the
+        messages are delivered encrypted and the principal cannot read them without the
+        key. SSE-SQS (AWS-managed, AES-256) decrypts transparently at the service
+        layer: no additional key permission needed, ACTIVE. BLOCKED by SCP or explicit
+        deny.
+      confidence: 0.95
+      derived_from: ["aws-sqs-receive-message (explicit)"]
+      false_positive_note: >-
+        SSE-KMS (KmsMasterKeyId set to a customer CMK, not the AWS-managed
+        alias/aws/sqs) requires kms:Decrypt — do NOT emit ACTIVE without confirming the
+        principal has decrypt permission on the specific CMK. AWS-managed SSE-SQS key
+        (alias/aws/sqs) does not require explicit kms:Decrypt — service handles it.
+        sqs:ReceiveMessage alone does not yield escalation; value comes only when
+        combined with ContainsSecret/CredentialsFor via credential-chains.
+      narrative: >-
+        {principal.name} can receive messages from SQS queue {queue.name}
+        (sqs:ReceiveMessage){if key_permission: ", and can decrypt SSE-KMS-protected
+        messages (kms:Decrypt on CMK)"}; if {queue.name} carries credential material,
+        credential-chains derives the ability to authenticate as the embedded identity.
+
+  # --- 3) Cross-account SendMessage grant in queue policy -> CrossAccountTrust --
+  # A queue resource policy that grants sqs:SendMessage (or sqs:*) to a principal
+  # in a DIFFERENT account is cross-account publish trust. The explicit rule
+  # aws-sqs-resource-policy-cross-account-send emits this fact; this derived rule
+  # references it for linchpin composition. messaging-chains rule 4
+  # (messaging-resource-policy-cross-boundary-trust) requires a HasPolicy edge
+  # connecting queue -> ResourcePolicy for its pattern to match. When that edge
+  # exists, messaging-chains emits the CanEnterAccount consequence.
+  - id: aws-sqs-cross-account-send-trust
+    emits: CrossAccountTrust
+    description: "A queue resource policy granting sqs:SendMessage to a principal in another account is cross-account publish trust; fed by messaging-chains rule 4 to derive CanEnterAccount."
+    match:
+      - match_record:
+          resource_type: "AWS::SQS::Queue"
+          field: "Policy"
+        where:
+          - "statement grants sqs:SendMessage or sqs:* to Principal in a different account than the queue owner"
+    where:
+      - "node_type(?policy) == ResourcePolicy"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<queue ResourcePolicy node>"
+      target: "<external account named in the policy statement>"
+      permissions: []
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the policy statement unconditionally grants sqs:SendMessage to a
+        named external principal (specific account root or role ARN, no restricting
+        condition). CONDITIONAL(condition_expression) when the grant is scoped by
+        aws:SourceArn, aws:SourceAccount, or aws:PrincipalOrgID — the external
+        principal must satisfy the condition to publish. BLOCKED by an SCP that denies
+        cross-account access or by an org-policy restricting external sharing.
+        An aws:PrincipalOrgID condition that covers the queue's own org is NOT
+        cross-account in the external sense; downgrade to ExposedToAccount.
+      confidence: 0.95
+      derived_from: ["aws-sqs-resource-policy-cross-account-send (explicit)"]
+      false_positive_note: >-
+        Honor aws:SourceArn/SourceAccount/PrincipalOrgID scoping — a grant scoped to a
+        specific SNS topic ARN (for SNS-to-SQS delivery) is CONDITIONAL, not open
+        cross-account access. A Principal:* with no condition is ExposedToInternet
+        (handled separately below), not CrossAccountTrust. Do not emit for grants where
+        the external principal account ID equals the queue owner account.
+      narrative: >-
+        The resource policy on SQS queue {queue.name} grants sqs:SendMessage to a
+        principal in account {external_account}; this cross-account trust lets that
+        external principal publish to {queue.name} and thereby (via messaging-chains)
+        trigger any Lambda consumer bound to it in {queue.owner_account}.
+
+  # --- 4) Public queue policy -> ExposedToInternet ---------------------------
+  # A queue with Principal:* (or Principal:{"AWS":"*"}) and NO restricting
+  # condition on sqs:SendMessage in its resource policy is publicly writable —
+  # any unauthenticated caller can send messages. This directly enables the
+  # trigger chain for any bound Lambda consumer without any identity requirement.
+  - id: aws-sqs-public-queue
+    emits: ExposedToInternet
+    description: "An SQS queue with Principal:* granting sqs:SendMessage (no condition) is publicly writable; any unauthenticated sender can trigger bound Lambda consumers via messaging-chains."
+    match:
+      - match_record:
+          resource_type: "AWS::SQS::Queue"
+          field: "Policy"
+        where:
+          - "statement grants sqs:SendMessage (or sqs:*) to Principal:* with no effective restricting condition"
+    where:
+      - "node_type(?queue) == Queue"
+    emit:
+      source_type: Queue
+      target_type: AnonymousIdentity
+      source: "<SQS queue node>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the queue policy has a statement granting sqs:SendMessage (or a
+        wildcard that includes it) to Principal:* or Principal:{"AWS":"*"} with NO
+        condition (or only non-restricting conditions such as an always-true Bool
+        condition). CONDITIONAL(resource_policy) when a condition exists that the
+        caller must satisfy (aws:SourceIp, aws:SourceVpc, etc.) — the queue is not
+        fully public but is reachable from a constrained source. BLOCKED by an SCP
+        that denies cross-account or public access.
+      confidence: 0.98
+      derived_from: ["aws-sqs-public-send-policy (explicit)"]
+      false_positive_note: >-
+        Principal:* WITH a meaningful condition (aws:SourceIp range, aws:SourceVpc,
+        aws:PrincipalOrgID) is NOT ExposedToInternet — it is conditionally reachable.
+        Downgrade to CONDITIONAL(condition_expression) when a non-trivial condition is
+        present. aws:PrincipalOrgID restricts to the org — ExposedToTenant, not
+        ExposedToInternet. An sqs:ReceiveMessage-only wildcard grant does NOT make the
+        queue a public write target; check that the allowed action includes
+        sqs:SendMessage. VPC endpoint policies (not queue policies) do not appear in
+        GetQueueAttributes[Policy] and are handled separately.
+      narrative: >-
+        SQS queue {queue.name} grants sqs:SendMessage to Principal:* with no
+        restricting condition; any unauthenticated caller can publish messages, enabling
+        the Phase-10 trigger chain for any Lambda consumer bound to this queue via
+        messaging-chains.
+
+  # --- 5) SetQueueAttributes (Policy attr) -> CanModifyPolicy ----------------
+  # sqs:SetQueueAttributes with the Policy attribute rewrites the queue resource
+  # policy. An attacker with this permission can grant themselves or a third party
+  # sqs:SendMessage, then proceed along the trigger chain. This is the admin
+  # escalation path: CanModifyPolicy -> (self-grant CanWriteData) -> CanTrigger.
+  # Modeled as an explicit capability; the downstream escalation is handled by
+  # the permission evaluator re-running after the policy change. sqs:AddPermission
+  # is a weaker variant (can only add Allow statements with service conditions).
+  - id: aws-sqs-set-queue-attributes-policy
+    emits: CanModifyPolicy
+    description: "sqs:SetQueueAttributes allows rewriting the queue resource policy (Policy attribute), enabling self-grant of sqs:SendMessage and the downstream trigger chain."
+    match:
+      - match_effective_permission:
+          action: "sqs:SetQueueAttributes"
+          resource_type: "AWS::SQS::Queue"
+    where:
+      - "the permission scope includes the Policy attribute (SetQueueAttributes applies to all attributes; no per-attribute scope in IAM)"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: "<principal>"
+      target: "<ResourcePolicy node attached to the SQS queue>"
+      permissions: ["sqs:SetQueueAttributes"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when effective sqs:SetQueueAttributes is granted (no SCP or explicit
+        deny). There is no IAM condition key that scopes SetQueueAttributes to specific
+        queue attributes — the permission covers all attributes including Policy.
+        BLOCKED by SCP denying the action or by a permission boundary excluding it.
+      confidence: 0.9
+      derived_from: ["aws-sqs-set-queue-attributes (explicit)"]
+      false_positive_note: >-
+        sqs:SetQueueAttributes is an unrestricted attribute-write — it covers ALL
+        queue attributes including the Policy. The downstream escalation (rewrite policy
+        -> grant SendMessage -> trigger) requires the attacker also has access to invoke
+        Lambda or that an ESM binding exists; the CanModifyPolicy edge alone is not
+        escalation. sqs:AddPermission is a weaker substitute that can ONLY add Allow
+        statements and automatically adds aws:SourceAccount-like conditions for service
+        principals — it cannot fully replace SetQueueAttributes for arbitrary policy
+        writes; model AddPermission separately if present.
+      narrative: >-
+        {principal.name} can rewrite the resource policy of SQS queue {queue.name}
+        (sqs:SetQueueAttributes); an attacker can self-grant sqs:SendMessage and then
+        trigger any Lambda consumer bound to {queue.name} via the Phase-10 trigger chain.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP denying sqs:SendMessage, sqs:ReceiveMessage, or sqs:SetQueueAttributes
+#    at the effective scope -> emit the edge with state: BLOCKED and
+#    denied_by=<SCP arn/statement>.
+#  - A queue KMS CMK that the principal cannot decrypt -> CanReadData is
+#    CONDITIONAL(key_permission), not ACTIVE.
+#  - A disabled ESM (State != Enabled) -> CanTrigger(queue→lambda) is
+#    CONDITIONAL(trigger_exists), not ACTIVE.
+#  - A resource-policy condition (aws:SourceArn, aws:SourceAccount, aws:PrincipalOrgID)
+#    -> CrossAccountTrust is CONDITIONAL(condition_expression).
+#  - Principal:* WITH a meaningful condition -> ExposedToInternet is
+#    CONDITIONAL(condition_expression), not ACTIVE.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/aws-sqs.yaml. All explicit edges (CanTrigger, CanWriteData,
+# CanReadData, CanModifyPolicy, CrossAccountTrust, ExposedToInternet, HasPolicy)
+# are defined there as the single source of truth.

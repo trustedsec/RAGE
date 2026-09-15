@@ -1,0 +1,388 @@
+# Provider-agnostic hierarchy & guardrail chain rules (Phase 3 — administrative hierarchy)
+# ===========================================================================
+# THE PHASE-3 LINCHPIN. Per-service adapters and explicit rules emit
+# boundary-scoped grants and control facts AT THE SCOPE THEY ARE ASSIGNED
+# (an Owner role assignment at a management group, an org-level setIamPolicy,
+# an AWS OrganizationAccountAccessRole, an SCP/OrgPolicy/DenyAssignment
+# guardrail node). None of those, on their own, are traversable attack paths:
+#   * Contains is walkable:false (schema/edges.yaml) — containment is INVENTORY,
+#     not a path. The fact that an Account contains a ResourceGroup does not by
+#     itself let anyone do anything.
+#   * A guardrail (SCP / Org Policy constraint / Azure deny assignment) is
+#     modeled as a Policy node that SUPPRESSES other edges to state BLOCKED.
+#
+# This file turns those static facts into TRAVERSABLE paths, exactly as
+# credential-chains.yaml did for Phase 5 credential pivots. Two big ideas:
+#
+#   (1) INHERITANCE (rules 1, 2, 4): control/permission held at a PARENT
+#       boundary flows DOWN the Contains* hierarchy to every descendant boundary
+#       and resource. Adapters emit the grant/control ONCE, at its true scope;
+#       admin-inherits-down-contains performs the generic transitive descent so
+#       we never hand-enumerate children. This is the rule the whole phase
+#       depends on.
+#
+#   (2) GUARDRAILS (rule 3): a principal who can MODIFY or REMOVE a guardrail
+#       (CanModifyPolicy over the SCP/OrgPolicy/ConditionalPolicy node, OR pull a
+#       resource out of the guardrail's scope by reparenting) UPGRADES the
+#       BLOCKED edges that guardrail was suppressing back to their underlying
+#       state. Modeled exactly like decrypt-gates-secret-read in
+#       credential-chains.yaml: a STATE-UPGRADE rule, not a new capability.
+#
+# STATE PROPAGATION (per RULE-FORMAT.md): a derived edge is never stronger than
+# its weakest contributor. Descending control inherits the weakest state along
+# the chain; a CONDITIONAL grant stays CONDITIONAL at every descendant; a BLOCKED
+# contributor blocks the descent (unless rule 3 first upgrades that BLOCK).
+#
+# COMPOSITION WITH THE OTHER PROVIDER-AGNOSTIC FILES (do NOT duplicate them):
+#   * can-control.yaml already provides:
+#       - control-via-admin        (CanAdminister -> Controls)
+#       - control-boundary-via-iam-admin (CanGrantPermission @boundary -> Controls
+#                                          of that boundary)  <-- rule 2 here
+#                                          FEEDS this; we chain the descent, not
+#                                          the boundary-control roll-up itself.
+#       - escalate-via-execute-as  (CanExecuteAs -> CanEscalateTo)
+#       - enter-account-via-assume (aws cross-account CanAssume -> CanEnterAccount)
+#     This file CONSUMES those Controls / CanEnter* edges and PROPAGATES them
+#     down the hierarchy; it does not re-derive the roll-ups.
+#   * credential-chains.yaml provides the credential pivots; guardrail-removal
+#     here mirrors its decrypt-gates-secret-read upgrade pattern.
+#
+# BOUNDARY vocab (schema): AdministrativeBoundary subtypes =
+#   Organization, Tenant, ManagementGroup, Folder, Account, Subscription,
+#   Project, ResourceGroup. Guardrail Policy subtypes =
+#   ServiceControlPolicy (AWS SCP), OrganizationPolicy (GCP org policy
+#   constraint), ConditionalPolicy (Azure deny assignment / condition).
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml), honored by every rule:
+#   Contains:            source [AdministrativeBoundary]  target [*]  (walkable:false)
+#   Controls:            source [Identity]  target [AdministrativeBoundary, *]
+#   CanAdminister:       source [Identity]  target [*]
+#   CanGrantPermission:  source [Identity]  target [Identity]
+#   CanModifyPolicy:     source [Identity]  target [Policy, Identity, *]
+#   CanEnterAccount:      source [Identity]  target [Account]
+#   CanEnterSubscription: source [Identity]  target [Subscription]
+#   CanEnterProject:      source [Identity]  target [Project]
+#   CanEnterTenant:       source [Identity]  target [Tenant]
+#   CanEnterOrganization: source [Identity]  target [Organization]
+# ===========================================================================
+
+applies_to: ["*"]
+phase: 3-administrative-hierarchy
+
+rules:
+
+  # --- 1) Control at a parent boundary inherits down the Contains hierarchy --
+  # THE inheritance rule. Contains is walkable:false, so a path-finder will never
+  # cross it on its own; this derived descent is the ONLY way parent control
+  # reaches descendants. A principal that administers/controls a boundary
+  # controls every child boundary and resource nested under it, transitively,
+  # AND — because a child that is itself a boundary is enterable — gains the
+  # matching CanEnter* foothold in each descendant boundary.
+  - id: admin-inherits-down-contains
+    emits: [Controls, CanEnterAccount, CanEnterSubscription, CanEnterProject, CanEnterOrganization, CanEnterTenant]
+    description: "Control of a parent administrative boundary inherits transitively to every descendant boundary and resource via Contains*."
+    applies_to: ["*"]
+    match:
+      # Either an admin capability or an already-derived Controls at the parent.
+      # (CanAdminister comes from resource RBAC/IAM; Controls is the can-control
+      #  roll-up of CanAdminister or CanGrantPermission@boundary — see rule 2.)
+      - [ ?principal, Controls, ?parent ]
+      - [ ?parent,    Contains, ?child ]     # transitive: Contains+ (one-or-more hops)
+    where:
+      - "node_class(?parent) == AdministrativeBoundary"
+      - "node_class(?principal) == Identity"
+      # Contains is matched transitively (Contains+): ?child is any descendant
+      # boundary or resource, at any depth, reached only through Contains edges.
+      - "reachable(?parent, ?child, via=Contains, transitive=true)"
+    emit:
+      source_type: Identity
+      # Primary emit: Controls over the descendant (boundary or resource).
+      source: ?principal
+      target: ?child
+      permissions: []
+      conditions: [scp_or_org_policy, deny_assignment]
+      state_logic: >-
+        inherit_weakest(Controls@parent, descent): the descendant Controls is at
+        best as strong as the parent Controls. If the parent control is CONDITIONAL
+        (e.g. a role assignment gated by a condition_expression / PIM activation)
+        the descendant Controls is CONDITIONAL with the same gate. A guardrail that
+        DENIES the inherited action at a descendant scope (SCP / Org Policy /
+        Azure deny assignment attached at or below ?child) makes the descendant
+        Controls BLOCKED for the denied actions until guardrail-removal-upgrades-
+        blocked (rule 3) lifts it. Otherwise ACTIVE.
+        SECONDARY EMIT (CanEnter*): when node_class(?child) == AdministrativeBoundary,
+        ALSO emit the matching enter edge keyed to the child's subtype —
+        Account->CanEnterAccount, Subscription->CanEnterSubscription,
+        Project->CanEnterProject, Organization->CanEnterOrganization,
+        Tenant->CanEnterTenant — carrying the same inherited state. ManagementGroup /
+        Folder / ResourceGroup have no dedicated CanEnter* edge; they surface only
+        as Controls (and propagate to their own enterable children).
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?principal Controls ?parent", "?parent Contains+ ?child (transitive)" ]
+      false_positive_note: >-
+        Inheritance is real only for control that is genuinely scope-inheriting.
+        Management-plane RBAC/IAM assigned at a boundary DOES flow down (AWS
+        OrganizationAccountAccessRole into member accounts, Azure roles at MG/sub/RG
+        inherit to children, GCP roles at org/folder/project inherit to descendants).
+        Do NOT inherit: (a) data-plane-only grants that the provider does not cascade
+        (e.g. an Azure role scoped with a DataActions condition, an S3 bucket policy —
+        those are resource-local); (b) grants explicitly scoped to a single resource
+        via a condition (Azure ABAC condition, IAM resource ARN, GCP IAM condition)
+        — respect the condition and do not widen it to siblings; (c) a descendant
+        where a deny guardrail actually blocks the action (keep BLOCKED — rule 3, not
+        this rule, decides upgrades). Contains must be a real administrative-hierarchy
+        edge, not a soft grouping (tags, folders-as-labels). When the parent Controls
+        is itself CONDITIONAL/BLOCKED, never emit a stronger descendant edge.
+      narrative: >-
+        {principal.name} controls the boundary {parent.name}; because {child.name}
+        is nested under {parent.name} in the administrative hierarchy, that control
+        inherits down and {principal.name} effectively controls {child.name}
+        (and can operate inside it).
+
+  # --- 2) Permission-granting at a boundary => control of that boundary + descent
+  # can-control.yaml's control-boundary-via-iam-admin already turns
+  # CanGrantPermission@boundary into Controls(boundary). This rule does the piece
+  # can-control does NOT: it makes explicit that the self-grant reaches the ENTIRE
+  # subtree, by chaining that boundary-Controls into rule 1's descent. It is kept
+  # separate (rather than folded into rule 1) so the "grant = own the whole tree"
+  # narrative is first-class and so it fires even where the adapter emitted the
+  # grant capability but the can-control roll-up has not yet run in the fixpoint.
+  - id: grant-at-boundary-controls-descendants
+    emits: Controls
+    description: "Ability to assign roles/permissions at a boundary scope lets the principal self-grant full control of that boundary and, by inheritance, its whole subtree."
+    applies_to: ["*"]
+    match:
+      - [ ?principal, CanGrantPermission, ?target_principal ]
+    where:
+      # The grant capability must be SCOPED AT a boundary (not a single resource).
+      - "scope_of(?principal, CanGrantPermission) is an AdministrativeBoundary  # ?boundary"
+      - "node_class(?principal) == Identity"
+      # Real assign-role capability, provider-precise:
+      #  AWS  : iam:PutRolePolicy/AttachRolePolicy/PutUserPolicy... OR org-admin
+      #         (organizations:*) at the mgmt account.
+      #  Azure: Microsoft.Authorization/roleAssignments/write — ONLY Owner or
+      #         User Access Administrator hold it. Contributor does NOT (it can
+      #         write resources but cannot assign RBAC) — do not fire on Contributor.
+      #  GCP  : resourcemanager.{organizations|folders|projects}.setIamPolicy.
+      - "principal holds a real role-assignment action at ?boundary (see per-provider note)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: "?boundary  (the AdministrativeBoundary the grant is scoped at)"
+      permissions: []
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the role-assignment action is unconditionally held at ?boundary;
+        CONDITIONAL(iam_permission) when the assignment is gated (Azure PIM eligible-
+        not-active, an IAM/ABAC condition, a GCP IAM condition) — the principal must
+        first satisfy the condition to self-grant. BLOCKED when an SCP/Org Policy
+        denies the assignment action (e.g. an SCP denying iam:* or organizations:*,
+        a GCP org policy, an Azure deny assignment on roleAssignments/write) — until
+        rule 3 upgrades it. This Controls(?boundary) then feeds admin-inherits-down-
+        contains (rule 1) to reach the entire subtree; do NOT re-enumerate the
+        descendants here.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?principal CanGrantPermission ?target_principal @?boundary" ]
+      false_positive_note: >-
+        Emit ONLY when the grant is boundary-scoped. A CanGrantPermission scoped to a
+        single principal/resource is an identity-escalation primitive (covered by the
+        identity-escalation rules), NOT boundary control — do not emit here. Respect
+        role capability boundaries precisely: Azure Contributor CANNOT assign roles
+        (no Microsoft.Authorization/roleAssignments/write) — only Owner and User
+        Access Administrator can; AWS iam:PassRole is NOT a grant; a GCP role lacking
+        setIamPolicy cannot self-grant. Overlaps can-control's control-boundary-via-
+        iam-admin for the Controls(?boundary) emit — dedupe on (Controls, principal,
+        boundary); the value this rule adds is the explicit chain into subtree descent.
+      narrative: >-
+        {principal.name} can assign roles/permissions at {boundary.name} and can
+        therefore grant itself full control of {boundary.name} — and, through
+        inheritance, of everything nested beneath it.
+
+  # --- 3) Guardrail removal UPGRADES the edges the guardrail was blocking -----
+  # The headline guardrail rule. A guardrail (AWS SCP, GCP Org Policy constraint,
+  # Azure deny assignment / restrictive condition) is a Policy node whose effect
+  # is to SUPPRESS one or more edges to state BLOCKED. A principal who can modify
+  # the guardrail policy itself, OR move the target resource OUT of the guardrail's
+  # scope, can lift that suppression — so every edge the guardrail was blocking
+  # UPGRADES to its underlying state (ACTIVE or CONDITIONAL). This is a
+  # STATE-UPGRADE rule (re-emit the suppressed edge with a better state), modeled
+  # exactly on decrypt-gates-secret-read in credential-chains.yaml — it introduces
+  # NO new capability of its own.
+  - id: guardrail-removal-upgrades-blocked
+    # Re-emission rule: the upgraded edge is the SAME edge that was suppressed, so its
+    # type is the bound variable ?cap (whatever the guardrail was blocking) — not a
+    # fixed edge name. Conformance is inherited from the matched edge match[1]. A
+    # source/target-class linter must treat a ?-variable emit as "re-emit of a matched
+    # edge" (skip literal-vocab check), the same way decrypt-gates-secret-read re-emits
+    # its matched CanReadSecret in place.
+    emits: ?cap
+    description: "A principal who can modify or escape a guardrail (SCP / Org Policy / deny assignment) upgrades the edges that guardrail was suppressing from BLOCKED to their underlying state."
+    applies_to: ["*"]
+    match:
+      # (a) Modify the guardrail policy node directly...
+      - [ ?principal, CanModifyPolicy, ?guardrail ]
+      # ...and there exists at least one edge the guardrail is blocking.
+      - [ ?x, ?cap, ?y ]                        # the suppressed edge (any type)
+    where:
+      - "node_class(?guardrail) == Policy"
+      - "node_type(?guardrail) in [ServiceControlPolicy, OrganizationPolicy, ConditionalPolicy]  # AWS SCP / GCP org policy / Azure deny assignment"
+      - "state_of(match[1]) == BLOCKED"
+      - "blocked_by(match[1]) == ?guardrail   # THIS guardrail is what suppresses THIS edge — not merely present in the account"
+      # Provider-precise modify actions on the guardrail:
+      #  AWS  : organizations:UpdatePolicy / DetachPolicy / DeletePolicy /
+      #         organizations:DisablePolicyType (held at the mgmt account / delegated admin).
+      #  GCP  : orgpolicy.policy.set (org/folder/project) to overwrite/delete the constraint.
+      #  Azure: deny assignments are created by Azure (e.g. Blueprints/Managed Apps) and are
+      #         NOT directly user-writable — the realistic removal is deleting the owning
+      #         blueprint assignment / managed-app, or holding the deny-assignment write on
+      #         the (rare) supported path. State CONDITIONAL when only the indirect path exists.
+    optional:
+      # (b) ALTERNATIVE removal: reparent/move the resource out of the guardrail's
+      # scope instead of editing the policy. Presence of EITHER path suffices.
+      #  AWS  : organizations:MoveAccount (move account to an OU the SCP isn't
+      #         attached to) OR organizations:LeaveOrganization.
+      #  Azure: Microsoft.Resources/subscriptions/moveResources or move the
+      #         subscription to an MG without the deny assignment.
+      #  GCP  : resourcemanager.projects.move (reparent project to a folder where
+      #         the org policy is overridden/not enforced).
+      - [ ?principal, CanModifyConfiguration, ?scope_binding ]   # reparent / move-out capability
+    emit:
+      source: ?x
+      target: ?y
+      permissions: []
+      conditions: [guardrail_removed]
+      state_logic: >-
+        UPGRADE (re-emit match[1] in place): the suppressed edge is re-emitted with
+        its UNDERLYING state — the state it would have had absent ?guardrail (ACTIVE,
+        or CONDITIONAL with whatever non-guardrail gate remains). The upgrade is
+        itself CONDITIONAL(guardrail_removed): it is only realizable AFTER the
+        principal actually removes/escapes the guardrail, so keep it
+        CONDITIONAL(guardrail_removed) unless the underlying edge would be BLOCKED for
+        an INDEPENDENT reason (a second guardrail, a hard deny not owned by
+        ?guardrail) — then it stays BLOCKED on that other cause. If ?principal's
+        CanModifyPolicy / move capability is itself CONDITIONAL or BLOCKED, the upgrade
+        inherits that (no upgrade from a BLOCKED modify). Never upgrade an edge that
+        was BLOCKED by something OTHER than this guardrail. Monotonic re-emit updates
+        the existing edge's state in place (RULE-FORMAT: re-derivation updates state).
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?principal CanModifyPolicy ?guardrail (or reparent via CanModifyConfiguration ?scope_binding)", "?x ?cap ?y (BLOCKED by ?guardrail)", "blocked_by == ?guardrail" ]
+      false_positive_note: >-
+        Fire ONLY when THIS guardrail is the actual cause of the BLOCK — check
+        blocked_by(edge)==?guardrail, not mere co-location in the account/org. Two
+        forms of removal, EITHER suffices: (a) modify the policy (AWS
+        organizations:UpdatePolicy/DetachPolicy/DisablePolicyType, GCP
+        orgpolicy.policy.set, Azure delete the owning blueprint/managed-app that
+        created the deny assignment); (b) move the resource out of scope (AWS
+        MoveAccount/LeaveOrganization, Azure subscription move to another MG, GCP
+        project.move). Keep the upgrade CONDITIONAL(guardrail_removed) — it is a
+        two-step action, not an already-realized path — so path scoring reflects the
+        extra removal step. Do NOT upgrade if a DIFFERENT guardrail or an explicit
+        hard deny independently blocks the same edge. AWS SCP nuance: an SCP can only
+        be edited from the management account or a delegated administrator — a member-
+        account principal with iam-only permissions CANNOT weaken it; require the
+        organizations:* action at the right scope. Azure deny-assignment nuance: most
+        deny assignments are system-managed and not directly writable — prefer the
+        move-out / delete-owning-assignment path and mark CONDITIONAL when only that
+        indirect route exists.
+      narrative: >-
+        {principal.name} can remove the guardrail {guardrail.name} (by editing it or
+        moving the affected resource out of its scope); doing so lifts the block on
+        "{x.name} {cap} {y.name}", restoring that path to its underlying state.
+
+  # --- 4) Enter-boundary roll-ups (subscription / project / org / tenant) -----
+  # can-control.yaml's enter-account-via-assume covers AWS cross-account CanAssume
+  # -> CanEnterAccount. This rule adds ONLY the missing analogues so a foothold-in-
+  # a-boundary is materialized consistently across providers, and connects a
+  # top-boundary entry to Controls where entry implies administrative reach. It is
+  # deliberately conservative: a mere read/guest presence in a boundary is NOT
+  # control, and we do not over-connect entry to the whole subtree (rule 1 already
+  # does subtree descent from Controls, not from CanEnter*).
+  - id: enter-boundary-rollups
+    emits: [CanEnterSubscription, CanEnterProject, CanEnterTenant, CanEnterOrganization, Controls]
+    description: "Materialize a foothold identity inside a subscription/project/tenant/organization when a principal can impersonate/assume/federate into an identity homed there; escalate to Controls only when entry implies admin at a top boundary."
+    applies_to: ["*"]
+    match:
+      # A principal that can act as an identity whose home boundary differs from
+      # the principal's own. Covers Azure MI/SP acquisition, GCP SA impersonation,
+      # and multi-tenant/B2B app entry — the non-AWS analogues of enter-account.
+      - [ ?principal, ?acquire, ?identity ]     # ?acquire in {CanImpersonate, CanAssume, CanFederateAs, CanCreateCredentialFor}
+    where:
+      - "?acquire in [CanImpersonate, CanAssume, CanFederateAs, CanCreateCredentialFor]"
+      - "node_class(?principal) == Identity and node_class(?identity) == Identity"
+      - "home_boundary(?identity) != home_boundary(?principal)   # crossing a boundary"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: "home_boundary(?identity)  (Subscription | Project | Tenant | Organization)"
+      permissions: []
+      conditions: [trust_relationship, iam_permission]
+      state_logic: >-
+        inherit from the acquisition edge (?acquire): the enter edge is as strong as
+        the CanImpersonate/CanAssume/CanFederateAs/CanCreateCredentialFor that grants
+        the foothold — CONDITIONAL if that is CONDITIONAL(trust_relationship /
+        condition_expression), BLOCKED if it is BLOCKED. Emit the enter edge keyed to
+        the target's home-boundary subtype:
+          Subscription -> CanEnterSubscription, Project -> CanEnterProject,
+          Tenant -> CanEnterTenant, Organization -> CanEnterOrganization.
+        (Account -> CanEnterAccount is already produced by can-control's
+        enter-account-via-assume; do not re-emit it here.)
+        ADDITIONALLY emit Controls(?principal -> boundary) ONLY when the acquired
+        identity is itself an administrator of that top boundary (e.g. it holds
+        Owner/Global Administrator at the tenant, Organization Administrator at a GCP
+        org, or org-management privileges) — entry alone is NOT control.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?principal ?acquire ?identity (cross-boundary foothold)" ]
+      false_positive_note: >-
+        Conservative by design. Getting a foothold identity inside a boundary makes
+        the principal able to operate there AS THAT IDENTITY — it does NOT grant the
+        boundary's full privilege. Only add the Controls emit when the acquired
+        identity is genuinely an admin of that boundary; a low-privileged SA/MI/guest
+        yields ONLY the CanEnter* foothold, whose downstream reach is then whatever
+        that identity itself can do (normal traversal), NOT rule-1 subtree descent.
+        Do NOT emit a CanEnter* for a same-boundary acquisition (no boundary crossed).
+        Respect trust/condition gates on the acquisition edge — never upgrade. This
+        rule cites, and does not duplicate, can-control's enter-account-via-assume
+        (AWS Account case) — it fills only the subscription/project/tenant/org gaps.
+      narrative: >-
+        {principal.name} can act as {identity.name}, which is homed in
+        {boundary.name}; {principal.name} thereby obtains a foothold identity inside
+        {boundary.name} and can operate there as {identity.name}.
+
+# ===========================================================================
+# WORKED EXAMPLES
+#
+# INHERITANCE (rules 2 -> 1):
+#   [p CanGrantPermission * @ManagementGroup MG]            (Azure Owner @ MG)
+#     => grant-at-boundary-controls-descendants: [p Controls MG]  (ACTIVE)
+#   + [MG Contains Subscription S], [S Contains ResourceGroup RG], [RG Contains VM v]
+#     => admin-inherits-down-contains:
+#          [p Controls S], [p Controls RG], [p Controls v]   (ACTIVE, inherited)
+#          + [p CanEnterSubscription S]                      (S is a boundary)
+#
+# GUARDRAIL UPGRADE (rule 3):
+#   [role CanAdminister acct-resource]  suppressed to BLOCKED by SCP scp-1
+#     (SCP denies the action) => edge state BLOCKED, blocked_by = scp-1
+#   + [p CanModifyPolicy scp-1]  (p holds organizations:UpdatePolicy @ mgmt acct)
+#     => guardrail-removal-upgrades-blocked:
+#          re-emit [role CanAdminister acct-resource] as
+#          CONDITIONAL(guardrail_removed) -> underlying ACTIVE once scp-1 is edited.
+#   Alternative escape: [p CanModifyConfiguration ou-binding]
+#     (organizations:MoveAccount to an OU without scp-1) -> same upgrade.
+#
+# TOP-BOUNDARY ENTRY (rule 4):
+#   [p CanImpersonate ga-sp]  where ga-sp is Global Administrator of Tenant T,
+#   home_boundary(ga-sp)=T != home_boundary(p)
+#     => enter-boundary-rollups: [p CanEnterTenant T] + [p Controls T]
+#        (Controls only because ga-sp is a tenant admin).
+#
+# BLOCKED-edge guidance:
+#  - Contains is walkable:false; without rule 1 no parent control ever reaches a
+#    child. If rule 1 does not fire (e.g. the parent Controls is CONDITIONAL), the
+#    descendant edges carry that same weakened state — never stronger.
+#  - A guardrail suppressing an edge stays BLOCKED until rule 3 proves the
+#    principal can remove/escape THAT specific guardrail; a second independent
+#    guardrail keeps the edge BLOCKED on its own cause.
+#  - Role capability precision: Azure Contributor cannot assign RBAC (rule 2 must
+#    not fire on it); only Owner / User Access Administrator can self-grant.
+# ===========================================================================

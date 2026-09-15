@@ -1,0 +1,387 @@
+# Azure — Managed Identities (Microsoft.ManagedIdentity) rules (Phase 2)
+# ---------------------------------------------------------------------------
+# SCOPE: fills the gaps NOT already covered by identity-escalation.yaml and the
+# linchpin files. Specifically:
+#   - IMDS / App Service identity endpoint token retrieval (new fact: any code on
+#     a host with a bound MI can mint a bearer token for it, no Entra credential).
+#   - The ExposesCredential / CredentialsFor link that wires IMDS retrieval into
+#     credential-chains.yaml's read-secret-yields-identity roll-up.
+#   - The user-assigned MI shared-blast-radius annotation (a single MI attached to
+#     N hosts; each host can independently retrieve the MI token).
+#   - The MI's own RBAC assignments as the downstream privilege surface.
+#
+# EXPLICITLY NOT RE-DERIVED HERE (already in linchpins / identity-escalation):
+#   - CanPassIdentity(principal -> MI) via assign/action + compute write
+#     -> azure-assign-user-assigned-mi (identity-escalation.yaml)
+#   - CanModifyTrust(principal -> MI/app) via federatedIdentityCredentials write
+#     -> azure-federated-credential-write (identity-escalation.yaml)
+#   - CanFederateAs(externalId -> MI) from TrustsExternalIdentity +
+#     ExternalIdentityMapsTo -> federation-chains.yaml (federation-maps-to-identity)
+#   - CanExecuteAs(principal -> MI) from CanModifyCode/CanExecuteCommand +
+#     ExecutesAs -> can-execute-as.yaml (execute-as-via-command /
+#     execute-as-via-code-modify)
+#   - CanEscalateTo from CanImpersonate(MI) -> credential-chains.yaml
+#     (impersonate-is-escalation); from CanExecuteAs -> can-control.yaml
+#     (escalate-via-execute-as)
+#   - CanGrantPermission / CanEnterSubscription from MI with Owner /
+#     User Access Administrator -> identity-escalation.yaml (azure-role-assignment-write)
+#     + hierarchy-chains.yaml (admin-inherits-down-contains)
+#
+# IMDS endpoint facts:
+#   VMs / VMSS / Arc:   GET http://169.254.169.254/metadata/identity/oauth2/token
+#                           ?api-version=2018-02-01&resource=<aud>
+#                           Header: Metadata: true
+#   App Service / Functions / Container Apps:
+#                       GET ${IDENTITY_ENDPOINT}?api-version=2019-08-01&resource=<aud>
+#                           Header: X-IDENTITY-HEADER: ${IDENTITY_HEADER}
+#   AKS Workload Identity: federated OIDC token projected by kubelet, exchanged via
+#                           azure-identity-credential-adapter -> federation path only.
+#
+# Permission strings verified against Microsoft.ManagedIdentity operations reference
+# (learn.microsoft.com, 2026-08 snapshot). Deny assignments override -> BLOCKED edges.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 2-identity-authorization
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # IMDS TOKEN RETRIEVAL — the core MI attack primitive
+  # ===========================================================================
+
+  # --- Any code on a host can mint a bearer token for each bound MI ----------
+  - id: azure-mi-imds-token
+    emits: CanRetrieveToken
+    description: "Any code running on a host that has a managed identity bound can obtain a bearer token for that MI from the IMDS (or App Service identity) endpoint with no Entra credential."
+    match:
+      - [ ?host, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?mi) == ManagedIdentity"
+      - "node_class(?host) == Compute"
+      # The host must actually have an MI binding — identity.type != None.
+      # System-assigned: principalId is populated. User-assigned: at least one
+      # entry in identity.userAssignedIdentities.
+      - "?host.identity.type != 'None'  # MI binding must exist"
+    emit:
+      source_type: Compute
+      target_type: ManagedIdentity
+      source: ?host
+      target: ?mi
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the host is running and has the MI binding.
+        CONDITIONAL(service_state) when the host is stopped/deallocated
+        (IMDS is only reachable from a running host). No Azure-side deny
+        mechanism exists for IMDS reads — once the host runs, this is always
+        ACTIVE regardless of RBAC; deny assignments on the MI's ARM resource
+        do NOT block IMDS token retrieval.
+      confidence: 0.98
+      derived_from:
+        - "?host ExecutesAs ?mi"
+      false_positive_note: >-
+        Do NOT emit if identity.type == 'None' (no MI bound). Do NOT emit for
+        AKS workload identity paths — those use a projected federated OIDC token
+        exchanged via the Azure OIDC endpoint, which is a federation-chains path
+        (federation-maps-to-identity), not a direct IMDS call. Arc-enabled servers
+        use http://localhost:40342/... instead of 169.254.169.254; model the same
+        way (IMDS-local, no credential). App Service / Functions / Container Apps
+        use the IDENTITY_ENDPOINT + IDENTITY_HEADER env vars injected by the
+        platform — semantically identical but NOT on the 169.254 address.
+
+        For user-assigned MIs: when multiple user-assigned MIs are bound to the
+        same host, the IMDS caller must specify the correct client_id or
+        mi_res_id to disambiguate. However, both are trivially enumerable from the
+        environment (AZURE_CLIENT_ID env var injected by the platform, or from a
+        prior IMDS /metadata/instance call). This is NOT a gate on the edge;
+        the attacker can freely specify any of the attached MIs' IDs and retrieve
+        its token. The false_positive_note in credential-chains or container-chains
+        (if the MI is shared across hosts) discusses multi-MI/multi-host enumeration
+        as a recon step, but does not block the core CanRetrieveToken fact.
+      narrative: >-
+        Any code running on {host.name} can mint a bearer token for managed identity
+        {mi.name} from the instance metadata service (IMDS at 169.254.169.254 for
+        VMs, or the IDENTITY_ENDPOINT for App Service / Functions) with no Entra
+        credential — the token is available to any process inside the host.
+
+  # --- The host exposes the MI's credential via IMDS (paired with CredentialsFor) ---
+  - id: azure-mi-exposes-credential
+    emits: ExposesCredential
+    description: "A host with a bound MI exposes that identity's bearer token credential via the IMDS / App Service identity endpoint to any code running inside it."
+    match:
+      - [ ?host, ExecutesAs, ?mi ]
+      - [ ?token, CredentialsFor, ?mi ]
+    where:
+      - "node_type(?mi) == ManagedIdentity"
+      - "node_type(?token) == Token"
+      - "node_class(?host) == Compute"
+      - "?host.identity.type != 'None'"
+      - "node_name(?token) matches 'imds-.*' and extract_host_id(?token) == node_id(?host)"
+    emit:
+      source_type: Compute
+      target_type: Credential
+      source: ?host
+      target: ?token
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when host is running and has the MI binding.
+        CONDITIONAL(service_state) when stopped/deallocated (IMDS is only
+        reachable from a running host).
+      confidence: 0.98
+      derived_from:
+        - "?host ExecutesAs ?mi"
+        - "?token CredentialsFor ?mi (synthetic IMDS token)"
+      false_positive_note: >-
+        Paired with azure-mi-token-credentials-for. Do NOT emit when identity.type == 'None'.
+        This edge models the FACT that the host's IMDS endpoint exposes the token
+        object to any code running inside. The endpoint is link-local — not accessible
+        from outside the host's network stack. The actual traversal value comes from
+        credential-chains (CanReadSecret on the token, then CredentialsFor to the MI).
+      narrative: >-
+        The instance metadata endpoint on {host.name} exposes the bearer token {token.name}
+        (for managed identity {mi.name}) to any code running inside {host.name}.
+        An attacker with code execution on {host.name} can retrieve this token and
+        authenticate as {mi.name}.
+
+
+  # ===========================================================================
+  # IMDS BEARER TOKEN SYNTHETIC NODE & CREDENTIALS CHAIN
+  # ===========================================================================
+  # The IMDS bearer token is a short-lived (1-hour) credential obtained via the
+  # instance metadata service. In the derived rules phase, we synthesize a Token
+  # node for each (Compute host, ManagedIdentity) pair where the host can retrieve
+  # the MI's token (i.e., where ExecutesAs exists), so that credential-chains and
+  # related queries have a real graph node to traverse.
+
+  - id: azure-mi-imds-token-node-create
+    emits: LocatedIn
+    description: "Synthesize an IMDS bearer token node for each host+MI pair where the host executes as the MI."
+    applies_to: [azure]
+    match:
+      - [ ?host, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?mi) == ManagedIdentity"
+      - "node_class(?host) == Compute"
+    emit:
+      source_type: Token
+      target_type: AdministrativeBoundary
+      source: "<synthetic IMDS Token node: azure:sub:Token:imds-<host-id>-<mi-id>>"
+      target: "<resource group or region containing ?host>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the host ExecutesAs the MI (the structural fact exists).
+        The synthetic node inherits the service_state from ?host; token is only
+        mintable when the host is running.
+      confidence: 0.99
+      derived_from:
+        - "?host ExecutesAs ?mi"
+      false_positive_note: >-
+        Create one Token node per (host, MI) pair. If the same host ExecutesAs
+        multiple MIs (e.g., multiple user-assigned MIs), create a separate token
+        node for each. The token node's native_id should encode both host and MI.
+      narrative: >-
+        Synthetic IMDS bearer token node created for managed identity {mi.name}
+        accessible from host {host.name} in {target.name}. This token is the
+        credential object that sources the CredentialsFor edge to {mi.name}.
+
+  - id: azure-mi-token-credentials-for
+    emits: CredentialsFor
+    description: "An IMDS bearer token minted from a host+MI pair is valid authentication as that MI."
+    applies_to: [azure]
+    match:
+      - [ ?token, LocatedIn, ?boundary ]
+      - [ ?host, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?token) == Token"
+      - "node_name(?token) matches 'imds-.*'"
+      - "extract_host_id(?token) == node_id(?host)"
+      - "extract_mi_id(?token) == node_id(?mi)"
+      - "node_type(?mi) == ManagedIdentity"
+      - "node_class(?host) == Compute"
+    emit:
+      source_type: Token
+      target_type: ManagedIdentity
+      source: ?token
+      target: ?mi
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the host is running and has the MI binding; the token can be
+        minted at any time while the host is up. CONDITIONAL(service_state) when
+        the host is stopped/deallocated.
+      confidence: 0.99
+      derived_from:
+        - "?host ExecutesAs ?mi"
+        - "?token LocatedIn ?boundary (synthetic IMDS token)"
+      false_positive_note: >-
+        Do NOT emit CredentialsFor if the host is not actually running
+        (check ?host.state == 'running' for ACTIVE emission). The token is
+        renewable and short-lived (default 1 hour). It authenticates as the MI
+        only against Azure APIs the MI is authorized on; a credential-chains
+        query will compose this with the MI's RBAC to determine downstream
+        privilege paths.
+      narrative: >-
+        The bearer token minted from IMDS for {mi.name} on {host.name} is valid
+        authentication as {mi.name} against any Azure API that {mi.name} is
+        authorized on. Any principal who can execute code on {host.name} or read
+        the cached token can then authenticate as {mi.name}.
+
+  # ===========================================================================
+  # USER-ASSIGNED MI — SHARED BLAST RADIUS
+  # ===========================================================================
+  # (Placeholder for future rule: when the same user-assigned MI is attached to
+  # multiple hosts, each host can independently retrieve the MI's token —
+  # the MI becomes a shared blast-radius vector across all attached hosts.
+  # This is primarily a visualization annotation and blast-radius scoring
+  # signal rather than a new capability edge.)
+
+  # ===========================================================================
+  # MI ADMINISTRATIVE CONTROL (ARM resource itself)
+  # ===========================================================================
+  # NOTE: These rules use match_effective_permission, which is the normalization
+  # pattern for the explicit-rule engine. They have been MOVED to
+  # /rules/explicit/azure-managedidentity.yaml to be processed in the correct
+  # phase (they depend on the effective-permission evaluator, not graph patterns).
+  # See comments in explicit/azure-managedidentity.yaml for details.
+
+  # ===========================================================================
+  # MI RBAC DOWNSTREAM — privilege the MI carries
+  # ===========================================================================
+  # NOTE: the MI's own role assignments are the downstream blast radius. We do
+  # NOT re-derive the RBAC rules here — they are generic to the Azure permission
+  # model and already handled by:
+  #   - azure-role-assignment-write (identity-escalation.yaml): MI holds
+  #     roleAssignments/write -> CanGrantPermission -> Controls(scope)
+  #   - hierarchy-chains admin-inherits-down-contains: Controls at a parent
+  #     scope propagates to child scopes
+  #   - can-control escalate-via-execute-as: CanExecuteAs + higher privilege ->
+  #     CanEscalateTo
+  #
+  # This section models only the cross-subscription RBAC fact: a user-assigned
+  # MI may hold role assignments in a subscription that is different from the
+  # subscription where the MI ARM resource lives or where the attached host lives.
+  # ---------------------------------------------------------------------------
+
+  # NOTE: Cross-subscription RBAC for MIs is handled by the canonical linchpins:
+  #   1. CanExecuteAs(?attacker, ?mi) — via can-execute-as.yaml (execute-as-via-command / execute-as-via-code-modify)
+  #   2. HasRole(?mi, ?role) — normalized from role assignments in explicit rules
+  #   3. hierarchy-chains.yaml (enter-boundary-rollups) — consumes CanImpersonate +
+  #      HasRole at cross-subscription scope to emit CanEnterSubscription
+  # The chain is:
+  #   CanExecuteAs(attacker,mi) —[can-control escalate-via-execute-as]—> CanEscalateTo(attacker,mi)
+  #   —[credential-chains impersonate-is-escalation]—> CanImpersonate(attacker,mi)
+  #   CanImpersonate(attacker,mi) + HasRole(mi,role@remote-sub) —[hierarchy-chains enter-boundary-rollups]—>
+  #   CanEnterSubscription(attacker, remote-sub)
+  # Do NOT re-derive CanEnterSubscription here; the linchpins handle it. If cross-subscription
+  # MI assignment needs an explicit annotation layer (e.g., for performance or clarity),
+  # emit CrossTenantTrust or a similar marker from the HasRole facts, but allow
+  # hierarchy-chains to consume and roll up.
+
+  # ===========================================================================
+  # FEDERATED CREDENTIAL TRUST (MI as OIDC relying party)
+  # ===========================================================================
+  # The explicit trust facts (TrustsExternalIdentity / ExternalIdentityMapsTo) are
+  # emitted by the normalization rules in /rules/explicit/azure-managedidentity.yaml
+  # from the federatedIdentityCredentials collection. The collapse into
+  # CanFederateAs is handled by federation-chains.yaml (federation-maps-to-identity).
+  # We cite it here but do NOT re-derive it.
+  #
+  # What we DO emit here is the TrustsExternalIdentity fact itself when the issuer
+  # and subject on the federated credential are collected — this is a normalization
+  # step for the explicit rule file, noted here for completeness.
+  # ---------------------------------------------------------------------------
+
+  # --- Note on federation: see explicit/azure-managedidentity.yaml for the
+  # TrustsExternalIdentity / ExternalIdentityMapsTo normalization rules that feed
+  # federation-chains.yaml (federation-maps-to-identity -> CanFederateAs).
+  # The CanModifyTrust (add federated credential) is already in
+  # azure-federated-credential-write (identity-escalation.yaml). Do NOT re-derive here.
+
+  # ===========================================================================
+  # HOST LIFECYCLE: CanStart upgrades CONDITIONAL IMDS paths to ACTIVE
+  # ===========================================================================
+
+  # --- Ability to start a stopped host unlocks IMDS token retrieval -----------
+  - id: azure-mi-start-unlocks-imds
+    emits: CanRetrieveToken
+    description: "An attacker who can start a stopped host can then retrieve IMDS tokens for its bound MI."
+    match:
+      - [ ?attacker, CanStart, ?host ]
+      - [ ?host, CanRetrieveToken, ?mi ]
+    where:
+      - "node_type(?mi) == ManagedIdentity"
+      - "node_class(?host) == Compute"
+      - "?host.state == 'stopped' or ?host.state == 'deallocated'"
+      - "?attacker != ?host"
+    emit:
+      source_type: Identity
+      target_type: ManagedIdentity
+      source: ?attacker
+      target: ?mi
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the attacker can start the stopped host, which unlocks IMDS
+        token retrieval. Starting the host removes the service_state gate that
+        makes CanRetrieveToken(host,mi) CONDITIONAL in azure-mi-imds-token.
+        For the attacker, this becomes unconditionally ACTIVE.
+      confidence: 0.98
+      derived_from:
+        - "?attacker CanStart ?host"
+        - "?host CanRetrieveToken ?mi (azure-mi-imds-token)"
+      false_positive_note: >-
+        This rule emits CanRetrieveToken(attacker, mi) when the attacker can start
+        a stopped host bound to the MI. Do NOT emit if the host is already running
+        (?host.state == 'running') — azure-mi-imds-token already emits ACTIVE for
+        running hosts. Only emit for stopped/deallocated hosts. The attacker identity
+        must be distinct from the host node.
+      narrative: >-
+        {attacker.name} can start {host.name}, which is currently stopped/deallocated.
+        Once running, {host.name} will expose IMDS tokens for managed identity
+        {mi.name}, allowing {attacker.name} to retrieve the MI token and authenticate as {mi.name}.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - A deny assignment on the MI ARM resource blocks CanAdminister / CanRead.
+#   - Deny assignments do NOT block IMDS token retrieval (IMDS is not an ARM
+#     operation; there is no Azure-side mechanism to deny it from within the host).
+#   - PIM-eligible-not-active role assignments for the MI yield CONDITIONAL edges
+#     downstream; the host-level CanRetrieveToken itself is still ACTIVE (the
+#     token can always be minted — only its downstream RBAC is gated on PIM).
+#   - If the MI itself has no RBAC assignments at any scope, CanRetrieveToken and
+#     ExposesCredential still emit (the token can be obtained) but downstream
+#     privilege edges are absent; the MI token is effectively inert for escalation.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# CITED LINCHPINS AND UPSTREAM RULES (do NOT duplicate):
+#   identity-escalation.yaml:
+#     - azure-assign-user-assigned-mi (CanPassIdentity via assign/action + compute write)
+#     - azure-federated-credential-write (CanModifyTrust -> federated credential)
+#     - azure-role-assignment-write (MI's own roleAssignments/write -> CanGrantPermission)
+#   can-execute-as.yaml:
+#     - execute-as-via-command: CanExecuteCommand(p,host) + ExecutesAs(host,MI)
+#       -> CanExecuteAs(p,MI)
+#     - execute-as-via-code-modify: CanModifyCode(p,host) + ExecutesAs(host,MI)
+#       -> CanExecuteAs(p,MI)
+#   credential-chains.yaml:
+#     - impersonate-is-escalation: CanImpersonate(p,MI) + privilege(MI)>privilege(p)
+#       -> CanEscalateTo(p,MI)
+#     - read-secret-yields-identity: CanReadSecret(p,token) + CredentialsFor(token,MI)
+#       -> CanImpersonate(p,MI)
+#   federation-chains.yaml:
+#     - federation-maps-to-identity: ExternalIdentityMapsTo(ext,MI)
+#       + TrustsExternalIdentity backing -> CanFederateAs(ext,MI)
+#     - federate-inherits-capabilities: CanFederateAs(p,MI) -> CanImpersonate(p,MI)
+#   can-control.yaml:
+#     - escalate-via-execute-as: CanExecuteAs(p,MI) + privilege(MI)>privilege(p)
+#       -> CanEscalateTo(p,MI)
+#   hierarchy-chains.yaml:
+#     - enter-boundary-rollups: CanImpersonate(p,MI) + cross-boundary
+#       -> CanEnterSubscription
+#     - admin-inherits-down-contains: Controls(MI, subscription) -> Controls(descendants)
+# ---------------------------------------------------------------------------

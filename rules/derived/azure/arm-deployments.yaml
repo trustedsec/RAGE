@@ -1,0 +1,581 @@
+# Azure ARM Deployments — derived attack-path rules (Phase 9 — CI/CD)
+# ---------------------------------------------------------------------------
+# Resource provider: Microsoft.Resources
+#   Microsoft.Resources/deployments            — ARM / Bicep deployment objects
+#   Microsoft.Resources/deploymentScripts      — inline PS/Bash in an ACI container
+#   Microsoft.Resources/templateSpecs          — versioned template artifact store
+#   Microsoft.Resources/deploymentStacks       — stack-managed deployment groups
+#
+# THE HEADLINE PRIMITIVE (verified against ARM documentation, 2026-08):
+#   A `Microsoft.Resources/deploymentScripts` resource spawns an Azure Container
+#   Instance that executes arbitrary inline PowerShell or Bash code.  The `identity`
+#   field on the deploymentScript names a User-Assigned Managed Identity (UAMI) the
+#   ACI container inherits — it becomes the execution identity for the lifetime of
+#   the script run.  Whoever can CREATE or MODIFY that script resource (and can
+#   assign the UAMI) can run arbitrary code as the UAMI.  This is the Azure
+#   ARM-deployment privilege-escalation well-known in public research.
+#
+# PHASE-9 FRAMING (see cicd-chains.yaml):
+#   An ARM deployment behaves as a CI/CD runner:
+#     BuildWorker (deployment / deploymentScript) — the "runner"
+#     ExecutesAs — the UAMI the script container runs as
+#     CanModifyCode — ability to change what the runner executes
+#     CanTrigger — ability to submit/re-run the deployment
+#   cicd-chains.yaml rule 1 (cicd-modify-buildspec-executes-as) subsumes the
+#   generic CanModifyCode + ExecutesAs => CanExecuteAs collapse.  The rules here
+#   emit the SERVICE-SPECIFIC FACTS and cite cicd-chains for the roll-up.
+#
+# LINCHPIN CITATIONS (do not re-derive their outputs):
+#   cicd-chains.yaml     — CanModifyCode(runner) + ExecutesAs => CanExecuteAs
+#                         (rule cicd-modify-buildspec-executes-as)
+#                        — CanTrigger(runner) + ExecutesAs => CanExecuteAs CONDITIONAL
+#                         (rule cicd-trigger-runner-executes-as)
+#   can-execute-as.yaml  — execute-as-via-code-modify, execute-as-via-config-identity-swap
+#   can-control.yaml     — escalate-via-execute-as (CanExecuteAs => CanEscalateTo)
+#                        — control-boundary-via-iam-admin (CanGrantPermission at
+#                          sub/MG scope => Controls boundary)
+#   credential-chains.yaml — read-secret-yields-identity, execute-then-read-secret
+#   identity-escalation.yaml — azure-assign-user-assigned-mi (CanPassIdentity),
+#                              azure-role-assignment-write (CanGrantPermission)
+#
+# KEY FALSE-POSITIVE GUARDS (enforced in every rule):
+#   1. ARM engine evaluates every template operation against the CALLING principal's
+#      effective RBAC — the template CANNOT elevate beyond what the caller already
+#      holds.  Emit CanGrantPermission only when the deployer already holds
+#      Microsoft.Authorization/roleAssignments/write at the target scope.
+#   2. UAMI attach requires assign/action on the UAMI (separate from deploymentScripts/write).
+#      Without it the deployment fails -> CONDITIONAL(role_compatibility).
+#   3. secureString parameters are redacted in deployment history; do NOT emit
+#      CanReadSecret for typed-secureString params.
+#   4. Deny assignments override Owner RBAC -> BLOCKED for any covered action.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 9-cicd-pipelines
+applies_to: [azure]
+
+rules:
+
+  # === 1. deploymentScript CREATE/MODIFY -> CanModifyCode on the script runner ===
+  # The `deploymentScript` resource IS the build definition: its `scriptContent`
+  # (inline PS/Bash) or `primaryScriptUri` (external script URL fetched at run time)
+  # is exactly what the ACI container executes.  Creating or updating the
+  # deploymentScript resource is therefore CanModifyCode on that BuildWorker/
+  # ContainerTask node.  cicd-chains rule 1 then collapses this with the
+  # deploymentScript's ExecutesAs(UAMI) into CanExecuteAs(principal -> UAMI).
+  - id: azure-arm-deploymentscript-write
+    emits: CanModifyCode
+    description: "Create or update a deploymentScript resource to run arbitrary PS/Bash as its attached UAMI."
+    match_effective_permission:
+      action: "Microsoft.Resources/deploymentScripts/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Microsoft.Resources/deploymentScripts/write at the scope"
+      - "the deploymentScript resource has an identity block naming a user-assigned MI (UAMI)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<deploymentScript resource (BuildWorker / ContainerTask)>"
+      permissions:
+        - "Microsoft.Resources/deploymentScripts/write"
+      conditions: [role_compatibility, service_state]
+      state_logic: >-
+        ACTIVE when the principal holds deploymentScripts/write AND assign/action on
+        the referenced UAMI (both are required for the deployment to succeed).
+        CONDITIONAL(role_compatibility) when assign/action on the UAMI is not confirmed
+        (the deployment would fail without it). CONDITIONAL(service_state) if the
+        Microsoft.ContainerInstance provider is not registered in the subscription
+        (deploymentScripts require ACI). BLOCKED if a deny assignment covers
+        deploymentScripts/write at this scope.
+      false_positive_note: >-
+        deploymentScripts/write alone is NOT sufficient — the deploying principal must
+        ALSO hold Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on
+        the UAMI named in the script's identity block; without it the ARM engine
+        rejects the deployment.  Do NOT emit ACTIVE unless assign/action is confirmed.
+        A deploymentScript with no identity block runs as no identity and yields no
+        CanExecuteAs — do not emit CanModifyCode in that case (nothing to execute as).
+        The ACI container is ephemeral: execution capability persists only for the
+        script's run; there is no standing compute to re-enter.
+      narrative: >-
+        {principal.name} can create or update deploymentScript {target.name}
+        (Microsoft.Resources/deploymentScripts/write), injecting arbitrary PowerShell
+        or Bash into its scriptContent; the ACI container executes that code as the
+        script's attached UAMI.  cicd-chains (cicd-modify-buildspec-executes-as)
+        collapses this with the script's ExecutesAs edge into CanExecuteAs(UAMI).
+      derived_from:
+        - "azure-arm-deploymentscript-write (match_effective_permission)"
+        - "cicd-chains: cicd-modify-buildspec-executes-as (roll-up)"
+
+  # === 1b. deployments/write + inline deploymentScript -> CanModifyCode =========
+  # A principal holding Microsoft.Resources/deployments/write can submit an ARM
+  # deployment at any scope (resource/RG/subscription/MG) carrying an inline
+  # deploymentScript resource with attacker-controlled scriptContent. This is
+  # materially distinct from azure-arm-deploymentscript-write (which targets
+  # deploymentScripts/write on an existing script resource) — here, the principal
+  # submits a NEW deployment carrying a new inline deploymentScript. The ARM engine
+  # executes the inline script as part of the deployment run, using the UAMI named
+  # in the deploymentScript's identity block. This is CanModifyCode on the ARM
+  # deployment BuildWorker node (the deployment's template IS the definition).
+  - id: azure-arm-deployment-write-script-inline
+    emits: CanModifyCode
+    description: "Principal with deployments/write at any scope can submit a deployment template containing an inline deploymentScript with attacker-controlled scriptContent."
+    match_effective_permission:
+      action: "Microsoft.Resources/deployments/write"
+      scope_type: "resource|resourceGroup|subscription|managementGroup"
+    where:
+      - "the submitted ARM template includes a Microsoft.Resources/deploymentScripts resource with attacker-controlled scriptContent or primaryScriptUri"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<ARM deployment (BuildWorker)>"
+      permissions:
+        - "Microsoft.Resources/deployments/write"
+      conditions: [role_compatibility, service_state]
+      state_logic: >-
+        ACTIVE when the principal holds deployments/write at the scope AND the
+        submitted template includes a deploymentScript block with attacker-
+        controlled scriptContent AND assign/action on the referenced UAMI is
+        confirmed (ARM engine requires both).  CONDITIONAL(role_compatibility) if
+        assign/action on the UAMI is not confirmed.  CONDITIONAL(service_state)
+        if the Microsoft.ContainerInstance provider is not registered.  BLOCKED if
+        a deny assignment covers deployments/write.
+      false_positive_note: >-
+        The submitted template MUST include a Microsoft.Resources/deploymentScripts
+        resource block for this edge to emit — a plain deployment/write without an
+        inline script is mere CanTrigger (see azure-arm-deployment-write-trigger).
+        The deploying principal must also hold assign/action on the UAMI named in
+        the deploymentScript's identity block; without it the ARM engine rejects
+        the deployment.  secureString parameters in the template are redacted in
+        deployment history; do NOT emit CanReadSecret for them.  The ACI container
+        is ephemeral: execution capability persists only for the script's run.
+      narrative: >-
+        {principal.name} can submit an ARM deployment at {target.name}'s scope
+        (Microsoft.Resources/deployments/write) carrying an inline
+        deploymentScript resource with attacker-controlled PowerShell or Bash in
+        its scriptContent; the ACI container executes that code as the script's
+        attached UAMI.  cicd-chains (cicd-modify-buildspec-executes-as) collapses
+        this CanModifyCode on the deployment + its ExecutesAs(UAMI) into
+        CanExecuteAs(UAMI).
+      derived_from:
+        - "<deployments/write effective permission>"
+        - "cicd-chains: cicd-modify-buildspec-executes-as (roll-up)"
+
+  # === 2. Template spec version write -> CanModifyCode on all consuming deployments ===
+  # A template spec version is an ArtifactRepository node whose content is a full
+  # ARM template.  Any deployment that references this version (or the latestVersion)
+  # executes WHATEVER the template now contains, including new deploymentScript
+  # resources.  Writing a new version arms a supply-chain CanModifyCode into every
+  # consuming BuildWorker (the deployment that references the spec).
+  - id: azure-arm-templatespec-write
+    emits: CanModifyCode
+    description: "Overwrite a template spec version to inject a deploymentScript into all deployments that reference it."
+    match_effective_permission:
+      action: "Microsoft.Resources/templateSpecs/versions/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "one or more ARM deployments reference this template spec version (or latestVersion)"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<template spec (ArtifactRepository)>"
+      permissions:
+        - "Microsoft.Resources/templateSpecs/versions/write"
+      conditions: [trigger_exists]
+      state_logic: >-
+        ACTIVE when a consuming deployment references the spec by `latestVersion`
+        (mutable) AND auto-redeploys on version update (e.g., a CI/CD pipeline webhook
+        or scheduled re-deploy on spec version change exists).  CONDITIONAL(trigger_exists)
+        when a consuming deployment uses `latestVersion` but requires manual re-trigger
+        by the attacker (or another admin) to pick up the new version — modifying the
+        spec alone does not guarantee execution without that trigger.  If the consuming
+        deployment pins a specific immutable version number (e.g. `v2.0.0`), the write
+        does not affect it and this edge is NOT emitted for that deployment.
+      false_positive_note: >-
+        A deployment that pins a SPECIFIC version number (e.g. `v2.0.0`) is unaffected
+        by a new version write; only deployments using `latestVersion` or a mutable
+        reference propagate this CanModifyCode.  Confirm that a re-deploy of the
+        consuming pipeline is possible (the attacker can trigger it OR it runs
+        automatically on update) — absent a run path, use CONDITIONAL(trigger_exists)
+        not ACTIVE.  container-chains does not apply here (this is IaC, not an OCI
+        image registry); cicd-chains rule 1 consumes the resulting CanModifyCode on
+        the consuming BuildWorker once the new version is deployed.
+      narrative: >-
+        {principal.name} can write a new version of template spec {target.name}
+        (Microsoft.Resources/templateSpecs/versions/write), injecting a
+        deploymentScript resource carrying attacker-controlled code; any downstream
+        deployment that re-deploys this spec will execute that code as the UAMI
+        named in the injected script.  cicd-chains (cicd-modify-buildspec-executes-as)
+        rolls up CanModifyCode on the consuming deployment + its ExecutesAs(UAMI)
+        into CanExecuteAs(UAMI).
+      derived_from:
+        - "azure-arm-templatespec-write (match_effective_permission)"
+        - "cicd-chains: cicd-modify-buildspec-executes-as (roll-up via consuming deployment)"
+
+  # === 3. deploymentScript UAMI attach -> CanPassIdentity ======================
+  # The deploying principal naming a UAMI in the deploymentScript's identity block
+  # is the Azure "PassRole" analog for ARM deployments.  This requires BOTH
+  # deploymentScripts/write AND assign/action on the UAMI.  Identity-escalation.yaml
+  # azure-assign-user-assigned-mi already handles the general UAMI CanPassIdentity
+  # for compute resources; this rule captures the ARM-deployment-specific pairing
+  # (deploymentScripts/write as the "compute write" complement).  The CanPassIdentity
+  # edge feeds can-execute-as execute-as-via-config-identity-swap to produce
+  # CanExecuteAs when the principal can also modify the script definition.
+  - id: azure-arm-deploymentscript-attach-uami
+    emits: CanPassIdentity
+    description: "Principal holds assign/action on a UAMI and deploymentScripts/write — can bind the UAMI to a new or existing deploymentScript, making it the script's execution identity."
+    match:
+      - [ ?principal, CanModifyCode, ?script ]
+      - [ ?script, AttachedTo, ?uami ]
+    where:
+      - "node_type(?script) in [BuildWorker, ContainerTask]  # Microsoft.Resources/deploymentScripts"
+      - "node_type(?uami) == ManagedIdentity"
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?uami"
+      - "?principal has EFFECTIVE Microsoft.Resources/deploymentScripts/write on ?script"
+    emit:
+      source_type: Identity
+      target_type: ManagedIdentity
+      source: "<principal>"
+      target: "<user-assigned managed identity (UAMI)>"
+      permissions:
+        - "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
+        - "Microsoft.Resources/deploymentScripts/write"
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when BOTH permissions are confirmed: assign/action on the target UAMI
+        AND deploymentScripts/write on the script resource.  CONDITIONAL(role_compatibility)
+        when assign/action on the UAMI is not confirmed (ARM rejects the deployment
+        without it).  CONDITIONAL(iam_permission) when deploymentScripts/write is not
+        confirmed at the script's scope.  BLOCKED if a deny assignment covers either
+        action.
+      false_positive_note: >-
+        CITE identity-escalation.yaml azure-assign-user-assigned-mi for the general
+        UAMI assign/action + compute-write CanPassIdentity primitive; this rule is
+        the ARM-deployment-specific framing (deploymentScripts/write as the
+        compute-write complement).  Both permissions are REQUIRED — neither alone
+        attaches the UAMI to the script.  Dedupes with
+        azure-assign-user-assigned-mi on (CanPassIdentity, ?principal, ?uami) when
+        both fire; emit once.
+      narrative: >-
+        {principal.name} can bind user-assigned MI {uami.name} to
+        deploymentScript {script.name} (assign/action on UAMI +
+        deploymentScripts/write); the ACI container will run as {uami.name},
+        executing attacker-controlled code as that identity.
+      derived_from:
+        - "identity-escalation.yaml: azure-assign-user-assigned-mi (general UAMI CanPassIdentity)"
+        - "<CanModifyCode edge on ?script>"
+
+  # === 5. deployments/write at broad scope + roleAssignments/write -> CanGrantPermission ===
+  # An ARM template submitted by a principal that ALREADY holds
+  # Microsoft.Authorization/roleAssignments/write at a subscription or management-group
+  # scope can include a roleAssignment resource granting any identity any role (including
+  # Owner). The target of this edge is ANY identity that can be granted a role at that
+  # scope (wildcard — the attacker can choose). This is a TEMPLATE-MEDIATED expression
+  # of the same capability that identity-escalation.yaml azure-role-assignment-write
+  # records directly; this rule emits the fact that a deployment CAN carry out the grant,
+  # letting the deploying principal use a template as the vehicle. The scope boundary
+  # is captured in the edge state/conditions; can-control.yaml control-boundary-via-iam-admin
+  # collapses CanGrantPermission at a boundary scope into Controls(boundary).
+  - id: azure-arm-deployment-role-assignment
+    emits: CanGrantPermission
+    description: "A deployment at subscription/MG scope whose deploying principal already holds roleAssignments/write can create role assignments (including Owner) for any identity via the template."
+    match_effective_permission:
+      action: "Microsoft.Authorization/roleAssignments/write"
+      scope_type: "subscription|managementGroup"
+    where:
+      - "principal also holds Microsoft.Resources/deployments/write at the same or broader scope"
+      - "the deployment scope is at subscription or management-group level (broad blast radius)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<any identity grantable a role at the subscription/MG scope>"
+      permissions:
+        - "Microsoft.Authorization/roleAssignments/write"
+        - "Microsoft.Resources/deployments/write"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal holds BOTH roleAssignments/write AND
+        deployments/write at the target scope and no deny assignment blocks either
+        action.  CONDITIONAL(scp_or_org_policy) if a management-group policy (e.g.
+        Azure Policy deny effect) blocks roleAssignments/write.  BLOCKED if a deny
+        assignment covers Microsoft.Authorization/roleAssignments/write.
+        Inherits weakest with contributing edges.
+      false_positive_note: >-
+        CITE identity-escalation.yaml azure-role-assignment-write as the baseline
+        — if the principal already directly holds Owner/User Access Administrator,
+        that rule already emits CanGrantPermission; this rule adds the DEPLOYMENT-
+        MEDIATED framing (the template as the vehicle).  The ARM engine does NOT
+        elevate beyond the calling principal's RBAC; a template referencing
+        roleAssignments/write submitted by a Contributor (who lacks that action)
+        fails at the ARM engine level — do NOT emit unless roleAssignments/write is
+        CONFIRMED effective on the principal.  Dedupes with azure-role-assignment-write
+        on (CanGrantPermission, ?principal, any); emit once. The target is WILDCARD
+        (any identity that can receive a role at this scope); the scope boundary
+        itself is the implicit objective.  can-control.yaml
+        control-boundary-via-iam-admin collapses CanGrantPermission at a boundary
+        scope into Controls(boundary) — cite, do not re-derive.
+      narrative: >-
+        {principal.name} holds Microsoft.Authorization/roleAssignments/write at
+        the subscription/management-group scope and can include a roleAssignment
+        resource in an ARM deployment to grant any identity (including itself) any
+        role at that scope — effective ownership of all resources in that boundary.
+      derived_from:
+        - "identity-escalation.yaml: azure-role-assignment-write (direct CanGrantPermission)"
+        - "<deployments/write effective permission at scope>"
+        - "can-control.yaml: control-boundary-via-iam-admin (CanGrantPermission at boundary => Controls — cited)"
+
+  # === 6. deployments/read -> CanReadSecret from deployment output values ======
+  # ARM deployment history persists the full template, parameters (except
+  # secureString/secureObject which are redacted), and OUTPUT values.  Template
+  # functions `listKeys()` (returns storage account primary/secondary keys),
+  # `listSecrets()`, and `reference()` with Key Vault secret integration resolve
+  # at deploy time and the results appear in the deployment output object.
+  # Any principal with deployments/read at the RG or subscription scope can
+  # retrieve these output values via:
+  #   az deployment group show -n <name> --query properties.outputs
+  # This is a data-plane credential harvest without touching the downstream
+  # service directly.
+  - id: azure-arm-deployment-outputs-secret
+    emits: CanReadSecret
+    description: "Principal with deployments/read can retrieve sensitive values (listKeys results, Key Vault references) stored in deployment output history."
+    match_effective_permission:
+      action: "Microsoft.Resources/deployments/read"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "at least one deployment in scope has output values carrying credential material"
+      - "(listKeys() / listSecrets() results, or reference() Key Vault secret inline values)"
+      - "output is NOT of secureString type (those are redacted in history)"
+    emit:
+      source_type: Identity
+      target_type: Secret
+      source: "<principal>"
+      target: "<secret / credential value in deployment output>"
+      permissions:
+        - "Microsoft.Resources/deployments/read"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds deployments/read AND the deployment output
+        contains unredacted credential material (listKeys result, raw connection string,
+        resolved Key Vault inline value written as a non-secure output type).
+        CONDITIONAL(iam_permission) when deployment output content has not been
+        confirmed to carry credentials — emit POTENTIAL(iam_permission) as a recon
+        flag and upgrade to ACTIVE when evidence confirms credential-bearing outputs.
+        BLOCKED if a deny assignment covers deployments/read.
+      false_positive_note: >-
+        secureString and secureObject typed outputs/parameters ARE redacted in
+        deployment history and the ARM API — do NOT emit CanReadSecret for those.
+        Only `listKeys()` results, inline plaintext connection strings, Key Vault
+        secret references whose value was materialized into a non-secure output, or
+        raw storage account keys surface as readable.  Collect and inspect the
+        `properties.outputs` map before emitting ACTIVE — if outputs are absent or
+        all typed secureString, do NOT emit.  credential-chains.yaml
+        read-secret-yields-identity collapses CanReadSecret + CredentialsFor(secret ->
+        identity) into CanImpersonate — cite, do not re-derive.
+      narrative: >-
+        {principal.name} holds deployments/read at {target.name}'s resource group
+        scope and can retrieve the deployment output, which contains credential
+        material (e.g. storage account keys from listKeys(), connection strings) —
+        an indirect credential harvest without direct access to the downstream service.
+      derived_from:
+        - "<deployments/read effective permission>"
+        - "credential-chains.yaml: read-secret-yields-identity (CanReadSecret + CredentialsFor => CanImpersonate — cited)"
+
+  # === 7. deployments/write -> CanTrigger on the deployment (submit / re-run) ==
+  # A principal that holds Microsoft.Resources/deployments/write can submit or
+  # re-run an ARM deployment at any time — effectively triggering the BuildWorker
+  # (the deployment object) to run its current or new template.  This is the
+  # CanTrigger fact consumed by cicd-chains rule 2
+  # (cicd-trigger-runner-executes-as) for the weaker "trigger-only" path.
+  # When combined with azure-arm-deploymentscript-write or azure-arm-templatespec-write
+  # (which give CanModifyCode), cicd-chains rule 1 fires with ACTIVE state.
+  - id: azure-arm-deployment-write-trigger
+    emits: CanTrigger
+    description: "Principal with deployments/write can submit or re-run a deployment, triggering the current template (including any deploymentScript resources) to execute."
+    match_effective_permission:
+      action: "Microsoft.Resources/deployments/write"
+      scope_type: "resource|resourceGroup|subscription|managementGroup"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<ARM deployment (BuildWorker)>"
+      permissions:
+        - "Microsoft.Resources/deployments/write"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds deployments/write at scope and no deny
+        assignment blocks it (the principal can submit a new deployment or re-deploy
+        an existing one at will).  cicd-chains rule 2 (cicd-trigger-runner-executes-as)
+        consumes this CanTrigger + the deployment's ExecutesAs(UAMI) to emit
+        CanExecuteAs CONDITIONAL(attacker_influenced_definition) — ACTIVE only if
+        the current template already contains attacker-controlled code.  When the
+        principal also holds CanModifyCode on the deployment (rules 1–2 above),
+        cicd-chains rule 1 fires with ACTIVE state (modify + trigger).
+        BLOCKED if a deny assignment covers deployments/write.
+      false_positive_note: >-
+        Triggering a deployment runs the CURRENT template as-is; this path only
+        yields CanExecuteAs(UAMI) if the current template ALREADY contains a
+        deploymentScript with attacker-influenced content (an existing script the
+        attacker previously modified, or a template spec version the attacker
+        already poisoned).  A clean, unmodified template with no deploymentScript
+        does not result in CanExecuteAs from triggering alone.  cicd-chains rule 2
+        keeps this CONDITIONAL by default; do not emit ACTIVE execute-as from trigger
+        alone unless attacker influence over the current template is established.
+      narrative: >-
+        {principal.name} can submit or re-run ARM deployment {target.name}
+        (deployments/write), triggering the current template to execute; if the
+        template contains a deploymentScript with attacker-influenced code (from a
+        prior poisoning), re-triggering the deployment runs that code as the UAMI
+        (cicd-chains cicd-trigger-runner-executes-as, CONDITIONAL unless attacker
+        influence over the current template is confirmed).
+      derived_from:
+        - "<deployments/write effective permission>"
+        - "cicd-chains: cicd-trigger-runner-executes-as (roll-up, CONDITIONAL — cited)"
+
+  # === 8. deploymentScript environment variables -> CanReadSecret ===============
+  # A deploymentScript's `environmentVariables` array carries values passed into
+  # the ACI container.  These may be plaintext credentials or Key Vault secret
+  # references that are resolved and injected into the container environment.
+  # Any principal that can READ the deploymentScript resource (deploymentScripts/read)
+  # can retrieve the `environmentVariables` array including plaintext values from
+  # the ARM resource definition. Key Vault references appear as opaque references
+  # at read-time (the resolved value is only available inside the running ACI
+  # container).  `secureValue` fields are redacted/masked in ARM GET responses and
+  # do NOT surface directly.  Only plaintext `value` fields carrying inline
+  # credentials are readable at the ARM API layer.
+  # More critically: the script's run output and logs are stored in a storage
+  # account whose name appears in the deploymentScript resource; principals with
+  # access to that storage account can read the full script log.
+  - id: azure-arm-deploymentscript-env-vars
+    emits: CanReadSecret
+    description: "Principal with deploymentScripts/read can retrieve plaintext values from the script's environmentVariables array if credentials are passed inline."
+    match_effective_permission:
+      action: "Microsoft.Resources/deploymentScripts/read"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "the deploymentScript resource has environmentVariables entries with plaintext value fields carrying credential material"
+      - "(not secureValue or Key Vault references — those are redacted/opaque)"
+    emit:
+      source_type: Identity
+      target_type: Secret
+      source: "<principal>"
+      target: "<credential / secret in deploymentScript environmentVariables>"
+      permissions:
+        - "Microsoft.Resources/deploymentScripts/read"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds deploymentScripts/read AND the
+        environmentVariables array contains plaintext credential values in `value`
+        fields (not Key Vault secret references, which are opaque at read-time; not
+        secureValue, which is redacted).  CONDITIONAL(iam_permission) if the content
+        of environmentVariables has not been confirmed to carry readable credentials.
+        BLOCKED if a deny assignment covers deploymentScripts/read.
+      false_positive_note: >-
+        `secureValue` fields are REDACTED in ARM GET responses per Azure documentation
+        and the ARM API does NOT return the value — they are masked like secureString
+        parameters. Do NOT emit CanReadSecret for secureValue entries from this rule;
+        only emit for confirmed plaintext `value` fields containing inline credential
+        strings.  Key Vault secret references in environmentVariables appear as opaque
+        references at ARM read-time (e.g., `/subscriptions/...`); the resolved secret
+        value is only available inside the running ACI container. Do NOT emit
+        CanReadSecret for KV-reference env vars from this rule.
+      narrative: >-
+        {principal.name} can read the deploymentScript {target.name} resource
+        definition (deploymentScripts/read) and retrieve plaintext credential values
+        stored in its environmentVariables array (plaintext `value` fields only) — an
+        indirect credential harvest if the script was configured with inline secrets.
+      derived_from:
+        - "<deploymentScripts/read effective permission>"
+        - "credential-chains.yaml: read-secret-yields-identity (cited for downstream pivot)"
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A deny assignment covering Microsoft.Resources/deploymentScripts/write or
+#    Microsoft.Resources/deployments/write at the relevant scope -> BLOCKED on
+#    the CanModifyCode or CanTrigger edges for that scope.
+#  - A deny assignment covering Microsoft.Authorization/roleAssignments/write ->
+#    BLOCKED on azure-arm-deployment-role-assignment.
+#  - A deny assignment covering Microsoft.Resources/deployments/read ->
+#    BLOCKED on azure-arm-deployment-outputs-secret.
+#  - deploymentStacks with denyAssignments set to `denyDelete` or `denyWriteAndDelete`
+#    on managed resources -> those specific resources have BLOCKED CanWrite/CanModify
+#    edges (persistence/lock mechanism; does not affect the deployment itself).
+#  - Azure Policy `deny` effect on the resource types above -> BLOCKED at the
+#    ARM request layer.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules for this service.
+# The full set belongs in /rules/explicit/azure-arm-deployments.yaml.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: azure-arm-deploymentscript-executes-as-uami-explicit
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Resources/deploymentScripts"
+      field: "identity.userAssignedIdentities"
+    where:
+      - "identity.userAssignedIdentities is non-empty (at least one UAMI named)"
+    emit:
+      source_type: Compute
+      target_type: ManagedIdentity
+      source: "<deploymentScript resource>"
+      target: "<each userAssignedIdentities key (UAMI resource id)>"
+      api_source: "az deployment-scripts show --resource-group <rg> --name <name>"
+      evidence_field: "identity.userAssignedIdentities"
+      narrative: "deploymentScript {script.name} runs its ACI container as UAMI {uami.name}."
+
+  - id: azure-arm-deploymentscript-uami-attached
+    emits: AttachedTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Resources/deploymentScripts"
+      field: "identity.userAssignedIdentities"
+    emit:
+      source_type: ManagedIdentity
+      target_type: Compute
+      source: "<user-assigned managed identity>"
+      target: "<deploymentScript resource>"
+      api_source: "az deployment-scripts show"
+      evidence_field: "identity.userAssignedIdentities"
+      narrative: "UAMI {uami.name} is attached to deploymentScript {script.name}."
+
+  - id: azure-arm-deployment-output-contains-secret
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Resources/deployments"
+      field: "properties.outputs"
+    where:
+      - "an output value is non-secureString type and carries credential material"
+      - "(listKeys() result, raw connection string, storage account key, etc.)"
+    emit:
+      source_type: Compute
+      target_type: Secret
+      source: "<deployment resource (BuildWorker)>"
+      target: "<credential value in output>"
+      api_source: "az deployment group show -n <name> --query properties.outputs"
+      evidence_field: "properties.outputs.<outputName>.value"
+      narrative: "ARM deployment {deployment.name} output contains credential material (listKeys result or plaintext connection string)."
+
+  - id: azure-arm-deploymentscript-env-secret
+    emits: ContainsCredential
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Resources/deploymentScripts"
+      field: "properties.environmentVariables"
+    where:
+      - "an environmentVariable entry has a plaintext value or secureValue carrying credential material"
+    emit:
+      source_type: Compute
+      target_type: Credential
+      source: "<deploymentScript resource>"
+      target: "<credential in environmentVariables>"
+      api_source: "az deployment-scripts show"
+      evidence_field: "properties.environmentVariables"
+      narrative: "deploymentScript {script.name} stores a credential in its environmentVariables array."

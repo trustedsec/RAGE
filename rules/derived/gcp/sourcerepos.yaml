@@ -1,0 +1,565 @@
+# GCP Cloud Source Repositories — Derived attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# Cloud Source Repositories (CSR) is a managed private Git service. It is a
+# SOURCE-CODE STORAGE NODE, not a compute surface. It does not execute AS any
+# identity. Its attack value is entirely through what it feeds:
+#
+#   (A) CanModifyCode(principal -> ArtifactRepository[CSR repo])
+#       via source.repos.update (push to a watched branch).
+#       cicd-chains::cicd-modify-buildspec-executes-as then collapses:
+#         CanModifyCode(repo) + ExecutesAs(build_worker, cloud_build_sa)
+#         => CanExecuteAs(principal -> cloud_build_sa)   [ACTIVE when run path exists]
+#
+#   (B) CanModifyCode reached via policy self-grant:
+#       source.repos.setIamPolicy -> self-bind roles/source.writer -> push.
+#       Two-step: gcp-sr-set-iam-policy (CanModifyPolicy) then
+#       gcp-sr-policy-self-grant-write (CanModifyCode).
+#
+#   (C) CanRead: source.repos.get -> clone; may surface ContainsSecret facts
+#       if committed credentials exist (credential-chains handles that pivot).
+#
+#   (D) CanModifyConfiguration: source.repos.updateRepoConfig unlocks branch
+#       protection or changes push rules, potentially upgrading a CONDITIONAL
+#       CanModifyCode (gated by branch protection) to ACTIVE.
+#
+#   (D2) CanModifyConfiguration (project-level): source.repos.updateProjectConfig
+#       controls project-wide CSR settings, including whether automatic Cloud Build
+#       triggers fire — a meta-gate on all CSR-triggered CI/CD paths.
+#
+#   (E) CrossProjectTrust on the repo IAM policy: cross-project SA granted
+#       source.repos.update can push and arm Cloud Build triggers in the
+#       hosting project (CanEnterProject via cicd-chains + can-control).
+#
+#   (F) TrustsExternalIdentity on the repo IAM policy: WIF principalSet/
+#       principal with source.repos.update lets an external OIDC workload
+#       (e.g. GitHub Actions) push without a long-lived key.
+#       federation-chains::federation-maps-to-identity consumes this.
+#
+# LINCHPIN CITATIONS — DO NOT RE-DERIVE:
+#   cicd-chains::cicd-modify-buildspec-executes-as
+#     INPUT: CanModifyCode(?p -> ?runner) + ExecutesAs(?runner -> ?identity)
+#     OUTPUT: CanExecuteAs(?p -> ?identity)
+#     This file emits CanModifyCode(principal -> CSR_repo); the Cloud Build
+#     trigger adapter emits ContainsResourceReference(trigger -> repo) so
+#     cicd-chains fans out through the trigger to the BuildWorker; the
+#     BuildWorker's ExecutesAs is Cloud Build's job.
+#     DO NOT emit CanExecuteAs directly from CSR rules.
+#
+#   cicd-chains::cicd-trigger-runner-executes-as
+#     INPUT: CanTrigger(?p -> ?runner) + ExecutesAs(?runner -> ?identity)
+#     OUTPUT: CanExecuteAs CONDITIONAL(attacker_influenced_definition)
+#     The push itself is the run path; no separate CanTrigger(principal->runner)
+#     needs to be emitted by CSR — the push IS the trigger arm.
+#
+#   can-control::escalate-via-execute-as
+#     INPUT: CanExecuteAs(?p -> ?identity) where privilege(identity) > privilege(p)
+#     OUTPUT: CanEscalateTo(?p -> ?identity)
+#     Not re-derived here.
+#
+#   can-control::control-via-admin
+#     INPUT: CanAdminister(?p -> ?repo)
+#     OUTPUT: Controls(?p -> ?repo)
+#     Not re-derived here.
+#
+#   gcp/identity-escalation::gcp-set-iam-policy-resource
+#     Covers the general resource-level setIamPolicy -> CanModifyPolicy.
+#     gcp-sr-set-iam-policy is the CSR-specific complement at repo scope.
+#
+#   federation-chains (federation-maps-to-identity, federate-then-enter-project)
+#     INPUT: TrustsExternalIdentity from gcp-sr-wif-writer-trust
+#            + ExternalIdentityMapsTo from gcp-wif.yaml
+#     OUTPUT: CanFederateAs -> CanEnterProject / CanImpersonate
+#     This file emits TrustsExternalIdentity; federation-chains owns the roll-up.
+#
+#   credential-chains::read-secret-yields-identity
+#     INPUT: CanReadSecret(?p -> ?secret) + CredentialsFor(?secret -> ?identity)
+#     OUTPUT: CanImpersonate(?p -> ?identity)
+#     CanRead(principal -> repo) + ContainsSecret(repo -> secret) feeds this;
+#     credential-chains does the collapse. Not re-derived here.
+#
+# PHASE-9 THEME (sourced from cicd-chains.yaml):
+#   A push to a watched branch = CanModifyCode into the runner the trigger
+#   arms. The runner ExecutesAs the Cloud Build SA. cicd-chains rolls up the
+#   full path. CSR emits the SOURCE-SIDE fact (push permission); Cloud Build
+#   emits the RUNNER-SIDE facts (ExecutesAs, trigger ContainsResourceReference).
+#
+# State propagation per RULE-FORMAT.md: a derived edge is never stronger than
+# its weakest contributor. CSR-specific state gates:
+#   * Branch protection / required reviewer (where CSR enforces it or the
+#     Cloud Build trigger has a branch filter): CanModifyCode CONDITIONAL.
+#   * VPC-SC perimeter enclosing sourcerepo.googleapis.com: API calls from
+#     outside the perimeter BLOCKED.
+#   * Project-level vs repo-level scope: project-level source.repos.update
+#     applies to ALL repos in the project; emit one CanModifyCode per repo.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 9-cicd-pipelines
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # A) Direct push: source.repos.update -> CanModifyCode on the repo
+  # ---------------------------------------------------------------------------
+  # THE core CSR fact. A principal with source.repos.update can push commits
+  # to a CSR repository, including to branches watched by a Cloud Build push
+  # trigger. cicd-chains::cicd-modify-buildspec-executes-as rolls up:
+  #   CanModifyCode(principal -> repo) + [Cloud Build trigger links repo to
+  #   BuildWorker] + ExecutesAs(BuildWorker -> CloudBuildSA) => CanExecuteAs.
+  - id: gcp-sr-push-is-code-modify
+    emits: CanModifyCode
+    description: "A principal with source.repos.update can push commits to the CSR repository, including a modified cloudbuild.yaml — the code-supply-chain write primitive that arms any Cloud Build push trigger watching the target branch."
+    match_effective_permission:
+      action: "source.repos.update"
+      resource_type: "google.sourcerepo.Repository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<CSR Repository in scope>"
+      permissions:
+        - "source.repos.update"
+      conditions: []
+      state_logic: >-
+        ACTIVE when source.repos.update is effective (not denied by IAM deny
+        policy) and the push target branch is unwatched or branch protection is
+        not enforced. CONDITIONAL(branch_protection) when the Cloud Build trigger
+        watches only a protected branch (e.g. main) that requires code review or
+        an admin merge before the push lands; in this case the attacker can push to
+        the repo but not to the branch the trigger fires on without additional
+        privilege. BLOCKED if an IAM deny policy denies source.repos.update or a
+        VPC-SC perimeter that includes sourcerepo.googleapis.com rejects the API
+        call from outside the perimeter. Inherit weakest from contributing role
+        binding. Project-level source.repos.update applies to ALL repos in the
+        project; emit one CanModifyCode per in-scope repository.
+      confidence: 0.95
+      derived_from:
+        - "effective permission: source.repos.update on <repo>"
+      false_positive_note: >-
+        Branch protection is the primary false-positive risk. CSR's native branch-
+        protection support is limited compared to GitHub; verify whether the Cloud
+        Build trigger filters to a specific branch ref and whether CSR enforces any
+        push restrictions (via IAM conditions or org policy) on that branch. A push
+        to a branch the trigger does NOT watch does not arm the trigger; scope
+        CanModifyCode to a branch the attacker can write AND the trigger watches.
+        VPC-SC enforcement (non-dry-run) on sourcerepo.googleapis.com blocks all
+        API calls from principals outside the perimeter; emit BLOCKED for those.
+        Do NOT emit CanExecuteAs here — cicd-chains owns that derivation via the
+        Cloud Build trigger's ContainsResourceReference(trigger -> repo) link.
+      narrative: >-
+        {principal.name} holds source.repos.update on repository {repo.name} and
+        can push commits to it, including a modified cloudbuild.yaml or build-spec
+        changes. Any Cloud Build push trigger watching the target branch will fire
+        and run the attacker-modified build definition as the Cloud Build service
+        account, yielding code execution with that SA's permissions.
+        cicd-chains::cicd-modify-buildspec-executes-as collapses this into
+        CanExecuteAs(principal -> CloudBuildSA) when the trigger+ExecutesAs chain
+        is present.
+
+  # ---------------------------------------------------------------------------
+  # B) setIamPolicy -> CanModifyPolicy on the repo's resource policy
+  # ---------------------------------------------------------------------------
+  - id: gcp-sr-set-iam-policy
+    emits: CanModifyPolicy
+    description: "source.repos.setIamPolicy grants full control over the repository's IAM allow policy — self-grant roles/source.writer, then push to arm Cloud Build triggers."
+    match_effective_permission:
+      action: "source.repos.setIamPolicy"
+      resource_type: "google.sourcerepo.Repository"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: "<principal>"
+      target: "<ResourcePolicy of the CSR repository>"
+      permissions:
+        - "source.repos.setIamPolicy"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the permission is effective. BLOCKED if an IAM deny policy
+        denies source.repos.setIamPolicy (e.g. from a project-wide deny policy)
+        or a VPC-SC perimeter rejects the API call. Inherit weakest from the
+        contributing role binding.
+      confidence: 0.95
+      derived_from:
+        - "effective permission: source.repos.setIamPolicy on <repo>"
+      false_positive_note: >-
+        setIamPolicy at project scope (resourcemanager.projects.setIamPolicy)
+        also implies CanModifyPolicy on the repo transitively via gcp/identity-
+        escalation::gcp-set-iam-policy-project. This rule covers the repo-level
+        setIamPolicy only. An IAM deny policy blocking setIamPolicy keeps this
+        BLOCKED regardless of what role bindings are present. The downstream
+        CanModifyCode consequence is derived by gcp-sr-policy-self-grant-write;
+        do not emit CanModifyCode here.
+      narrative: >-
+        {principal.name} can rewrite the IAM allow policy of repository
+        {repo.name} (source.repos.setIamPolicy), granting itself
+        roles/source.writer and then pushing a malicious commit to arm any
+        Cloud Build push trigger watching a branch in {repo.name}.
+
+  # ---------------------------------------------------------------------------
+  # B2) CanModifyPolicy -> CanModifyCode: self-grant writer then push
+  # ---------------------------------------------------------------------------
+  - id: gcp-sr-policy-self-grant-write
+    emits: CanModifyCode
+    description: "A principal that can set the repo IAM policy can self-grant roles/source.writer and then push commits — policy manipulation yields the same CanModifyCode as a direct writer binding."
+    match:
+      - [ ?principal, CanModifyPolicy, ?repo_policy ]
+    where:
+      - "?repo_policy is the ResourcePolicy of a CSR repository ?repo"
+      - "node_type(?repo) == ArtifactRepository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: ?principal
+      target: "<CSR repository whose ResourcePolicy is ?repo_policy>"
+      permissions:
+        - "source.repos.setIamPolicy"
+        - "source.repos.update"
+      conditions: [iam_permission]
+      state_logic: >-
+        CONDITIONAL(iam_permission): the self-grant step requires a successful
+        setIamPolicy call (ACTIVE setIamPolicy permission, no IAM deny overriding
+        it) followed by the push. If the CanModifyPolicy contributor is ACTIVE
+        (setIamPolicy not denied) the combined capability is effectively ACTIVE
+        (the self-grant is an in-band step). BLOCKED if setIamPolicy is BLOCKED
+        (IAM deny, VPC-SC). Inherit weakest from the contributing CanModifyPolicy.
+      confidence: 0.90
+      derived_from:
+        - "?principal CanModifyPolicy ?repo_policy (gcp-sr-set-iam-policy)"
+      false_positive_note: >-
+        The self-grant is a two-step action (setIamPolicy then push); both steps
+        must succeed under the effective IAM policy. An IAM deny blocking
+        setIamPolicy (e.g. an org-wide deny on source.repos.setIamPolicy) keeps
+        this BLOCKED regardless of the push permission. The CanModifyCode emitted
+        here is the same capability as gcp-sr-push-is-code-modify but reached via
+        policy manipulation; graph deduplication should treat them as the same
+        (CanModifyCode, ?principal, ?repo) edge — pick higher confidence, do not
+        double-count weight. cicd-chains fan-out applies equally.
+      narrative: >-
+        {principal.name} can set the IAM policy of {repo.name}
+        (source.repos.setIamPolicy), granting itself roles/source.writer, and then
+        push a modified cloudbuild.yaml or build-spec commit. Policy manipulation
+        yields the same CanModifyCode supply-chain write as a direct writer grant.
+
+  # ---------------------------------------------------------------------------
+  # C) source.repos.get -> CanRead on the repository
+  # ---------------------------------------------------------------------------
+  - id: gcp-sr-read-is-can-read
+    emits: CanRead
+    description: "source.repos.get (clone/read) grants read access to the full repository content, including any secrets committed to history and build-spec files that reveal SA references and deployment targets."
+    match_effective_permission:
+      action: "source.repos.get"
+      resource_type: "google.sourcerepo.Repository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<CSR repository in scope>"
+      permissions:
+        - "source.repos.get"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the permission is effective. BLOCKED if VPC-SC perimeter
+        enforced and principal project is outside it. Low attack value by itself;
+        primary path-finding value is for ContainsSecret + credential-chains
+        pivots and recon of build-spec SA references.
+      confidence: 0.80
+      derived_from:
+        - "effective permission: source.repos.get on <repo>"
+      false_positive_note: >-
+        Read alone is not escalation — do not include this edge in privilege-
+        escalation path queries without a ContainsSecret annotation on the repo.
+        The escalation consequence (CanReadSecret -> CredentialsFor -> CanImpersonate)
+        is credential-chains' job; this edge is the reachability fact.
+      narrative: >-
+        {principal.name} can clone (read) repository {repo.name}
+        (source.repos.get), including the full commit history and any secrets
+        accidentally committed. If the repo is annotated ContainsSecret, this
+        CanRead chains to CanReadSecret via credential-chains.
+
+  # ---------------------------------------------------------------------------
+  # D) source.repos.updateRepoConfig -> CanModifyConfiguration
+  # ---------------------------------------------------------------------------
+  - id: gcp-sr-repo-config-update
+    emits: CanModifyConfiguration
+    description: "source.repos.updateRepoConfig can relax branch-protection rules or change push configurations, potentially upgrading a CONDITIONAL CanModifyCode (gated by branch protection) to ACTIVE."
+    match_effective_permission:
+      action: "source.repos.updateRepoConfig"
+      resource_type: "google.sourcerepo.Repository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<CSR repository in scope>"
+      permissions:
+        - "source.repos.updateRepoConfig"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the permission is effective. The downstream consequence depends
+        on the current configuration: if the repo enforces branch-protection rules
+        that gate direct pushes to the branch a Cloud Build trigger watches,
+        removing those rules upgrades the CanModifyCode edge from
+        CONDITIONAL(branch_protection) to ACTIVE. BLOCKED if IAM deny or VPC-SC
+        prevents the call. Inherit weakest from contributing role binding.
+      confidence: 0.80
+      derived_from:
+        - "effective permission: source.repos.updateRepoConfig on <repo>"
+      false_positive_note: >-
+        CanModifyConfiguration on a repo does NOT itself push code; it is a
+        precondition that may unlock a subsequent push. CSR's native branch-
+        protection configuration is limited; verify whether the protection being
+        removed actually gates the build trigger's target branch before treating
+        the config change as a direct path to code execution. The escalation
+        consequence is still cicd-chains'; this edge only records the config
+        mutation capability.
+      narrative: >-
+        {principal.name} can update the configuration of repository {repo.name}
+        (source.repos.updateRepoConfig), for example relaxing branch-protection rules
+        to allow direct pushes to the branch a Cloud Build trigger watches —
+        upgrading a CONDITIONAL CanModifyCode to ACTIVE.
+
+  # ---------------------------------------------------------------------------
+  # D2) source.repos.updateProjectConfig -> CanModifyConfiguration (project scope)
+  # ---------------------------------------------------------------------------
+  - id: gcp-sr-project-config-update
+    emits: CanModifyConfiguration
+    description: "source.repos.updateProjectConfig controls project-wide CSR settings, including whether Cloud Build automatic triggers fire — a meta-gate on CSR-triggered CI/CD paths in the project."
+    match_effective_permission:
+      action: "source.repos.updateProjectConfig"
+      resource_type: "google.cloudresourcemanager.Project"
+    emit:
+      source_type: Identity
+      target_type: Project
+      source: "<principal>"
+      target: "<GCP Project containing CSR repositories>"
+      permissions:
+        - "source.repos.updateProjectConfig"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the permission is effective. This permission controls project-wide
+        CSR settings (auto-trigger enabling, push notification configuration). While it
+        does not directly push code, changing these settings can disable or re-enable
+        Cloud Build automatic triggers firing across all repositories in the project,
+        gating or enabling the entire CSR-to-Build CI/CD pathway. BLOCKED if IAM deny
+        or org policy prevents the call. Inherit weakest from contributing role binding.
+      confidence: 0.75
+      derived_from:
+        - "effective permission: source.repos.updateProjectConfig on <project>"
+      false_positive_note: >-
+        CanModifyConfiguration on a project does NOT itself push code or directly arm
+        any specific trigger; it is a meta-gate on whether triggers fire project-wide.
+        An attacker with this permission can disable Cloud Build auto-triggers,
+        preventing supply-chain CI/CD injection for a period (denial of service), or
+        re-enable them if they were disabled. Treat as a configuration mutation that
+        affects the gating of cicd-chains derivations at project scope. The downstream
+        escalation (code push → code execution) is still cicd-chains'; this edge only
+        records the project-config mutation capability.
+      narrative: >-
+        {principal.name} can update the project-wide configuration of Cloud Source
+        Repositories (source.repos.updateProjectConfig), including whether automatic
+        Cloud Build triggers fire across all repositories in {project.name}. Modifying
+        this setting can disable or re-enable the entire CSR-triggered CI/CD pathway,
+        affecting the attack surface of all CSR repositories in the project.
+
+  # ---------------------------------------------------------------------------
+  # E) CanAdminister: full repo admin (setIamPolicy + update + get + list)
+  # ---------------------------------------------------------------------------
+  - id: gcp-sr-admin
+    emits: CanAdminister
+    description: "roles/source.admin grants full control over a CSR repository, including push, IAM policy mutation, and deletion — implies CanModifyCode, CanModifyPolicy, CanRead, and CanModifyConfiguration."
+    match_effective_permission:
+      action: "source.repos.setIamPolicy"
+      resource_type: "google.sourcerepo.Repository"
+    where:
+      - "principal also holds source.repos.update AND source.repos.get on the same repository (i.e. roles/source.admin, not setIamPolicy alone)"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<CSR repository in scope>"
+      permissions:
+        - "source.repos.get"
+        - "source.repos.list"
+        - "source.repos.update"
+        - "source.repos.setIamPolicy"
+        - "source.repos.getIamPolicy"
+        - "source.repos.updateRepoConfig"
+        - "source.repos.delete"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the combined set of admin permissions is effective. BLOCKED if
+        an IAM deny policy denies any of the key permissions. Inherits weakest from
+        contributing role binding. can-control::control-via-admin produces
+        Controls(?principal -> ?repo) from this edge — not re-derived here.
+      confidence: 0.95
+      derived_from:
+        - "effective roles/source.admin on <repo>"
+      false_positive_note: >-
+        setIamPolicy alone (without update + get) is CanModifyPolicy, not
+        CanAdminister. Verify the full permission set is granted before emitting
+        CanAdminister. roles/source.admin at project scope covers ALL repos;
+        emit CanAdminister per repository.
+      narrative: >-
+        {principal.name} has full administrative control over repository {repo.name}
+        (roles/source.admin): can clone, push, set IAM policy, update configuration,
+        and delete the repository. This implies CanModifyCode, CanModifyPolicy,
+        CanRead, and CanModifyConfiguration on {repo.name}.
+
+  # ---------------------------------------------------------------------------
+  # F) Cross-project push: CrossProjectTrust on the repo ResourcePolicy
+  # ---------------------------------------------------------------------------
+  - id: gcp-sr-cross-project-writer
+    emits: CrossProjectTrust
+    description: "A CSR repo IAM binding that grants source.repos.update to a service account from a different GCP project establishes cross-project trust — that SA can push to this project's repository and arm Cloud Build triggers."
+    match:
+      - [ ?repo, HasPolicy, ?repo_policy ]
+    where:
+      - "?repo is a CSR ArtifactRepository"
+      - "?repo_policy is a ResourcePolicy of the CSR repository"
+      - "?repo_policy has an IAM binding for a ServiceAccount from a DIFFERENT GCP project (member is serviceAccount:*@<other-project>.iam.gserviceaccount.com)"
+      - "the binding role or permissions include source.repos.update"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: ?repo_policy
+      target: "<GCP project of the external ServiceAccount>"
+      permissions:
+        - "source.repos.update"
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the IAM binding is present, the role includes
+        source.repos.update, and no IAM deny policy overrides it. CONDITIONAL
+        (resource_policy) if the binding has an IAM condition expression that
+        may not be satisfied. BLOCKED if a VPC-SC perimeter rejects the cross-
+        project API call or an org policy restricts cross-project resource sharing.
+        Inherit weakest from the binding's effective state.
+      confidence: 0.90
+      derived_from:
+        - "IAM binding on ?repo_policy: <external SA> has source.repos.update"
+      false_positive_note: >-
+        The cross-project SA must be usable by a principal the attacker controls
+        — this trust edge models the repo's posture, not that the SA is compromised.
+        Path-finding chains this CrossProjectTrust to the SA's home project; only
+        if a principal there can act as the SA (actAs or direct key) does the push
+        materialize. Verify the SA is not a Google-managed service agent (those
+        have restricted actAs surfaces).
+      narrative: >-
+        Repository {repo.name} (project {repo.project}) grants source.repos.update
+        to service account {sa.name} from project {sa.project}. A principal that
+        can act as {sa.name} can push commits to {repo.name}, arming any Cloud
+        Build push trigger watching a target branch in {repo.project}.
+
+  # ---------------------------------------------------------------------------
+  # G) WIF / external identity push: TrustsExternalIdentity on the repo policy
+  # ---------------------------------------------------------------------------
+  - id: gcp-sr-wif-writer-trust
+    emits: TrustsExternalIdentity
+    description: "A CSR repo IAM binding for a WIF principalSet/principal with source.repos.update grants an external OIDC identity (e.g. GitHub Actions) direct push access without any long-lived GCP key — supply-chain injection from external CI."
+    match:
+      - [ ?repo, HasPolicy, ?repo_policy ]
+    where:
+      - "?repo is a CSR ArtifactRepository"
+      - "?repo_policy is a ResourcePolicy of the CSR repository"
+      - "?repo_policy has an IAM binding for a WIF principal (member starts with principalSet://iam.googleapis.com/ or principal://iam.googleapis.com/)"
+      - "the binding role or permissions include source.repos.update"
+    emit:
+      source_type: ResourcePolicy
+      target_type: FederatedIdentity
+      source: ?repo_policy
+      target: "<FederatedIdentity / WIF principalSet or principal>"
+      permissions:
+        - "source.repos.update"
+      conditions: [trust_relationship, condition_expression]
+      state_logic: >-
+        ACTIVE when the WIF binding attribute condition is BROAD or UNPINNED —
+        the external assertion is easily satisfied (principalSet covers all pool
+        identities, no specific subject constraint). CONDITIONAL(trust_relationship)
+        when pinned to a specific external subject (e.g. a specific GitHub repo +
+        branch ref), because the attacker must control a matching identity.
+        BLOCKED if the WIF pool is disabled. Inherit weakest from the pool's
+        trust posture. federation-chains::federation-maps-to-identity consumes
+        this TrustsExternalIdentity + ExternalIdentityMapsTo to derive
+        CanFederateAs -> CanEnterProject.
+      confidence: 0.85
+      derived_from:
+        - "IAM binding on ?repo_policy: WIF principalSet/principal has source.repos.update"
+        - "federation-chains::federation-maps-to-identity (for CanFederateAs consequence)"
+      false_positive_note: >-
+        The strength depends entirely on the WIF attribute condition. A
+        principalSet mapping google.subject == 'repo:org/repo:ref:refs/heads/main'
+        is CONDITIONAL — the attacker must push code to that branch in that repo.
+        A principalSet covering all pool identities (no attribute condition) is
+        ACTIVE. Cite federation-chains for the CanFederateAs -> CanEnterProject
+        roll-up; do not re-derive it here.
+      narrative: >-
+        Repository {repo.name} grants source.repos.update to WIF identity
+        {ext_identity.name}; an external OIDC workload (e.g. GitHub Actions)
+        satisfying the attribute condition can push commits directly to {repo.name}
+        without any GCP service account key — supply-chain injection from external
+        CI into any Cloud Build trigger watching a branch in {repo.name}.
+        federation-chains rolls up the CanFederateAs and CanEnterProject
+        consequences.
+
+# ---------------------------------------------------------------------------
+# LINCHPIN CITATIONS — rules NOT re-derived here (consume their outputs):
+#
+#   cicd-chains::cicd-modify-buildspec-executes-as
+#     INPUT: CanModifyCode(?principal -> ?repo) from gcp-sr-push-is-code-modify
+#            or gcp-sr-policy-self-grant-write;
+#            the Cloud Build trigger adapter emits ContainsResourceReference
+#            (trigger -> repo) so the CSR CanModifyCode fans out through the
+#            trigger to the BuildWorker; the BuildWorker ExecutesAs CloudBuildSA.
+#     OUTPUT: CanExecuteAs(?principal -> ?CloudBuildSA)
+#     This file provides CanModifyCode(repo); Cloud Build normalization provides
+#     ExecutesAs(BuildWorker, SA). cicd-chains owns the collapse.
+#
+#   cicd-chains::cicd-trigger-runner-executes-as
+#     Not a primary CSR path — the push itself arms the trigger's run path;
+#     no separate CanTrigger(principal -> runner) is emitted by CSR.
+#
+#   can-control::escalate-via-execute-as
+#     INPUT: CanExecuteAs(?p -> ?SA) where SA privilege > p privilege
+#     OUTPUT: CanEscalateTo(?p -> ?SA)
+#     Not re-derived here.
+#
+#   can-control::control-via-admin
+#     INPUT: CanAdminister(?p -> ?repo) from gcp-sr-admin
+#     OUTPUT: Controls(?p -> ?repo)
+#     Not re-derived here.
+#
+#   gcp/identity-escalation::gcp-set-iam-policy-resource
+#     Covers the general resource setIamPolicy -> CanModifyPolicy derivation.
+#     gcp-sr-set-iam-policy is the CSR-specific complement.
+#
+#   federation-chains (federation-maps-to-identity, federate-then-enter-project)
+#     INPUT: TrustsExternalIdentity from gcp-sr-wif-writer-trust
+#            + ExternalIdentityMapsTo from gcp-wif.yaml
+#     OUTPUT: CanFederateAs -> CanEnterProject / CanImpersonate
+#     This file emits TrustsExternalIdentity; federation-chains owns the roll-up.
+#
+#   credential-chains::read-secret-yields-identity
+#     INPUT: CanRead(?p -> ?repo) + ContainsSecret(?repo -> ?secret) =>
+#            CanReadSecret(?p -> ?secret) + CredentialsFor(?secret -> ?identity)
+#     OUTPUT: CanImpersonate(?p -> ?identity)
+#     CanRead here (gcp-sr-read-is-can-read) feeds that chain when the repo
+#     has a ContainsSecret annotation. credential-chains owns the collapse.
+#
+#   hierarchy-chains (guardrail-removal for VPC-SC perimeter)
+#     A principal with CanModifyPolicy on the VPC-SC perimeter definition can
+#     remove sourcerepo.googleapis.com from the perimeter, transitioning BLOCKED
+#     push edges to ACTIVE. hierarchy-chains models that path; this file only
+#     records the BLOCKED state gate on perimeter-restricted API calls.
+#
+# BLOCKED-edge guidance:
+#   - IAM deny policy denying source.repos.update on the repo or project ->
+#     gcp-sr-push-is-code-modify BLOCKED.
+#   - IAM deny policy denying source.repos.setIamPolicy ->
+#     gcp-sr-set-iam-policy BLOCKED; gcp-sr-policy-self-grant-write BLOCKED.
+#   - VPC-SC perimeter (non-dry-run) enclosing sourcerepo.googleapis.com and
+#     principal project NOT in the perimeter -> all CSR API calls BLOCKED for
+#     that principal.
+#   - Cloud Build trigger branch filter excludes the attacker's push target ->
+#     CanModifyCode CONDITIONAL(branch_protection) for that trigger path.
+#   - Branch-protection rules in CSR requiring code review on the watched branch ->
+#     CanModifyCode CONDITIONAL(branch_protection) until protection is removed.
+# ---------------------------------------------------------------------------

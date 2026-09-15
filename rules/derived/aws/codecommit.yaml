@@ -1,0 +1,313 @@
+# AWS CodeCommit — Derived attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# CodeCommit is a managed Git service. It does NOT execute code itself and has
+# no ExecutesAs edge. Its entire attack value is as a supply-chain PIVOT:
+# writing to the branch a downstream CodeBuild project or CodePipeline tracks
+# = CanModifyCode on the runner (BuildWorker) that consumes that source. The
+# cicd-chains linchpin then collapses:
+#   CanModifyCode(?runner) + ExecutesAs(?runner -> ?role) => CanExecuteAs(?p -> ?role)
+#
+# Rules here emit the FACTS (CanModifyCode, CrossAccountTrust, CanModifyPolicy)
+# off CodeCommit-specific permission patterns and let cicd-chains / can-control /
+# credential-chains do all the roll-ups (CanExecuteAs, CanEscalateTo, CanEnterAccount).
+#
+# Permissions are EXACT action names from the AWS CodeCommit Service Authorization
+# Reference (prefix `codecommit`). No action names are invented.
+# Ref: https://docs.aws.amazon.com/codecommit/latest/userguide/auth-and-access-control-permissions-reference.html
+#
+# State defaults ACTIVE; an unmet listed condition yields CONDITIONAL/POTENTIAL;
+# an SCP/permission-boundary/explicit deny yields BLOCKED.
+#
+# CITED LINCHPINS (do not re-derive):
+#   cicd-chains.yaml         — cicd-modify-buildspec-executes-as (rules 1 & 2)
+#   can-control.yaml         — escalate-via-execute-as, enter-account-via-assume
+#   credential-chains.yaml   — read-secret-yields-identity (for ContainsSecret paths)
+#   federation-chains.yaml   — for any external CI OIDC trust over this repo
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-pipelines
+applies_to: [aws]
+
+rules:
+
+  # --- 1) GitPush to tracked branch -> CanModifyCode on consuming BuildWorker ---
+  # The primary CodeCommit escalation primitive. Any identity that can push to the
+  # branch a CodeBuild project or CodePipeline stage watches effectively controls the
+  # build definition executed by that runner. cicd-chains collapses this into
+  # CanExecuteAs the runner's service role.
+  #
+  # BRANCH-SCOPE DISCIPLINE: the push permission may be restricted to specific Git
+  # refs via the `codecommit:References` IAM condition key. Only emit when the
+  # effective push scope OVERLAPS the branch the runner tracks (see false_positive_note).
+  - id: aws-cc-can-modify-code-gitpush
+    emits: CanModifyCode
+    description: "GitPush to the branch a downstream CodeBuild project or CodePipeline stage tracks gives the attacker code-injection into that runner's execution."
+    match:
+      - [ ?principal, HasPermission, ?repo ]
+    where:
+      - "node_type(?repo) == ArtifactRepository"
+      - "?repo.provider_type == 'AWS::CodeCommit::Repository'"
+      - "effective permission includes codecommit:GitPush on ?repo ARN for ?principal"
+      - "exists a BuildWorker ?runner whose source is ?repo AND whose tracked branch intersects the effective push scope of ?principal (accounting for codecommit:References condition; if the condition restricts refs to branches the runner does NOT track, do not emit)"
+    optional:
+      # A push webhook on the CodeBuild project fires a build automatically on the
+      # push event — makes the resulting cicd-chains execute-as ACTIVE without a
+      # separate CanTrigger from the attacker. The webhook is represented as a
+      # CanTrigger edge from the repo to the runner (repo CanTrigger runner).
+      - [ ?repo, CanTrigger, ?runner ]   # webhook or EventBridge rule auto-triggers ?runner on push to ?repo
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: ?runner
+      permissions: ["codecommit:GitPush"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when effective codecommit:GitPush covers the tracked branch (no
+        codecommit:References condition, or the condition includes the tracked branch ref)
+        AND the runner exists and sources from ?repo.
+        CONDITIONAL(iam_permission) when the push scope only partially overlaps the
+        tracked branch (e.g. a wildcard ref filter on the runner may or may not match
+        the push ref — requires runtime evaluation).
+        BLOCKED when an SCP or permission boundary denies codecommit:GitPush, or when
+        the codecommit:References condition on the grant explicitly excludes the tracked
+        branch ref.
+      confidence: 0.95
+      derived_from: ["effective codecommit:GitPush on ?repo", "?runner source binding to ?repo branch"]
+      false_positive_note: >-
+        CRITICAL: honor the codecommit:References IAM condition. A push grant scoped to
+        refs/heads/feature/* does NOT reach refs/heads/main — do not emit CanModifyCode
+        on a runner tracking main if the attacker can only push to feature branches.
+        Resolve the branch intersection: collect the runner's tracked branch (CodeBuild:
+        source.branchName or webhook filterGroups branch filter; CodePipeline: source
+        action configuration BranchName) and the principal's effective push ref scope
+        (from codecommit:References condition on the grant) before emitting. If the
+        branch is protected by an approval rule (merge-gate; see rule 3) the DIRECT push
+        path may be blocked but the PR-merge path still exists — keep them separate rules.
+        A principal with only codecommit:GitPull (no GitPush) is CanReadData, not
+        CanModifyCode.
+      narrative: >-
+        {principal.name} can push commits to {repo.name} (codecommit:GitPush) on the
+        branch that {runner.name} tracks; a push injects attacker-controlled code that
+        runs as {runner.name}'s service role on the next build (cicd-chains rolls up to
+        CanExecuteAs).
+
+  # --- 2) PutFile to tracked branch -> CanModifyCode on consuming BuildWorker ----
+  # codecommit:PutFile is a REST API action (distinct from Git protocol GitPush)
+  # that writes or updates a single file in a branch. Many broad `codecommit:Put*`
+  # policies grant it. Functionally equivalent to a single-file GitPush for
+  # buildspec injection; the same downstream effect applies.
+  - id: aws-cc-can-modify-code-putfile
+    emits: CanModifyCode
+    description: "PutFile to the branch a downstream runner tracks injects a single-file change (e.g. buildspec.yml) into the pipeline's build."
+    match:
+      - [ ?principal, HasPermission, ?repo ]
+    where:
+      - "node_type(?repo) == ArtifactRepository"
+      - "?repo.provider_type == 'AWS::CodeCommit::Repository'"
+      - "effective permission includes codecommit:PutFile on ?repo ARN for ?principal"
+      - "exists a BuildWorker ?runner whose source is ?repo AND whose tracked branch intersects the effective file-write scope of ?principal"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: ?runner
+      permissions: ["codecommit:PutFile"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when codecommit:PutFile is effective on ?repo for the tracked branch.
+        Downgrade to CONDITIONAL(iam_permission) when the branch scope is ambiguous.
+        BLOCKED when an SCP or boundary denies codecommit:PutFile.
+      confidence: 0.92
+      derived_from: ["effective codecommit:PutFile on ?repo", "?runner source binding to ?repo branch"]
+      false_positive_note: >-
+        Honor codecommit:References condition analogously to rule 1. PutFile operates
+        one file at a time via the REST API; it cannot push multiple files in one
+        operation, but a single buildspec.yml change is sufficient for code injection.
+        Some policies grant codecommit:Put* (star) which includes PutFile; confirm the
+        exact action is in scope. This rule dedupes with aws-cc-can-modify-code-gitpush
+        on (CanModifyCode, ?principal, ?runner) — emit once with the highest-confidence
+        permission when a principal holds both GitPush and PutFile.
+      narrative: >-
+        {principal.name} can write files to {repo.name} (codecommit:PutFile) on the
+        branch that {runner.name} tracks; writing a malicious buildspec or source file
+        injects attacker-controlled code into {runner.name}'s next build.
+
+  # --- 3) Override approval rules + merge -> CanModifyCode via PR merge ---------
+  # CodeCommit approval rule templates are the "branch protection" equivalent. A
+  # principal who can both override approval rules on a PR and merge it can bypass
+  # the human-review gate and inject attacker-authored code from a PR branch into
+  # the protected target (main/master) branch — without any direct push permission.
+  #
+  # This is CONDITIONAL by default: the attacker must first create a PR (from a
+  # branch they control), then override the approval rules, then merge. The full
+  # path requires codecommit:CreatePullRequest (or an existing PR from an
+  # attacker-controlled branch) + codecommit:OverridePullRequestApprovalRules +
+  # one of the merge actions. Without all three, this is POTENTIAL at best.
+  - id: aws-cc-can-modify-code-pr-override
+    emits: CanModifyCode
+    description: "Overriding PR approval rules and merging an attacker-authored PR branch into the tracked branch bypasses the branch-protection gate and injects code into the pipeline."
+    match:
+      - [ ?principal, HasPermission, ?repo ]
+    where:
+      - "node_type(?repo) == ArtifactRepository"
+      - "?repo.provider_type == 'AWS::CodeCommit::Repository'"
+      - "effective permission includes codecommit:CreatePullRequest on ?repo ARN for ?principal"
+      - "effective permission includes codecommit:OverridePullRequestApprovalRules on ?repo ARN for ?principal"
+      - "effective permission includes at least one of [codecommit:MergePullRequestByFastForward, codecommit:MergePullRequestBySquash, codecommit:MergePullRequestByThreeWay] on ?repo ARN for ?principal"
+      - "exists a BuildWorker ?runner whose source is ?repo AND whose tracked branch is a merge target accessible to a PR the attacker could create (e.g. main/master is the CodePipeline source branch)"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: ?runner
+      permissions: ["codecommit:CreatePullRequest", "codecommit:OverridePullRequestApprovalRules", "codecommit:MergePullRequestByFastForward|codecommit:MergePullRequestBySquash|codecommit:MergePullRequestByThreeWay"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when all three capabilities are confirmed effective: codecommit:CreatePullRequest,
+        codecommit:OverridePullRequestApprovalRules, and at least one merge action
+        (MergePullRequestByFastForward, MergePullRequestBySquash, or MergePullRequestByThreeWay).
+        CONDITIONAL(iam_permission) if only override + merge are present but CreatePullRequest
+        is missing (attacker cannot create PR with malicious content). POTENTIAL when the
+        attacker holds override + merge but cannot confirm control of a source PR branch.
+        BLOCKED when an SCP or boundary denies any of the required actions.
+      confidence: 0.80
+      derived_from: ["effective codecommit:CreatePullRequest on ?repo", "effective codecommit:OverridePullRequestApprovalRules on ?repo", "effective merge permission on ?repo", "?runner source binding to tracked branch"]
+      false_positive_note: >-
+        This is strictly a multi-step path: (1) attacker can create a pull request (CreatePullRequest),
+        (2) attacker can override approval rules (OverridePullRequestApprovalRules),
+        (3) attacker can merge via one of the three merge actions. Do NOT emit ACTIVE unless
+        all three capabilities are confirmed. The permissions field enumerates the union of
+        possible merge actions — record the specific merge action(s) the principal holds.
+        Confidence is lower (0.80) than direct GitPush because of the multi-step path and
+        the requirement for CreatePullRequest + override + merge simultaneity.
+      narrative: >-
+        {principal.name} can create a pull request, override approval rules, and merge
+        (one of: codecommit:MergePullRequestByFastForward, MergePullRequestBySquash,
+        MergePullRequestByThreeWay) on {repo.name}, bypassing the required reviewers and
+        injecting attacker-controlled code into the branch that {runner.name} tracks.
+
+  # --- 5) Cross-account push grant in resource policy -> cross-account CanModifyCode
+  # A CodeCommit repository resource policy that grants codecommit:GitPush to a
+  # principal in a different account creates a CrossAccountTrust. Combined with a
+  # downstream pipeline in the repository-owning account that tracks the pushed
+  # branch, the cross-account push = cross-account supply-chain code injection.
+  # This makes the external principal a CanModifyCode contributor and, via
+  # cicd-chains, can yield CanEnterAccount in the owning account.
+  - id: aws-cc-cross-account-push-code-inject
+    emits: CanModifyCode
+    description: "A cross-account GitPush grant in the repository resource policy lets an external principal inject code into pipelines in the repository-owning account."
+    match:
+      - [ ?ext_principal, HasPermission, ?repo ]
+    where:
+      - "node_type(?repo) == ArtifactRepository"
+      - "?repo.provider_type == 'AWS::CodeCommit::Repository'"
+      - "?ext_principal.account != ?repo.account  # cross-account"
+      - "effective permission includes codecommit:GitPush on ?repo ARN for ?ext_principal (from resource policy + caller IAM policy, dual-policy eval)"
+      - "exists a BuildWorker ?runner in ?repo.account whose source is ?repo AND tracked branch intersects the push scope"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?ext_principal
+      target: ?runner
+      permissions: ["codecommit:GitPush"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        CONDITIONAL(iam_permission, resource_policy) by default: cross-account access
+        requires BOTH the resource policy grant (in the repo-owning account) AND an IAM
+        policy grant in the caller's own account. Confirm both sides before upgrading to
+        ACTIVE. BLOCKED when either side is denied (SCP in the repo account denying
+        cross-account push, or no matching IAM grant in the caller account).
+      confidence: 0.88
+      derived_from: ["codecommit:GitPush effective via resource policy (cross-account)", "?runner source binding to ?repo branch"]
+      false_positive_note: >-
+        Cross-account CodeCommit access uses standard dual-policy evaluation: the
+        resource policy in the repository-owning account + an IAM policy in the calling
+        principal's account must both allow the action. Confirm the IAM side before
+        emitting ACTIVE. Honor codecommit:References conditions on either policy side.
+        This rule emits CanModifyCode (not CrossAccountTrust) because it is the
+        CanModifyCode FACT — the CrossAccountTrust explicit edge is separately emitted by
+        the explicit normalization rules (aws-codecommit.yaml, rule cross-account-policy).
+        cicd-chains then collapses the resulting CanModifyCode + ExecutesAs into
+        CanExecuteAs, and can-control produces CanEnterAccount for the owning account.
+      narrative: >-
+        {ext_principal.name} (account {ext_principal.account}) has codecommit:GitPush on
+        {repo.name} via its resource policy; pushing to the branch {runner.name} tracks
+        injects attacker code into {runner.name}'s build, running as {runner.name}'s
+        service role in account {repo.account}.
+
+  # --- 6) GitPull (read-only) -> CanReadData on the repository ------------------
+  # A principal with codecommit:GitPull or codecommit:GetFile can read all repository
+  # content. This enables (a) reconnaissance of the build system, (b) harvesting of
+  # hardcoded secrets if the repository contains committed credentials. This is
+  # NOT CanModifyCode; it is CanReadData. The credential-harvest path uses the
+  # credential-chains linchpin: ContainsSecret(repo -> secret) + CanReadData =>
+  # CanReadSecret (per credential-chains execute-then-read-secret analogue) =>
+  # CredentialsFor => CanImpersonate.
+  - id: aws-cc-can-read-data
+    emits: CanReadData
+    description: "GitPull or GetFile lets a principal read the full repository content, potentially harvesting secrets committed to source code."
+    match:
+      - [ ?principal, HasPermission, ?repo ]
+    where:
+      - "node_type(?repo) == ArtifactRepository"
+      - "?repo.provider_type == 'AWS::CodeCommit::Repository'"
+      - "effective permission includes codecommit:GitPull OR codecommit:GetFile on ?repo ARN for ?principal"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: ?principal
+      target: ?repo
+      permissions: ["codecommit:GitPull", "codecommit:GetFile", "codecommit:GetFolder"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when effective codecommit:GitPull, codecommit:GetFile, or codecommit:GetFolder
+        is confirmed on ?repo ARN. BLOCKED when denied by SCP or boundary.
+      confidence: 0.90
+      derived_from: ["effective codecommit:GitPull, codecommit:GetFile, or codecommit:GetFolder on ?repo"]
+      false_positive_note: >-
+        CanReadData on the repository is low-severity on its own; its attack value comes
+        from ContainsSecret edges (analyst-populated or SIEM-identified hardcoded
+        credentials) and reconnaissance value (build system topology, downstream service
+        ARNs in buildspec files). Do not conflate with CanModifyCode — read-only access
+        cannot inject code. The credential-chains linchpin handles the
+        ContainsSecret -> CanReadSecret -> CredentialsFor -> CanImpersonate chain; do
+        not re-derive it here. All three actions (GitPull, GetFile, GetFolder) yield
+        CanReadData; emit edge with the effective permission(s) from the principal's grant.
+      narrative: >-
+        {principal.name} can read the contents of {repo.name} via codecommit:GitPull,
+        codecommit:GetFile, or codecommit:GetFolder, which may expose build system
+        configuration or secrets committed to source code.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying codecommit:GitPush / codecommit:PutFile at the org or OU
+#     level -> rules 1/2 BLOCKED.
+#   - A codecommit:References IAM condition that excludes the tracked branch ref ->
+#     rule 1/2 BLOCKED for that specific runner (the branch scope does not overlap).
+#   - An SCP or policy boundary denying codecommit:SetRepositoryPolicy -> rule 4 BLOCKED.
+#   - A VPC endpoint requirement (aws:SourceVpc/SourceVpce condition) on the repo
+#     policy -> CONDITIONAL(network_reachability) unless the caller is inside the VPC.
+#   - codecommit:OverridePullRequestApprovalRules denied by SCP -> rule 3 BLOCKED.
+#   - Cross-account dual-policy not satisfied (resource policy grants push but no IAM
+#     policy in caller account) -> rule 5 CONDITIONAL(iam_permission), not ACTIVE.
+#
+# ESCALATION ROLL-UP (cite, do not re-derive):
+#   CanModifyCode(Identity -> BuildWorker)                      [rules 1-3, 5]
+#     + ExecutesAs(BuildWorker -> Role)                         [explicit normalization]
+#     => CanExecuteAs(Identity -> Role)                         [cicd-chains: cicd-modify-buildspec-executes-as]
+#     + privilege(Role) > privilege(Identity)
+#     => CanEscalateTo(Identity -> Role)                        [can-control: escalate-via-execute-as]
+#
+#   cross-account CanExecuteAs(ext -> role_in_repo_account)
+#     => CanEnterAccount(ext -> repo_account)                   [can-control: enter-account-via-assume analogue]
+#
+#   ContainsSecret(repo -> secret) + CanReadData(Identity -> repo)
+#     (analyst populates ContainsSecret; credential-chains handles the rest)
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw config -> explicit edges) live in
+# /rules/explicit/aws-codecommit.yaml. These rules supply structural binding facts
+# and cross-account trust facts that the derived rules above consume. Do not duplicate
+# explicit rules here; keep them in /rules/explicit/aws-codecommit.yaml only.

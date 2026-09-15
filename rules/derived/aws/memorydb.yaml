@@ -1,0 +1,618 @@
+# AWS MemoryDB — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Amazon MemoryDB for Redis is a fully managed, durable, in-memory Redis-
+# compatible database. All clusters are VPC-only — there are no public
+# endpoints. Data-plane access (Redis commands) is authenticated via ACL users
+# (username + password over TLS), NOT by IAM.
+#
+# THE CRITICAL IAM/DATA-PLANE AUTH SPLIT — governs every rule in this file:
+#   * memorydb:* actions control the CONTROL PLANE only (cluster lifecycle,
+#     ACL/user CRUD, snapshot management). IAM does not authenticate Redis
+#     wire-protocol connections.
+#   * Redis data-plane access uses ACL user credentials (username + password).
+#   * MemoryDB does NOT support resource-based policies; no cross-account
+#     grant surface exists on clusters (no CrossAccountTrust edges).
+#   * Clusters are always VPC-private; ExposedToInternet NEVER applies.
+#
+# PHASE-6 ATTACK SURFACE (conservative — low relevance service):
+#   Rule A: IAM principal with memorydb:UpdateUser resets an ACL user password
+#           -> if the principal also has VPC network reach, can authenticate
+#           to the Redis data plane and read/write cluster data.
+#           => CanReadData(principal -> cluster) CONDITIONAL(network_reachability)
+#   Rule B: Compute node with VPC network reach to the cluster endpoint plus
+#           an ACL credential (in-scope: the application normally holds this)
+#           => CanReadData(Compute -> cluster) as a general VPC-reach pattern.
+#
+# CONSERVATIVE DESIGN:
+#   * All data-plane paths are CONDITIONAL(network_reachability): the cluster
+#     endpoint is VPC-private; an attacker must have a VPC foothold.
+#   * ACL users are NOT IAM identities. Authenticating to Redis yields data-
+#     plane Redis command access, NOT IAM role assumption. No CanImpersonate
+#     or CanAssume edges are emitted from ACL credential reads.
+#   * No ExposedToInternet rule — MemoryDB never has a public endpoint.
+#   * CMEK-encrypted snapshots require kms:Decrypt to read; CanExfiltrate on
+#     CMK snapshots is CONDITIONAL(key_permission) per credential-chains.yaml.
+#
+# LINCHPINS CITED (DO NOT DUPLICATE):
+#   credential-chains.yaml — rule 1 (read-secret-yields-identity) handles
+#     CanReadSecret(principal, secret) + CredentialsFor(secret, identity) =>
+#     CanImpersonate. ACL user passwords do NOT yield IAM identity assumption;
+#     that chain stops at data-plane access. However, if a Redis key stores
+#     an IAM access key or service-account credential, ContainsSecret ->
+#     CredentialsFor -> CanImpersonate is the correct roll-up (cite linchpin).
+#   credential-chains.yaml — rule 4 (decrypt-gates-secret-read) handles
+#     CMEK-gated snapshot reads: CanReadData on a CMK-encrypted snapshot is
+#     CONDITIONAL(key_permission) until CanDecrypt on the wrapping key is
+#     confirmed.
+#   can-control.yaml — control-via-admin rolls up CanAdminister to Controls.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # --- A) IAM control-plane overwrite of ACL user password -> data-plane read -
+  # An IAM principal with memorydb:UpdateUser can overwrite any ACL user's
+  # authentication password to an attacker-controlled value. The ACL user is a
+  # Credential node (not an IAM identity); the control-plane write is modeled
+  # as CanModify(principal -> aclUser Credential). If the same principal also
+  # has VPC network connectivity to the cluster endpoint (port 6379/TLS), it
+  # can authenticate as that ACL user and issue Redis commands.
+  #
+  # Schema note: CanModify source=[Identity] target=["*"] — correctly admits
+  # a Credential target. CredentialsFor source=[Secret,Credential,...] target=
+  # [Identity,Data,ServiceIdentity] — Cache is in the Data class, so the
+  # CredentialsFor link from an ACL Credential to a Cache node is admissible.
+  #
+  # FALSE-POSITIVE NOTES:
+  #   * Only emit when the CanModify edge is sourced from memorydb:UpdateUser
+  #     on the specific Credential node (ACL user) that authenticates to this
+  #     cluster. DescribeUsers (read-only) does NOT produce CanModify.
+  #   * Network reachability is a hard gate: the cluster is always VPC-private;
+  #     CONDITIONAL(network_reachability) until a foothold is confirmed.
+  #   * ACL users are NOT IAM identities. Do NOT emit CanImpersonate or
+  #     CanAssume — data-plane Redis access ≠ IAM role assumption.
+  #   * The ACL user's access string constrains which commands/keys are
+  #     accessible; a read-only or key-scoped access string limits impact.
+  - id: aws-memorydb-update-user-yields-data-read
+    emits: CanReadData
+    description: "memorydb:UpdateUser overwrites an ACL user password (CanModify on Credential); attacker with VPC reach can then authenticate and read cluster data."
+    match:
+      - [ ?principal, CanModify,       ?aclUser ]
+      - [ ?aclUser,   CredentialsFor,  ?cluster ]
+    optional:
+      - [ ?principal, CanNetworkReach, ?cluster ]
+    where:
+      - "node_type(?aclUser) == Credential"
+      - "?aclUser.provider_type == 'memorydb_acl_user'"
+      - "node_type(?cluster) == Cache"
+      - "?cluster.provider == 'aws'"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cluster
+      permissions: ["memorydb:UpdateUser"]
+      conditions: [network_reachability]
+      state_logic: >-
+        if matched(optional[0]): ACTIVE — network reach to the cluster is already
+        derived and confirmed; the principal can reset the ACL user password and
+        authenticate immediately. else: CONDITIONAL(network_reachability) — the
+        cluster endpoint is always VPC-private; confirm a VPC foothold (Compute in
+        the same VPC, VPN/Direct Connect, or VPC peering) before upgrading to ACTIVE.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "<CanModify edge_id: ?principal -> ?aclUser>"
+        - "<CredentialsFor edge_id: ?aclUser -> ?cluster>"
+        - "[optional] <CanNetworkReach edge_id: ?principal -> ?cluster>"
+      false_positive_note: >-
+        Only emit when the CanModify edge is backed by memorydb:UpdateUser on
+        the specific ACL user (provider_type memorydb_acl_user) whose
+        CredentialsFor link targets this cluster. Do NOT emit for
+        DescribeUsers (read-only; produces no CanModify). Do NOT emit
+        CanImpersonate or CanAssume — ACL users are not IAM identities;
+        data-plane access is not IAM role assumption. Downgrade confidence
+        when the ACL user's access string is known to be read-only or
+        key-restricted. CONDITIONAL(network_reachability) is mandatory —
+        MemoryDB is always VPC-private. The optional CanNetworkReach clause
+        structurally enforces the network gate rather than relying on prose alone.
+      narrative: >-
+        {principal.name} can overwrite the password of ACL user {aclUser.name}
+        (memorydb:UpdateUser), whose credentials authenticate to MemoryDB cluster
+        {cluster.name}; with VPC network access to the cluster endpoint,
+        {principal.name} can read and write Redis data on {cluster.name}.
+
+  # --- A2) IAM control-plane password reset of ACL user -> data-plane write ------
+  # Companion rule to A: MemoryDB ACL users' access strings grant write permissions
+  # by default ('on ~* &* +@all' = full access including SET, DEL, SCAN, FLUSHDB).
+  # An attacker who resets the ACL user's password and has VPC network connectivity
+  # to the cluster endpoint can write to the cache, poisoning data, invalidating
+  # auth tokens, injecting malicious content, or clearing the entire cache.
+  - id: aws-memorydb-update-user-yields-data-write
+    emits: CanWriteData
+    description: "memorydb:UpdateUser overwrites an ACL user password (CanModify on Credential); attacker with VPC reach can then authenticate and write cluster data."
+    match:
+      - [ ?principal, CanModify,       ?aclUser ]
+      - [ ?aclUser,   CredentialsFor,  ?cluster ]
+    optional:
+      - [ ?principal, CanNetworkReach, ?cluster ]
+    where:
+      - "node_type(?aclUser) == Credential"
+      - "?aclUser.provider_type == 'memorydb_acl_user'"
+      - "node_type(?cluster) == Cache"
+      - "?cluster.provider == 'aws'"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cluster
+      permissions: ["memorydb:UpdateUser"]
+      conditions: [network_reachability]
+      state_logic: >-
+        if matched(optional[0]): ACTIVE — network reach to the cluster is already
+        derived and confirmed; the principal can reset the ACL user password and
+        authenticate immediately, then issue write commands. else: CONDITIONAL(network_reachability) —
+        the cluster endpoint is always VPC-private; confirm a VPC foothold before
+        upgrading to ACTIVE.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "<CanModify edge_id: ?principal -> ?aclUser>"
+        - "<CredentialsFor edge_id: ?aclUser -> ?cluster>"
+        - "[optional] <CanNetworkReach edge_id: ?principal -> ?cluster>"
+      false_positive_note: >-
+        Only emit when the CanModify edge is backed by memorydb:UpdateUser on
+        the specific ACL user (provider_type memorydb_acl_user) whose
+        CredentialsFor link targets this cluster. The ACL user's access string
+        must permit write commands: if the string is 'on ~* &* +@all' (default)
+        or contains write patterns (+@write, +SET, +DEL, etc.), emit ACTIVE.
+        If the string is known to be read-only (+@read only), emit BLOCKED.
+        If unknown, emit CONDITIONAL(resource_policy). CONDITIONAL(network_reachability)
+        is mandatory — MemoryDB is always VPC-private. Do NOT emit CanImpersonate
+        or CanAssume — ACL users are not IAM identities; data-plane access is not
+        IAM role assumption.
+      narrative: >-
+        {principal.name} can overwrite the password of ACL user {aclUser.name}
+        (memorydb:UpdateUser), whose credentials authenticate to MemoryDB cluster
+        {cluster.name}; with VPC network access to the cluster endpoint,
+        {principal.name} can write to {cluster.name} (SET, DEL, FLUSHDB, etc.),
+        poisoning cached data or invalidating application sessions.
+
+  # --- A3) IAM CreateUser + UpdateACL two-permission escalation -> data-plane read ---
+  # An IAM principal with both memorydb:CreateUser and memorydb:UpdateAcl can:
+  #   1. Create a new ACL user with a chosen password and full access string
+  #      ('on ~* &* +@all')
+  #   2. Add that user to a cluster's ACL via UpdateACL
+  #   3. Use the created credential to authenticate to the cluster's Redis data plane
+  # This is a distinct attack vector that does NOT require resetting an existing user's
+  # password, and may be less monitored than UpdateUser actions. The derivation models:
+  # CanCreate(principal -> aclUser) + CanModify(principal -> acl) + CredentialsFor(aclUser -> cluster)
+  # => CanReadData(principal -> cluster).
+  - id: aws-memorydb-create-user-yields-data-read
+    emits: CanReadData
+    description: "memorydb:CreateUser + memorydb:UpdateAcl creates a privileged ACL user and adds them to a cluster's ACL; with VPC reach, principal can then read all cluster data."
+    match:
+      - [ ?principal, CanCreate,       ?aclUser ]
+      - [ ?principal, CanModify,       ?acl ]
+      - [ ?aclUser,   CredentialsFor,  ?cluster ]
+      - [ ?cluster,   Contains,        ?acl ]
+    optional:
+      - [ ?principal, CanNetworkReach, ?cluster ]
+    where:
+      - "node_type(?principal) == Identity"
+      - "node_type(?aclUser) == Credential"
+      - "?aclUser.provider_type == 'memorydb_acl_user'"
+      - "node_type(?acl) == GenericPolicy"
+      - "?acl.provider_type == 'AWS::MemoryDB::ACL'"
+      - "node_type(?cluster) == Cache"
+      - "?cluster.provider == 'aws'"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cluster
+      permissions: ["memorydb:CreateUser", "memorydb:UpdateAcl"]
+      conditions: [network_reachability]
+      state_logic: >-
+        if matched(optional[0]): ACTIVE — the principal has both CreateUser and
+        UpdateACL permissions AND confirmed network reach to the cluster; they can
+        create a user, add them to the ACL, and authenticate immediately.
+        else: CONDITIONAL(network_reachability) — confirm a VPC foothold before
+        upgrading to ACTIVE.
+      confidence: "min(contributing_confidences) * 0.80"
+      derived_from:
+        - "<CanCreate edge_id: ?principal -> ?aclUser>"
+        - "<CanModify edge_id: ?principal -> ?acl>"
+        - "<CredentialsFor edge_id: ?aclUser -> ?cluster>"
+        - "<Contains edge_id: ?cluster -> ?acl>"
+        - "[optional] <CanNetworkReach edge_id: ?principal -> ?cluster>"
+      false_positive_note: >-
+        This rule requires BOTH CreateUser and UpdateACL permissions on the same
+        principal. If the principal has only one of these, the rule does not fire.
+        Emit only when both CanCreate and CanModify edges are present and backed
+        by the respective memorydb:* permissions. The created ACL user must have
+        write permission: check the chosen access string — default is 'on ~* &* +@all'.
+        If the user's access string is constrained or read-only, emit BLOCKED.
+        Network reachability is mandatory: confirm a VPC foothold before ACTIVE.
+      narrative: >-
+        {principal.name} can create a new MemoryDB ACL user (memorydb:CreateUser)
+        with full permissions ('on ~* &* +@all') and a chosen password, then add
+        that user to the cluster's ACL (memorydb:UpdateAcl). If {principal.name}
+        also has VPC network access to {cluster.name}, they can immediately
+        authenticate as the created user and read all cluster data without needing
+        to reset an existing user's password.
+
+  # --- A4) IAM CreateUser + UpdateACL two-permission escalation -> data-plane write ---
+  # Companion rule to A3: MemoryDB ACL users created with default access strings
+  # grant full write permissions ('on ~* &* +@all'). An attacker who creates a
+  # user, adds them to the ACL, and has VPC reach can write to the cluster.
+  - id: aws-memorydb-create-user-yields-data-write
+    emits: CanWriteData
+    description: "memorydb:CreateUser + memorydb:UpdateAcl creates a privileged ACL user; with VPC reach, principal can then write all cluster data."
+    match:
+      - [ ?principal, CanCreate,       ?aclUser ]
+      - [ ?principal, CanModify,       ?acl ]
+      - [ ?aclUser,   CredentialsFor,  ?cluster ]
+      - [ ?cluster,   Contains,        ?acl ]
+    optional:
+      - [ ?principal, CanNetworkReach, ?cluster ]
+    where:
+      - "node_type(?principal) == Identity"
+      - "node_type(?aclUser) == Credential"
+      - "?aclUser.provider_type == 'memorydb_acl_user'"
+      - "node_type(?acl) == GenericPolicy"
+      - "?acl.provider_type == 'AWS::MemoryDB::ACL'"
+      - "node_type(?cluster) == Cache"
+      - "?cluster.provider == 'aws'"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cluster
+      permissions: ["memorydb:CreateUser", "memorydb:UpdateAcl"]
+      conditions: [network_reachability]
+      state_logic: >-
+        if matched(optional[0]): ACTIVE — the principal has both CreateUser and
+        UpdateACL permissions AND confirmed network reach; they can create a user,
+        add them to the ACL, and write to the cluster.
+        else: CONDITIONAL(network_reachability) — confirm a VPC foothold.
+      confidence: "min(contributing_confidences) * 0.80"
+      derived_from:
+        - "<CanCreate edge_id: ?principal -> ?aclUser>"
+        - "<CanModify edge_id: ?principal -> ?acl>"
+        - "<CredentialsFor edge_id: ?aclUser -> ?cluster>"
+        - "<Contains edge_id: ?cluster -> ?acl>"
+        - "[optional] <CanNetworkReach edge_id: ?principal -> ?cluster>"
+      false_positive_note: >-
+        The created ACL user's access string determines write capability: if it is
+        'on ~* &* +@all' (default) or contains +@write / +SET / +DEL patterns, emit
+        ACTIVE (if network reach is confirmed). If the access string is read-only,
+        emit BLOCKED. Network reachability is mandatory — MemoryDB is always VPC-private.
+      narrative: >-
+        {principal.name} can create a new MemoryDB ACL user with full write
+        permissions and add them to {cluster.name}'s ACL (via memorydb:CreateUser
+        and memorydb:UpdateAcl); with VPC network access, {principal.name} can
+        write to the cluster (SET, DEL, FLUSHDB), poisoning cached data or
+        invalidating application sessions.
+
+  # --- B0) Cluster exposes its ACL user credentials (derived) ---------------
+  # A MemoryDB cluster contains an ACL, which defines ACL user(s). This derived rule
+  # promotes the structural Contains relationship (cluster contains ACL) + the fact
+  # that ACL users are credentials (Credential nodes) into the ExposesCredential edge,
+  # indicating that the cluster's configuration exposes those credentials to potential
+  # attackers (i.e., anyone with password knowledge and network reach can authenticate).
+  #
+  # This is the bridge rule: explicit normalization (Contains) -> derived ExposesCredential
+  # -> downstream CanReadData/CanWriteData rules.
+  - id: aws-memorydb-cluster-exposes-acl-credentials
+    emits: ExposesCredential
+    description: "Cluster's ACL contains users (credentials); the cluster exposes those credentials to authenticated network access."
+    match:
+      - [ ?cluster, Contains, ?aclUser ]
+    where:
+      - "node_type(?cluster) == Cache"
+      - "?cluster.provider == 'aws'"
+      - "node_type(?aclUser) == Credential"
+      - "?aclUser.provider_type == 'memorydb_acl_user'"
+    emit:
+      source_type: Cache
+      target_type: Credential
+      source: ?cluster
+      target: ?aclUser
+      conditions: []
+      state_logic: >-
+        ACTIVE — the cluster structurally contains the ACL user (Credential node).
+        The credential authenticates to the cluster; therefore the cluster "exposes"
+        the credential to anyone who obtains password knowledge and network reach.
+      confidence: "contributing_confidences[0]"
+      derived_from:
+        - "<Contains edge_id: ?cluster -> ?aclUser>"
+      false_positive_note: >-
+        This rule is a structural promotion: it derives ExposesCredential from the
+        explicit Contains relationship. Emit whenever Contains(cluster, aclUser)
+        is observed. The actual risk (CanReadData) is derived downstream by rules
+        that match on both ExposesCredential and CanNetworkReach.
+      narrative: >-
+        {cluster.name} is associated with ACL users ({aclUser.name}); the cluster
+        exposes these wire-protocol credentials to any network-reachable entity
+        that can authenticate with the user's password.
+
+  # --- B) Compute with VPC reach + ACL credential -> data-plane read ---------
+  # A Compute node (EC2, Lambda, ECS task, etc.) that is in the same VPC as
+  # the cluster AND holds (or can obtain) a valid ACL user credential can issue
+  # Redis commands against the cluster. This models the standard application
+  # access pattern as an explicit CanReadData edge so that data-centric queries
+  # surface MemoryDB as a target reachable from VPC-member compute resources.
+  #
+  # This rule fires when the graph already contains:
+  #   CanNetworkReach(Compute -> Cache)   — VPC-level reachability confirmed
+  #   ExposesCredential(Cache -> Credential) — cluster exposes ACL credentials (derived)
+  #
+  # The ExposesCredential edge documents that the cluster has ACL user(s); any
+  # Compute node that CanNetworkReach the cluster and holds (or can obtain) that
+  # credential can read data. This is ACTIVE when both preconditions are met.
+  #
+  # FALSE-POSITIVE NOTES:
+  #   * CanNetworkReach must be confirmed by VPC/security-group topology analysis
+  #     (port 6379/TLS open from the compute's security group to the cluster's
+  #     security group). Do not emit if only a generic "same VPC" fact exists
+  #     without security group confirmation.
+  #   * The Compute node must hold or be able to obtain the ACL credential. This
+  #     is typically modeled via ExposesCredential(cluster -> aclUser) +
+  #     CredentialsFor(aclUser -> cluster). If the cluster has the "open-access"
+  #     ACL with the default user (TLS-disabled, no password required), the
+  #     credential gate is absent and the state may be ACTIVE on reach alone.
+  #   * TLS-disabled clusters with the open-access ACL have no wire-protocol
+  #     authentication; any VPC-reachable host can read all data — higher
+  #     confidence for those clusters.
+  - id: aws-memorydb-vpc-reach-yields-data-read
+    emits: CanReadData
+    description: "Compute with confirmed VPC network reach to the cluster plus access to an ACL credential can read Redis data."
+    match:
+      - [ ?compute,  CanNetworkReach,    ?cluster ]
+      - [ ?cluster,  ExposesCredential,  ?aclUser ]
+    where:
+      - "node_class(?compute) == Compute"
+      - "node_type(?cluster) == Cache"
+      - "?cluster.provider == 'aws'"
+    emit:
+      source_type: Compute
+      target_type: Cache
+      source: ?compute
+      target: ?cluster
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if confirmed CanNetworkReach(compute -> cluster, port 6379/TLS) AND
+        (cluster uses open-access ACL with no AUTH required, OR compute can
+        obtain the ACL credential via ExposesCredential chain): ACTIVE.
+        If network reach is confirmed but credential acquisition path is
+        CONDITIONAL: CONDITIONAL(resource_policy) — the credential availability
+        (whether the Compute node can actually obtain the ACL credential from
+        the ExposesCredential chain) is the unsatisfied condition, not an IAM
+        permission issue.
+        If network reach is not yet confirmed: CONDITIONAL(network_reachability).
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from:
+        - "<CanNetworkReach edge_id: ?compute -> ?cluster>"
+        - "<ExposesCredential edge_id: ?cluster -> ?aclUser>"
+      false_positive_note: >-
+        Require security-group-level confirmation that port 6379 (TLS) is open
+        from the compute's security group to the cluster's security group; same-
+        VPC membership alone is insufficient. For open-access (no-TLS, no-AUTH)
+        clusters, the credential gate is absent: state is ACTIVE on network reach
+        alone. Do NOT emit ExposedToInternet for MemoryDB — clusters are always
+        VPC-private and have no public endpoint option. Do NOT elevate to
+        CanImpersonate; data-plane access grants Redis commands, not IAM identity.
+        Note: MemoryDB ACL users can both read AND write cluster data by default
+        (access string 'on ~* &* +@all' grants full command and key access);
+        CanWriteData is emitted as a companion capability. Downgrade confidence
+        if the ACL access string is known to restrict writes.
+      narrative: >-
+        {compute.name} can reach the MemoryDB cluster {cluster.name} over the
+        Redis TLS endpoint (confirmed VPC/security-group reach) and the cluster
+        exposes ACL user credentials {aclUser.name}; {compute.name} can
+        authenticate and read or write cluster data.
+
+  # --- B2) VPC network reach + ACL credential -> data-plane write ---------
+  # Companion rule to B: MemoryDB ACL users' access strings grant write permissions
+  # by default ('on ~* &* +@all' = full access including SET, DEL, SCAN, etc.).
+  # An attacker with VPC reach and the ACL credential can write to the cache,
+  # poisoning data, invalidating auth tokens, or injecting malicious content.
+  - id: aws-memorydb-vpc-reach-yields-data-write
+    emits: CanWriteData
+    description: "Compute with confirmed VPC network reach to the cluster plus access to an ACL credential can write Redis data (default ACL permissions allow writes)."
+    match:
+      - [ ?compute,  CanNetworkReach,    ?cluster ]
+      - [ ?cluster,  ExposesCredential,  ?aclUser ]
+    where:
+      - "node_class(?compute) == Compute"
+      - "node_type(?cluster) == Cache"
+      - "?cluster.provider == 'aws'"
+    emit:
+      source_type: Compute
+      target_type: Cache
+      source: ?compute
+      target: ?cluster
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if confirmed CanNetworkReach(compute -> cluster, port 6379/TLS) AND
+        (cluster uses open-access ACL with no AUTH required, OR compute can
+        obtain the ACL credential via ExposesCredential chain) AND the ACL
+        user's access string permits write commands (default is 'on ~* &* +@all'
+        which allows all commands): ACTIVE.
+        If network reach is confirmed but the credential's access string is
+        known to restrict writes (e.g., read-only ACL): BLOCKED.
+        If network reach is confirmed but credential acquisition or ACL scope
+        is CONDITIONAL: CONDITIONAL(resource_policy).
+        If network reach is not yet confirmed: CONDITIONAL(network_reachability).
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "<CanNetworkReach edge_id: ?compute -> ?cluster>"
+        - "<ExposesCredential edge_id: ?cluster -> ?aclUser>"
+      false_positive_note: >-
+        Require the same security-group-level confirmation as rule B2 (CanReadData).
+        The ACL user's access string is the write-permission gate: if the string
+        is 'on ~* &* +@all' (default) or contains write-permitting patterns (+@write,
+        +SET, +DEL, etc.), emit ACTIVE. If the string is known to be read-only
+        (e.g., '+@read' or no write commands listed), emit BLOCKED. If the access
+        string is unknown or unresolved, emit CONDITIONAL(resource_policy).
+        MemoryDB's default ACL users grant full access; most production deployments
+        create custom ACLs with limited scopes — check the actual access string
+        before upgrading to ACTIVE.
+      narrative: >-
+        {compute.name} can reach the MemoryDB cluster {cluster.name} over the
+        Redis TLS endpoint (confirmed VPC/security-group reach) and the cluster
+        exposes ACL user credentials {aclUser.name} whose access string permits
+        write commands; {compute.name} can authenticate and write to the cluster,
+        potentially poisoning cached data or invalidating application sessions.
+
+  # --- C) ACL swap to open-access enables full data access -------------------
+  # An IAM principal with memorydb:UpdateCluster can change the cluster's ACL to
+  # the built-in "open-access" ACL (or another permissive ACL). The "open-access"
+  # ACL includes a "default" user with full permissions ('on ~* &* +@all') and
+  # no authentication requirement on TLS-disabled clusters. Swapping to this ACL
+  # grants the principal themselves full data-plane access if they have VPC reach,
+  # and any other VPC-reachable principal can similarly access the cluster. This is
+  # a derived escalation: CanModifyConfiguration(principal -> cluster) + network
+  # reach => CanReadData (principal -> cluster). Other VPC-reachable hosts gain
+  # access via re-evaluation of rules B/B2 if the ExposesCredential edge is re-fired.
+  - id: aws-memorydb-swap-acl-yields-data-read
+    emits: CanReadData
+    description: "memorydb:UpdateCluster can swap cluster's ACL to open-access; principal with VPC reach gains full data-plane access to the cluster."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?cluster ]
+    optional:
+      - [ ?principal, CanNetworkReach, ?cluster ]
+    where:
+      - "node_type(?cluster) == Cache"
+      - "?cluster.provider_type == 'AWS::MemoryDB::Cluster'"
+      - "?cluster.provider == 'aws'"
+      - >-
+        ?principal has EFFECTIVE memorydb:UpdateCluster on ?cluster ARN
+        (via explicit normalization rule aws-memorydb-update-cluster-modifies-config)
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cluster
+      permissions: ["memorydb:UpdateCluster"]
+      conditions: [network_reachability, iam_permission, scp_or_org_policy]
+      state_logic: >-
+        CONDITIONAL(network_reachability): the principal can call
+        memorydb:UpdateCluster to set the cluster's ACL to "open-access"
+        (or another permissive ACL), removing authentication barriers. However,
+        the cluster is always VPC-private; data access requires network reach.
+        If matched(optional[0]): ACTIVE — the principal has both UpdateCluster
+        permission AND confirmed network reach to the cluster; escalation is
+        complete. Else: CONDITIONAL(network_reachability) — the principal must
+        obtain a VPC foothold (via compromised EC2, Lambda, ECS task, etc.) to
+        exploit the open-access ACL.
+      confidence: "min(contributing_confidences) * 0.75"
+      derived_from:
+        - "<CanModifyConfiguration edge_id: ?principal -> ?cluster>"
+        - "[optional] <CanNetworkReach edge_id: ?principal -> ?cluster>"
+      false_positive_note: >-
+        This rule assumes the cluster CAN use the open-access ACL. The built-in
+        ACL is always available, so the risk is always present if UpdateCluster
+        permission exists. TLS provides transport-layer encryption but does NOT
+        impose authentication requirements — the "default" user in the open-access
+        ACL has no password requirement regardless of TLS status. Both TLS-enabled
+        and TLS-disabled clusters with open-access are equally exploitable: any
+        VPC-reachable principal can authenticate as the default user and read/write
+        all data. Downgrade confidence only if the cluster uses a non-open-access
+        custom ACL with confirmed restrictive user permissions AND TLS is enabled.
+        CONDITIONAL(network_reachability) is mandatory — MemoryDB is always VPC-private.
+      narrative: >-
+        {principal.name} can call memorydb:UpdateCluster to swap {cluster.name}'s
+        ACL to the built-in "open-access" ACL. This removes authentication
+        barriers and allows any principal with VPC network reach to the cluster
+        to read (and write) all data using the default user's full permissions
+        ('on ~* &* +@all'). If {principal.name} already has confirmed network
+        reach to the cluster, escalation is complete: full data exfiltration.
+
+  # --- D) Snapshot copy to attacker-accessible S3 -> data exfiltration -------
+  # memorydb:CopySnapshot exports a MemoryDB cluster snapshot (a complete in-memory
+  # data dump) to an S3 bucket. The snapshot is a full serialized dump including
+  # all cached application data (sessions, tokens, credentials, cache entries).
+  # An attacker with CopySnapshot permission and write access to a destination S3
+  # bucket (in their account or a bucket with an attacker-friendly policy) can
+  # exfiltrate the snapshot offline without touching the live cluster.
+  #
+  # CanExfiltrate requires the destination S3 bucket to be attacker-accessible.
+  # This is a resource_policy gate: the bucket must allow writes from the
+  # principal's account (or the principal must have cross-account S3 write access).
+  - id: aws-memorydb-snapshot-exfil
+    emits: CanExfiltrate
+    description: "memorydb:CopySnapshot exports cluster snapshot to S3; attacker-accessible bucket yields full data exfiltration."
+    match:
+      - [ ?principal, HasPermission, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?snapshot.provider_type == 'AWS::MemoryDB::Snapshot'"
+      - >-
+        ?principal has EFFECTIVE memorydb:CopySnapshot on ?snapshot ARN
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions:
+        - "memorydb:CopySnapshot"
+      conditions: [iam_permission, scp_or_org_policy, resource_policy, key_permission]
+      state_logic: >-
+        CONDITIONAL(resource_policy): the principal can call memorydb:CopySnapshot
+        to export the snapshot to an S3 bucket. However, the destination bucket
+        must be attacker-accessible (principal controls the bucket, or bucket
+        policy allows writes from the principal's account, or cross-account S3
+        write edge exists). Upgrade to ACTIVE only when the destination bucket
+        is confirmed attacker-accessible. CONDITIONAL(key_permission) when the
+        snapshot is encrypted with a CMK: the CopySnapshot call succeeds, but
+        reading the snapshot content in S3 requires kms:Decrypt on the CMK.
+        BLOCKED when an SCP or permission boundary denies memorydb:CopySnapshot.
+      confidence: "min(contributing_confidences) * 0.75"
+      derived_from:
+        - "?principal HasPermission ?snapshot (memorydb:CopySnapshot effective permission)"
+      false_positive_note: >-
+        The destination S3 bucket is the critical gate. memorydb:CopySnapshot's
+        TargetS3BucketName parameter specifies where the snapshot is written.
+        The attacker must have write access (s3:PutObject) on the bucket to
+        retrieve the snapshot file. Do NOT emit ACTIVE without confirming the
+        bucket is attacker-accessible (in the attacker's account, or the bucket
+        policy allows the principal's account to write). For encrypted snapshots
+        (KmsKeyId is non-empty), the snapshot is encrypted with that CMK; the
+        attacker needs kms:Decrypt on the key to read the unencrypted snapshot
+        file. AWS-managed key (default aws/memorydb) is available per-account;
+        custom CMKs require explicit key-grant evaluation. This rule requires an
+        existing snapshot — memorydb:CreateSnapshot must have been called first
+        (or a snapshot is pre-existing). The snapshot itself is the attack target,
+        not the cluster; a snapshot can persist long after the cluster is deleted.
+        This rule is conservative (Phase-6 low-relevance guidance: 1-3 rules).
+        Snapshot exfil is powerful but requires two permissions (CopySnapshot +
+        S3 access) and is more complex than the ACL-swap path.
+      narrative: >-
+        {principal.name} can call memorydb:CopySnapshot to export the MemoryDB
+        snapshot {snapshot.name} to an S3 bucket as a complete data dump. The
+        snapshot contains all in-memory cluster data at snapshot time, including
+        any cached application secrets, session tokens, API keys, or database
+        credentials. If the destination S3 bucket is attacker-accessible,
+        {principal.name} can download and parse the snapshot offline to extract
+        all cached data without ever connecting to the live cluster.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   * A VPC security group rule that does not permit inbound port 6379 from
+#     the source's security group -> emit CanReadData with state BLOCKED
+#     (denied_by = security group rule) for that source/cluster pair.
+#   * A non-empty ACL with TLS enabled on the cluster blocks the open-access
+#     path (rule B state CONDITIONAL, not ACTIVE) — credential acquisition
+#     must still be confirmed.
+#   * An SCP denying memorydb:UpdateUser blocks rule A -> state BLOCKED.
+#   * An SCP or permission boundary denying memorydb:UpdateCluster blocks the
+#     ACL-swap escalation path -> state BLOCKED.
+#
+# EXPLICIT NORMALIZATION RULES:
+#   Moved to /rules/explicit/aws-memorydb.yaml (see that file).
+# ---------------------------------------------------------------------------

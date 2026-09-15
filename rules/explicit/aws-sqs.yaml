@@ -1,0 +1,189 @@
+# Explicit normalization rules: AWS SQS raw config/permissions -> explicit edges.
+# Adapters emit raw records; these rules translate them to common explicit edges
+# consumed by /rules/derived/aws/sqs.yaml and the messaging-chains linchpin.
+#
+# SQS explicit surface:
+#   - Queue resource policy (GetQueueAttributes[Policy]) -> CrossAccountTrust, ExposedToInternet, HasPolicy
+#   - Event-source-mapping binding (lambda:ListEventSourceMappings) -> CanTrigger
+#   - Effective sqs:SendMessage -> CanWriteData
+#   - Effective sqs:ReceiveMessage -> CanReadData with SSE-KMS CONDITIONAL gate
+#   - Effective sqs:SetQueueAttributes -> CanModifyPolicy (on ResourcePolicy target)
+#   - SSE-KMS presence (GetQueueAttributes[KmsMasterKeyId]) -> CONDITIONAL gate on CanReadData
+#
+# Each rule is the single source of truth — no duplication. Derived rules in
+# /rules/derived/aws/sqs.yaml cite these by id, not duplicate them.
+
+rules:
+
+  # --- Queue event-source-mapping -> CanTrigger(queue -> Lambda) -------------
+  - id: aws-sqs-esm-binding
+    emits: CanTrigger
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Lambda::EventSourceMapping"
+      field: "EventSourceArn"
+    where:
+      - "EventSourceArn contains ':sqs:'"
+    emit:
+      source_type: Queue
+      target_type: ServerlessFunction
+      source: "<SQS queue node matching EventSourceArn>"
+      target: "<Lambda function node matching FunctionArn>"
+      api_source: "lambda:ListEventSourceMappings"
+      evidence_field: "EventSourceArn, FunctionArn, State"
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        ACTIVE when State == Enabled. CONDITIONAL(trigger_exists) when State is
+        Disabled, Creating, or Updating. BLOCKED when the function resource-based
+        policy denies Lambda invocation.
+      narrative: "{queue.name} triggers {function.name} via a SQS event-source-mapping (State: {esm.State})."
+
+  # --- Effective sqs:SendMessage -> CanWriteData -----------------------------
+  - id: aws-sqs-send-message
+    emits: CanWriteData
+    applies_to: [aws]
+    match_effective_permission:
+      action: "sqs:SendMessage"
+      resource_type: "AWS::SQS::Queue"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<SQS queue node>"
+      permissions: ["sqs:SendMessage"]
+      conditions: [iam_permission, resource_policy]
+      narrative: "{principal.name} can send messages to {queue.name} (sqs:SendMessage)."
+
+  # --- Effective sqs:ReceiveMessage -> CanReadData ---------------------------
+  - id: aws-sqs-receive-message
+    emits: CanReadData
+    applies_to: [aws]
+    match_effective_permission:
+      action: "sqs:ReceiveMessage"
+      resource_type: "AWS::SQS::Queue"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<SQS queue node>"
+      permissions: ["sqs:ReceiveMessage"]
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        ACTIVE when effective sqs:ReceiveMessage granted and either no SSE-KMS is
+        configured (AWS-managed SSE-SQS or no encryption) or the principal also holds
+        kms:Decrypt on the CMK. CONDITIONAL(key_permission) when SSE-KMS is configured
+        with a customer CMK and kms:Decrypt on that CMK is not confirmed.
+      narrative: "{principal.name} can receive messages from {queue.name} (sqs:ReceiveMessage)."
+
+  # --- Effective sqs:SetQueueAttributes -> CanModifyPolicy -------------------
+  # SetQueueAttributes with the Policy attribute rewrites the queue resource
+  # policy. IAM has no per-attribute scope for this action, so the permission
+  # is unrestricted across all queue attributes. Target is the ResourcePolicy
+  # node since CanModifyPolicy modifies policy artifacts (Policy class).
+  - id: aws-sqs-set-queue-attributes
+    emits: CanModifyPolicy
+    applies_to: [aws]
+    match_effective_permission:
+      action: "sqs:SetQueueAttributes"
+      resource_type: "AWS::SQS::Queue"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: "<principal>"
+      target: "<ResourcePolicy node attached to the SQS queue>"
+      permissions: ["sqs:SetQueueAttributes"]
+      conditions: [iam_permission]
+      narrative: "{principal.name} can rewrite the resource policy of {queue.name} (sqs:SetQueueAttributes)."
+
+  # --- Cross-account SendMessage in queue policy -> CrossAccountTrust --------
+  - id: aws-sqs-resource-policy-cross-account-send
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SQS::Queue"
+      field: "Policy"
+    where:
+      - "statement Action includes sqs:SendMessage or sqs:*"
+      - "statement Principal is an ARN in a different account than the queue owner"
+      - "statement Effect == Allow"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<queue ResourcePolicy node>"
+      target: "<external account of the named principal>"
+      api_source: "sqs:GetQueueAttributes[Policy]"
+      evidence_field: "Policy.Statement[].Principal, Action, Condition"
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the grant has no restricting condition. CONDITIONAL(condition_expression)
+        when scoped by aws:SourceArn, aws:SourceAccount, or aws:PrincipalOrgID.
+      narrative: "{queue.name} resource policy grants sqs:SendMessage to {external.name} (account {account}), creating cross-account publish trust."
+
+  # --- Cross-account ReceiveMessage in queue policy -> CrossAccountTrust -----
+  - id: aws-sqs-resource-policy-cross-account-receive
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SQS::Queue"
+      field: "Policy"
+    where:
+      - "statement Action includes sqs:ReceiveMessage or sqs:*"
+      - "statement Principal is an ARN in a different account than the queue owner"
+      - "statement Effect == Allow"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<queue ResourcePolicy node>"
+      target: "<external account of the named principal>"
+      api_source: "sqs:GetQueueAttributes[Policy]"
+      evidence_field: "Policy.Statement[].Principal, Action, Condition"
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when no restricting condition. CONDITIONAL(condition_expression) when
+        scoped by aws:SourceArn/SourceAccount/PrincipalOrgID.
+      narrative: "{queue.name} resource policy grants sqs:ReceiveMessage to {external.name} (account {account}), creating cross-account data-read trust."
+
+  # --- Principal:* SendMessage in queue policy -> ExposedToInternet ----------
+  - id: aws-sqs-public-send-policy
+    emits: ExposedToInternet
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SQS::Queue"
+      field: "Policy"
+    where:
+      - "statement Action includes sqs:SendMessage or sqs:*"
+      - "statement Principal is * or {\"AWS\":\"*\"}"
+      - "statement Effect == Allow"
+      - "statement has no effective restricting condition"
+    emit:
+      source_type: Queue
+      target_type: AnonymousIdentity
+      source: "<SQS queue node>"
+      target: "<AnonymousIdentity>"
+      api_source: "sqs:GetQueueAttributes[Policy]"
+      evidence_field: "Policy.Statement[].Principal, Action, Condition"
+      conditions: [resource_policy]
+      narrative: "{queue.name} grants sqs:SendMessage to Principal:* with no condition; publicly writable by any unauthenticated caller."
+
+  # --- Queue resource policy -> HasPolicy structural link --------------------
+  # Establishes the structural HasPolicy edge from a queue to its ResourcePolicy
+  # node. This link is required by messaging-chains rule 4
+  # (messaging-resource-policy-cross-boundary-trust) to match the pattern
+  # [?msgpolicy, HasPolicy, ?src] and emit the CanEnterAccount consequence.
+  # Without this edge, cross-account publish-triggered execution is not modeled.
+  - id: aws-sqs-queue-has-policy
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SQS::Queue"
+      field: "Policy"
+    where:
+      - "Policy document is present and non-empty"
+    emit:
+      source_type: Queue
+      target_type: ResourcePolicy
+      source: "<SQS queue node>"
+      target: "<ResourcePolicy node for the SQS queue>"
+      api_source: "sqs:GetQueueAttributes[Policy]"
+      evidence_field: "Policy"
+      narrative: "{queue.name} has an attached resource policy; used by messaging-chains rule 4 to derive cross-account publish-triggered execution."

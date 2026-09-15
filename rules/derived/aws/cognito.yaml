@@ -1,0 +1,347 @@
+# AWS Cognito — Derived attack-path rules (Phase 2 — identity federation)
+# ===========================================================================
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (TrustsExternalIdentity, ExternalIdentityMapsTo, ExposedToInternet, CanReadSecret,
+# MemberOf) already lives in /rules/explicit/aws-cognito.yaml; these rules turn those
+# normalized trust facts + cognito-identity:* / cognito-idp:Admin* management perms
+# into the Phase-2 federation takeovers (CanFederateAs), admin credential resets
+# (CanResetCredential, CanAddMember), and config-privesc trust mutations
+# (CanModifyTrust).
+#
+# TWO-SERVICE ARCHITECTURE:
+#  (A) Cognito Identity Pools — issue temporary IAM credentials to external/anonymous
+#      callers. The core attack is a WEAK TRUST CONDITION on the mapped IAM role or an
+#      unauthenticated role enabled for public access.
+#  (B) Cognito User Pools — managed OIDC IdP. The core attack is admin-API account
+#      takeover: AdminSetUserPassword / AdminAddUserToGroup allows an IAM principal
+#      to reset any user's password or escalate group membership, then use the pool
+#      JWT to drive Identity Pool authenticated-role creds.
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE:
+#   * federation-chains.yaml (Phase-14 linchpin) —
+#       - federation-maps-to-identity: also collapses normalized ExternalIdentityMapsTo
+#         + TrustsExternalIdentity into CanFederateAs; rules 1–3 below are the
+#         Cognito-SPECIFIC realizations (annotated trust breadth, developer auth,
+#         claim-mapping mis-config). They dedupe on (CanFederateAs, ?src, ?role).
+#       - federate-then-enter-account: CanFederateAs -> CanEnterAccount foothold
+#         DEFERRED to federation-chains; not re-emitted here.
+#       - federate-inherits-capabilities: CanFederateAs -> CanImpersonate roll-up
+#         for SA/MachineIdentity targets DEFERRED to federation-chains.
+#   * credential-chains.yaml (Phase-5 linchpin) —
+#       - impersonate-is-escalation: when a federated-into role is strictly more
+#         privileged than the originating identity, escalation roll-up DEFERRED here.
+#       - read-secret-yields-identity: downstream use of any CanReadSecret emitted
+#         by explicit rules (app client secret) DEFERRED here.
+#   * identity-escalation.yaml (Phase-2, aws) —
+#       - aws-assume-role-web-identity: the generic OIDC/SAML role trust pattern;
+#         our rules are the Cognito-SPECIFIC realization (Principal.Federated ==
+#         cognito-identity.amazonaws.com, conditions on cognito-identity:aud / amr).
+#       - aws-update-assume-role-policy: CanModifyTrust on the underlying IAM role
+#         trust policy (iam:UpdateAssumeRolePolicy) is already modeled there; CITED.
+#   * can-control.yaml — escalate-via-execute-as and enter-account-via-assume:
+#       consumed downstream by federation-chains / the path-finder; not re-derived.
+#
+# PERMISSIONS are the EXACT action names from the AWS Service Authorization Reference:
+#   * cognito-identity: https://docs.aws.amazon.com/service-authorization/latest/
+#       reference/list_amazoncognitoidentity.html
+#   * cognito-idp: https://docs.aws.amazon.com/service-authorization/latest/
+#       reference/list_amazoncognitouserpools.html
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml) — honored by every emit;
+# typed source_type/target_type declared per RULE-FORMAT.md:
+#   CanFederateAs:    source [Identity, FederatedIdentity, WorkloadIdentity]
+#                     target [Role, ServiceAccount, MachineIdentity]
+#   ExposedToInternet: source [Compute, Data, PublicEndpoint, LoadBalancer, Storage]
+#                      target [AnonymousIdentity]
+#   CanResetCredential: source [Identity]   target [Identity, HumanIdentity]
+#   CanAddMember:     source [Identity]     target [Group, Role]
+#   CanModifyTrust:   source [Identity]     target [Role, TrustPolicy, ServiceAccount, MachineIdentity]
+#   TrustsExternalIdentity: source [Role, ServiceAccount, ApplicationIdentity, ResourcePolicy]
+#                           target [ExternalIdentity, FederatedIdentity]
+#   ExternalIdentityMapsTo: source [ExternalIdentity, FederatedIdentity]
+#                           target [Identity, Role, ServiceAccount]
+# ===========================================================================
+
+provider: aws
+phase: 2-identity-authorization
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # BLOCK A — IDENTITY POOL FEDERATION (CanFederateAs)
+  # ===========================================================================
+
+  # --- 1. Unauthenticated Identity Pool — public entry ---------------------
+  # The highest-severity Cognito path. When AllowUnauthenticatedIdentities=true,
+  # ANY internet user can call GetId (no auth required) + GetCredentialsForIdentity
+  # to receive temporary IAM credentials for the unauthenticated IAM role. The
+  # ExternalIdentityMapsTo(AnonymousIdentity → unauth-role) is emitted by the
+  # explicit rule (cognito-identity:GetIdentityPoolRoles + pool flag). This rule
+  # collapses it to CanFederateAs and also asserts ExposedToInternet on the pool.
+  #
+  # STATE: ACTIVE — no trust condition gates this. The pool is reachable via the
+  # public Cognito data-plane endpoint; GetId requires only the pool ID (public
+  # metadata). No MFA, no network restriction, no IAM auth on the caller.
+  - id: aws-cognito-unauth-pool-federate
+    emits: CanFederateAs
+    description: >-
+      An Identity Pool with AllowUnauthenticatedIdentities=true lets any internet
+      user call GetId + GetCredentialsForIdentity (no credentials required) to
+      receive temporary IAM credentials for the unauthenticated role.
+    applies_to: [aws]
+    match:
+      - [ ?unauth_fed, ExternalIdentityMapsTo, ?unauth_role ]
+    where:
+      - "node_type(?unauth_fed) in [FederatedIdentity, AnonymousIdentity]"
+      - "node_type(?unauth_role) == Role"
+      - "?unauth_fed represents unauthenticated access to the source Identity Pool"
+      - "?unauth_fed.source_pool.AllowUnauthenticatedIdentities == true"
+      - "?unauth_role is the unauthenticated role of ?unauth_fed.source_pool (GetIdentityPoolRoles.Roles.unauthenticated)"
+      - "?pool = ?unauth_fed.source_pool"
+    emit:
+      source_type: AnonymousIdentity
+      target_type: Role
+      source: ?unauth_fed
+      target: ?unauth_role
+      permissions: ["cognito-identity:GetId", "cognito-identity:GetCredentialsForIdentity"]
+      conditions: []
+      state_logic: >-
+        ACTIVE — AllowUnauthenticatedIdentities=true unconditionally admits any
+        unauthenticated caller. No trust condition gates the GetId call; the only
+        requirement is knowing the Identity Pool ID (publicly discoverable via the
+        pool ARN in app bundles or CloudTrail). No MFA, no IAM auth on the caller.
+        BLOCKED if an SCP denies cognito-identity:GetCredentialsForIdentity
+        account-wide (uncommon but possible).
+      confidence: 0.95
+      derived_from:
+        - "?unauth_fed ExternalIdentityMapsTo ?unauth_role"
+        - "?pool.AllowUnauthenticatedIdentities == true (cognito-identity:DescribeIdentityPool)"
+        - "cognito-identity:GetIdentityPoolRoles.Roles.unauthenticated == ?unauth_role"
+      false_positive_note: >-
+        Confirm AllowUnauthenticatedIdentities=true via cognito-identity:DescribeIdentityPool
+        (field AllowUnauthenticatedIdentities). Confirm the unauthenticated role ARN via
+        cognito-identity:GetIdentityPoolRoles (field Roles.unauthenticated). Do not emit
+        if the field is false or missing — GetCredentialsForIdentity with no token returns
+        NotAuthorizedException in that case. Do not conflate with the authenticated role.
+        If an SCP blocks cognito-identity:GetCredentialsForIdentity, emit state BLOCKED.
+      narrative: >-
+        Identity Pool {pool.name} (AllowUnauthenticatedIdentities=true) accepts
+        unauthenticated callers: any internet user can call cognito-identity:GetId and
+        cognito-identity:GetCredentialsForIdentity (no credentials required) to receive
+        temporary IAM credentials for unauthenticated role {unauth_role.name}.
+
+  # --- 2. Authenticated Identity Pool — broad / unpinned trust -------------
+  # An Identity Pool maps authenticated federated tokens to an IAM role via
+  # sts:AssumeRoleWithWebIdentity. The role's trust policy names
+  # Principal.Federated = cognito-identity.amazonaws.com and CONDITIONS on
+  # cognito-identity:aud (pool ID) and cognito-identity:amr (authenticated /
+  # unauthenticated / specific provider). This rule emits ACTIVE when the trust
+  # condition is BROAD (missing amr provider pin, or amr = "authenticated" without
+  # a specific pool-linked provider restriction) so any authenticated token for
+  # that pool earns the role — e.g. an attacker who signs up via a social/SAML
+  # provider the application didn't intend gets the same role as a corporate SSO user.
+  - id: aws-cognito-authenticated-role-federate
+    emits: CanFederateAs
+    description: >-
+      A Cognito-authenticated federated identity presents a valid pool token to
+      receive temporary IAM credentials for the authenticated role. When the role
+      trust condition is broad (authenticated but any provider), any authenticated
+      pool user — regardless of the provider used — receives the role.
+    applies_to: [aws]
+    match:
+      - [ ?federated, ExternalIdentityMapsTo, ?auth_role ]
+      - [ ?auth_role, TrustsExternalIdentity, ?federated ]
+    where:
+      - "node_type(?federated) in [FederatedIdentity, ExternalIdentity]"
+      - "node_type(?auth_role) == Role"
+      - "?auth_role trust policy Federated == cognito-identity.amazonaws.com"
+      - "trust condition includes cognito-identity:aud == ?pool.id"
+      - "trust condition cognito-identity:amr is absent OR is only 'authenticated' (no specific provider pin)"
+    emit:
+      source_type: FederatedIdentity
+      target_type: Role
+      source: ?federated
+      target: ?auth_role
+      permissions: ["cognito-identity:GetId", "cognito-identity:GetCredentialsForIdentity"]
+      conditions: [trust_condition]
+      state_logic: >-
+        ACTIVE when cognito-identity:amr is absent or only 'authenticated' (no specific
+        provider sub-condition): any valid authentication for the pool (any linked IdP,
+        social login, User Pool) earns the role. CONDITIONAL(trust_condition) when amr
+        is pinned to a specific provider (e.g. 'accounts.google.com' or the User Pool
+        issuer URL) that the attacker does not control — realizable only if the attacker
+        can authenticate via that specific provider. BLOCKED if an SCP denies
+        cognito-identity:GetCredentialsForIdentity.
+      confidence: 0.90
+      derived_from:
+        - "?federated ExternalIdentityMapsTo ?auth_role"
+        - "?auth_role TrustsExternalIdentity ?federated (trust condition breadth: broad/unpinned amr)"
+        - "federation-chains.yaml federation-maps-to-identity (provider-agnostic collapse CITED)"
+      false_positive_note: >-
+        Evaluate the trust condition breadth carefully. ACTIVE requires the amr condition
+        to be absent or only 'authenticated' (not provider-specific). If amr is pinned to
+        a specific sub-provider (e.g. 'accounts.google.com', or a specific User Pool
+        issuer URL like 'cognito-idp.us-east-1.amazonaws.com/<pool-id>'), emit
+        CONDITIONAL(trust_condition) — the attacker must obtain a valid token from that
+        specific provider to realize the path. Honor the aud condition: a role that
+        specifies cognito-identity:aud == <poolId> is correctly scoped to that pool. A
+        role that omits the aud condition can be driven by ANY pool in the account that
+        has the service principal in its trust — widen the ExternalIdentityMapsTo source
+        accordingly. Do not emit for a well-pinned trust (specific provider + specific
+        pool + MFA required) as it is a legitimate, well-configured federation.
+      narrative: >-
+        Federated identity {federated.name} holds a valid authentication token for
+        Identity Pool {pool.name}; because the authenticated role {auth_role.name} trusts
+        cognito-identity.amazonaws.com with condition {trust_condition_summary}, it can
+        call GetCredentialsForIdentity to receive temporary IAM credentials for {auth_role.name}.
+
+  # --- 3. Role mapping rules — claim-to-role over-grant --------------------
+  # Identity Pools with RoleResolution=Rules assign roles based on token claim values
+  # (e.g. custom:role, cognito:groups, custom:department). If an attacker-controllable
+  # claim value (e.g. a User Pool attribute the user can set via UpdateUserAttributes)
+  # maps to a more-privileged role, the attacker changes their claim and receives
+  # escalated credentials. This rule fires when the claim that drives the role mapping
+  # is writable by the pool user (no admin required).
+  - id: aws-cognito-role-mapping-claim-override
+    emits: CanFederateAs
+    description: >-
+      An Identity Pool role mapping rule selects a privileged IAM role based on a
+      token claim value the pool user can write (e.g. a custom User Pool attribute
+      updatable via UpdateUserAttributes), enabling self-escalation to the mapped role.
+    applies_to: [aws]
+    match:
+      - [ ?federated, ExternalIdentityMapsTo, ?privileged_role ]
+    where:
+      - "node_type(?federated) in [FederatedIdentity, ExternalIdentity]"
+      - "node_type(?privileged_role) == Role"
+      - "?pool.RoleMappings[*].RulesConfiguration is not null (Type==Rules)"
+      - "the claim driving the matching rule is a User Pool attribute writable by the user (not admin-only)"
+      - "the matching claim value maps to ?privileged_role (not the default authenticated role)"
+    emit:
+      source_type: FederatedIdentity
+      target_type: Role
+      source: ?federated
+      target: ?privileged_role
+      permissions: ["cognito-idp:UpdateUserAttributes", "cognito-identity:GetId", "cognito-identity:GetCredentialsForIdentity"]
+      conditions: [trust_condition]
+      state_logic: >-
+        ACTIVE when the claim is writable via cognito-idp:UpdateUserAttributes (or
+        similarly user-writable flow) with no admin involvement — the pool user sets
+        the claim to the escalating value, gets a new token, calls
+        GetCredentialsForIdentity, and receives the privileged role's credentials.
+        CONDITIONAL(trust_condition) when the claim is admin-only (only settable via
+        AdminUpdateUserAttributes — the attacker needs admin access to the User Pool).
+        POTENTIAL when the claim source cannot be determined from collected data.
+      confidence: 0.80
+      derived_from:
+        - "?federated ExternalIdentityMapsTo ?privileged_role"
+        - "cognito-identity:GetIdentityPoolRoles.RoleMappings[*].RulesConfiguration (claim -> role mapping)"
+        - "cognito-idp:DescribeUserPool / DescribeUserPoolClient (schema writeability of the claim attribute)"
+      false_positive_note: >-
+        This rule fires only when the claim is USER-WRITABLE (no admin) and maps to a
+        DIFFERENT (more privileged) role than the default authenticated role. Many User
+        Pool custom attributes are read-only from the user's perspective (admin-set-only
+        via AdminUpdateUserAttributes or AdminSetUserPassword); if the claim is admin-only,
+        downgrade to CONDITIONAL and require the AdminUpdateUserAttributes path instead.
+        Honor the 'Match Type' of the rule: an 'Equals' match on a specific admin-set
+        value is not exploitable by the user; a 'Contains'/'NotEqual' on a writable
+        attribute is. Do not emit for the default authenticated role (no claim mismatch
+        escalation). If Rules-based role assignment is disabled or the pool uses Token
+        (not Rules) resolution, do not emit this rule.
+      narrative: >-
+        Identity Pool {pool.name} uses claim-based role mapping; the claim {claim.name}
+        drives selection of {privileged_role.name} and is writable by the pool user via
+        cognito-idp:UpdateUserAttributes. An attacker who sets {claim.name}={escalating_value}
+        in their profile receives a token with that claim and can then call
+        GetCredentialsForIdentity to receive credentials for {privileged_role.name}.
+
+  # --- 4. Developer-authenticated identity abuse ---------------------------
+  # When an Identity Pool configures a DeveloperProviderName, a trusted backend calls
+  # cognito-identity:GetOpenIdTokenForDeveloperIdentity to create a custom login token
+  # for any arbitrary developerUserId. An IAM principal with this permission can
+  # synthesize a token for any identity in the pool — including impersonating existing
+  # users — and then call GetCredentialsForIdentity to receive the authenticated role
+  # credentials for ANY pool member without knowing their password.
+  - id: aws-cognito-developer-auth-abuse
+    emits: CanFederateAs
+    description: >-
+      An IAM principal with cognito-identity:GetOpenIdTokenForDeveloperIdentity can
+      synthesize a developer-authenticated token for any developerUserId in the pool
+      and exchange it for the authenticated role's IAM credentials, bypassing user
+      authentication entirely.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?pool ]
+    where:
+      - "node_type(?principal) in [HumanIdentity, MachineIdentity, Role, ServiceIdentity]"
+      - "node_type(?pool) == ApplicationIdentity  # Cognito Identity Pool"
+      - "?principal has EFFECTIVE cognito-identity:GetOpenIdTokenForDeveloperIdentity on ?pool ARN"
+      - "?pool.DeveloperProviderName is not null  # developer-authenticated flow configured"
+      - "?auth_role = GetIdentityPoolRoles(?pool).Roles.authenticated"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: ?principal
+      target: ?auth_role
+      permissions: ["cognito-identity:GetOpenIdTokenForDeveloperIdentity", "cognito-identity:GetCredentialsForIdentity"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when GetOpenIdTokenForDeveloperIdentity is effective (not blocked by SCP
+        or permission boundary) AND the pool has DeveloperProviderName set. No trust
+        condition gates this path — the developer-auth API is designed to issue tokens
+        for arbitrary user IDs; any effective holder of this permission can impersonate
+        any pool user. BLOCKED if an SCP denies GetOpenIdTokenForDeveloperIdentity or
+        GetCredentialsForIdentity for the pool.
+      confidence: 0.90
+      derived_from:
+        - "?principal HasPermission cognito-identity:GetOpenIdTokenForDeveloperIdentity on ?pool"
+        - "?pool.DeveloperProviderName != null (cognito-identity:DescribeIdentityPool)"
+        - "GetIdentityPoolRoles.Roles.authenticated (authenticated role)"
+      false_positive_note: >-
+        Only emit when the pool ACTUALLY has DeveloperProviderName configured
+        (DescribeIdentityPool field DeveloperProviderName is non-null). Without it,
+        GetOpenIdTokenForDeveloperIdentity returns an error. Verify that the calling
+        principal's effective permission covers the specific pool ARN (not just *).
+        This path bypasses the end-user's authentication entirely — it is not mitigated
+        by strong user passwords or MFA — so a broad IAM grant of this action is high
+        severity regardless of other pool configuration.
+      narrative: >-
+        {principal.name} holds effective cognito-identity:GetOpenIdTokenForDeveloperIdentity
+        on Identity Pool {pool.name} (developer-provider: {pool.DeveloperProviderName}).
+        It can synthesize a developer-authenticated token for any pool user, then call
+        GetCredentialsForIdentity to receive temporary IAM credentials for authenticated
+        role {auth_role.name} — without knowing any user's password.
+
+  # ===========================================================================
+  # BLOCK B — IDENTITY POOL CONFIGURATION PRIVESC (CanModifyTrust)
+  #
+  # NOTE: CanModifyTrust has nature: explicit in schema/edges.yaml. Rules emitting
+  # CanModifyTrust MUST live in /rules/explicit/aws-cognito.yaml. The rules
+  # aws-cognito-set-pool-roles-modify-trust and aws-cognito-idp-substitution have
+  # been moved to the explicit file (see aws-cognito-set-identity-pool-roles and
+  # aws-cognito-create-identity-provider / aws-cognito-update-identity-provider).
+  # ===========================================================================
+
+# ===========================================================================
+# EXPLICIT NORMALIZATION RULES — AUTHORITATIVE SOURCE: /rules/explicit/aws-cognito.yaml
+#
+# The explicit file is the sole authoritative source for match_record normalization
+# steps producing explicit edges (TrustsExternalIdentity, ExternalIdentityMapsTo,
+# ExposedToInternet, CanResetCredential, CanAddMember, CanReadSecret, MemberOf).
+# This derived file does NOT duplicate them; instead:
+#   1. Feeds from explicit edges via rule matching (match: [...edge...])
+#   2. Cites the explicit rules in derived_from blocks for traceability
+#   3. Rolls up explicit facts into higher-order derivations (federation-chains)
+#
+# BLOCKED-edge guidance:
+#  - An SCP denying cognito-identity:GetCredentialsForIdentity account-wide BLOCKS
+#    all CanFederateAs edges derived from Identity Pools -> emit state BLOCKED.
+#  - An SCP denying cognito-identity:SetIdentityPoolRoles BLOCKS
+#    aws-cognito-set-pool-roles-modify-trust.
+#  - A permission boundary capping an IAM principal below the Cognito actions
+#    -> the effective permission evaluator must confirm the action passes the boundary;
+#    if not, BLOCKED.
+#  - AllowUnauthenticatedIdentities=false is NOT a guard against the authenticated
+#    paths — it only blocks the unauthenticated rule.
+# ===========================================================================

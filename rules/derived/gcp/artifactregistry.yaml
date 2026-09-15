@@ -1,0 +1,603 @@
+# GCP Artifact Registry — Derived attack-path rules (Phase 7 — containers & supply chain)
+# ---------------------------------------------------------------------------
+# Artifact Registry is a SUPPLY-CHAIN node, not a compute node. It does not
+# execute directly. The attack primitives it emits are:
+#
+#   (A) CanModifyCode(principal -> ContainerRegistry/ArtifactRepository)
+#       via artifactregistry.repositories.uploadArtifacts (push/overwrite), or
+#       via artifactregistry.tags.update (tag-move / retag to attacker digest).
+#       container-chains::image-push-poisons-consumers then fans this out to
+#       every Compute/KubernetesWorkload that pulls from the repo.
+#
+#   (B) CanModifyCode reached via policy self-grant:
+#       artifactregistry.repositories.setIamPolicy -> self-bind writer -> push.
+#
+#   (C) CanModifyCode reached after configuration unlock:
+#       artifactregistry.repositories.update removes tag immutability,
+#       enabling a subsequent push that was previously BLOCKED.
+#
+#   (D) CrossProjectTrust / TrustsExternalIdentity on the repo IAM policy:
+#       cross-project or federated principals granted writer access.
+#       Feeds container-chains supply-chain fan-out into a foreign project.
+#
+#   (E) CanModifyPolicy on the repository's IAM allow policy:
+#       principal can set the repo's resource policy, enabling self-grant.
+#
+# LINCHPIN CITATIONS — DO NOT RE-DERIVE:
+#   container-chains::image-push-poisons-consumers
+#     Consumes CanModifyCode(principal -> repo) + ContainsResourceReference(consumer
+#     -> repo) and produces CanModifyCode(principal -> consumer). This file only
+#     emits CanModifyCode onto the repo; the fan-out is container-chains' job.
+#   container-chains::poisoned-image-executes-as
+#     Consumes CanModifyCode(principal -> consumer) + ExecutesAs(consumer -> SA)
+#     and produces CanExecuteAs(principal -> SA). Not re-derived here.
+#   can-control::escalate-via-execute-as
+#     Consumes CanExecuteAs and produces CanEscalateTo when privilege increases.
+#     Not re-derived here.
+#   gcp/identity-escalation::gcp-set-iam-policy-resource
+#     Covers the general setIamPolicy -> CanModifyPolicy derivation at resource
+#     scope. This file emits the Artifact Registry-specific CanModifyCode
+#     consequence of a policy self-grant.
+#   federation-chains (all federation roll-ups)
+#     TrustsExternalIdentity / ExternalIdentityMapsTo -> CanFederateAs and
+#     CanEnter* consequences are federation-chains'. This file emits only
+#     the TrustsExternalIdentity fact on the repo ResourcePolicy.
+#   hierarchy-chains (guardrail removal)
+#     VPC-SC perimeter removal via CanModifyPolicy -> re-enables BLOCKED edges.
+#     This file notes the BLOCKED state gate; hierarchy-chains drives the
+#     guardrail-removal escalation path.
+#
+# Binary Authorization gate: any CanModifyCode fan-out to a GKE consumer that
+# enforces Binary Authorization is CONDITIONAL(binauthorz_attestation). The
+# supply-chain edge to that consumer is only ACTIVE when the pushed image is
+# validly attested OR BinAuthz is not enforced. Collectors must surface the
+# BinAuthz admission plugin status and attestor policy per cluster.
+#
+# State propagation per RULE-FORMAT.md: a derived edge is never stronger than
+# its weakest contributor.
+#
+# Scope discipline:
+#   - A project-level role binding applies to ALL repos in the project; emit
+#     CanModifyCode for every repo in scope, not just one.
+#   - A repo-level binding applies only to that repo.
+#   - Org-level bindings cascade via folder/project to all repos in scope.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 7-containers-k8s
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # A) Direct push: uploadArtifacts -> CanModifyCode on the repo
+  # ---------------------------------------------------------------------------
+  # This is the FACT rule — the principal holds the upload permission.
+  # container-chains::image-push-poisons-consumers is the fan-out.
+  # We emit CanModifyCode on the repository node; container-chains consumes it.
+  - id: gcp-ar-upload-is-code-modify
+    emits: CanModifyCode
+    description: "A principal with artifactregistry.repositories.uploadArtifacts can push/overwrite images or packages into the repo — the code-supply-chain write primitive feeding container-chains fan-out."
+    match_effective_permission:
+      action: "artifactregistry.repositories.uploadArtifacts"
+      resource_type: "google.artifactregistry.Repository"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Artifact Registry repository in scope>"
+      permissions:
+        - "artifactregistry.repositories.uploadArtifacts"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the permission is effective (not denied by IAM deny policy or
+        VPC-SC perimeter enforcement). CONDITIONAL(push_succeeds) if the repo has
+        immutable tags enabled (ImmutableTags: true) — a push to an EXISTING tag
+        fails; a push creating a NEW tag would succeed but reaches only consumers
+        referencing that new tag. BLOCKED if an IAM deny policy denies
+        artifactregistry.repositories.uploadArtifacts or a VPC-SC perimeter
+        rejects the API call from the principal's project. Inherit weakest with
+        any contributing role binding.
+      confidence: 0.95
+      derived_from:
+        - "effective permission: artifactregistry.repositories.uploadArtifacts on <repo>"
+      false_positive_note: >-
+        Immutable-tag repos (ImmutableTags: true) block overwrite of existing
+        tags — downgrade the fan-out to CONDITIONAL(push_succeeds) for consumers
+        that reference a mutable (non-digest-pinned) tag, because while the
+        push of a NEW tag succeeds, an existing-tag consumer is not automatically
+        redirected. Digest-pinned consumers (@sha256) are not reached regardless
+        of immutability — container-chains sets those fan-out edges to BLOCKED.
+        VPC-SC enforcement on the repo's project rejects push calls from outside
+        the perimeter even with the IAM permission — emit BLOCKED for such
+        principals. Binary Authorization on consuming GKE clusters makes the
+        supply-chain consequence CONDITIONAL(binauthorz_attestation) even when
+        this push is ACTIVE. Do not conflate project-level role grant (all repos)
+        with a single-repo-scoped CanModifyCode — scope edges per repo.
+        For non-OCI repos (Maven, npm, PyPI, etc.), the target_type is resolved
+        at emit time from the repository's generic_type (ArtifactRepository for
+        package repos, ContainerRegistry for Docker/OCI).
+      narrative: >-
+        {principal.name} holds artifactregistry.repositories.uploadArtifacts on
+        repository {repo.name}; it can push or overwrite container images (or
+        package artifacts) in that repo. container-chains then propagates this
+        CanModifyCode to every workload that pulls from {repo.name} via a mutable
+        tag, injecting attacker code into those workloads on next pull/redeploy.
+
+  # ---------------------------------------------------------------------------
+  # A2) Tag retag / tag.update -> CanModifyCode
+  # Moving a mutable tag to point to a different (attacker-controlled) digest is
+  # functionally equivalent to a push for the supply-chain attack: any consumer
+  # that re-pulls the tag now runs the attacker's image. Covered by
+  # roles/artifactregistry.writer (includes tags.create, tags.update).
+  # ---------------------------------------------------------------------------
+  - id: gcp-ar-tag-update-is-code-modify
+    emits: CanModifyCode
+    description: "Moving a tag to a different digest (artifactregistry.tags.update) is equivalent to a code push — mutable-tag consumers that re-pull will run the new image."
+    match_effective_permission:
+      action: "artifactregistry.tags.update"
+      resource_type: "google.artifactregistry.Repository"
+    where:
+      - "node_type(?repo) in [ContainerRegistry]  # tag semantics apply to OCI/Docker repos"
+    emit:
+      source_type: Identity
+      target_type: ContainerRegistry
+      source: "<principal>"
+      target: "<Artifact Registry Docker/OCI repository in scope>"
+      permissions:
+        - "artifactregistry.tags.update"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the permission is effective and the repo type is Docker/OCI
+        (tag move has no code-execution meaning for non-OCI package repos).
+        BLOCKED if the repo has ImmutableTags: true — the tag update API call
+        is rejected. CONDITIONAL(image_pulled) for the downstream fan-out
+        (consumer must re-pull after the retag).
+      confidence: 0.90
+      derived_from:
+        - "effective permission: artifactregistry.tags.update on <repo>"
+      false_positive_note: >-
+        Tag update only applies to Docker/OCI repos. For Maven/npm/PyPI repos,
+        tags.update does not exist in the same way — do not emit for non-OCI
+        repos. Repos with ImmutableTags: true reject tag updates — emit BLOCKED.
+        The consumer must re-pull after the retag for the poison to land;
+        container-chains carries the CONDITIONAL(image_pulled) gate on the
+        fan-out edge, not here.
+      narrative: >-
+        {principal.name} can move a Docker tag in {repo.name}
+        (artifactregistry.tags.update) to point to an attacker-controlled image
+        digest; any workload that re-pulls that tag will run the attacker's
+        image, equivalent to a supply-chain push.
+
+  # ---------------------------------------------------------------------------
+  # B) setIamPolicy -> CanModifyPolicy on the repo's IAM policy
+  # Policy self-grant: bind roles/artifactregistry.writer to self, then push.
+  # The CanModifyCode consequence is derived via gcp-ar-policy-self-grant-write
+  # below. Here we emit the CanModifyPolicy fact.
+  # ---------------------------------------------------------------------------
+  - id: gcp-ar-set-iam-policy
+    emits: CanModifyPolicy
+    description: "artifactregistry.repositories.setIamPolicy grants full control over the repo's IAM allow policy — self-grant writer access, then push to poison consumers."
+    match_effective_permission:
+      action: "artifactregistry.repositories.setIamPolicy"
+      resource_type: "google.artifactregistry.Repository"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: "<principal>"
+      target: "<ResourcePolicy of the Artifact Registry repository>"
+      permissions:
+        - "artifactregistry.repositories.setIamPolicy"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the permission is effective. BLOCKED if an IAM deny policy
+        denies artifactregistry.repositories.setIamPolicy (e.g. from an org-wide
+        deny policy), or if a VPC-SC perimeter rejects the API call. Inherits
+        weakest from the contributing role binding.
+      confidence: 0.95
+      derived_from:
+        - "effective permission: artifactregistry.repositories.setIamPolicy on <repo>"
+      false_positive_note: >-
+        setIamPolicy at project/folder/org scope (resourcemanager.*.setIamPolicy)
+        also implies CanModifyPolicy on the repo transitively — those paths are
+        handled by gcp/identity-escalation.yaml. This rule covers the repo-level
+        setIamPolicy permission only. Check that an IAM deny policy does not
+        shadow the grant before emitting ACTIVE.
+      narrative: >-
+        {principal.name} can set the IAM allow policy of repository {repo.name}
+        (artifactregistry.repositories.setIamPolicy), granting itself
+        roles/artifactregistry.writer and subsequently pushing a malicious image
+        to poison every mutable-tag consumer.
+
+  # ---------------------------------------------------------------------------
+  # B2) CanModifyPolicy -> CanModifyCode: policy self-grant enables push
+  # Once the principal can set the repo policy, it can bind writer to itself,
+  # gaining uploadArtifacts. The CanModifyCode then feeds container-chains.
+  # ---------------------------------------------------------------------------
+  - id: gcp-ar-policy-self-grant-write
+    emits: CanModifyCode
+    description: "A principal that can set a repo's IAM policy can self-grant roles/artifactregistry.writer and then push, reaching CanModifyCode on the repo via policy manipulation."
+    match:
+      - [ ?principal, CanModifyPolicy, ?repo_policy ]
+    where:
+      - "?repo_policy is the ResourcePolicy of an Artifact Registry repository ?repo"
+      - "node_type(?repo) in [ContainerRegistry, ArtifactRepository]"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: "<Artifact Registry repository whose ResourcePolicy is ?repo_policy>"
+      permissions:
+        - "artifactregistry.repositories.setIamPolicy"
+        - "artifactregistry.repositories.uploadArtifacts"
+      conditions: [iam_permission]
+      state_logic: >-
+        CONDITIONAL(iam_permission): the self-grant step requires a successful
+        setIamPolicy call followed by uploadArtifacts, a sequential two-step
+        action. The iam_permission condition gates both steps — if either
+        setIamPolicy or uploadArtifacts is denied by IAM deny policy, the
+        derivation is BLOCKED. ACTIVE when the setIamPolicy CanModifyPolicy
+        is ACTIVE and no deny shadows the uploadArtifacts permission.
+        Inherit weakest from the contributing CanModifyPolicy.
+      confidence: 0.90
+      derived_from:
+        - "?principal CanModifyPolicy ?repo_policy (gcp-ar-set-iam-policy)"
+      false_positive_note: >-
+        The self-grant is a two-step action (setIamPolicy then uploadArtifacts);
+        both steps must succeed. An IAM deny blocking setIamPolicy keeps this
+        BLOCKED regardless of the upload permission. The CanModifyCode emitted
+        here is the SAME capability as gcp-ar-upload-is-code-modify but reached
+        via policy manipulation; graph deduplication should treat them as the
+        same (CanModifyCode, ?principal, ?repo) edge — pick higher confidence,
+        do not double-count weight. container-chains fan-out applies equally.
+        The target_type is resolved at emit time from the repository's
+        generic_type (ContainerRegistry for Docker/OCI, ArtifactRepository for
+        package repos).
+      narrative: >-
+        {principal.name} can set the IAM policy of {repo.name}
+        (artifactregistry.repositories.setIamPolicy), granting itself writer
+        access, and then push a malicious image (artifactregistry.repositories.
+        uploadArtifacts) — policy manipulation yields the same supply-chain
+        CanModifyCode as a direct writer grant.
+
+  # ---------------------------------------------------------------------------
+  # C) CanModifyConfiguration: repositories.update unlocks or reconfigures
+  # This covers:
+  #   - Disabling tag immutability (removes the tag-overwrite guard rail)
+  #   - Changing a remote repo's upstream URL (dependency confusion)
+  #   - Changing a virtual repo's upstream priority
+  # ---------------------------------------------------------------------------
+  - id: gcp-ar-repo-update-config
+    emits: CanModifyConfiguration
+    description: "artifactregistry.repositories.update can disable tag immutability, change remote/virtual repo upstreams, or otherwise reconfigure a repository — enabling subsequent supply-chain attacks that were previously BLOCKED."
+    match_effective_permission:
+      action: "artifactregistry.repositories.update"
+      resource_type: "google.artifactregistry.Repository"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Artifact Registry repository in scope>"
+      permissions:
+        - "artifactregistry.repositories.update"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the permission is effective. The downstream consequence
+        depends on the repo type: for a ContainerRegistry (Docker/OCI) with
+        ImmutableTags: true, this configuration change UNLOCKS the tag-overwrite
+        path (transitioning the subsequent CanModifyCode to ACTIVE from BLOCKED/CONDITIONAL).
+        For a remote repo, changing the upstream URL redirects pull traffic to an
+        attacker-controlled origin. BLOCKED if an IAM deny policy denies
+        artifactregistry.repositories.update. Inherits weakest from contributing
+        role binding.
+      confidence: 0.85
+      derived_from:
+        - "effective permission: artifactregistry.repositories.update on <repo>"
+      false_positive_note: >-
+        CanModifyConfiguration on a repo does NOT itself push code; it is a
+        precondition that unlocks a subsequent push (immutability removal) or
+        redirects pulls (upstream change). The escalation consequence is
+        CONDITIONAL on both the config change AND a subsequent push or pull from
+        the changed upstream. For the immutability-removal path, emit
+        CanModifyCode for the subsequent push as CONDITIONAL (precondition:
+        immutability was removed) rather than ACTIVE, unless the principal also
+        holds uploadArtifacts. For the remote-upstream-change path, the
+        dependency confusion vector does not require any further GCP permission;
+        the attacker must control a public upstream package at the right version.
+        The target_type is resolved at emit time from the repository's
+        generic_type (ContainerRegistry for Docker/OCI, ArtifactRepository for
+        package repos).
+      narrative: >-
+        {principal.name} can update the configuration of repository {repo.name}
+        (artifactregistry.repositories.update), for example disabling tag
+        immutability to enable tag overwrite, or changing a remote repo's
+        upstream URL to redirect pulls to an attacker-controlled source.
+
+  # ---------------------------------------------------------------------------
+  # D) Cross-project binding: CrossProjectTrust on the repo's ResourcePolicy
+  # A repo IAM binding that names a principal from another GCP project.
+  # The cross-project writer can push and poison the host project's workloads.
+  # ---------------------------------------------------------------------------
+  - id: gcp-ar-cross-project-writer
+    emits: CrossProjectTrust
+    description: "An Artifact Registry repo IAM allow policy that grants roles/artifactregistry.writer (or uploadArtifacts) to a service account from a different GCP project establishes cross-project trust — that SA can push to this project's registry."
+    match:
+      - [ ?repo, HasPolicy, ?repo_policy ]
+    where:
+      - "?repo is an Artifact Registry repository node"
+      - "?repo_policy is the ResourcePolicy of ?repo"
+      - "?repo_policy has an IAM binding for a ServiceAccount from a DIFFERENT GCP project (member is serviceAccount:*@<other-project>.iam.gserviceaccount.com)"
+      - "the binding role or permissions include artifactregistry.repositories.uploadArtifacts"
+      - "node_type(?repo) in [ContainerRegistry, ArtifactRepository]"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: ?repo_policy
+      target: "<GCP project of the external ServiceAccount>"
+      permissions:
+        - "artifactregistry.repositories.uploadArtifacts"
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the IAM binding is present, the role includes uploadArtifacts,
+        and no IAM deny overrides it. CONDITIONAL(resource_policy) if the binding
+        has an IAM condition expression (e.g. a resource tag condition) that may not
+        be satisfied. BLOCKED if a VPC-SC perimeter prevents the cross-project API
+        call or an org policy restricts cross-project resource sharing. Inherit
+        weakest from the binding's effective state.
+      confidence: 0.90
+      derived_from:
+        - "gcp-ar-cross-project-binding (explicit: cross-project IAM binding)"
+      false_positive_note: >-
+        The cross-project SA must actually be usable by a principal the attacker
+        controls — the trust edge models the repo's posture, not that the SA is
+        necessarily compromised. Path-finding chains this CrossProjectTrust to the
+        SA's owner project; only if a principal in that project can act as the SA
+        (via iam.serviceAccounts.actAs or direct SA credential access) does the
+        push capability materialize. Verify that the SA is not a Google-managed
+        service agent (those have restricted key creation and actAs surfaces).
+      narrative: >-
+        Repository {repo.name} (project {repo.project}) grants uploadArtifacts to
+        service account {sa.name} from project {sa.project}. A principal that can
+        act as {sa.name} can push to {repo.name} and poison every mutable-tag
+        workload consuming images from it in {repo.project}.
+
+  # ---------------------------------------------------------------------------
+  # D2) WIF / external principal: TrustsExternalIdentity on the repo policy
+  # A repo IAM binding using a principalSet:// or principal:// (WIF pool) that
+  # grants uploadArtifacts to an external/federated identity (GitHub Actions, etc.)
+  # ONLY emit when grants_upload is true to avoid conflating write trust with
+  # read-only pull access. For read-only WIF bindings, the edge is lower value.
+  # ---------------------------------------------------------------------------
+  - id: gcp-ar-wif-writer-trust
+    emits: TrustsExternalIdentity
+    description: "An Artifact Registry repo IAM binding for a Workload Identity Federation principalSet/principal with uploadArtifacts grants an external OIDC identity (e.g. GitHub Actions) direct push access — supply-chain from external CI into GCP workloads."
+    match:
+      - [ ?repo, HasPolicy, ?repo_policy ]
+    where:
+      - "?repo_policy is a ResourcePolicy of an Artifact Registry repository ?repo"
+      - "?repo_policy has an IAM binding for a WIF principal (member starts with principalSet://iam.googleapis.com/ or principal://iam.googleapis.com/)"
+      - "the binding role or permissions include artifactregistry.repositories.uploadArtifacts"
+      - "node_type(?repo) in [ContainerRegistry, ArtifactRepository]"
+    emit:
+      source_type: ResourcePolicy
+      target_type: FederatedIdentity
+      source: ?repo_policy
+      target: "<FederatedIdentity / WIF principalSet or principal>"
+      permissions:
+        - "artifactregistry.repositories.uploadArtifacts"
+      conditions: [trust_relationship, condition_expression]
+      state_logic: >-
+        ACTIVE when the trust condition on the WIF binding is BROAD or UNPINNED
+        (the external identity assertion is easily satisfied — e.g. the principalSet
+        covers all identities in the WIF pool, or the attribute mapping has no
+        specific subject constraint). CONDITIONAL(trust_relationship) when the
+        binding is pinned to a specific subject (e.g. a specific GitHub repo +
+        branch ref), because the attacker must control an identity matching that
+        subject. BLOCKED if the WIF pool is disabled or the pool's OIDC issuer
+        is not trusted. Inherit weakest from the WIF pool's trust posture.
+      confidence: 0.85
+      derived_from:
+        - "gcp-ar-wif-binding (explicit: TrustsExternalIdentity from IAM binding)"
+      false_positive_note: >-
+        The strength of this edge depends entirely on the WIF attribute condition.
+        A principalSet that maps `google.subject` to `repo:org/repo:ref:refs/heads/main`
+        is CONDITIONAL — the attacker must push code to that specific branch. A
+        principalSet covering all identities in the pool (no attribute condition)
+        is ACTIVE. Only emit this rule when grants_upload is true; read-only WIF
+        bindings (downloadArtifacts only) do not model supply-chain write risk and
+        should not traverse this path for CanModifyCode derivations. Cite
+        federation-chains for the CanFederateAs -> CanEnterProject roll-up; do
+        not re-derive it here. The push permission itself is the Artifact Registry
+        fact; the federation trust is the GCP WIF posture.
+      narrative: >-
+        Repository {repo.name} grants artifactregistry.repositories.uploadArtifacts
+        to WIF identity {ext_identity.name}; an external OIDC workload (e.g. GitHub
+        Actions runner) satisfying the attribute condition can push a malicious image
+        directly to {repo.name} without any GCP service account key — supply-chain
+        injection from external CI.
+
+  # ---------------------------------------------------------------------------
+  # D3) Public-writable repo: allUsers uploadArtifacts -> CanModifyCode
+  # An extreme misconfiguration where allUsers is granted uploadArtifacts.
+  # This is the highest-severity supply-chain vulnerability: anonymous
+  # attackers on the public internet can directly push malicious code.
+  # ---------------------------------------------------------------------------
+  - id: gcp-ar-public-upload-is-code-modify
+    emits: CanModifyCode
+    description: "A repository granting uploadArtifacts to allUsers allows any unauthenticated attacker on the public internet to push code — the most critical supply-chain injection vulnerability."
+    match:
+      - [ ?anon, ExposedToInternet, ?repo ]
+    where:
+      - "?anon is AnonymousIdentity"
+      - "?repo has a CanModifyCode derivation path via allUsers+uploadArtifacts (from explicit gcp-ar-public-upload rule)"
+    emit:
+      source_type: AnonymousIdentity
+      target_type: "*"
+      source: ?anon
+      target: ?repo
+      permissions:
+        - "artifactregistry.repositories.uploadArtifacts (granted to allUsers)"
+      conditions: []
+      state_logic: >-
+        ACTIVE — no authentication required. Any attacker with internet connectivity
+        can push code directly. BLOCKED only if a VPC-SC perimeter is misconfigured
+        to reject allUsers API calls (rare; most SCPs allow allUsers in the perimeter
+        to prevent breaking legitimate public-consumer scenarios).
+      confidence: 0.98
+      derived_from:
+        - "gcp-ar-public-upload (explicit: allUsers uploadArtifacts)"
+      false_positive_note: >-
+        This is not a false positive — it is a critical misconfiguration. Verify
+        the IAM binding exists and that no VPC-SC perimeter actively rejects the
+        allUsers principal. If both are true, treat this as a P1 incident: any
+        external attacker can poison every workload consuming from {repo.name}.
+      narrative: >-
+        Repository {repo.name} grants artifactregistry.repositories.uploadArtifacts
+        to allUsers (public internet access). Any unauthenticated attacker can push
+        a malicious container image or package directly into this repository,
+        poisoning every workload that pulls from it. This is the highest-severity
+        supply-chain vulnerability in Artifact Registry — immediate remediation
+        required.
+
+  # ---------------------------------------------------------------------------
+  # E) CanRead: downloadArtifacts -> read/pull from the repo
+  # Low-value structural fact; emitted for completeness and for lateral-movement
+  # queries (who can read secrets in generic-file repos).
+  # ---------------------------------------------------------------------------
+  - id: gcp-ar-download-is-read
+    emits: CanRead
+    description: "artifactregistry.repositories.downloadArtifacts grants pull/read access to images and packages in the repo — required for consumers and useful for recon."
+    match_effective_permission:
+      action: "artifactregistry.repositories.downloadArtifacts"
+      resource_type: "google.artifactregistry.Repository"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Artifact Registry repository in scope>"
+      permissions:
+        - "artifactregistry.repositories.downloadArtifacts"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the permission is effective. BLOCKED if VPC-SC perimeter
+        enforced and principal is outside it. Low attack value by itself; primarily
+        useful when chained with ContainsSecret on generic-artifact repos or as
+        a prerequisite for dependency recon.
+      confidence: 0.80
+      derived_from:
+        - "effective permission: artifactregistry.repositories.downloadArtifacts on <repo>"
+      false_positive_note: >-
+        Pull access alone is not an escalation — do not include this edge in
+        privilege-escalation path queries without a ContainsSecret or similar
+        annotation on the repo. Its primary path-finding value is for data-access
+        and recon queries, and as evidence that a workload is a legitimate consumer
+        (feeds ContainsResourceReference edge collection).
+        The target_type is resolved at emit time from the repository's generic_type
+        (both ContainerRegistry and ArtifactRepository nodes are valid pull targets).
+      narrative: >-
+        {principal.name} can pull artifacts from repository {repo.name}
+        (artifactregistry.repositories.downloadArtifacts) — read access to all
+        images and packages in the repo.
+
+  # ---------------------------------------------------------------------------
+  # F) CanAdminister: full repo admin
+  # roles/artifactregistry.admin or roles/artifactregistry.repoAdmin.
+  # Implies CanModifyCode + CanModifyPolicy + CanModifyConfiguration.
+  # ---------------------------------------------------------------------------
+  - id: gcp-ar-admin
+    emits: CanAdminister
+    description: "roles/artifactregistry.admin or roles/artifactregistry.repoAdmin grants full control over an Artifact Registry repository, including push, policy mutation, and deletion."
+    match_effective_permission:
+      action: "artifactregistry.repositories.setIamPolicy"
+      resource_type: "google.artifactregistry.Repository"
+    where:
+      - "principal also holds artifactregistry.repositories.uploadArtifacts AND artifactregistry.repositories.update on the same repo (i.e. repoAdmin or admin role, not setIamPolicy alone)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Artifact Registry repository in scope>"
+      permissions:
+        - "artifactregistry.repositories.uploadArtifacts"
+        - "artifactregistry.repositories.update"
+        - "artifactregistry.repositories.setIamPolicy"
+        - "artifactregistry.repositories.delete"
+        - "artifactregistry.tags.create"
+        - "artifactregistry.tags.update"
+        - "artifactregistry.tags.delete"
+        - "artifactregistry.versions.delete"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the combined set of admin permissions is effective. BLOCKED if
+        an IAM deny policy denies any of the key permissions. Inherits weakest from
+        contributing role binding. Can-control roll-up applies via can-control.yaml.
+      confidence: 0.95
+      derived_from:
+        - "effective roles/artifactregistry.admin or roles/artifactregistry.repoAdmin on <repo>"
+      false_positive_note: >-
+        setIamPolicy alone (without uploadArtifacts + update) is CanModifyPolicy,
+        not CanAdminister. Verify the full permission set is granted before emitting
+        CanAdminister. A project-level roles/viewer grants read but not admin — check
+        the resolved role, not just a partial set. roles/artifactregistry.admin at
+        project scope covers ALL repos in the project; emit CanAdminister per repo.
+        The target_type is resolved at emit time from the repository's generic_type
+        (ContainerRegistry for Docker/OCI, ArtifactRepository for package repos).
+      narrative: >-
+        {principal.name} has full administrative control over repository {repo.name}
+        (roles/artifactregistry.admin / roles/artifactregistry.repoAdmin): can push,
+        delete, retag, set policy, and reconfigure the repository.
+
+# ---------------------------------------------------------------------------
+# LINCHPIN CITATIONS — rules NOT re-derived here (consume their outputs):
+#
+#   container-chains::image-push-poisons-consumers
+#     INPUT: CanModifyCode(?principal -> ?repo) from gcp-ar-upload-is-code-modify,
+#            gcp-ar-tag-update-is-code-modify, gcp-ar-policy-self-grant-write
+#     OUTPUT: CanModifyCode(?principal -> ?consumer-workload) for each consumer
+#     This file provides the CanModifyCode(repo) fact; container-chains does the fan-out.
+#
+#   container-chains::poisoned-image-executes-as
+#     INPUT: CanModifyCode(?principal -> ?consumer) + ExecutesAs(?consumer -> ?SA)
+#     OUTPUT: CanExecuteAs(?principal -> ?SA)
+#     This file does NOT emit CanExecuteAs — container-chains owns it.
+#
+#   can-control::escalate-via-execute-as
+#     INPUT: CanExecuteAs(?principal -> ?SA) where SA privilege > principal privilege
+#     OUTPUT: CanEscalateTo(?principal -> ?SA)
+#     Not re-derived here.
+#
+#   can-control::control-via-admin
+#     INPUT: CanAdminister(?principal -> ?repo) from gcp-ar-admin
+#     OUTPUT: Controls(?principal -> ?repo)
+#     Not re-derived here.
+#
+#   gcp/identity-escalation::gcp-set-iam-policy-resource
+#     Covers the general resource setIamPolicy -> CanModifyPolicy path.
+#     gcp-ar-set-iam-policy is the Artifact Registry-specific complement.
+#
+#   federation-chains (federation-maps-to-identity, federate-then-enter-project, etc.)
+#     INPUT: TrustsExternalIdentity from gcp-ar-wif-writer-trust
+#            + ExternalIdentityMapsTo from gcp-wif.yaml
+#     OUTPUT: CanFederateAs -> CanEnterProject / CanImpersonate
+#     This file emits TrustsExternalIdentity; federation-chains owns the roll-up.
+#
+#   hierarchy-chains (guardrail-removal for VPC-SC perimeter)
+#     A principal with CanModifyPolicy on the VPC-SC perimeter definition can
+#     remove the Artifact Registry service from the perimeter, transitioning
+#     BLOCKED supply-chain edges to ACTIVE. hierarchy-chains models that path;
+#     this file only records the BLOCKED state gate on perimeter-restricted repos.
+#
+# BLOCKED-edge guidance:
+#   - IAM deny policy denying artifactregistry.repositories.uploadArtifacts ->
+#     gcp-ar-upload-is-code-modify BLOCKED.
+#   - VPC-SC perimeter enforced (not dry-run) and principal project not in
+#     perimeter -> all repo API calls BLOCKED for that principal.
+#   - ImmutableTags: true on the repo -> tag-overwrite push BLOCKED (gcp-ar-upload
+#     downgraded to CONDITIONAL(push_succeeds) for mutable-tag fan-out; NEW-tag
+#     pushes still succeed but may not reach existing consumers).
+#   - Binary Authorization enforcement on consumer GKE cluster -> supply-chain
+#     fan-out CONDITIONAL(binauthorz_attestation) even when push is ACTIVE.
+#   - Digest-pinned consumer image references -> container-chains marks that
+#     specific fan-out edge BLOCKED (push cannot change what digest-pinned
+#     consumers run).
+# ---------------------------------------------------------------------------

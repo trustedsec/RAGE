@@ -1,0 +1,386 @@
+# Azure — App Configuration (Microsoft.AppConfiguration/configurationStores)
+# credential-access rules (Phase 5 — credential-access)
+# ---------------------------------------------------------------------------
+# An App Configuration store holds KEY-VALUES: plaintext strings returned to any
+# reader. Developers routinely store raw secrets there (connection strings, API
+# keys, client secrets), so "read the key-values" == "read whatever credentials
+# they contain". TWO read paths exist, both verified against the App Configuration
+# Entra-authorization reference and the access-key how-to (learn.microsoft.com):
+#
+#   1. Data-plane Entra RBAC:
+#        Microsoft.AppConfiguration/configurationStores/keyValues/read
+#        (App Configuration Data Reader = */read; Data Owner = */read,write,delete,action)
+#        also snapshots/read returns the key-values captured in a snapshot.
+#   2. Access-key connection strings:
+#        Microsoft.AppConfiguration/configurationStores/listKeys/action
+#        (held by Contributor / Owner — NOT a data role) returns read/read-write
+#        connection strings that authenticate to the data plane and read ALL
+#        key-values, BYPASSING data-plane RBAC. Gated by disableLocalAuth: when
+#        true, listKeys returns an empty list -> BLOCKED.
+#
+# KEY-PERMISSION GATE (Phase-5 theme) — DELIBERATELY NOT APPLIED to ordinary
+# reads: App Configuration CMK decryption is transparent server-side; a data-plane
+# reader does NOT need CanDecrypt on the CMK. So these reads are ACTIVE, not
+# CONDITIONAL(key_permission). (The only CMK failure mode is the store losing
+# access to its own key -> service_state, not a caller gate.) See functions/vm
+# rules for the contrasting case where the caller must decrypt.
+#
+# KEY VAULT REFERENCES are a CHAIN, not a direct read: a key-value can be a KV
+# reference (contentType application/vnd.microsoft.appconfig.keyvaultref+json)
+# whose value is a URI, not the secret. Reading it yields ContainsResourceReference
+# to the external Key Vault Secret; the plaintext needs a SEPARATE Key Vault
+# data-plane read. We never collapse it into a CanReadSecret on the KV secret.
+#
+# These rules emit the per-service credential edges (CanReadSecret, ExposesCredential,
+# CanWriteData). The KV-reference ContainsResourceReference is an EXPLICIT edge (see
+# the explicit file). The provider-agnostic Phase-5 rules in
+# /rules/derived/credential-chains.yaml collapse CanReadSecret + CredentialsFor
+# into CanImpersonate/CanEscalateTo, and complete the Phase-4 chain
+# CanExecuteAs -> CanReadSecret via execute-then-read-secret.
+#
+# EDGE NATURE (schema/edges.yaml) — a /rules/derived/ file may only EMIT edges whose
+# nature is derived|both (matching any edge in `match:` is always allowed):
+#   CanReadSecret:      nature both     (emitted here — explicit data-plane grant AND derivable)
+#   ExposesCredential:  nature derived  (emitted here)
+#   CanWriteData:       nature derived  (emitted here)
+#   ContainsResourceReference / CanModifyConfiguration: nature EXPLICIT — NOT emittable here.
+#     The KV-reference ContainsResourceReference is produced by the explicit rule
+#     azure-appconfig-keyvalue-kv-reference; the configurationStores/write ->
+#     CanModifyConfiguration fact is produced by the explicit rule
+#     azure-appconfig-reenable-local-auth. Both live in /rules/explicit/azure-appconfig.yaml.
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml), honored below:
+#   CanReadSecret:            source [Identity, Compute]  target [Secret, ConnectionString, Password, APIKey, Certificate]
+#   ExposesCredential:        source [Compute, Storage, Data, Messaging, Secret] target [Credential, Identity]
+#     -> target here constrained to Credential (ConnectionString is a Secret-class
+#        subtype and is NOT in ExposesCredential's target set).
+#   CredentialsFor:           source [Secret, Credential, AccessKey, Token, Certificate] target [Identity, Data, ServiceIdentity]
+#   ContainsSecret:           source [Storage, Data, Compute, Messaging] target [Secret, Credential]
+# App Configuration store nodes are class ManagementService; per edges.yaml,
+# ManagementService is NOT in ExposesCredential/ContainsSecret source sets, so
+# store-sourced credential edges use the store's Data/Storage facet (see notes on
+# each rule). The store's key-values are Secret/ConnectionString nodes.
+# Quote any scalar containing ':'.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 5-credential-access
+applies_to: [azure]
+
+rules:
+
+  # === 1) Data-plane read of a secret key-value -> CanReadSecret =============
+  - id: azure-appconfig-data-reader-read-kv
+    emits: CanReadSecret
+    description: "App Configuration Data Reader (keyValues/read) can read a key-value that holds credential material."
+    match:
+      - [ ?principal,  HasPermission,  ?store ]
+      - [ ?store,      Contains,       ?dataplane ]
+      - [ ?dataplane,  ContainsSecret, ?keyvalue ]
+    where:
+      - "node_class(?store) == ManagementService"
+      - "provider_type(?store) == 'Microsoft.AppConfiguration/configurationStores'"
+      - "node_class(?dataplane) == Data"
+      - "?principal has EFFECTIVE Microsoft.AppConfiguration/configurationStores/keyValues/read at the store scope (App Configuration Data Reader / Data Owner / custom role)"
+      - "node_type(?keyvalue) in [Secret, ConnectionString, APIKey, Password]"
+      - "?keyvalue is a plaintext key-value (contentType is NOT application/vnd.microsoft.appconfig.keyvaultref+json)"
+    emit:
+      source: ?principal
+      target: ?keyvalue
+      permissions: ["Microsoft.AppConfiguration/configurationStores/keyValues/read"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the effective keyValues/read is granted at the store scope and
+        access to the key-value is not denied. CMK on the store does NOT add a
+        key_permission gate (server-side transparent decrypt). BLOCKED if a deny
+        assignment / deny (Azure Policy) neutralizes keyValues/read at the scope.
+      confidence: "0.9"
+      derived_from: [ "?principal HasPermission ?store (keyValues/read)", "?store Contains ?dataplane", "?dataplane ContainsSecret ?keyvalue" ]
+      false_positive_note: >-
+        Only emit when the key-value's value is genuinely credential material
+        (connection string, client secret, API key) — feature flags / plain config
+        are NOT secrets and must not yield CanReadSecret. Do NOT emit for
+        Key-Vault-reference key-values (their value is a URI, not the secret — see
+        azure-appconfig-kv-reference). Do NOT add a caller CanDecrypt/key_permission
+        condition for CMK-encrypted stores: App Configuration decrypts server-side
+        for any authorized reader.
+      narrative: >-
+        {principal.name} can read key-value {keyvalue.name} in App Configuration
+        store {store.name} (keyValues/read); its value is credential material.
+
+  - id: azure-appconfig-data-owner-read-kv
+    emits: CanReadSecret
+    description: "App Configuration Data Owner (*/read incl. keyValues/read) can read a secret key-value."
+    match:
+      - [ ?principal,  HasPermission,  ?store ]
+      - [ ?store,      Contains,       ?dataplane ]
+      - [ ?dataplane,  ContainsSecret, ?keyvalue ]
+    where:
+      - "node_class(?store) == ManagementService"
+      - "provider_type(?store) == 'Microsoft.AppConfiguration/configurationStores'"
+      - "node_class(?dataplane) == Data"
+      - "?principal has EFFECTIVE Microsoft.AppConfiguration/configurationStores/*/read (App Configuration Data Owner) OR configurationStores/*/action at the store scope"
+      - "node_type(?keyvalue) in [Secret, ConnectionString, APIKey, Password]"
+      - "?keyvalue is a plaintext key-value (not a keyvaultref)"
+    emit:
+      source: ?principal
+      target: ?keyvalue
+      permissions: ["Microsoft.AppConfiguration/configurationStores/keyValues/read"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when Data Owner (or a custom role granting configurationStores/*/read)
+        is effective at the store scope. BLOCKED under a deny assignment / deny policy
+        on the read action.
+      confidence: "0.9"
+      derived_from: [ "?principal HasPermission ?store (*/read via Data Owner)", "?store Contains ?dataplane", "?dataplane ContainsSecret ?keyvalue" ]
+      false_positive_note: >-
+        Redundant with azure-appconfig-data-reader-read-kv when both roles resolve to
+        keyValues/read; deduped by (type,source,target,scope). Same secret-vs-config
+        classification and KV-reference exclusion apply. No caller key_permission gate.
+      narrative: >-
+        {principal.name} is App Configuration Data Owner on {store.name} and can read
+        secret key-value {keyvalue.name} (keyValues/read).
+
+  # === 2) Snapshot read exposes captured secret key-values ==================
+  - id: azure-appconfig-snapshot-read-kv
+    emits: CanReadSecret
+    description: "snapshots/read returns the key-values frozen in a snapshot, including secret ones."
+    match:
+      - [ ?principal, HasPermission, ?store ]
+      - [ ?store,     Contains,      ?snapshot ]
+      - [ ?snapshot,  ContainsSecret, ?keyvalue ]
+    where:
+      - "node_class(?store) == ManagementService"
+      - "provider_type(?store) == 'Microsoft.AppConfiguration/configurationStores'"
+      - "node_class(?snapshot) == Data  # 'Data' is a node CLASS (use node_class), matching the dataplane elsewhere in this file; a snapshot is a Data-class node capturing key-values"
+      - "?principal has EFFECTIVE Microsoft.AppConfiguration/configurationStores/snapshots/read at the store scope (Data Reader */read and Data Owner both include it)"
+      - "node_type(?keyvalue) in [Secret, ConnectionString, APIKey, Password]"
+    emit:
+      source: ?principal
+      target: ?keyvalue
+      permissions: ["Microsoft.AppConfiguration/configurationStores/snapshots/read"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when snapshots/read is effective at the store scope. BLOCKED under a
+        deny on the snapshots/read action. No caller key_permission gate (CMK is
+        server-side).
+      confidence: "0.85"
+      derived_from: [ "?principal HasPermission ?store (snapshots/read)", "?store Contains ?snapshot", "?snapshot ContainsSecret ?keyvalue" ]
+      false_positive_note: >-
+        Only when the snapshot actually captured a secret-bearing key-value. A store
+        with snapshots but no secret values yields nothing. Do not double-count with
+        the live keyValues/read edge for the same underlying secret value.
+      narrative: >-
+        {principal.name} can read snapshot {snapshot.name} of App Configuration store
+        {store.name} (snapshots/read), exposing secret key-value {keyvalue.name}.
+
+  # === 3) Access-key connection strings -> ExposesCredential ================
+  # listKeys is a CONTROL-plane action in Contributor/Owner. It returns connection
+  # strings that read ALL data, bypassing data-plane RBAC.
+  # SCHEMA CONFORMANCE: ExposesCredential source set is [Compute, Storage, Data,
+  # Messaging, Secret] and does NOT include ManagementService. The store's
+  # credential-bearing DATA-PLANE facet (?dataplane, node_class Data — the whole
+  # key-value set) is the ExposesCredential source; the explicit normalization
+  # (azure-appconfig-access-keys-present) materializes the connection-string
+  # Credential node the store's data plane leaks.
+  - id: azure-appconfig-listkeys-exposes-connstring
+    emits: ExposesCredential
+    description: "A principal with listKeys/action obtains the store's access-key connection strings (unless local auth is disabled)."
+    match:
+      - [ ?principal, HasPermission,      ?store ]
+      - [ ?store,     Contains,           ?dataplane ]
+      - [ ?dataplane, ContainsCredential, ?connstring ]
+    where:
+      - "node_class(?store) == ManagementService"
+      - "provider_type(?store) == 'Microsoft.AppConfiguration/configurationStores'"
+      - "node_class(?dataplane) == Data"
+      - "?dataplane is the store's data plane (all key-values)"
+      - "node_type(?connstring) == Credential  # ExposesCredential target set is [Credential, Identity]; ConnectionString (a Secret-class subtype) is NOT a valid target. The explicit rule azure-appconfig-access-keys-present materializes the access-key connection strings as Credential nodes."
+      - "?principal has EFFECTIVE Microsoft.AppConfiguration/configurationStores/listKeys/action at the store scope (Contributor / Owner / custom role)"
+    emit:
+      source: ?dataplane
+      target: ?connstring
+      permissions: ["Microsoft.AppConfiguration/configurationStores/listKeys/action"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE if disableLocalAuth == false (access keys enabled) AND the principal
+        holds listKeys/action. BLOCKED if disableLocalAuth == true (listKeys returns
+        an empty list — no credential to expose). If disableLocalAuth is unknown,
+        POTENTIAL(service_state).
+      confidence: "0.95"
+      derived_from: [ "?principal HasPermission ?store (listKeys/action)", "?store Contains ?dataplane", "?dataplane ContainsCredential ?connstring" ]
+      false_positive_note: >-
+        BLOCKED when disableLocalAuth=true — do not emit an exposed connection string
+        that does not exist. This is the credential-leak fact; the actual data read is
+        modeled by azure-appconfig-connstring-reads-all-kv. Do NOT invoke listKeys
+        during collection to confirm — infer from role assignments + disableLocalAuth.
+        ExposesCredential source is the store's Data-plane node, not the
+        ManagementService store object (schema source-set conformance).
+      narrative: >-
+        The data plane of {store.name} exposes its access-key connection string(s) to
+        any principal with listKeys (Contributor/Owner); access keys are enabled.
+
+  # === 4) Connection string reads ALL key-values (RBAC bypass) ==============
+  # SCHEMA CONFORMANCE: CanReadSecret source set is [Identity, Compute] — a
+  # ConnectionString cannot be a CanReadSecret source. The connection string's power
+  # is modeled by CredentialsFor(connstring -> dataplane) (already emitted by the
+  # explicit rule) PLUS the principal's data-plane reach: a listKeys holder EFFECTIVELY
+  # reads every key-value. We therefore emit CanReadSecret from the PRINCIPAL (Identity)
+  # to each secret key-value, justified by the connection string it can obtain.
+  # FIXPOINT ORDERING: this rule matches [?dataplane ExposesCredential ?connstring],
+  # which is produced ONLY by the derived rule azure-appconfig-listkeys-exposes-connstring
+  # above (the explicit file emits ContainsCredential, not ExposesCredential, from the
+  # data plane). So this rule fires only AFTER that derived edge exists — a within-file
+  # fixpoint dependency. It is internally consistent: the same listKeys/action gate
+  # backs both, so the ExposesCredential edge is present exactly when this rule's own
+  # gate is satisfied.
+  - id: azure-appconfig-connstring-reads-all-kv
+    emits: CanReadSecret
+    description: "A listKeys holder uses the access-key connection string to read every secret key-value, bypassing data-plane RBAC."
+    match:
+      - [ ?principal,  HasPermission,      ?store ]
+      - [ ?store,      Contains,           ?dataplane ]
+      - [ ?dataplane,  ExposesCredential,  ?connstring ]
+      - [ ?connstring, CredentialsFor,     ?dataplane ]
+      - [ ?dataplane,  ContainsSecret,     ?keyvalue ]
+    where:
+      - "node_class(?principal) == Identity"
+      - "node_class(?store) == ManagementService"
+      - "provider_type(?store) == 'Microsoft.AppConfiguration/configurationStores'"
+      - "node_class(?dataplane) == Data"
+      - "node_class(?connstring) == Secret  # ?connstring is Secret-class (subtype Credential), so it is a valid CredentialsFor source (source set [Secret, Credential, AccessKey, Token, Certificate]) and a valid ExposesCredential target (Credential)"
+      - "node_type(?connstring) == Credential"
+      - "?principal has EFFECTIVE Microsoft.AppConfiguration/configurationStores/listKeys/action at the store scope"
+      - "node_type(?keyvalue) in [Secret, ConnectionString, APIKey, Password]"
+      - "?keyvalue is a plaintext key-value (not a keyvaultref)"
+    emit:
+      source: ?principal
+      target: ?keyvalue
+      permissions: ["Microsoft.AppConfiguration/configurationStores/listKeys/action"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when listKeys/action is effective AND disableLocalAuth == false (a valid
+        connection string is obtainable). A read-only OR read-write key both read
+        key-values. BLOCKED if disableLocalAuth == true (no key) or the read action is
+        denied. This is the RBAC-BYPASS: it does NOT require a data-plane role.
+      confidence: "0.95"
+      derived_from: [ "?principal HasPermission ?store (listKeys/action)", "?dataplane ExposesCredential ?connstring", "?connstring CredentialsFor ?dataplane", "?dataplane ContainsSecret ?keyvalue" ]
+      false_positive_note: >-
+        The connection string reads the WHOLE data plane, so emit once per
+        secret-bearing key-value. This is what makes a listKeys holder
+        (Contributor/Owner) equivalent to a data reader for secrets WITHOUT any
+        App Configuration data role. BLOCKED when disableLocalAuth=true. KV-reference
+        key-values are still excluded (their value is a URI). Source is the Identity
+        principal (schema: CanReadSecret source is [Identity, Compute]), not the
+        connection string. Depends on the ExposesCredential edge from
+        azure-appconfig-listkeys-exposes-connstring (fixpoint ordering); ?connstring is
+        a Secret-class Credential node, conformant as the CredentialsFor source.
+      narrative: >-
+        {principal.name} can read secret key-value {keyvalue.name} in {store.name} via
+        its access-key connection string (listKeys), bypassing data-plane RBAC.
+
+  # === 5) Key Vault reference key-value -> reference, NOT a direct read =====
+  # REMOVED from the derived file: ContainsResourceReference has nature: explicit in
+  # schema/edges.yaml, so a /rules/derived/ file may not emit it (RULE-FORMAT: emits
+  # must be derived|both). The identical edge (KV-reference key-value ->
+  # external Key Vault Secret) is already produced by the EXPLICIT rule
+  # azure-appconfig-keyvalue-kv-reference in /rules/explicit/azure-appconfig.yaml
+  # (same source key-value -> same ?kvsecret), so this was a pure structural
+  # restatement — no capability lost by removing it.
+  #
+  # FALSE-POSITIVE GUIDANCE PRESERVED (still authoritative for consumers):
+  #   CRITICAL: never collapse a Key Vault reference into a CanReadSecret on the KV
+  #   secret. App Configuration stores only the URI; the client resolves it against
+  #   Key Vault with its OWN credentials, gated by Key Vault RBAC/access-policy (a
+  #   separate edge the App Config reader may not hold). The ContainsResourceReference
+  #   edge is structural (not walkable) and aids recon/collection only — obtaining the
+  #   plaintext requires a SEPARATE Key Vault data-plane CanReadSecret against the
+  #   referenced secret. The data-plane read rules above already exclude keyvaultref
+  #   key-values from CanReadSecret for this reason.
+
+  # === 6) Config write = supply-chain poisoning of downstream apps ==========
+  # Not escalation by itself; a downstream workload must trust the poisoned value.
+  - id: azure-appconfig-kv-write-poison
+    emits: CanWriteData
+    description: "Writing a key-value can poison config a downstream app trusts (e.g. swap a connection string endpoint)."
+    match:
+      - [ ?principal, HasPermission, ?store ]
+      - [ ?store,     Contains,      ?dataplane ]
+    where:
+      - "node_class(?store) == ManagementService"
+      - "provider_type(?store) == 'Microsoft.AppConfiguration/configurationStores'"
+      - "node_class(?dataplane) == Data"
+      - "?principal has EFFECTIVE Microsoft.AppConfiguration/configurationStores/keyValues/write at the store scope (App Configuration Data Owner / custom role)"
+    emit:
+      source: ?principal
+      target: ?dataplane
+      permissions: ["Microsoft.AppConfiguration/configurationStores/keyValues/write"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE for the write capability itself. Onward execution/exfil is CONDITIONAL
+        on a consuming workload reading and trusting the mutated value. BLOCKED under
+        a deny on keyValues/write.
+      confidence: "0.7"
+      derived_from: [ "?principal HasPermission ?store (keyValues/write)", "?store Contains ?dataplane" ]
+      false_positive_note: >-
+        This is a supply-chain primitive, not a direct escalation: it only yields
+        privilege when a downstream app actually consumes the poisoned key-value
+        (e.g. redirecting a DB/storage connection string to an attacker endpoint to
+        capture credentials, or flipping a feature flag that gates auth). Do not roll
+        this up to CanExecuteAs/CanEscalateTo without a modeled consumer.
+      narrative: >-
+        {principal.name} can write key-values in {store.name} (keyValues/write),
+        enabling config poisoning of apps that read them.
+
+  # === 7) Re-enable access keys (persistence / un-block the leak) ===========
+  # MOVED to the explicit file: CanModifyConfiguration has nature: explicit in
+  # schema/edges.yaml (a directly-observed permission fact from
+  # configurationStores/write), so it may not be emitted from a /rules/derived/ file
+  # per RULE-FORMAT. It is now the explicit match_effective_permission rule
+  # azure-appconfig-reenable-local-auth in /rules/explicit/azure-appconfig.yaml
+  # (principal -> store on Microsoft.AppConfiguration/configurationStores/write).
+  #
+  # PERSISTENCE / UN-BLOCK NOTE PRESERVED: this write can flip disableLocalAuth from
+  # true back to false, regenerating access keys and un-blocking the connection-string
+  # read path — i.e. it turns azure-appconfig-listkeys-exposes-connstring from BLOCKED
+  # into ACTIVE for listKeys holders. Only meaningful when access keys are currently
+  # DISABLED (if already enabled the connstring path is directly modeled). An Azure
+  # Policy 'deny' enforcing disableLocalAuth=true makes the re-enable BLOCKED even with
+  # configurationStores/write.
+
+# ---------------------------------------------------------------------------
+# CHAIN COMPLETION (worked, ties into /rules/derived/credential-chains.yaml):
+#
+#  A) Data-reader path:
+#     [p HasPermission store (keyValues/read)] + [store ContainsSecret kv]
+#       => azure-appconfig-data-reader-read-kv: [p CanReadSecret kv]  (ACTIVE)
+#     + [kv CredentialsFor svcPrincipal]                              (explicit)
+#       => read-secret-yields-identity:        [p CanImpersonate svcPrincipal]
+#     + privilege(svcPrincipal) > privilege(p)
+#       => impersonate-is-escalation:          [p CanEscalateTo svcPrincipal]
+#
+#  B) Access-key (RBAC-bypass) path:
+#     [p HasPermission store (listKeys/action)], disableLocalAuth=false
+#       => azure-appconfig-listkeys-exposes-connstring: [store ExposesCredential cs]
+#     + [cs CredentialsFor dataplane] + [store ContainsSecret kv]
+#       => azure-appconfig-connstring-reads-all-kv:      [cs CanReadSecret kv]
+#     ... then CredentialsFor + read-secret-yields-identity as in (A).
+#
+#  C) Phase-4 -> Phase-5 completion:
+#     [p CanExecuteAs workloadMI]                         (Phase-4, functions/vm/etc.)
+#     + [workloadMI CanReadSecret kv]                     (rule A above, MI is Data Reader)
+#       => execute-then-read-secret:            [p CanReadSecret kv]
+#
+# BLOCKED / CONDITIONAL guidance:
+#  - disableLocalAuth=true  -> BLOCKED for the entire access-key path (B).
+#  - Deny assignment / Azure Policy 'deny' on keyValues/read or snapshots/read
+#    -> BLOCKED for the data-plane path (A).
+#  - CMK on the store does NOT add a caller key_permission gate — reads stay ACTIVE
+#    (server-side transparent decrypt). CMK-key loss is service_state, not a caller gate.
+#  - Key Vault reference key-values are NEVER a direct CanReadSecret on the KV secret;
+#    they only yield ContainsResourceReference (rule 5).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization records for this service live in
+# /rules/explicit/azure-appconfig.yaml (ContainsSecret / CredentialsFor /
+# ContainsResourceReference / HasPermission triggers).

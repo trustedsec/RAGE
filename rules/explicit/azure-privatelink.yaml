@@ -1,0 +1,258 @@
+# Azure Private Link — Explicit normalization rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# Converts Azure Private Link raw config (ARM records) into explicit edges.
+# These are FACTS directly observed in resource properties, not inferred.
+#
+# Emitted edges:
+#   - PrivateReachability: PE approved + DNS configured → PaaS reachable at private IP
+#   - LocatedIn: private DNS zone linked to a VNet
+#   - CanAdminister: zone-level write permission (on PaaS resource owner)
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 8-networking
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # SECTION 1 — EXPLICIT FACTS FROM PE ARM RECORDS
+  # ===========================================================================
+
+  - id: azure-pl-pe-record
+    emits: PrivateReachability
+    description: >-
+      A Microsoft.Network/privateEndpoints ARM record with provisioningState=Succeeded,
+      connection status=Approved, and a privateDnsZoneGroup attachment directly establishes
+      that the backing PaaS resource is privately reachable from compute in the same or
+      peered VNet. This is a structural fact observed in the PE resource properties.
+    source_config:
+      resource_type: "Microsoft.Network/privateEndpoints"
+      field: "properties"
+    where:
+      - "properties.provisioningState == 'Succeeded'"
+      - "properties.privateLinkServiceConnections[].privateLinkServiceConnectionState.status == 'Approved'"
+      - "properties.privateDnsZoneGroups is non-empty"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<Compute resources in the same or peered VNet as the PE subnet>"
+      target: "<private endpoint node>"
+      api_source: "Microsoft.Network/privateEndpoints GET"
+      evidence_field: "properties.subnet.id + properties.privateLinkServiceConnections + properties.privateDnsZoneGroups"
+      state_logic: ACTIVE
+      narrative: >-
+        Private endpoint {pe.name} (Approved, DNS-linked) makes {linkedService.name}
+        privately reachable within VNet {vnet.name} at the PE's private IP address.
+
+  - id: azure-pl-dns-zone-link-record
+    emits: LocatedIn
+    description: >-
+      A Microsoft.Network/privateDnsZones/virtualNetworkLinks ARM record directly observes
+      that a private DNS zone is linked to a VNet. This is a structural fact: the zone's
+      DNS records apply to name resolution within that VNet.
+    source_config:
+      resource_type: "Microsoft.Network/privateDnsZones/virtualNetworkLinks"
+      field: "properties"
+    where:
+      - "properties.provisioningState == 'Succeeded'"
+      - "properties.virtualNetwork.id is non-empty"
+    emit:
+      source_type: DNS
+      target_type: VirtualNetwork
+      source: "<private DNS zone>"
+      target: "<linked VNet>"
+      api_source: "Microsoft.Network/privateDnsZones/virtualNetworkLinks GET"
+      evidence_field: "properties.virtualNetwork.id + properties.provisioningState"
+      state_logic: ACTIVE
+      note: >-
+        LocatedIn in edges.yaml: source=[*], target=[AdministrativeBoundary, Network].
+        DNS → VirtualNetwork is valid (Network is the target category).
+        This edge records which VNets receive name resolution from this private DNS zone.
+      narrative: >-
+        Private DNS zone {zone.name} is linked to VNet {vnet.name}
+        (virtualNetworkLink: {link.name}); resources in {vnet.name} resolve PaaS FQDNs via this zone.
+
+  - id: azure-pl-pe-connection-cross-sub
+    emits: PrivateReachability
+    description: >-
+      A Microsoft.Network/privateEndpoints ARM record where the PE subscription differs
+      from the backing resource's subscription (cross-subscription connection) directly
+      establishes cross-subscription private reachability. The connection is approved and
+      DNS-configured, so network traffic flows across the subscription boundary.
+    source_config:
+      resource_type: "Microsoft.Network/privateEndpoints"
+      field: "properties"
+    where:
+      - "properties.provisioningState == 'Succeeded'"
+      - "properties.privateLinkServiceConnections[].privateLinkServiceConnectionState.status == 'Approved'"
+      - "subscription-segment of PE resource id != subscription-segment of privateLinkServiceConnections[].privateLinkServiceId"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<Compute resources in the consumer VNet that hosts this PE>"
+      target: "<private endpoint node (cross-subscription, Approved)>"
+      api_source: "Microsoft.Network/privateEndpoints GET"
+      evidence_field: "properties.privateLinkServiceConnections[].privateLinkServiceId (cross-subscription check)"
+      properties:
+        cross_subscription: true
+      state_logic: ACTIVE
+      narrative: >-
+        Private endpoint {pe.name} crosses subscription boundaries (consumer sub {consumerSub} →
+        provider resource in sub {providerSub}, Approved); consumer VNet compute has private
+        reach to {linkedService.name} without traversing the public internet.
+
+  # ===========================================================================
+  # SECTION 2 — ADMINISTRATIVE PERMISSION: zone-level write
+  # ===========================================================================
+
+  - id: azure-pl-dns-zone-write
+    emits: CanAdminister
+    description: >-
+      Write access to a private DNS zone object (Microsoft.Network/privateDnsZones/write)
+      grants full administrative control: the identity can replace, delete, or recreate the
+      zone entirely. This is higher-impact than record-level write because it includes zone
+      deletion (DoS) and recreation with attacker-controlled records. Zone write subsumes
+      record write (the can-control linchpin derives Controls from this).
+    match_effective_permission:
+      action: "Microsoft.Network/privateDnsZones/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal>"
+      target: "<private DNS zone>"
+      permissions:
+        - "Microsoft.Network/privateDnsZones/write"
+      state_logic: ACTIVE
+      derived_from: ["<effective permission record: privateDnsZones/write>"]
+      false_positive_note: >-
+        CanAdminister on the zone grants full control but does NOT automatically grant
+        Microsoft.Authorization/*/write (cannot assign RBAC directly on the zone).
+        Zone deletion can cause DoS and requires recreation. CanAdminister -> Controls
+        is derived by can-control.yaml (cited, not duplicated here).
+        Deny assignments at the zone or RG scope block this -> BLOCKED.
+      narrative: >-
+        {principal.name} has full administrative control of private DNS zone {target.name}
+        (Microsoft.Network/privateDnsZones/write), including the ability to replace,
+        delete, or recreate the zone with attacker-controlled records.
+
+  - id: azure-pl-approve-cross-sub
+    emits: CrossAccountTrust
+    description: >-
+      An identity with <resource>/privateEndpointConnections/write on a PaaS resource can
+      approve a private endpoint connection from a different subscription. Approving such a
+      connection records a cross-subscription trust: the resource owner has explicitly
+      authorized a network connection from another subscription's VNet, extending the reach
+      of that remote VNet across the subscription boundary.
+    match_effective_permission:
+      action: "<resource-type>/privateEndpointConnections/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - >-
+        The PE connection is from a subscription other than the target resource's subscription
+        (detected via properties.privateLinkServiceConnections[].privateLinkServiceId).
+    emit:
+      source_type: ResourcePolicy
+      target_type: Subscription
+      source: "<resource policy approval record (implicit: identity with privateEndpointConnections/write)>"
+      target: "<consumer subscription (the subscription hosting the cross-sub PE)>"
+      permissions:
+        - "Microsoft.KeyVault/vaults/privateEndpointConnections/write"
+        - "Microsoft.Storage/storageAccounts/privateEndpointConnections/write"
+        - "Microsoft.Sql/servers/privateEndpointConnections/write"
+        - "Microsoft.ServiceBus/namespaces/privateEndpointConnections/write"
+        - "Microsoft.DocumentDB/databaseAccounts/privateEndpointConnections/write"
+        - "Microsoft.Cache/redis/privateEndpointConnections/write"
+        - "Microsoft.ContainerRegistry/registries/privateEndpointConnections/write"
+        - "Microsoft.CognitiveServices/accounts/privateEndpointConnections/write"
+        - "Microsoft.Search/searchServices/privateEndpointConnections/write"
+      properties:
+        cross_subscription: true
+        provider_subscription: "<subscription hosting the PaaS resource>"
+        consumer_subscription: "<subscription hosting the PE>"
+      state_logic: >-
+        ACTIVE: the approval is complete (connection status = Approved). The cross-subscription
+        trust is now in effect, recording that the provider has authorized this consumer's
+        network connection.
+      derived_from: ["<PE connection record: cross-subscription + Approved state>", "<effective permission: privateEndpointConnections/write>"]
+      false_positive_note: >-
+        CrossAccountTrust models the authorization relationship, not the network fact.
+        The network reachability itself is modeled by PrivateReachability.
+        An identity with privateEndpointConnections/write can CREATE additional approvals,
+        but this edge captures the EXISTING approval recorded in the resource's
+        privateEndpointConnections array.
+      narrative: >-
+        Cross-subscription PE connection from {consumerSub.id} to {linkedService.name}
+        (in {providerSub.id}) is Approved. The resource owner has recorded a cross-subscription
+        trust allowing the consumer VNet private network access.
+
+  # ===========================================================================
+  # SECTION 3 — AUTO-APPROVAL SUBID LIST FACT
+  # ===========================================================================
+
+  - id: azure-pl-auto-approval-sub
+    emits: PrivateReachability
+    description: >-
+      If the backing PaaS resource (Key Vault, Storage, etc.) has a non-empty
+      autoApprovalSubIds list in its privateEndpointConnections properties, and a PE is
+      created in a subscription matching that list, the connection is auto-approved
+      (no manual approval step required). Creating a PE in that subscription immediately
+      grants the consumer VNet private access to the resource.
+    source_config:
+      resource_type: "<resource-type with privateEndpointConnections support>"
+      field: "properties.privateEndpointConnections[].properties"
+    where:
+      - "properties.privateEndpointConnections[].properties.autoApprovalSubIds is non-empty"
+      - "a PE resource exists with subscriber-segment of its id matching an entry in autoApprovalSubIds"
+      - "properties.privateDnsZoneGroups on the PE is non-empty (DNS linked)"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<Compute resources in the PE's VNet (the auto-approved consumer subscription's VNet)>"
+      target: "<private endpoint node>"
+      api_source: "Microsoft.KeyVault/vaults GET, Microsoft.Storage/storageAccounts GET, etc."
+      evidence_field: "properties.privateEndpointConnections[].properties.autoApprovalSubIds"
+      properties:
+        auto_approved: true
+        approved_subscription: "<subscription matching autoApprovalSubIds entry>"
+      state_logic: ACTIVE
+      narrative: >-
+        Subscription {approvedSub.id} is on the auto-approval list for {linkedService.name}.
+        Any PE created in {approvedSub.id} connecting to {linkedService.name} is
+        automatically Approved, immediately granting private network access without owner
+        interaction. Compute in the PE's VNet can reach {linkedService.name} at its private IP.
+
+  # ===========================================================================
+  # SECTION 4 — ADMINISTRATIVE CONTROL of private endpoints
+  # ===========================================================================
+
+  - id: azure-pl-pe-write
+    emits: CanAdminister
+    description: >-
+      Write access to a private endpoint object (privateEndpoints/write) grants
+      full control of that PE — NIC, DNS zone groups, and subnet placement —
+      enabling the attacker to reconfigure where private traffic flows.
+    match_effective_permission:
+      action: "Microsoft.Network/privateEndpoints/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: PrivateEndpoint
+      source: "<principal>"
+      target: "<private endpoint>"
+      permissions:
+        - "Microsoft.Network/privateEndpoints/write"
+      state_logic: ACTIVE
+      derived_from: ["<effective permission record: privateEndpoints/write>"]
+      false_positive_note: >-
+        CanAdminister on a PE grants config control but NOT Microsoft.Authorization/*/write;
+        it does not let the attacker assign RBAC. Escalation runs through reconfiguring
+        DNS zone groups (azure-pl-pe-dnsgroup-write) or replacing the PE's NIC/subnet
+        placement. CanAdminister -> Controls is derived by can-control.yaml (cited,
+        not duplicated here). Network Contributor and Contributor/Owner roles include
+        privateEndpoints/write at the applicable scope.
+      narrative: >-
+        {principal.name} has full control of private endpoint {target.name}
+        (Microsoft.Network/privateEndpoints/write), including its NIC placement,
+        subnet, and DNS zone group configuration.

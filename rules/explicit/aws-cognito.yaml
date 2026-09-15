@@ -1,0 +1,606 @@
+# Normalizing AWS Cognito into explicit edges.
+# ---------------------------------------------------------------------------
+# The adapter emits raw Cognito records (cognito-identity:DescribeIdentityPool,
+# GetIdentityPoolRoles, cognito-idp:DescribeUserPool, ListGroups, ListIdentityProviders,
+# DescribeUserPoolClient) and the Cognito-mapped IAM roles' trust policies
+# (iam:GetRole AssumeRolePolicyDocument), plus effective-permission decisions for
+# cognito-identity:* and cognito-idp:Admin* management actions.
+#
+# These rules translate them into normalized Phase-2 trust facts:
+#   TrustsExternalIdentity + ExternalIdentityMapsTo  (federation trust normalization)
+#   ExposedToInternet                                (unauthenticated pool flag)
+#   CanResetCredential                               (AdminSetUserPassword)
+#   CanAddMember                                     (AdminAddUserToGroup)
+#   CanReadSecret                                    (app client secret)
+#
+# The provider-agnostic collapse in /rules/derived/federation-chains.yaml gives full
+# CanFederateAs + CanEnterAccount + CanImpersonate path-finding for free (that file
+# is the linchpin). Service-specific derived rules live in
+# /rules/derived/aws/cognito.yaml (unauthenticated federation, role-mapping-claim
+# escalation, developer-auth abuse, SetIdentityPoolRoles config-privesc, IdP
+# substitution).
+#
+# TRUST MODEL:
+#   Identity Pools: role mapped via GetIdentityPoolRoles (authenticated + unauthenticated
+#   roles, or Rules-based claim-to-role mapping). The mapped IAM role's trust policy
+#   MUST name Principal.Federated = cognito-identity.amazonaws.com and CONDITIONS on
+#   cognito-identity:aud (pool ID) and cognito-identity:amr (provider hint).
+#   User Pools: act as OIDC IdPs; issue JWTs. Admin API (AdminSetUserPassword,
+#   AdminAddUserToGroup) operates out-of-band on any pool user.
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml), honored by every emit; typed
+# source_type/target_type declared per RULE-FORMAT.md:
+#   TrustsExternalIdentity: source [Role, ServiceAccount, ApplicationIdentity, ResourcePolicy]
+#                           target [ExternalIdentity, FederatedIdentity]
+#   ExternalIdentityMapsTo: source [ExternalIdentity, FederatedIdentity]
+#                           target [Identity, Role, ServiceAccount]
+#   ExposedToInternet:      source [Compute, Data, PublicEndpoint, LoadBalancer, Storage]
+#                           target [AnonymousIdentity]
+#   CanResetCredential:     source [Identity]   target [Identity, HumanIdentity]
+#   CanAddMember:           source [Identity]   target [Group, Role]
+#   CanReadSecret:          source [Identity, Compute]  target [Secret, ConnectionString, Password, APIKey, Certificate]
+#   MemberOf:               source [Identity]   target [Group, Role]
+# ---------------------------------------------------------------------------
+
+rules:
+
+  # ===========================================================================
+  # IDENTITY POOL — unauthenticated exposure
+  # ===========================================================================
+
+  # When AllowUnauthenticatedIdentities=true, the Identity Pool accepts unauthenticated
+  # callers. ExposedToInternet has nature: derived in schema/edges.yaml and is emitted
+  # by derived rules only (see /rules/derived/aws/cognito.yaml or cognito-exposure.yaml).
+  # The explicit file emits ExternalIdentityMapsTo from AnonymousIdentity to the
+  # unauthenticated role; the derived rule collapses that to ExposedToInternet.
+
+  - id: aws-cognito-identity-pool-unauth-role-mapping
+    emits: ExternalIdentityMapsTo
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Cognito::IdentityPool"
+      api_source: "cognito-identity:GetIdentityPoolRoles"
+      field: "Roles.unauthenticated"
+    match_condition: "AllowUnauthenticatedIdentities == true on the same pool"
+    emit:
+      source_type: FederatedIdentity
+      target_type: Role
+      source: "<FederatedIdentity node representing unauthenticated callers (AnonymousIdentity at runtime)>"
+      target: "<IAM Role from Roles.unauthenticated ARN>"
+      permissions: ["cognito-identity:GetId", "cognito-identity:GetCredentialsForIdentity"]
+      evidence_field: "Roles.unauthenticated"
+      state_logic: >-
+        ACTIVE — this edge represents a collected role-mapping fact (inventory) when
+        AllowUnauthenticatedIdentities=true on the pool.
+      confidence: 0.99
+      derived_from: ["cognito-identity:GetIdentityPoolRoles, cognito-identity:DescribeIdentityPool (AWS Service Authorization Reference)"]
+      condition_note: >-
+        Only emit when AllowUnauthenticatedIdentities=true on the same Identity Pool
+        (confirmed via DescribeIdentityPool). Records trust condition as BROAD (no token
+        required). The source is modeled as a FederatedIdentity (unauthenticated external caller)
+        mapping to the unauthenticated role; at collection time this will be an AnonymousIdentity node.
+      false_positive_note: >-
+        Only emit when AllowUnauthenticatedIdentities=true. If the field is false or missing,
+        do not emit this edge — GetCredentialsForIdentity with no token returns NotAuthorizedException.
+        Do not conflate with the authenticated role (Roles.authenticated). Confirm the field via
+        DescribeIdentityPool before emitting.
+      narrative: >-
+        Any unauthenticated internet user maps to IAM role {role.name} via Identity Pool
+        {pool.name} (GetIdentityPoolRoles.Roles.unauthenticated); AllowUnauthenticatedIdentities=true.
+
+  # ===========================================================================
+  # IDENTITY POOL — authenticated role mapping
+  # ===========================================================================
+
+  - id: aws-cognito-identity-pool-auth-role-mapping
+    emits: ExternalIdentityMapsTo
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Cognito::IdentityPool"
+      api_source: "cognito-identity:GetIdentityPoolRoles"
+      field: "Roles.authenticated"
+    emit:
+      source_type: FederatedIdentity
+      target_type: Role
+      source: "<FederatedIdentity node (pool-authenticated users)>"
+      target: "<IAM Role from Roles.authenticated ARN>"
+      permissions: ["cognito-identity:GetId", "cognito-identity:GetCredentialsForIdentity"]
+      evidence_field: "Roles.authenticated"
+      state_logic: >-
+        ACTIVE — this edge represents a collected role-mapping fact (inventory).
+      confidence: 0.99
+      derived_from: ["cognito-identity:GetIdentityPoolRoles (AWS Service Authorization Reference)"]
+      condition_note: >-
+        Records the trust condition breadth from the role's trust policy
+        (cognito-identity:amr and cognito-identity:aud conditions); BROAD if amr is
+        absent or only 'authenticated'; PINNED if amr specifies a particular provider.
+      false_positive_note: >-
+        This edge is a structural fact (role mapping configuration). Its exploitability
+        depends on the trust condition breadth (recorded in condition_note). Confirm the
+        role's trust policy condition (amr/aud) to determine if this path is BROAD (ACTIVE)
+        or PINNED (CONDITIONAL). The federation-chains.yaml rules consume this edge and
+        emit CanFederateAs with state based on trust condition breadth.
+      narrative: >-
+        Authenticated users of Identity Pool {pool.name} map to IAM role {role.name}
+        (GetIdentityPoolRoles.Roles.authenticated).
+
+  # Rules-based role mappings (RoleMappings[*].Type == Rules): one entry per
+  # RoleMappings entry that specifies a role override via claim-value rules.
+  - id: aws-cognito-identity-pool-rules-role-mapping
+    emits: ExternalIdentityMapsTo
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Cognito::IdentityPool"
+      api_source: "cognito-identity:GetIdentityPoolRoles"
+      field: "RoleMappings[*].RulesConfiguration.Rules[*].RoleARN"
+    match_condition: "RoleMappings[*].Type == Rules"
+    emit:
+      source_type: FederatedIdentity
+      target_type: Role
+      source: "<FederatedIdentity node (pool-authenticated users whose token satisfies the claim rule)>"
+      target: "<IAM Role ARN from RulesConfiguration.Rules[*].RoleARN>"
+      permissions: ["cognito-identity:GetId", "cognito-identity:GetCredentialsForIdentity"]
+      evidence_field: "RoleMappings[*].RulesConfiguration.Rules[*]"
+      state_logic: >-
+        ACTIVE — this edge represents a collected role-mapping fact (inventory).
+      confidence: 0.99
+      derived_from: ["cognito-identity:GetIdentityPoolRoles (AWS Service Authorization Reference)"]
+      condition_note: >-
+        Records the claim name and match type from RulesConfiguration.Rules[*].Claim /
+        MatchType / Value. If the claim is writable by the pool user (User Pool user
+        attribute not admin-only), classify as attacker_controllable=true (feeds
+        aws-cognito-role-mapping-claim-override derived rule).
+      false_positive_note: >-
+        This edge represents role mapping configuration. Exploitability depends on the
+        claim writeability (admin-only vs user-writable). The aws-cognito-role-mapping-claim-override
+        derived rule consumes this edge and emits CanFederateAs with state based on claim
+        writeability analysis.
+      narrative: >-
+        Identity Pool {pool.name} uses claim-based role rules: users whose token contains
+        {claim.name} {match_type} '{claim.value}' receive IAM role {role.name}.
+
+  # ===========================================================================
+  # IDENTITY POOL — IAM role trust policy trusts Cognito
+  # ===========================================================================
+
+  - id: aws-cognito-role-trust-cognito-identity
+    emits: TrustsExternalIdentity
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::IAM::Role"
+      api_source: "iam:GetRole"
+      field: "AssumeRolePolicyDocument"
+      match_condition: "Statement[].Principal.Federated contains 'cognito-identity.amazonaws.com'"
+    emit:
+      source_type: Role
+      target_type: FederatedIdentity
+      source: "<IAM Role node>"
+      target: "<FederatedIdentity node (Cognito identity pool)>"
+      permissions: ["sts:AssumeRoleWithWebIdentity"]
+      evidence_field: "AssumeRolePolicyDocument.Statement[].Condition"
+      state_logic: >-
+        ACTIVE — this edge represents a collected trust policy fact (inventory).
+      confidence: 0.99
+      derived_from: ["iam:GetRole (AWS Service Authorization Reference)"]
+      condition_note: >-
+        Record cognito-identity:aud value (pool ID; absent = any pool in account),
+        cognito-identity:amr value (absent = any caller; 'authenticated' = any authed
+        caller; specific provider = PINNED). Classify BROAD when amr is absent or only
+        'authenticated' (not provider-specific). Classify PINNED when amr specifies a
+        single provider URL. Record aws:SourceArn condition if present (narrows which
+        trust anchor / pool). Trust condition properties feed federation-chains.yaml
+        federation-maps-to-identity state gate (ACTIVE for BROAD, CONDITIONAL for PINNED).
+      false_positive_note: >-
+        This edge represents a trust policy fact. Exploitability depends on the trust
+        condition breadth (amr/aud pinning). Confirm the trust policy condition before
+        inferring escalation. The federation-chains.yaml rules consume this edge and emit
+        CanFederateAs with state based on trust condition breadth.
+      narrative: >-
+        IAM role {role.name} trusts cognito-identity.amazonaws.com
+        (AssumeRolePolicyDocument.Federated); conditions: aud={aud}, amr={amr} —
+        trust_condition_breadth: {BROAD|PINNED}.
+
+  # ===========================================================================
+  # USER POOL — admin effective permissions -> explicit edges
+  # ===========================================================================
+
+  - id: aws-cognito-admin-set-user-password
+    emits: CanResetCredential
+    applies_to: [aws]
+    match_effective_permission:
+      action: "cognito-idp:AdminSetUserPassword"
+      resource_type: "AWS::Cognito::UserPool"
+    emit:
+      source_type: Identity
+      target_type: HumanIdentity
+      source: "<principal with effective cognito-idp:AdminSetUserPassword>"
+      target: "<User Pool users (HumanIdentity) in the scoped User Pool ARN>"
+      permissions: ["cognito-idp:AdminSetUserPassword"]
+      state_logic: >-
+        ACTIVE when the principal holds effective cognito-idp:AdminSetUserPassword on
+        the User Pool ARN and no SCP/permission boundary blocks the action.
+      confidence: 0.95
+      derived_from: ["cognito-idp:AdminSetUserPassword (AWS Service Authorization Reference)"]
+      false_positive_note: >-
+        Confirm the permission is scoped to the specific User Pool ARN, not a different pool.
+        MFA device reset is a separate action (AdminSetUserMFAPreference); this rule covers
+        password-only takeover. If the pool enforces AdminUserPasswordConstraints requiring
+        admin confirmation, the target user will receive a temporary password; downgrade to
+        CONDITIONAL(service_state) to represent that step.
+      narrative: >-
+        {principal.name} can call cognito-idp:AdminSetUserPassword on User Pool {pool.name}
+        to set an arbitrary password for any pool user without knowing the current
+        credentials or MFA secret.
+
+  - id: aws-cognito-admin-create-user
+    emits: CanCreateCredentialFor
+    applies_to: [aws]
+    match_effective_permission:
+      action: "cognito-idp:AdminCreateUser"
+      resource_type: "AWS::Cognito::UserPool"
+    emit:
+      source_type: Identity
+      target_type: HumanIdentity
+      source: "<principal with effective cognito-idp:AdminCreateUser>"
+      target: "<newly created User Pool user (HumanIdentity)>"
+      permissions: ["cognito-idp:AdminCreateUser"]
+      state_logic: >-
+        ACTIVE when the principal holds effective cognito-idp:AdminCreateUser on the
+        User Pool ARN and can set an initial password for the created user.
+      confidence: 0.95
+      derived_from: ["cognito-idp:AdminCreateUser (AWS Service Authorization Reference)"]
+      false_positive_note: >-
+        The target is the newly-created User Pool user (HumanIdentity), not the pool itself.
+        AdminCreateUser's Groups parameter allows setting initial group membership at creation time,
+        which feeds into group-to-role escalation if the group is mapped by an Identity Pool role rule.
+      narrative: >-
+        {principal.name} can call cognito-idp:AdminCreateUser on User Pool {pool.name}
+        to create a new user with a known temporary password; if the pool feeds an Identity
+        Pool, the new user can immediately acquire authenticated-role IAM credentials.
+
+  - id: aws-cognito-admin-add-user-to-group
+    emits: CanAddMember
+    applies_to: [aws]
+    match_effective_permission:
+      action: "cognito-idp:AdminAddUserToGroup"
+      resource_type: "AWS::Cognito::UserPool"
+    emit:
+      source_type: Identity
+      target_type: Group
+      source: "<principal with effective cognito-idp:AdminAddUserToGroup>"
+      target: "<User Pool Groups in the scoped User Pool ARN>"
+      permissions: ["cognito-idp:AdminAddUserToGroup"]
+      state_logic: >-
+        ACTIVE when the principal holds effective cognito-idp:AdminAddUserToGroup on
+        the User Pool ARN and can add any user to any group.
+      confidence: 0.95
+      derived_from: ["cognito-idp:AdminAddUserToGroup (AWS Service Authorization Reference)"]
+      false_positive_note: >-
+        Confirm that the group membership update is not restricted by additional conditions
+        (e.g., group-level access control). If the group maps to an Identity Pool role via
+        claim-based or token-based rule, adding a user to that group enables the user to
+        receive elevated IAM credentials on next authentication. The attacker must first
+        control or compromise a User Pool user account before this escalation is realized.
+      narrative: >-
+        {principal.name} can call cognito-idp:AdminAddUserToGroup on User Pool {pool.name}
+        to add any user to any group, potentially elevating their Identity Pool role
+        mapping if the group maps to a privileged authenticated role.
+
+  - id: aws-cognito-admin-update-user-attributes
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "cognito-idp:AdminUpdateUserAttributes"
+      resource_type: "AWS::Cognito::UserPool"
+    emit:
+      source_type: Identity
+      target_type: ApplicationIdentity
+      source: "<principal with effective cognito-idp:AdminUpdateUserAttributes>"
+      target: "<User Pool (ApplicationIdentity) in the scoped ARN>"
+      permissions: ["cognito-idp:AdminUpdateUserAttributes"]
+      state_logic: >-
+        ACTIVE when the principal holds effective cognito-idp:AdminUpdateUserAttributes
+        on the User Pool ARN and can modify user profile attributes (claims).
+      confidence: 0.80
+      derived_from: ["cognito-idp:AdminUpdateUserAttributes (AWS Service Authorization Reference)"]
+      condition_note: >-
+        The security impact is realized only when modified attributes drive an Identity Pool
+        role-mapping rule (claim-to-role). If no claim-based role mapping is configured,
+        this edge represents configuration mutation but not direct privilege escalation.
+        See aws-cognito-role-mapping-claim-override for the downstream escalation path.
+      false_positive_note: >-
+        This edge represents modification of user profile attributes (custom claims), not IAM
+        permission grants. The escalation impact is CONDITIONAL on identity-pool claim-based
+        role mapping being active. If the pool does not use RulesMappings or claim-based role
+        selection, the attacker cannot escalate privileges via this path alone.
+      narrative: >-
+        {principal.name} can call cognito-idp:AdminUpdateUserAttributes on User Pool {pool.name}
+        to modify any user's profile attributes (e.g., custom claims) without user consent;
+        if those attributes drive Identity Pool role mapping via claim-based rules, this enables
+        the admin to escalate the target user to elevated IAM role privileges on their next
+        authentication (see aws-cognito-role-mapping-claim-override).
+
+  # ===========================================================================
+  # IDENTITY POOL — configuration privesc (SetIdentityPoolRoles)
+  # ===========================================================================
+  # The explicit file records the CanPassIdentity edges required for
+  # aws-cognito-set-pool-roles-modify-trust. CanPassIdentity for cognito-identity
+  # is already produced by identity-escalation.yaml aws-pass-role (iam:PassRole);
+  # the cognito-specific effective-permission for SetIdentityPoolRoles feeds the
+  # derived rule.
+
+  - id: aws-cognito-set-identity-pool-roles
+    emits: CanModifyTrust
+    applies_to: [aws]
+    match_effective_permission:
+      action: "cognito-identity:SetIdentityPoolRoles"
+      resource_type: "AWS::Cognito::IdentityPool"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: "<principal with effective cognito-identity:SetIdentityPoolRoles>"
+      target: "<IAM Role passable to Cognito Identity service (cross-ref with iam:PassRole)>"
+      permissions: ["cognito-identity:SetIdentityPoolRoles", "iam:PassRole"]
+      state_logic: >-
+        ACTIVE when the principal holds effective cognito-identity:SetIdentityPoolRoles on
+        an Identity Pool ARN AND iam:PassRole on the target role has no iam:PassedToService
+        restriction excluding cognito-identity.amazonaws.com. POTENTIAL(role_compatibility)
+        when the PassRole scope or PassedToService condition cannot be confirmed.
+        BLOCKED if an SCP denies SetIdentityPoolRoles or iam:PassRole.
+      confidence: 0.85
+      derived_from: ["cognito-identity:SetIdentityPoolRoles", "iam:PassRole (AWS Service Authorization Reference)"]
+      false_positive_note: >-
+        iam:PassRole is required by Cognito Identity Pools when setting role mappings
+        (per AWS docs: the caller must hold iam:PassRole for each role placed in the mapping).
+        Without it, SetIdentityPoolRoles returns AccessDenied. Verify that the PassRole
+        resource covers the target role AND that any iam:PassedToService condition does not
+        exclude cognito-identity.amazonaws.com. Note that applying this change is permanent
+        and visible: it modifies the pool's configuration and affects ALL users — it is not
+        a stealth attack; include in the narrative.
+      narrative: >-
+        {principal.name} can call cognito-identity:SetIdentityPoolRoles on Identity Pool
+        {pool.name} and pass {target_role.name} (iam:PassRole), rewriting the pool's role mapping,
+        making all future pool users receive credentials for a privileged IAM role.
+
+  # ===========================================================================
+  # USER POOL — IdP link (CreateIdentityProvider / UpdateIdentityProvider)
+  # ===========================================================================
+
+  - id: aws-cognito-create-identity-provider
+    emits: CanModifyTrust
+    applies_to: [aws]
+    match_effective_permission:
+      action: "cognito-idp:CreateIdentityProvider"
+      resource_type: "AWS::Cognito::UserPool"
+    emit:
+      source_type: Identity
+      target_type: TrustPolicy
+      source: "<principal with effective cognito-idp:CreateIdentityProvider>"
+      target: "<TrustPolicy node representing the User Pool's IdP configuration>"
+      permissions: ["cognito-idp:CreateIdentityProvider"]
+      state_logic: >-
+        ACTIVE when the principal holds effective cognito-idp:CreateIdentityProvider on
+        the User Pool ARN and no SCP blocks the action. The attacker can immediately
+        register a SAML or OIDC IdP.
+      confidence: 0.85
+      derived_from: ["cognito-idp:CreateIdentityProvider (AWS Service Authorization Reference)"]
+      false_positive_note: >-
+        CreateIdentityProvider requires that at least one app client has the IdP enabled
+        in SupportedIdentityProviders for the IdP to be usable by end users. If no app client
+        includes the new IdP, end users cannot select it for sign-in — verify that at least
+        one app client has SupportedIdentityProviders configured to include the new IdP
+        (or that cognito-idp:UpdateUserPoolClient permission allows the attacker to add it).
+        If both CreateIdentityProvider and UpdateUserPoolClient permissions are needed,
+        downgrade to CONDITIONAL(permission). This edge represents modification of the
+        authentication trust (User Pool IdP linkage), not direct IAM credential access.
+        Downstream CanFederateAs edges on an Identity Pool linked to the User Pool are the
+        escalation path: even with a valid User Pool JWT from the attacker's SAML IdP, a
+        second step (GetCredentialsForIdentity on the Identity Pool) is required to obtain
+        IAM credentials.
+      narrative: >-
+        {principal.name} can call cognito-idp:CreateIdentityProvider on User Pool {pool.name}
+        to register an attacker-controlled SAML or OIDC identity provider, enabling
+        sign-in as any pool user via forged assertions.
+
+  - id: aws-cognito-update-identity-provider
+    emits: CanModifyTrust
+    applies_to: [aws]
+    match_effective_permission:
+      action: "cognito-idp:UpdateIdentityProvider"
+      resource_type: "AWS::Cognito::UserPool"
+    emit:
+      source_type: Identity
+      target_type: TrustPolicy
+      source: "<principal with effective cognito-idp:UpdateIdentityProvider>"
+      target: "<TrustPolicy node representing the User Pool's IdP configuration>"
+      permissions: ["cognito-idp:UpdateIdentityProvider"]
+      state_logic: >-
+        ACTIVE when the principal holds effective cognito-idp:UpdateIdentityProvider on
+        the User Pool ARN and an EXISTING SAML or OIDC IdP is linked to the pool.
+        CONDITIONAL(service_state) when no SAML/OIDC IdP is yet linked (UpdateIdentityProvider
+        requires an existing IdP to modify; only CreateIdentityProvider creates new ones).
+      confidence: 0.85
+      derived_from: ["cognito-idp:UpdateIdentityProvider (AWS Service Authorization Reference)"]
+      false_positive_note: >-
+        UpdateIdentityProvider targets an EXISTING linked IdP; it does not create new IdPs.
+        If no SAML/OIDC IdP is linked yet, only CreateIdentityProvider is relevant and
+        UpdateIdentityProvider will fail with InvalidParameterException. The downstream
+        CanFederateAs realization still requires a valid User Pool JWT exchanged for
+        Identity Pool IAM credentials.
+      narrative: >-
+        {principal.name} can call cognito-idp:UpdateIdentityProvider on User Pool {pool.name}
+        to replace an existing linked identity provider with an attacker-controlled
+        SAML or OIDC endpoint.
+
+  # ===========================================================================
+  # USER POOL GROUP — membership facts
+  # ===========================================================================
+
+  - id: aws-cognito-user-pool-group-membership
+    emits: MemberOf
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Cognito::UserPool"
+      api_source: "cognito-idp:ListUsersInGroup"
+      field: "Users[*].Username + GroupName"
+    emit:
+      source_type: Identity
+      target_type: Group
+      source: "<User Pool User (HumanIdentity or FederatedIdentity) node>"
+      target: "<User Pool Group (Group) node>"
+      permissions: []
+      evidence_field: "ListUsersInGroup.Users[*].Username"
+      state_logic: >-
+        ACTIVE — this edge represents a collected membership fact (inventory).
+      confidence: 0.99
+      derived_from: ["cognito-idp:ListUsersInGroup (AWS Service Authorization Reference)"]
+      false_positive_note: >-
+        This edge is a structural fact (membership), not an attack capability by itself.
+        It drives downstream escalation paths only when the group is mapped to a privileged
+        Identity Pool role via claim-based role selection (see aws-cognito-role-mapping-claim-override).
+        Confirm the group is actually used in an Identity Pool role rule before scoring escalation.
+      narrative: >-
+        User Pool user {user.name} is a member of group {group.name} in pool {pool.name};
+        this membership affects their cognito:groups claim and may drive privileged role
+        assignment via Identity Pool claim-based role rules.
+
+  # ===========================================================================
+  # USER POOL APP CLIENT SECRET (CanReadSecret)
+  # ===========================================================================
+
+  - id: aws-cognito-app-client-secret
+    emits: CanReadSecret
+    applies_to: [aws]
+    match_effective_permission:
+      action: "cognito-idp:DescribeUserPoolClient"
+      resource_type: "AWS::Cognito::UserPoolClient"
+    match_condition: "UserPoolClient.GenerateSecret == true"
+    emit:
+      source_type: Identity
+      target_type: APIKey
+      source: "<principal with effective cognito-idp:DescribeUserPoolClient>"
+      target: "<App Client Secret (APIKey node; ClientSecret field)>"
+      permissions: ["cognito-idp:DescribeUserPoolClient"]
+      state_logic: >-
+        ACTIVE when the principal holds effective cognito-idp:DescribeUserPoolClient on
+        the User Pool Client ARN and the client has GenerateSecret=true.
+      confidence: 0.95
+      derived_from: ["cognito-idp:DescribeUserPoolClient (AWS Service Authorization Reference)"]
+      condition_note: >-
+        Only emit when GenerateSecret=true on the UserPoolClient (DescribeUserPoolClient
+        response field GenerateSecret). If GenerateSecret=false (no client secret), the
+        DescribeUserPoolClient response omits ClientSecret — do not emit CanReadSecret.
+      false_positive_note: >-
+        Only emit when GenerateSecret=true is confirmed on the UserPoolClient. Clients
+        without GenerateSecret do not have a client secret; DescribeUserPoolClient will
+        return no ClientSecret field. This secret is used in server-side OAuth token flows
+        and is often more tightly guarded than user passwords.
+      narrative: >-
+        {principal.name} can call cognito-idp:DescribeUserPoolClient and read the
+        ClientSecret for app client {client.name} in User Pool {pool.name}; this is a
+        long-lived symmetric secret used in server-side OAuth token flows.
+
+  # ===========================================================================
+  # DEVELOPER-AUTHENTICATED IDENTITIES
+  # ===========================================================================
+  # CanFederateAs emission for developer-authenticated paths is DERIVED only.
+  # See aws-cognito-developer-auth-abuse in /rules/derived/aws/cognito.yaml.
+  # The explicit file emits only HasPermission normalization if needed; the derived
+  # rule matches on that and emits CanFederateAs.
+
+  # ===========================================================================
+  # MISSING RULES — HIGH-VALUE ESCALATION PATHS
+  # ===========================================================================
+
+  # --- UpdateUserPool: modify linked IdP trust ---
+  - id: aws-cognito-update-user-pool-idp-trust
+    emits: CanModifyTrust
+    applies_to: [aws]
+    match_effective_permission:
+      action: "cognito-idp:UpdateUserPool"
+      resource_type: "AWS::Cognito::UserPool"
+    match_condition: "the pool has linked SAML/OIDC identity providers"
+    emit:
+      source_type: Identity
+      target_type: TrustPolicy
+      source: "<principal with effective cognito-idp:UpdateUserPool>"
+      target: "<TrustPolicy node representing the User Pool's linked IdP configuration>"
+      permissions: ["cognito-idp:UpdateUserPool"]
+      state_logic: >-
+        ACTIVE when the principal holds effective cognito-idp:UpdateUserPool on the
+        User Pool ARN and the pool has linked SAML/OIDC providers configured.
+        CONDITIONAL(service_state) when no SAML/OIDC IdP is linked to the pool.
+      confidence: 0.80
+      derived_from: ["cognito-idp:UpdateUserPool (AWS Service Authorization Reference)", "AWS Cognito User Pools Administrator Guide (UpdateUserPool enables IdP modification)"]
+      false_positive_note: >-
+        UpdateUserPool can modify or remove linked SAML/OIDC identity providers, equivalent
+        to CreateIdentityProvider/UpdateIdentityProvider trust-rewrite. Verify the pool has
+        linked SAML/OIDC providers (via ListIdentityProviders) before emitting. If no IdP is
+        linked, this edge represents general pool configuration mutation only.
+      narrative: >-
+        {principal.name} can call cognito-idp:UpdateUserPool on User Pool {pool.name} to
+        modify or remove linked SAML/OIDC identity providers, rewriting the authentication
+        trust to accept tokens from attacker-controlled IdPs.
+
+  # --- UpdateUserPool: modify Lambda trigger ---
+  - id: aws-cognito-update-user-pool-lambda-trigger
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "cognito-idp:UpdateUserPool"
+      resource_type: "AWS::Cognito::UserPool"
+    match_condition: "can set LambdaConfig trigger to an attacker-controlled Lambda ARN"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal with effective cognito-idp:UpdateUserPool>"
+      target: "<Lambda function targeted by LambdaConfig trigger>"
+      permissions: ["cognito-idp:UpdateUserPool"]
+      state_logic: >-
+        ACTIVE when the principal holds effective cognito-idp:UpdateUserPool on the
+        User Pool ARN and can direct the pool to invoke an attacker-controlled Lambda
+        (via LambdaConfig.PreSignUp or other trigger hooks).
+      confidence: 0.85
+      derived_from: ["cognito-idp:UpdateUserPool (AWS Service Authorization Reference)", "AWS Cognito User Pools Developer Guide (LambdaConfig trigger setup)"]
+      false_positive_note: >-
+        UpdateUserPool enables setting arbitrary Lambda function ARNs in LambdaConfig
+        trigger hooks (PreSignUp, PreAuthentication, etc.). Confirm the attacker can
+        either control the Lambda function or has sufficient permissions to modify it
+        (CanModifyCode). This edge feeds downstream Lambda execution-as chains.
+      narrative: >-
+        {principal.name} can call cognito-idp:UpdateUserPool on User Pool {pool.name} to
+        set or modify LambdaConfig trigger hooks, directing authentication events to an
+        attacker-controlled Lambda function that executes with the pool's configured role.
+
+  # --- UpdateIdentityPool: flip AllowUnauthenticatedIdentities ---
+  - id: aws-cognito-update-identity-pool
+    emits: CanModifyTrust
+    applies_to: [aws]
+    match_effective_permission:
+      action: "cognito-identity:UpdateIdentityPool"
+      resource_type: "AWS::Cognito::IdentityPool"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: "<principal with effective cognito-identity:UpdateIdentityPool>"
+      target: "<the Identity Pool's mapped role (or TrustPolicy representing pool access control)>"
+      permissions: ["cognito-identity:UpdateIdentityPool", "iam:PassRole"]
+      state_logic: >-
+        ACTIVE when the principal holds effective cognito-identity:UpdateIdentityPool on
+        an Identity Pool ARN. Can flip AllowUnauthenticatedIdentities from false to true
+        (converting secure pool to public-entry pool) or modify RoleMapping rules to redirect
+        claims to privileged roles. CONDITIONAL(role_compatibility) if the new role requires
+        iam:PassRole and the principal lacks it.
+      confidence: 0.85
+      derived_from: ["cognito-identity:UpdateIdentityPool (AWS Service Authorization Reference)"]
+      false_positive_note: >-
+        UpdateIdentityPool can (a) flip AllowUnauthenticatedIdentities to true (persistent,
+        visible config change affecting all pool users) and (b) modify RoleMappings to
+        redirect claims to privileged roles. Confirm the attacker has not only
+        UpdateIdentityPool permission but also iam:PassRole for any new role they assign
+        (per AWS Service Authorization Reference). Include visibility note: this is not a
+        stealth attack; it modifies pool configuration visible to all users and admins.
+      narrative: >-
+        {principal.name} can call cognito-identity:UpdateIdentityPool on Identity Pool {pool.name}
+        to flip AllowUnauthenticatedIdentities to true (if currently false) or modify role
+        mappings, redirecting claims to privileged IAM roles and affecting all pool users.

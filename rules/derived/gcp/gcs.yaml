@@ -1,0 +1,698 @@
+# GCP Cloud Storage (GCS) — Derived attack-path rules (Phase 6 — Storage & Databases)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:gcs. Emits ONLY common edge types from schema/edges.yaml.
+# All permissions are taken verbatim from the GCS IAM permissions reference:
+#   cloud.google.com/storage/docs/access-control/iam-permissions
+#   cloud.google.com/storage/docs/authentication/hmackeys
+#   cloud.google.com/storage/docs/encryption/customer-managed-keys
+#   cloud.google.com/storage/docs/uniform-bucket-level-access
+#
+# CENTRAL ATTACK-PATH THEMES (Phase 6 — storage & databases):
+#
+#   (1) CREDENTIAL GRAB:
+#       storage.hmacKeys.create on a Service Account yields a long-lived
+#       HMAC key (access-key ID + secret) returned once at creation time.
+#       The secret grants S3-compatible CRUD access to every GCS bucket the
+#       SA can reach. -> ExposesCredential(Identity -> AccessKey).
+#
+#   (2) DATA READ + EXFIL:
+#       storage.objects.get -> CanReadData(Identity -> ObjectStorage).
+#       storage.objects.copy / storage.objects.create in a destination bucket
+#       -> CanExfiltrate(Identity -> ObjectStorage). Objects often contain
+#       SA JSON keys, Terraform state, .env files -> ContainsSecret.
+#       Cite credential-chains.yaml for the ContainsSecret->CredentialsFor
+#       ->CanImpersonate roll-up; do NOT re-derive it here.
+#
+#   (3) PUBLIC EXPOSURE:
+#       allUsers binding on bucket IAM policy (or publicRead predefined ACL
+#       when UBLA is disabled) -> ExposedToInternet(ObjectStorage -> AnonymousIdentity).
+#       allAuthenticatedUsers -> ExposedToTenant (NOT internet: requires a
+#       Google account).
+#
+#   (4) CROSS-BOUNDARY SHARING:
+#       Bucket IAM binding naming a member in a foreign GCP project ->
+#       CrossProjectTrust. storage.buckets.setIamPolicy self-grant -> CanModifyPolicy.
+#       CMEK bucket: CanReadData is CONDITIONAL(key_permission) gated on the
+#       Storage service agent's cloudkms.cryptoKeyVersions.useToDecrypt grant
+#       (NOT on the caller — same pattern as gcp:secretmanager).
+#
+# CMEK / key_permission — GCP-SPECIFIC:
+#   For a CMEK bucket (defaultKmsKeyName set), the STORAGE SERVICE AGENT
+#   (service-PROJECT_NUMBER@gs-project-accounts.iam.gserviceaccount.com),
+#   NOT the caller, performs decrypt via cloudkms.cryptoKeyVersions.useToDecrypt
+#   (roles/cloudkms.cryptoKeyEncrypterDecrypter). A caller with only
+#   storage.objects.get still reads CMEK objects AS LONG AS the service agent
+#   retains the KMS grant. Do NOT require caller cloudkms.* for GCS object reads.
+#   key_permission condition gates on the SERVICE AGENT, never on the caller.
+#   Not every object in a CMEK bucket is CMEK-encrypted (objects uploaded before
+#   CMEK was enabled, or with per-object overrides, may use Google-managed keys).
+#
+# LINCHPIN CITATIONS (do NOT re-derive the roll-ups listed here):
+#   * /rules/derived/credential-chains.yaml — read-secret-yields-identity:
+#     ContainsSecret + CanReadData => CredentialsFor => CanImpersonate / CanEscalateTo.
+#     Also decrypt-gates-secret-read for CMEK; execute-then-read-secret for workload-
+#     identity-based object reads.
+#   * /rules/derived/can-control.yaml — control-via-admin / escalate-via-execute-as.
+#   * /rules/derived/gcp/gcf.yaml, gcp/cloudrun.yaml — CanModifyCode + ExecutesAs =>
+#     CanExecuteAs when the GCS bucket is a Cloud Function source archive.
+#
+# PERMISSIONS ARE EFFECTIVE: the permission evaluator has already resolved
+# IAM bindings (project/folder/org inheritance, predefined ACL to permission
+# mapping, UBLA flag) before these rules fire. State defaults to ACTIVE; an
+# unmet condition yields CONDITIONAL/POTENTIAL; an explicit deny / VPC-SC
+# perimeter / org policy yields BLOCKED.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 6-storage-databases
+service: gcs
+applies_to: [gcp]
+
+rules:
+
+  # =====================================================================
+  # SECTION 1 — CREDENTIAL GRAB: HMAC KEY CREATION
+  # =====================================================================
+
+  # --- CanCreateCredentialFor: storage.hmacKeys.create yields a long-lived HMAC key --
+  # HMAC keys are the highest-value GCS primitive: the secret is returned ONCE
+  # at creation time and grants S3-compatible storage access to every bucket
+  # the SA can reach. This is a LONG-LIVED credential scoped to GCS S3-compatible API only.
+  - id: gcp-gcs-hmac-key-create
+    emits: CanCreateCredentialFor
+    description: "storage.hmacKeys.create generates a long-lived HMAC key (ID + secret) for a Service Account; the secret grants S3-compatible access to all GCS buckets the SA can reach but is scoped to the GCS API only, not full SA impersonation."
+    match_effective_permission:
+      action: "storage.hmacKeys.create"
+      resource_type: "google.storage.HmacKey"
+    where:
+      - "principal has EFFECTIVE storage.hmacKeys.create at the project scope (included in roles/storage.hmacKeyAdmin)"
+      - "principal also has EFFECTIVE iam.serviceAccounts.actAs on the target SA (to create a key FOR another SA; if creating for self, actAs is not required)"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "<principal>"
+      target: "<Service Account (HmacKey target)>"
+      permissions: ["storage.hmacKeys.create", "iam.serviceAccounts.actAs?"]
+      conditions: [iam_permission, role_compatibility]
+      scope_qualifier: "gcs_s3_compatible_api_only"
+      state_logic: >-
+        CONDITIONAL(iam_permission) as default: the HMAC key secret grants S3-compatible
+        GCS access only (NOT full Google Cloud API access). ACTIVE when
+        storage.hmacKeys.create is confirmed at the project scope AND (the target SA is
+        the calling SA itself OR iam.serviceAccounts.actAs is also confirmed on the
+        target SA); CONDITIONAL(iam_permission) when actAs grant is uncertain for a
+        cross-SA key creation; BLOCKED when an org policy disables HMAC key creation
+        (constraints/storage.hmacKeyServiceAccount restrictions) or an IAM deny targets
+        storage.hmacKeys.create. Note: this edge grants S3-compatible credential
+        creation, not full SA impersonation across Google APIs.
+      confidence: "min(contributing_confidences) * 0.97"
+      derived_from: ["storage.hmacKeys.create effective permission at project scope", "iam.serviceAccounts.actAs on target SA (if cross-SA)"]
+      false_positive_note: >-
+        The HMAC secret is returned ONLY at creation time (CreateHmacKeyResponse.secret);
+        storage.hmacKeys.get / storage.hmacKeys.list return only the key metadata (ID,
+        state, SA email) — NOT the secret. Only emit CanCreateCredentialFor from the
+        CREATE action, not from list/get. Callers need iam.serviceAccounts.actAs on
+        the target SA when the key is for a SA other than themselves — without actAs,
+        the Storage API returns 403; downgrade to CONDITIONAL(iam_permission). The HMAC
+        secret is valid only while the key state is ACTIVE; if the SA is disabled or the
+        key is deactivated, the credential is not usable. An org policy
+        constraints/storage.hmacKeyServiceAccount that restricts which SAs can have
+        HMAC keys may block creation for certain SAs -> CONDITIONAL(scp_or_org_policy).
+        CRITICAL: HMAC keys authenticate ONLY to the GCS S3-compatible XML API endpoint
+        — NOT to the JSON API or other Google Cloud APIs. This is storage-scoped
+        credential creation, not full SA impersonation. Query filters should exclude this
+        edge from general CanImpersonate/CanExecuteAs paths unless explicitly scoped to
+        GCS operations.
+      narrative: >-
+        {principal.name} holds storage.hmacKeys.create and can generate a long-lived
+        HMAC key (access-key ID + secret) for service account {sa.name}; the returned
+        secret grants S3-compatible access to all GCS buckets {sa.name} can reach via
+        the GCS S3 API only (NOT full Google Cloud API access).
+
+  # =====================================================================
+  # SECTION 2 — DATA READ + EXFILTRATION
+  # =====================================================================
+
+  # --- CanReadData: storage.objects.get effective ----------------------------
+  - id: gcp-gcs-read-data
+    emits: CanReadData
+    description: "storage.objects.get constitutes effective data-plane read access to GCS objects in the bucket (permission applies at object level but IAM bindings are bucket-scoped)."
+    match_effective_permission:
+      action: "storage.objects.get"
+      resource_type: "google.storage.Object"
+    where:
+      - "bucket is NOT CMEK-encrypted (defaultKmsKeyName unset, or all objects use Google-managed keys) — for CMEK buckets see gcp-gcs-read-data-cmek"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: "<principal>"
+      target: "<GCS Bucket / ObjectStorage node>"
+      permissions: ["storage.objects.get"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when storage.objects.get is confirmed effective at the bucket (IAM
+        allow policy, UBLA, and predefined ACL layers unified) and no VPC-SC
+        perimeter blocks the storage API for the caller; CONDITIONAL(resource_policy)
+        when UBLA is disabled and object-level ACLs may restrict individual objects;
+        BLOCKED when a VPC-SC perimeter, org policy
+        (constraints/gcp.storageForcePublicAccessPrevention), or IAM deny explicitly
+        blocks storage.objects.get for this caller.
+      confidence: "min(contributing_confidences) * 0.97"
+      derived_from: ["storage.objects.get effective permission on bucket"]
+      false_positive_note: >-
+        storage.objects.list (without get) provides only object metadata (names,
+        sizes, kmsKeyName) — NOT content. Do NOT emit CanReadData from list alone.
+        storage.objects.get is an OBJECT-level permission (applies to individual objects);
+        however, IAM bindings granting this permission are typically set at the BUCKET
+        scope, covering all objects within the bucket. When UBLA is enabled, bucket-level
+        IAM is authoritative. When UBLA is disabled, object-level ACLs may restrict
+        individual objects even if the bucket IAM policy grants read — downgrade to
+        CONDITIONAL(resource_policy) in that case and note that fine-grained object ACLs
+        may limit scope. VPC-SC perimeters that include storage.googleapis.com in the
+        restricted services set block callers outside the perimeter -> BLOCKED(resource_policy).
+        Public access prevention (org policy constraints/gcp.storagePublicAccessPrevention
+        or bucket-level publicAccessPrevention) blocks allUsers reads but does NOT
+        affect authenticated callers — do not confuse the two.
+      narrative: >-
+        {principal.name} holds storage.objects.get on bucket {bucket.name} and can
+        read the content of any object in the bucket.
+
+  # --- CanReadData (CMEK): service-agent key_permission gate ----------------
+  - id: gcp-gcs-read-data-cmek
+    emits: CanReadData
+    description: "storage.objects.get on a CMEK bucket; the Storage service agent (not the caller) decrypts — CanReadData is CONDITIONAL(key_permission) on the service agent's KMS grant."
+    match_effective_permission:
+      action: "storage.objects.get"
+      resource_type: "google.storage.Object"
+    where:
+      - "bucket IS CMEK-encrypted (defaultKmsKeyName set)"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: "<principal>"
+      target: "<CMEK GCS Bucket / ObjectStorage node>"
+      permissions: ["storage.objects.get"]
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        ACTIVE if the Storage service agent
+        (service-PROJECT_NUMBER@gs-project-accounts.iam.gserviceaccount.com) holds
+        cloudkms.cryptoKeyVersions.useToDecrypt (roles/cloudkms.cryptoKeyEncrypterDecrypter)
+        on defaultKmsKeyName AND the key/version is ENABLED;
+        CONDITIONAL(key_permission) if the service-agent grant or key state is unknown;
+        BLOCKED if the service agent lacks the grant, OR the key is DISABLED/DESTROYED,
+        OR a KMS deny applies (storage.objects.get then returns encrypted bytes that
+        cannot be decrypted, or a KMS error).
+        Note: objects uploaded before CMEK was configured use Google-managed keys
+        and are always readable by authorized callers regardless of KMS state.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["storage.objects.get effective permission on CMEK bucket", "Storage service-agent KMS binding on defaultKmsKeyName"]
+      false_positive_note: >-
+        GCP-SPECIFIC: the key_permission gate is on the STORAGE SERVICE AGENT, not
+        the caller. Do NOT require the accessing principal to hold cloudkms.* — a
+        caller with only storage.objects.get reads CMEK objects while the service
+        agent keeps useToDecrypt. Requiring caller KMS decrypt (AWS-style) produces
+        false negatives. Downgrade to CONDITIONAL/BLOCKED only based on the service
+        agent's grant and the key's enabled state. Objects with per-object kmsKeyName
+        (different from defaultKmsKeyName) are gated on THEIR OWN key — handle
+        per-object CMEK separately when the object metadata shows a different key.
+        Objects with no kmsKeyName field use Google-managed keys (transparent,
+        always ACTIVE for authorized callers).
+      narrative: >-
+        {principal.name} holds storage.objects.get on CMEK bucket {bucket.name}
+        (defaultKmsKeyName: {key.name}); the Storage service agent — not the caller
+        — decrypts objects using cloudkms.cryptoKeyEncrypterDecrypter on {key.name}.
+        Access is ACTIVE while the service agent retains that grant and the key is
+        enabled.
+
+  # --- CanWriteData: storage.objects.create effective -----------------------
+  - id: gcp-gcs-write-data
+    emits: CanWriteData
+    description: "storage.objects.create constitutes effective data-plane write access to a GCS bucket; also enables supply-chain poisoning if the bucket backs a Cloud Function source archive."
+    match_effective_permission:
+      action: "storage.objects.create"
+      resource_type: "google.storage.Bucket"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: "<principal>"
+      target: "<GCS Bucket / ObjectStorage node>"
+      permissions: ["storage.objects.create"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when storage.objects.create is confirmed effective on the bucket and
+        no VPC-SC perimeter or retention policy (locked / retention lock) prevents
+        object creation; CONDITIONAL(resource_policy) when UBLA is disabled and
+        bucket-level conditions may restrict writes; BLOCKED under a VPC-SC perimeter
+        deny or org policy.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["storage.objects.create effective permission on bucket"]
+      false_positive_note: >-
+        A locked retention policy on the bucket prevents deletion/overwrite of objects
+        within the retention period — new objects can still be created unless the
+        bucket is also under a hold. When the bucket's objects are a Cloud Function
+        source archive, CanWriteData here enables CanModifyCode derivation in
+        gcp/gcf.yaml or gcp/cloudrun.yaml — this file emits the write fact and
+        defers the function-escalation derivation to those services. Versioning
+        enabled means old versions survive; the write still creates a new version and
+        may redirect function deployments to it.
+      narrative: >-
+        {principal.name} holds storage.objects.create on bucket {bucket.name} and can
+        write or overwrite objects in it (supply-chain risk if bucket backs a Cloud
+        Function source archive).
+
+  # --- CanExfiltrate: copy objects to an attacker-controlled bucket ----------
+  - id: gcp-gcs-exfiltrate
+    emits: CanExfiltrate
+    description: "storage.objects.get on the source bucket + storage.objects.create on a destination bucket (cross-project or attacker-controlled) constitute effective data exfiltration; achievable via storage.objects.copy (rewriteObject) which combines read+write permissions."
+    match:
+      - [ ?principal, CanReadData, ?bucket ]
+    where:
+      - "?principal has EFFECTIVE storage.objects.create on a destination bucket in a different project or attacker-controlled bucket"
+      - "node_type(?bucket) == ObjectStorage"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: ?principal
+      target: ?bucket
+      permissions: ["storage.objects.get", "storage.objects.create"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when CanReadData(?principal, ?bucket) is ACTIVE AND
+        storage.objects.create on a writable destination bucket (ideally
+        attacker-controlled or cross-project) is confirmed; CONDITIONAL(iam_permission)
+        when destination bucket write rights are uncertain; POTENTIAL when no
+        destination write path is modeled. CMEK state inherits from the CanReadData
+        input (CONDITIONAL(key_permission) if CMEK gated).
+      confidence: "min(contributing_confidences) * 0.92"
+      derived_from: ["?principal CanReadData ?bucket", "storage.objects.create on destination bucket"]
+      false_positive_note: >-
+        Exfiltration requires write access to a destination bucket outside the
+        source project boundary or controlled by the attacker. The GCS JSON API
+        storage.objects.copy (rewriteObject) operation uses the SAME permissions
+        required by this rule: storage.objects.get on the source AND storage.objects.create
+        on the destination. Both the copy operation and the gcloud storage cp command
+        use storage.objects.get + storage.objects.create and are covered by this rule.
+        A write-only path to a bucket in the SAME project without read may indicate
+        supply-chain risk but not exfiltration. VPC-SC perimeters that co-perimeter
+        source and destination projects may block cross-perimeter object copies ->
+        BLOCKED(resource_policy). Object lifecycle / retention does not block copy
+        operations to a different bucket. Storage Transfer Service (storagetransfer.*)
+        is a separate API and requires separate permissions not modeled here.
+      narrative: >-
+        {principal.name} can read objects from {bucket.name} (storage.objects.get)
+        and write them to an attacker-controlled or cross-project bucket
+        (storage.objects.create), enabling exfiltration via storage.objects.copy or
+        gcloud storage cp to move data outside the project boundary.
+
+  # --- CanTrigger: object write to bucket with Pub/Sub triggers Cloud Function --
+  - id: gcp-gcs-write-triggers-function
+    emits: CanTrigger
+    description: "An object write to a GCS bucket with Pub/Sub notification config pointing to a Cloud Function/Cloud Run service triggers downstream compute execution as the function's service account."
+    match:
+      - [ ?principal, CanWriteData, ?bucket ]
+      - [ ?bucket,    CanTrigger,   ?function ]
+    where:
+      - "?bucket has a Pub/Sub notification config targeting ?function (Cloud Function or Cloud Run service)"
+      - "notification is configured to fire on object-create events"
+    emit:
+      source_type: Identity
+      target_type: ServerlessFunction
+      source: ?principal
+      target: ?function
+      permissions: ["storage.objects.create"]
+      conditions: [iam_permission, trigger_exists]
+      state_logic: >-
+        ACTIVE when CanWriteData(?principal, ?bucket) is ACTIVE AND the bucket's
+        Pub/Sub notification config targeting ?function is confirmed active;
+        CONDITIONAL(trigger_exists) when the notification config is not confirmed
+        or the Cloud Function/Cloud Run target state is unknown; BLOCKED if the
+        notification config is removed or the target service is disabled.
+        Note: the attacker's privilege level during function execution is determined
+        by the function's ExecutesAs service account (modeled by gcp/gcf.yaml or
+        gcp/cloudrun.yaml).
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: ["?principal CanWriteData ?bucket", "?bucket notification config targeting ?function"]
+      false_positive_note: >-
+        Object-write triggers are event-driven: only object-creation events fire
+        the notification (not object deletes, updates, or metadata changes — unless
+        explicitly configured). The exact event filter and destination must be
+        confirmed in the bucket's notificationConfig field. CanTrigger here is a
+        CAPABILITY (the write fires the trigger); downstream execution privilege is
+        separate and depends on the function's ExecutesAs role (cite can-execute-as).
+        A bucket with multiple notification configs may trigger multiple downstream
+        services — emit a CanTrigger edge for each. VPC-SC perimeters that co-perimeter
+        the bucket and Pub/Sub may allow the trigger; perimeters that exclude Pub/Sub
+        or target functions may block it -> CONDITIONAL(trigger_exists).
+      narrative: >-
+        {principal.name} can write objects to {bucket.name}; the bucket is configured
+        with a Pub/Sub notification pointing to {function.name}, which fires on object
+        creation. Writing an object will trigger {function.name} to execute.
+
+  # --- CanModifyConfiguration: storage.buckets.update mutates bucket config ----
+  - id: gcp-gcs-bucket-update-config
+    emits: CanModifyConfiguration
+    description: "storage.buckets.update allows a principal to modify bucket configuration: UBLA settings, CMEK default key, versioning, Pub/Sub notification configs, retention policy, and logging — enabling encryption ransomware, trigger hijacking, and configuration-based escalation."
+    match_effective_permission:
+      action: "storage.buckets.update"
+      resource_type: "google.storage.Bucket"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: "<principal>"
+      target: "<GCS Bucket>"
+      permissions: ["storage.buckets.update"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when storage.buckets.update is confirmed effective on the bucket and
+        no VPC-SC perimeter or org policy blocks the buckets.update action;
+        CONDITIONAL(resource_policy) when project-level or resource-based restrictions
+        apply; BLOCKED when an IAM deny or org policy denies storage.buckets.update.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["storage.buckets.update effective permission on bucket"]
+      false_positive_note: >-
+        storage.buckets.update is a powerful configuration verb covering multiple
+        sub-impacts: (1) UBLA enable/disable changes access control model;
+        (2) defaultKmsKeyName swap to an attacker-controlled key enables encryption
+        ransomware (new writes encrypt under attacker key, preventing owner decrypt);
+        (3) notification config add/update enables CanTrigger to downstream functions;
+        (4) lifecycle rules / retention policy changes affect data durability and
+        deletion capabilities; (5) logging enable/disable affects auditability.
+        An attacker with buckets.update can perform any of these mutations, but the
+        exploitability of each depends on downstream conditions (e.g., KMS key
+        accessibility, notification config target state). This edge signals
+        configuration-mutation capability; derive specific impacts (CanTrigger,
+        encryption-blocked) as separate rules when the downstream state is known.
+      narrative: >-
+        {principal.name} holds storage.buckets.update on {bucket.name} and can modify
+        bucket configuration: change UBLA settings, swap CMEK keys, add Pub/Sub
+        notification triggers, adjust retention policy, and toggle logging.
+
+  # =====================================================================
+  # SECTION 3 — PUBLIC EXPOSURE
+  # =====================================================================
+
+  # --- ExposedToInternet: allUsers binding or publicRead ACL ----------------
+  - id: gcp-gcs-public-allUsers
+    emits: ExposedToInternet
+    description: "A bucket IAM binding granting any read role to allUsers, or a publicRead/publicReadWrite predefined ACL (when UBLA is disabled), makes the bucket's objects accessible to unauthenticated internet principals."
+    match_record:
+      resource_type: "google.storage.Bucket"
+      field: "iamPolicy.bindings[].members (contains 'allUsers') OR acl[].entity == 'allUsers' OR defaultObjectAcl[].entity == 'allUsers'"
+    where:
+      - "the binding or ACL entry grants a role that includes storage.objects.get (e.g. roles/storage.objectViewer, roles/storage.legacyObjectReader, roles/storage.legacyBucketReader)"
+      - "OR predefined ACL is publicRead / publicReadWrite (when UBLA is disabled)"
+    emit:
+      source_type: Storage
+      target_type: AnonymousIdentity
+      source: "<GCS Bucket / ObjectStorage node>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when allUsers binding or publicRead ACL is present in the effective
+        IAM policy or ACL and no org policy (constraints/gcp.storagePublicAccessPrevention
+        or publicAccessPrevention == enforced at bucket level) blocks it; BLOCKED when
+        org policy or bucket-level public access prevention is enforced AND confirmed.
+        When UBLA is enabled, the IAM layer is authoritative; when UBLA is disabled,
+        both IAM and ACL layers must be checked.
+      confidence: "0.98"
+      derived_from: ["google.storage.Bucket iamPolicy.bindings (allUsers) or acl[].entity == 'allUsers'"]
+      false_positive_note: >-
+        allUsers grants UNAUTHENTICATED access — any internet client can fetch objects
+        at https://storage.googleapis.com/{bucket}/{object} without any credentials.
+        allAuthenticatedUsers requires a Google account and is modeled separately as
+        ExposedToTenant. When UBLA is disabled, both the bucket IAM policy AND the
+        bucket/object ACL arrays must be inspected; publicRead predefined ACL
+        (acl[].entity == 'allUsers') is equivalent to an IAM allUsers binding and
+        must be detected. When UBLA is enabled, object-level ACLs cannot override
+        bucket IAM, so a bucket-level allUsers binding exposes ALL objects. When UBLA
+        is disabled, individual object ACLs may still restrict specific objects — emit
+        ExposedToInternet at the bucket level with a CONDITIONAL note when UBLA is off.
+        Org policy publicAccessPrevention == 'enforced' at the project/folder/org level
+        prevents allUsers bindings from being created and removes existing ones ->
+        BLOCKED. Check publicAccessPrevention bucket field directly.
+      narrative: >-
+        Bucket {bucket.name} is publicly accessible — any unauthenticated internet
+        client can read its objects (allUsers IAM binding or publicRead ACL grants
+        storage.objects.get without credentials).
+
+  # --- ExposedToTenant: allAuthenticatedUsers binding -----------------------
+  - id: gcp-gcs-authed-users
+    emits: ExposedToTenant
+    description: "A bucket IAM binding granting any read role to allAuthenticatedUsers makes the bucket readable by any Google-authenticated user worldwide (not limited to the organization) — broad tenant-wide exposure including external Google accounts."
+    match_record:
+      resource_type: "google.storage.Bucket"
+      field: "iamPolicy.bindings[].members (contains 'allAuthenticatedUsers')"
+    where:
+      - "the binding grants a role that includes storage.objects.get"
+    emit:
+      source_type: Storage
+      target_type: Organization
+      source: "<GCS Bucket / ObjectStorage node>"
+      target: "<GCP Organization / Tenant node>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when allAuthenticatedUsers binding is present in the effective IAM
+        policy and no org policy (iam.allowedPolicyMemberTypes or publicAccessPrevention)
+        blocks it; CONDITIONAL(scp_or_org_policy) when org policy restricts
+        allAuthenticatedUsers usage; BLOCKED when org policy explicitly denies it.
+      confidence: "0.95"
+      derived_from: ["google.storage.Bucket iamPolicy.bindings (allAuthenticatedUsers)"]
+      false_positive_note: >-
+        allAuthenticatedUsers grants access to any Google-authenticated account —
+        including personal Gmail accounts, Google accounts in other organizations,
+        and any account with a valid Google identity. This is BROADER than an
+        org-level domain grant and is a serious misconfiguration for any bucket
+        holding non-public data. The target_type Organization signals GCP-org scope,
+        but the actual exposure extends GLOBALLY to any Google-authenticated user
+        worldwide. Do NOT model as ExposedToInternet (requires no login); model as
+        ExposedToTenant. Org policy iam.allowedPolicyMemberTypes can restrict
+        allAuthenticatedUsers usage at the org/folder/project level ->
+        BLOCKED(scp_or_org_policy). Analyst should note that this exposure is NOT
+        limited to the GCP Organization boundary — it is open to any Google account.
+      narrative: >-
+        Bucket {bucket.name} grants storage.objects.get to allAuthenticatedUsers;
+        any Google-authenticated account worldwide (including accounts outside the
+        GCP Organization, personal Gmail, foreign projects) can read its objects.
+
+  # =====================================================================
+  # SECTION 4 — IAM POLICY MUTATION
+  # =====================================================================
+
+  # --- CanGrantPermission: CanModifyPolicy self-grant -> read/admin access ----
+  - id: gcp-gcs-set-iam-self-grant
+    emits: CanGrantPermission
+    description: "A principal with CanModifyPolicy on a bucket's IAM policy can grant itself roles/storage.objectViewer or roles/storage.admin and read or administer its objects."
+    match:
+      - [ ?principal, CanModifyPolicy, ?bucket_policy ]
+    where:
+      - "?bucket_policy is the ResourcePolicy of ?bucket"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?principal
+      permissions: ["storage.buckets.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if CanModifyPolicy is ACTIVE (setIamPolicy resolves on the bucket);
+        inherits state from CanModifyPolicy input. BLOCKED if an IAM deny or org
+        policy denies it. Chains to CanReadData(principal, bucket) via a self-bound
+        roles/storage.objectViewer, then to ContainsSecret/CanExfiltrate if the
+        bucket holds sensitive data.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["?principal CanModifyPolicy ?bucket_policy (produced by gcp-gcs-can-modify-policy)"]
+      false_positive_note: >-
+        Escalation primitive: a principal with CanModifyPolicy can grant itself
+        roles/storage.objectViewer (or roles/storage.admin) and read all objects.
+        For CMEK buckets the service-agent KMS gate still applies to the subsequent
+        read. Confirm that setIamPolicy is on the SAME bucket the principal intends to
+        read; project-scoped grants cover all buckets in the project. Org policy
+        denying iam.setIamPolicy mutations -> BLOCKED.
+      narrative: >-
+        {principal.name} holds CanModifyPolicy on bucket {bucket.name}'s IAM policy
+        and can grant itself roles/storage.objectViewer, then read all objects in
+        the bucket.
+
+  # =====================================================================
+  # SECTION 5 — CROSS-BOUNDARY
+  # =====================================================================
+
+
+  # --- CanEnterProject: cross-project read of a bucket containing secrets ----
+  - id: gcp-gcs-enter-project-via-secrets
+    emits: CanEnterProject
+    description: "A cross-project principal that can read a bucket containing credentials for a principal privileged in the bucket's project effectively enters that project."
+    match:
+      - [ ?principal, CanReadData, ?bucket ]
+      - [ ?bucket,    ContainsSecret, ?secret ]
+      - [ ?secret,    CredentialsFor, ?identity ]
+    where:
+      - "?principal.project != ?bucket.project   # cross-project read"
+      - "?identity has bindings granting privilege in ?bucket.project"
+    emit:
+      source_type: Identity
+      target_type: Project
+      source: ?principal
+      target: "<bucket.project>"
+      permissions: ["storage.objects.get"]
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        Inherits weakest state from CanReadData (ACTIVE or CONDITIONAL(key_permission)
+        for CMEK), ContainsSecret, and CredentialsFor contributors. ACTIVE when all
+        three contributing edges are ACTIVE and the credentialed identity is confirmed
+        as privileged in the target project; CONDITIONAL(key_permission) when the
+        bucket is CMEK and service-agent grant is unconfirmed.
+      confidence: "min(contributing_confidences) * 0.8"
+      derived_from: ["?principal CanReadData ?bucket", "?bucket ContainsSecret ?secret", "?secret CredentialsFor ?identity"]
+      false_positive_note: >-
+        Low-confidence derivation: ContainsSecret is asserted from object-name
+        heuristics (e.g. `.tfstate`, `serviceaccount`, `credentials`, `.env`,
+        `kubeconfig`) — NEVER from reading object content. Emit with confidence 0.6-0.7
+        when based on name alone; raise to 0.85+ when object metadata (content-type,
+        label, annotation) corroborates. The CredentialsFor edge must also be
+        evidenced or asserted. Do NOT emit when the principal and bucket are in the
+        same project. The credentialed identity must be privileged in the BUCKET's
+        project, not the reading principal's project.
+      narrative: >-
+        {principal.name} (project {projectB.name}) can read objects in bucket
+        {bucket.name} (project {projectA.name}), which is classified as containing
+        credentials for {identity.name} that is privileged in {projectA.name} —
+        reading the object yields a pivot into project {projectA.name}.
+
+  # =====================================================================
+  # SECTION 6 — OBJECT DATA CONTAINS SECRETS
+  # =====================================================================
+
+
+  # =====================================================================
+  # SECTION 7 — ESCALATION ROLL-UPS
+  # =====================================================================
+
+  # --- CanEscalateTo: HMAC key for more-privileged SA is escalation ---------
+  - id: gcp-gcs-escalate-via-hmac-key
+    emits: CanEscalateTo
+    description: "Generating an HMAC key for a Service Account with greater GCS-scoped access and using it via the S3-compatible GCS API constitutes privilege escalation (storage-scoped only, not full SA impersonation)."
+    match:
+      - [ ?principal, CanCreateCredentialFor, ?sa ]
+    where:
+      - "edge comes from gcp-gcs-hmac-key-create (scope_qualifier: gcs_s3_compatible_api_only)"
+      - "?sa has read/write/admin permissions on GCS buckets that ?principal cannot access (as evidenced by CanReadData/CanWriteData roles or bucket IAM bindings)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?sa
+      permissions: ["storage.hmacKeys.create"]
+      conditions: [iam_permission, role_compatibility]
+      scope_qualifier: "gcs_s3_compatible_api_only"
+      state_logic: >-
+        Inherits state from the CanCreateCredentialFor contributor (gcp-gcs-hmac-key-create):
+        ACTIVE when hmacKeys.create is confirmed and the target SA has demonstrably
+        greater GCS access (via sampled bucket IAM bindings or role assignments) than
+        the calling principal; CONDITIONAL when actAs grant uncertainty downgrades
+        CanCreateCredentialFor; BLOCKED if hmacKeys.create is denied. Scope limited to
+        GCS S3-compatible operations (not full SA impersonation across all Google APIs —
+        HMAC keys authenticate only to the GCS S3-compatible XML API endpoint).
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: ["?principal CanCreateCredentialFor ?sa (via gcp-gcs-hmac-key-create, scope: gcs_s3_api)", "?sa has greater GCS bucket access than ?principal"]
+      false_positive_note: >-
+        CRITICAL: HMAC keys authenticate ONLY to the GCS S3-compatible XML API
+        (s3.googleapis.com / storage.googleapis.com S3 endpoint). The JSON API at
+        storage.googleapis.com/storage/v1 is a separate authentication domain.
+        A HMAC key does NOT grant iam.*, cloudfunctions.*, or other GCP APIs —
+        privilege escalation is STORAGE-SCOPED ONLY, not full SA impersonation.
+        This rule emits CanEscalateTo (not full CanImpersonate) to signal GCS-scoped
+        escalation. DO NOT compare broad IAM privilege_level fields across different
+        API families — instead, sample bucket IAM bindings to confirm the target SA
+        has greater storage.objects.get / storage.objects.create reach than the
+        principal. Escalation is spurious if both SAs have identical GCS bucket access
+        — emit POTENTIAL or CONDITIONAL, not ACTIVE. can-control.yaml and
+        credential-chains.yaml handle broader (full-API) escalation roll-ups; cite them
+        for GCS-scoped findings that transition to org-level escalation, do not duplicate.
+      narrative: >-
+        {principal.name} can generate an HMAC key for {sa.name} (which has greater
+        GCS-scoped access to buckets). Using the key's S3-compatible credential,
+        {principal.name} can access buckets {sa.name} can reach — GCS storage-scoped
+        privilege escalation (NOT full SA impersonation across Google APIs).
+
+  # --- CanEnterProject: setIamPolicy self-grant enables project data entry ---
+  - id: gcp-gcs-enter-project-via-set-iam
+    emits: CanEnterProject
+    description: "A cross-project principal that can set the bucket IAM policy can grant itself objectViewer, read the bucket contents, and enter the bucket's project data boundary — especially when the bucket contains privileged credentials."
+    match:
+      - [ ?principal, CanModifyPolicy, ?bucket_policy ]
+      - [ ?bucket,    HasPolicy,       ?bucket_policy ]
+      - [ ?bucket,    ContainsSecret,  ?secret ]
+    where:
+      - "?principal.project != ?bucket.project   # cross-project caller"
+      - "?bucket_policy is the ResourcePolicy of ?bucket"
+    emit:
+      source_type: Identity
+      target_type: Project
+      source: ?principal
+      target: "<bucket.project>"
+      permissions: ["storage.buckets.setIamPolicy", "storage.objects.get"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        CONDITIONAL(resource_policy) as the default: CanModifyPolicy(setIamPolicy)
+        is necessary but NOT sufficient — the principal must execute the self-grant
+        (write IAM policy to bind itself to objectViewer) and THEN read the bucket
+        objects. These mandatory intermediate steps are not guaranteed even when
+        setIamPolicy is ACTIVE — org policy or IAM deny could block the self-grant
+        at execution time. ACTIVE only if execution of self-grant is confirmed;
+        POTENTIAL if ContainsSecret is POTENTIAL and the attack path is plausible
+        but not yet confirmed.
+      confidence: "min(contributing_confidences) * 0.82"
+      derived_from: ["?principal CanModifyPolicy ?bucket_policy", "?bucket ContainsSecret ?secret"]
+      false_positive_note: >-
+        This rule fires when a CROSS-PROJECT principal can write the bucket's IAM
+        policy AND the bucket contains classified secrets. If the principal is in the
+        SAME project, the data-boundary crossing is weaker (intra-project). The
+        CanEnterProject impact is data-plane only (read the bucket contents); full
+        management-plane control requires resourcemanager.projects.setIamPolicy, a
+        different edge. The ContainsSecret classification must be at least POTENTIAL —
+        do not emit for buckets with no credential indicator. Confidence degrades
+        with heuristic ContainsSecret inputs.
+      narrative: >-
+        {principal.name} (project {projectB.name}) holds storage.buckets.setIamPolicy
+        on bucket {bucket.name} (project {projectA.name}) and can grant itself
+        objectViewer; the bucket is classified as containing secrets — reading its
+        objects may yield credentials for project {projectA.name}.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-EDGE GUIDANCE:
+#   - A VPC-SC perimeter that includes storage.googleapis.com in the restricted
+#     services set blocks callers outside the perimeter -> emit CanReadData /
+#     CanWriteData / CanExfiltrate / ExposesCredential with state: BLOCKED and
+#     denied_by=<perimeter resource name>.
+#   - Org policy constraints/gcp.storagePublicAccessPrevention or bucket-level
+#     publicAccessPrevention == 'enforced' blocks allUsers bindings ->
+#     gcp-gcs-public-allUsers BLOCKED.
+#   - Org policy iam.allowedPolicyMemberTypes restricting allAuthenticatedUsers ->
+#     gcp-gcs-authed-users BLOCKED(scp_or_org_policy).
+#   - Org policy constraints/storage.hmacKeyServiceAccount restricting HMAC key
+#     creation for specific SAs -> gcp-gcs-hmac-key-create CONDITIONAL or BLOCKED.
+#   - Storage service agent lacking cloudkms.cryptoKeyVersions.useToDecrypt on
+#     defaultKmsKeyName, or the key being DISABLED/DESTROYED ->
+#     gcp-gcs-read-data-cmek BLOCKED(key_permission).
+#   - An IAM deny policy denying storage.objects.get / storage.buckets.setIamPolicy
+#     / storage.hmacKeys.create at the effective scope -> respective edges BLOCKED.
+#   - A locked bucket retention policy prevents overwrite but NOT new object creation;
+#     gcp-gcs-write-data may still be ACTIVE with a note on retention.
+#
+# LINCHPIN CROSS-REFERENCES:
+#   * gcp-gcs-contains-secret (ContainsSecret) + CanReadData ->
+#     credential-chains.yaml read-secret-yields-identity =>
+#     CanImpersonate / CanEscalateTo for the contained credential's target identity.
+#   * gcp-gcs-write-data (CanWriteData on a function source bucket) ->
+#     gcp/gcf.yaml CanModifyCode / gcp/cloudrun.yaml CanModifyCode ->
+#     can-execute-as.yaml execute-as-via-code-modify => CanExecuteAs(principal, SA).
+#   * gcp-gcs-hmac-key-create (CanImpersonate via storage.hmacKeys.create) ->
+#     gcp-gcs-escalate-via-hmac-key (CanEscalateTo if target SA more privileged) ->
+#     can-control / credential-chains roll-ups for full attack paths.
+#   * gcp-gcs-set-iam-self-grant (CanGrantPermission) ->
+#     can-control.yaml control-boundary-via-iam-admin => Controls(bucket-project).
+# ---------------------------------------------------------------------------
+

@@ -1,0 +1,575 @@
+# GCP Cloud Identity / Workspace — Derived attack-path rules (Phase 2 — identity stragglers)
+# ---------------------------------------------------------------------------
+# Attack surface: Google Groups, Domain-Wide Delegation (DWD), Workspace admin
+# roles (super-admin and delegated-admin), and password reset.
+#
+# HEADLINE PRIMITIVES:
+#   1. cloudidentity.groups.memberships.create → add self to a group that holds
+#      a GCP IAM role → inherit that role → CanAddMember → CanGrantPermission.
+#   2. Service Account with DWD → impersonate ANY Workspace user for configured
+#      scopes → CanImpersonate(SA, HumanIdentity). This is tenant-wide. Whoever
+#      can run code as the DWD SA (CanExecuteAs) inherits it.
+#   3. Workspace super-admin → implicit GCP org IAM write → CanGrantPermission.
+#   4. Delegated admin with "Reset passwords" → CanResetCredential(admin, user).
+#   5. Admin can grant/revoke DWD scope bindings → CanModifyTrust(admin, SA).
+#
+# LINCHPINS — CITED, NOT DUPLICATED:
+#   * credential-chains.yaml: impersonate-is-escalation (CanImpersonate +
+#     privilege_delta → CanEscalateTo); execute-then-read-secret (CanExecuteAs
+#     → inherit outbound CanReadSecret); read-secret-yields-identity.
+#   * can-control.yaml: control-boundary-via-iam-admin (CanGrantPermission @scope
+#     → Controls(scope)); escalate-via-execute-as (CanExecuteAs → CanEscalateTo).
+#   * can-execute-as.yaml: CanExecuteAs(attacker, DWD-SA) + the DWD-SA's
+#     CanImpersonate edges → attacker inherits CanImpersonate (capability-inheritance
+#     traversal, NOT re-derived here).
+#   * federation-chains.yaml: federate-inherits-capabilities (CanFederateAs →
+#     CanImpersonate when target is ServiceAccount). Not applicable to DWD directly
+#     (DWD is not OIDC federation), but referenced for the WIF SA path.
+#   * hierarchy-chains.yaml: admin-inherits-down-contains (CanGrantPermission @org
+#     → Controls of all descendant projects via hierarchy inheritance).
+#
+# Permissions are verbatim from the Cloud Identity permissions reference
+# (cloud.google.com/iam/docs/permissions-reference, cloudidentity.*) and the
+# Admin SDK Directory API documentation.
+#
+# State defaults: ACTIVE when effective permission confirmed at scope;
+#   CONDITIONAL when gating condition (e.g. group has no privileged IAM binding,
+#   DWD scopes too narrow) is unresolved; POTENTIAL when permission is absent
+#   but creatable; BLOCKED when an IAM deny policy or org policy prevents it.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 2-identity-authorization
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # RULE 1: Group membership write → can grant that group's IAM role to self
+  # ---------------------------------------------------------------------------
+  # RULE NOTE: The explicit CanAddMember fact (reading IAM bindings and membership
+  # roles from the collector) is emitted by /rules/explicit/gcp-cloudidentity.yaml.
+  # This derived rule consumes that explicit edge and emits CanGrantPermission
+  # when the group holds an elevated IAM role. The can-control.yaml linchpin
+  # then rolls CanGrantPermission up to Controls(scope).
+  #
+  # Pattern: CanAddMember(principal, group) + HasRole(group, elevated_role@scope)
+  # → CanGrantPermission(principal, any_principal_at_scope)
+  #
+  # NOT CURRENTLY MODELED: this file documents the logical flow but defers
+  # the intermediate CanGrantPermission derivation to the linchpin coordination.
+  # For now, CanAddMember is the primary fact; collectors and explicit rules
+  # (gcp-cloudidentity.yaml) handle fact production directly.
+  - id: gcp-ci-group-member-inherits-role
+    emits: CanAddMember
+    description: >-
+      Principal with cloudidentity.groups.memberships.create (or group Manager/Owner role)
+      can add any principal — including itself — to the target group, inheriting its
+      bound GCP IAM roles.
+    match:
+      - [ ?principal, HasPermission, ?group ]
+    where:
+      - "node_type(?group) == Group"
+      - "effective_permission(?principal, cloudidentity.groups.memberships.create, ?group) == true
+         OR membership_role(?principal, ?group) in [MANAGER, OWNER]"
+    emit:
+      source_type: Identity
+      target_type: Group
+      source: ?principal
+      target: ?group
+      permissions:
+        - "cloudidentity.groups.memberships.create"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if effective permission is confirmed at the group scope (role binding
+        that grants cloudidentity.groups.memberships.create, or the principal is a
+        group MANAGER/OWNER). CONDITIONAL(iam_permission) if permission is inherited
+        from a parent resource and not yet confirmed. BLOCKED if an IAM deny policy
+        explicitly denies cloudidentity.groups.memberships.create on the group.
+        Note: even ACTIVE, a downstream CanGrantPermission edge is only meaningful
+        if the group actually has a GCP IAM role binding — without one, this is
+        group-membership access only (still a finding but lower-impact).
+      confidence: 0.95
+      derived_from:
+        - "effective cloudidentity.groups.memberships.create on ?group (or MANAGER/OWNER membership role)"
+      false_positive_note: >-
+        A group MEMBER cannot add members — only a MANAGER/OWNER or a principal with
+        the explicit cloudidentity.groups.memberships.create permission at the group
+        scope can do so. Check both the IAM binding AND the membership role.
+        Also verify the group has at least one GCP IAM role binding (HasRole) to
+        confirm this is a privilege-escalation vector and not just group management.
+        Admin SDK admin.directory.groups.members.insert is the Workspace-equivalent
+        path — if the collector uses Admin SDK, map that permission to this rule.
+        An org-level roles/cloudidentity.groupAdmin covers all groups; a group-scoped
+        binding is narrower — honor the scope.
+      narrative: >-
+        {principal.name} can add any principal (including itself) to {group.name}
+        (cloudidentity.groups.memberships.create or group Manager/Owner role).
+        Any GCP IAM role bound to {group.name} is inherited by the added principal,
+        making this a privilege-escalation vector when {group.name} carries
+        elevated IAM roles.
+
+  # ---------------------------------------------------------------------------
+  # RULE 2: Domain-Wide Delegation SA → act as all domain users (headline)
+  # ---------------------------------------------------------------------------
+  # A service account granted DWD can request an access token as ANY Workspace
+  # user (subject to configured OAuth2 scopes) by calling the Google OAuth2
+  # endpoint directly, using its own private key. There is no user consent
+  # required. This is a TENANT-WIDE primitive: the SA can act as every active
+  # user in the organization for the authorized scopes.
+  #
+  # EDGE CHOICE: The schema defines CanDelegate (source: [Identity, ApplicationIdentity],
+  # target: [Identity], nature: both) with the explicit GCP trigger
+  # "Domain-wide delegation on SA" — this is the correct edge for DWD semantics.
+  # CanImpersonate is restricted to target types [ServiceAccount, MachineIdentity,
+  # ManagedIdentity, WorkloadIdentity, ApplicationIdentity] and does NOT include
+  # HumanIdentity, so DWD-into-user must be modeled as CanDelegate, not CanImpersonate.
+  #
+  # State: CONDITIONAL because the DWD grant requires the SA to possess an active
+  # service account private key (to sign the JWT for OAuth2 token endpoint). A
+  # key-less SA (after key deletion hardening) cannot exploit DWD.
+  #
+  # LINCHPIN NOTE: can-control.yaml escalate-via-execute-as and
+  # credential-chains.yaml impersonate-is-escalation both operate on CanImpersonate.
+  # For CanDelegate escalation, the path is:
+  #   CanExecuteAs(attacker, DWD-SA) + CanDelegate(DWD-SA, user) →
+  #   attacker can act as user via traversal (capability-inheritance).
+  #   This is surfaced by traversing CanExecuteAs then CanDelegate outbound edges.
+  - id: gcp-ci-dwd-sa-delegates-user
+    emits: CanDelegate
+    description: >-
+      Service account with Domain-Wide Delegation can act as any active Workspace
+      user in the domain for its configured OAuth2 scopes, without the user's
+      knowledge or consent — a tenant-wide identity takeover primitive.
+    match:
+      - [ ?sa, HasPolicy, ?dwd_binding ]
+    where:
+      - "node_type(?sa) == ServiceAccount"
+      - "?dwd_binding.type == 'DWDScopeBinding'   # the SA's OAuth2 client ID appears in the Workspace Admin console DWD list"
+      - "?dwd_binding.scopes is non-empty          # at least one authorized OAuth2 scope"
+      - "?sa.suspended == false OR ?sa.suspended is unknown  # skip suspended SAs"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?sa
+      target: "<any active HumanIdentity in the domain>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        CONDITIONAL(service_state) if the SA has at least one active service account
+        key (iam.serviceAccountKeys.list is non-empty) — DWD requires the SA to sign
+        a JWT with its private key to call the OAuth2 token endpoint. If the SA has no
+        active keys, the edge is BLOCKED and DWD cannot be exploited. BLOCKED if the
+        DWD grant has been revoked (client ID removed from delegated clients list).
+        Note: delegation is scoped to the authorized OAuth2 scopes — a narrow-scope
+        DWD SA (e.g. gmail.readonly only) cannot call admin APIs, but can still read
+        email for every user. The node target is HumanIdentity(domain=*), not one user.
+        Key existence is the gating precondition, checked via iam.serviceAccountKeys.list,
+        not iam.serviceAccountKeys.create (which creates new keys, not exercises delegation).
+      confidence: 0.97
+      derived_from:
+        - "DWD scope binding: SA client_id authorized in Workspace Admin console with scopes ?dwd_binding.scopes"
+      false_positive_note: >-
+        DWD grant is a Workspace directory admin capability, not a GCP IAM permission.
+        The key existence check (iam.serviceAccountKeys.list is non-empty) is a precondition
+        on state_logic, not a permission — SA must have an active private key to sign
+        DWD JWTs. Verify iam.serviceAccountKeys.list is non-empty before asserting ACTIVE
+        or CONDITIONAL(service_state). Do not confuse iam.serviceAccountKeys.create
+        (which creates new keys) with the key-existence check. Scope matters: a DWD SA
+        authorized only for gmail.readonly cannot make Admin SDK calls or reset passwords —
+        do not inflate capability beyond the configured scopes. Model scope-specific capabilities
+        separately if needed (e.g. CanReadData for Gmail scope, CanAdminister only if
+        admin.directory.* scopes are present). Suspended users (suspended=true in Directory API)
+        cannot have tokens minted for them via DWD — exclude them from the target set.
+        Some Workspace Enterprise Plus configurations restrict DWD per organizational unit;
+        if collected, narrow the target set accordingly. Do NOT emit for SAs whose DWD grant
+        has been deleted or whose OAuth2 client ID no longer appears in the delegated clients list.
+        Edge is CanDelegate (not CanImpersonate) because the DWD target is a HumanIdentity
+        and CanImpersonate's target set excludes HumanIdentity in the schema.
+      narrative: >-
+        {sa.name} has been granted Domain-Wide Delegation (client_id: {sa.client_id})
+        with authorized scopes {dwd_binding.scopes}. If {sa.name} has an active private
+        key, any code running as {sa.name} can call Google Workspace APIs as ANY active
+        user in the domain — reading email, accessing Drive files, and (if admin.directory.*
+        scopes are present) performing admin operations — without the targeted user's
+        knowledge or consent.
+
+  # ---------------------------------------------------------------------------
+  # RULE 3: Workspace super-admin → CanGrantPermission at Organization scope
+  # ---------------------------------------------------------------------------
+  # A Workspace super-admin (isAdmin=true in the Directory API) can grant
+  # themselves or others any GCP IAM role in the linked GCP organization via the
+  # Cloud Console / Resource Manager API. This is a fact of the Workspace–GCP
+  # integration: the org's bootstrap super-admin created the GCP org and retains
+  # this implicit control. The GCP IAM permission is effectively
+  # resourcemanager.organizations.setIamPolicy.
+  #
+  # LINCHPIN: can-control.yaml control-boundary-via-iam-admin fires on this
+  # CanGrantPermission @org to produce Controls(org). hierarchy-chains.yaml
+  # admin-inherits-down-contains propagates that org-level control to all
+  # descendant folders/projects. Do NOT re-derive here.
+  #
+  # TARGET NOTE: CanGrantPermission in schema/edges.yaml restricts target to
+  # [Identity]. The super-admin's capability is org-level (binding applies at the
+  # Organization resource). We model this by scoping the target to "principals in
+  # the organization" rather than naming the organization boundary directly. This
+  # implies: the super-admin can grant any Identity (user, SA, group) a role at
+  # org scope. The can-control.yaml linchpin (control-boundary-via-iam-admin)
+  # recognizes the boundary-scoped grant and emits Controls(org).
+  - id: gcp-ci-super-admin-controls-org
+    emits: CanGrantPermission
+    description: >-
+      Workspace super-admin can grant any GCP IAM role to any principal in the linked
+      GCP organization, equivalent to resourcemanager.organizations.setIamPolicy.
+    match:
+      - [ ?user, HasProperty, ?org_linkage ]
+    where:
+      - "node_type(?user) == HumanIdentity"
+      - "?user.is_super_admin == true   # isAdmin=true from Directory API users.list"
+      - "?user.suspended == false"
+      - "?org_linkage exists   # GCP-Workspace org linkage verified"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?user
+      target: "<any principal (Identity, ServiceAccount, Group) in the linked GCP Organization>"
+      permissions:
+        - "resourcemanager.organizations.setIamPolicy"
+      conditions: []
+      state_logic: >-
+        ACTIVE when GCP-Workspace org linkage is confirmed AND user.is_super_admin==true
+        AND user.suspended==false. CONDITIONAL(service_state) if org linkage is unverified
+        or the user account is suspended. BLOCKED if an IAM deny policy at the org level
+        explicitly denies resourcemanager.organizations.setIamPolicy for the super-admin.
+      confidence: 0.92
+      derived_from:
+        - "Directory API users.list: isAdmin=true for ?user"
+        - "GCP-Workspace org linkage: resourcemanager.organizations.get -> displayName matches customer domain"
+      false_positive_note: >-
+        Distinguish super-admin (isAdmin=true) from delegated admin
+        (isDelegatedAdmin=true) — they have very different privilege levels. A
+        delegated admin does NOT have implicit org IAM write unless their admin
+        role specifically grants it. Verify the GCP organization is actually linked
+        to the Workspace customer before emitting; a standalone Cloud Identity
+        customer without a GCP org linkage is narrower in scope. The super-admin's
+        GCP org control requires them to first navigate to Cloud Console or call
+        the Resource Manager API — it is not granted automatically without action,
+        but the capability is real and standing.
+      narrative: >-
+        {user.name} is a Workspace super-admin (isAdmin=true) and can grant any GCP
+        IAM role — including roles/owner and roles/resourcemanager.organizationAdmin —
+        to any principal in the linked GCP organization by accessing the Cloud Console
+        or Resource Manager API. This is equivalent to resourcemanager.organizations.setIamPolicy
+        and constitutes full organization control.
+
+  # ---------------------------------------------------------------------------
+  # RULE 4: Delegated admin with password-reset privilege → CanResetCredential
+  # ---------------------------------------------------------------------------
+  # RULE NOTE: The explicit CanResetCredential fact (reading Workspace admin roles
+  # and their privileges) is emitted by /rules/explicit/gcp-cloudidentity.yaml.
+  # That rule parses Directory API roleAssignments.list for USER_MANAGEMENT privilege
+  # and emits CanResetCredential with evidence tied to the Workspace admin capability.
+  #
+  # Workspace delegated admin roles can include the USER_MANAGEMENT privilege,
+  # which allows password resets for non-admin users. This lets the admin take
+  # over any non-super-admin user account in the domain. Super-admin accounts
+  # are protected; delegated admins cannot reset their passwords.
+  #
+  # NOTE: admin.directory.users.update is an Admin SDK REST method name, not a
+  # GCP IAM permission string. The actual Workspace privilege is encoded via the
+  # admin role's has_privilege field. There is no GCP IAM permission that gates this —
+  # it is a Workspace directory privilege. DWD scope for admin API access is required.
+  - id: gcp-ci-admin-reset-credential
+    emits: CanResetCredential
+    description: >-
+      Workspace delegated admin (or super-admin) with the USER_MANAGEMENT / password-reset
+      privilege can reset any non-admin user's password, hijacking their account.
+    match:
+      - [ ?admin, HasRole, ?delegated_role ]
+    where:
+      - "node_type(?admin) == HumanIdentity"
+      - "?admin.suspended == false"
+      - "(?delegated_role.has_privilege == 'USER_MANAGEMENT'    # includes password reset
+         OR ?admin.is_super_admin == true)"
+    emit:
+      source_type: Identity
+      target_type: HumanIdentity
+      source: ?admin
+      target: "<any non-super-admin HumanIdentity in the domain>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE if ?admin holds the USER_MANAGEMENT privilege (delegated admin) or
+        is a super-admin (isAdmin=true), and the target user is not a super-admin
+        (isAdmin=false). CONDITIONAL(service_state) if the admin account itself is
+        suspended or if the admin lacks DWD authorization for admin.directory.* scopes.
+        BLOCKED if organizational security controls prevent admin password reset
+        (e.g., Workspace for Enterprise Plus admin-protection policies).
+        Note: password reset is a Workspace directory admin privilege, not a GCP IAM
+        permission. The gating factor is the admin role's USER_MANAGEMENT privilege,
+        checked via Directory API roleAssignments.list.
+      confidence: 0.92
+      derived_from:
+        - "Directory API roleAssignments.list → role with USER_MANAGEMENT privilege; OR users.list isAdmin=true"
+      false_positive_note: >-
+        Password reset is a Workspace admin privilege (USER_MANAGEMENT), not a GCP IAM
+        permission. Verify via Directory API roleAssignments.list that the admin role
+        has USER_MANAGEMENT privilege. Delegated admins CANNOT reset super-admin
+        passwords — exclude super-admin (isAdmin=true) users from the target set for
+        delegated-admin rules. A super-admin CAN reset other super-admin passwords, so
+        for the super-admin case, all users are valid targets. Workspace for Enterprise
+        Plus supports protected admin accounts that cannot be reset by other admins
+        without a recovery flow — if this is detected, downgrade to CONDITIONAL. The
+        admin.directory.users.update call sets the password field; the attacker must then
+        authenticate via the Google sign-in page (or API) to complete the takeover — this
+        is a real but interactive step. Suspended admin accounts (suspended=true) cannot
+        perform this action.
+      narrative: >-
+        {admin.name} holds the Workspace USER_MANAGEMENT privilege (or is a super-admin)
+        and can reset any non-super-admin user's password via admin.directory.users.update,
+        then authenticate as that user. This enables account takeover of any domain user
+        whose identity inherits GCP IAM roles (especially useful when the target user
+        is a member of privileged groups or holds direct GCP role bindings).
+
+  # ---------------------------------------------------------------------------
+  # RULE 5: DWD SA → foothold in the linked GCP Organization
+  # ---------------------------------------------------------------------------
+  # A DWD SA that can impersonate a super-admin (rule 2 + credential-chains
+  # impersonate-is-escalation) can then obtain GCP org control. This rule
+  # directly emits the org-entry edge rather than relying solely on the two-hop
+  # chain, so org-level attack queries surface this path explicitly.
+  #
+  # State: CONDITIONAL(service_state) requires the DWD SA to have BOTH
+  # (1) admin.directory.* Admin SDK scopes (to call admin APIs as super-admin) AND
+  # (2) cloud-platform GCP API scope (to call Resource Manager API). Admin SDK scopes
+  # alone are insufficient for GCP org IAM writes. Without cloud-platform scope,
+  # the path works for Workspace-level actions but not direct GCP org IAM modification.
+  # Requires a super-admin user to impersonate and GCP-Workspace org linkage.
+  - id: gcp-ci-dwd-enter-org
+    emits: CanEnterOrganization
+    description: >-
+      A DWD SA with both admin-directory and cloud-platform scopes can act as a
+      super-admin and thereby obtain GCP Organization-level control.
+    match:
+      - [ ?sa, CanDelegate, ?superadmin ]
+      - [ ?sa, HasPolicy, ?dwd_binding ]
+    where:
+      - "node_type(?sa) == ServiceAccount"
+      - "node_type(?superadmin) == HumanIdentity"
+      - "?superadmin.is_super_admin == true"
+      - "?dwd_binding.type == 'DWDScopeBinding'"
+      - "?dwd_binding.scopes contains admin_scope"
+      - "?dwd_binding.scopes contains 'https://www.googleapis.com/auth/cloud-platform'"
+    emit:
+      source_type: Identity
+      target_type: Organization
+      source: ?sa
+      target: "<linked GCP Organization>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when: (1) the DWD SA has admin.directory.* Admin SDK scopes (admin_scope)
+        AND cloud-platform GCP API scope in ?dwd_binding.scopes, (2) the domain has
+        at least one active super-admin user, (3) the SA's DWD grant is active, and
+        (4) the SA has at least one active service account key. CONDITIONAL(service_state)
+        if the DWD SA has admin.directory.* scopes but lacks cloud-platform scope (can
+        call Admin SDK but not Resource Manager API), or if all super-admin accounts
+        are suspended or if the SA has no active keys. BLOCKED if the DWD grant has
+        been revoked or if the Workspace org is not linked to a GCP organization.
+      confidence: 0.90
+      derived_from:
+        - "gcp-ci-dwd-sa-delegates-user (CanDelegate ?sa -> ?superadmin)"
+        - "?superadmin.is_super_admin == true"
+        - "?dwd_binding.scopes contains both admin-level scope (admin.directory.*) and cloud-platform"
+      false_positive_note: >-
+        This path REQUIRES both admin.directory.* scopes (for Admin SDK) AND
+        cloud-platform scope (for GCP Resource Manager). Admin scopes alone are
+        INSUFFICIENT — a DWD SA with only admin.directory.* scopes can call Admin
+        SDK as a super-admin but will receive an authorization error when calling
+        resourcemanager.organizations.setIamPolicy. Do NOT emit ACTIVE if only
+        admin scopes are present; emit CONDITIONAL(service_state) instead. A narrow-
+        scope DWD SA (e.g. gmail.readonly) cannot call the GCP Resource Manager API
+        even while acting as a super-admin. Narrow-scope DWD SAs yield user-level
+        data access but not GCP org control. Always verify that at least one
+        non-suspended super-admin exists in the domain before asserting ACTIVE state.
+        The SA must also have an active service account key to sign JWTs for DWD.
+        This rule deliberately surfaces the high-impact path for org-level attack
+        queries without requiring the analyst to manually chain CanDelegate →
+        CanGrantPermission → Controls(org).
+      narrative: >-
+        {sa.name} has Domain-Wide Delegation with both admin.directory.* and
+        cloud-platform scopes and can impersonate any Workspace super-admin in the
+        domain (if it has an active private key). By acting as a super-admin and using
+        the cloud-platform scope, {sa.name} can call the GCP Resource Manager API and
+        grant any GCP IAM role in the linked organization, effectively achieving full
+        GCP Organization control.
+
+  # ---------------------------------------------------------------------------
+  # RULE 6: Admin can authorize new DWD scope bindings → CanModifyTrust on SA
+  # ---------------------------------------------------------------------------
+  # RULE NOTE: The explicit CanModifyTrust fact (reading which SAs have DWD grants)
+  # is emitted by /rules/explicit/gcp-cloudidentity.yaml, which reads the Workspace
+  # Admin console DWD list and emits CanModifyTrust(superadmin, sa) for each SA that
+  # IS or COULD BE authorized. In the explicit form, the target is concrete (a specific SA).
+  #
+  # Workspace super-admin (or a delegated admin with appropriate privilege) can
+  # add a service account client ID to the authorized clients list in the Admin
+  # console, granting it Domain-Wide Delegation with chosen scopes. This is the
+  # config-side privesc: the attacker does not need an existing DWD SA if they
+  # can CREATE one. Only a super-admin can authorize DWD — there is no GCP IAM
+  # permission for this; it requires Workspace admin console access.
+  - id: gcp-ci-admin-grants-dwd
+    emits: CanModifyTrust
+    description: >-
+      Workspace super-admin can authorize any service account for Domain-Wide Delegation
+      (adding its OAuth2 client ID to the delegated clients list with chosen scopes),
+      creating a new tenant-wide impersonation primitive.
+    match:
+      - [ ?admin, HasRole, ?admin_role ]
+    where:
+      - "node_type(?admin) == HumanIdentity"
+      - "?admin.is_super_admin == true"
+      - "?admin.suspended == false"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: ?admin
+      target: "<any existing ServiceAccount in the domain that the admin can authorize for DWD>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE: a super-admin has standing capability to authorize DWD for any existing
+        service account at any time. CONDITIONAL(service_state) if the admin account is
+        suspended or MFA-protected in a way that prevents console access. BLOCKED if
+        the Workspace organization has restricted DWD authorization (an org-level
+        policy that prevents new DWD grants — available in some Enterprise configurations).
+      confidence: 0.88
+      derived_from:
+        - "Directory API users.list: is_super_admin=true for ?admin"
+      false_positive_note: >-
+        DWD authorization requires the super-admin to actively add a client ID in the
+        Workspace Admin console (Admin console > Security > API controls > Domain-wide
+        delegation). This is an ACTIVE capability, not a passive one — the admin must
+        take a deliberate action on each SA. The super-admin can also revoke existing
+        DWD grants. Model this as CanModifyTrust (the admin can rewrite the trust
+        configuration of any SA's DWD status), not as CanAdminister. A delegated admin
+        CANNOT authorize DWD — only full super-admins have this capability. Emit only
+        when is_super_admin is confirmed true (not merely isDelegatedAdmin). Scope the
+        target to existing ServiceAccount nodes in the graph, not hypothetical future SAs.
+      narrative: >-
+        {admin.name} is a Workspace super-admin and can authorize any existing service
+        account for Domain-Wide Delegation via the Admin console, granting it the ability
+        to impersonate any domain user for any configured OAuth2 scopes. This is the
+        mechanism that creates the DWD SA → CanDelegate tenant-wide primitive (rule
+        gcp-ci-dwd-sa-delegates-user).
+
+  # ---------------------------------------------------------------------------
+  # RULE 7: Principal with group-membership write → can remove members
+  # ---------------------------------------------------------------------------
+  # A principal with cloudidentity.groups.memberships.delete (or group Manager/Owner
+  # role) can remove members from a group. While removal is primarily destructive
+  # (not escalation), it is relevant for compliance/forensics and can be a persistence
+  # mechanism (removing audit trail). Listed in schema as CanRemoveMember.
+  - id: gcp-ci-group-member-remove
+    emits: CanRemoveMember
+    description: >-
+      Principal with cloudidentity.groups.memberships.delete (or group Manager/Owner)
+      can remove members from the target group, enabling member deprovisioning or
+      audit-trail destruction.
+    match:
+      - [ ?principal, HasPermission, ?group ]
+    where:
+      - "node_type(?group) == Group"
+      - "effective_permission(?principal, cloudidentity.groups.memberships.delete, ?group) == true
+         OR membership_role(?principal, ?group) in [MANAGER, OWNER]"
+    emit:
+      source_type: Identity
+      target_type: Group
+      source: ?principal
+      target: ?group
+      permissions:
+        - "cloudidentity.groups.memberships.delete"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if effective permission is confirmed at the group scope (role binding
+        that grants cloudidentity.groups.memberships.delete, or the principal is a
+        group MANAGER/OWNER). CONDITIONAL(iam_permission) if permission is inherited
+        from a parent resource and not yet confirmed. BLOCKED if an IAM deny policy
+        explicitly denies cloudidentity.groups.memberships.delete on the group.
+      confidence: 0.90
+      derived_from:
+        - "effective cloudidentity.groups.memberships.delete on ?group (or MANAGER/OWNER membership role)"
+      false_positive_note: >-
+        CanRemoveMember is walkable: false in the schema (not traversed by default in
+        attack paths) because membership removal is primarily destructive, not escalation.
+        However, it can be used for persistence (removing audit members) or disruption
+        (removing security team members from critical groups). Only emit if the principal
+        holds the explicit delete permission or a MANAGER/OWNER membership role.
+      narrative: >-
+        {principal.name} can remove members from {group.name} (cloudidentity.groups.memberships.delete
+        or group Manager/Owner role). While not directly escalatory, this can disrupt
+        alerting/audit channels or enable persistence by removing evidence of a breach.
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION — cross-reference
+# ---------------------------------------------------------------------------
+# These rules consume explicit facts that the collector produces from:
+#   1. cloudidentity.groups.memberships.list → MemberOf(user, group)
+#   2. resourcemanager.*.getIamPolicy → HasRole(group, role@scope)
+#   3. DWD scope bindings from Admin console / customers API → HasPolicy(SA, dwd_binding)
+#   4. Directory API users.list (isAdmin, isDelegatedAdmin, suspended) → node properties
+#   5. Directory API roleAssignments.list → HasRole(admin, delegated_admin_role)
+#
+# No separate /rules/explicit/gcp-cloudidentity.yaml is required because the
+# facts above map directly to standard node/edge types (MemberOf, HasRole,
+# HasPolicy, node properties). The collector populates these via the Admin SDK
+# and Cloud Identity APIs without custom normalization rules.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# LINCHPIN CITATIONS (not duplicated here):
+#
+# credential-chains.yaml:
+#   - impersonate-is-escalation: fires on CanImpersonate edges from the GCP
+#     identity-escalation.yaml primitives (getAccessToken, signJwt, etc.) —
+#     NOT on CanDelegate from DWD, since CanDelegate target is Identity (not
+#     restricted to SA/MachineIdentity like CanImpersonate).
+#   - execute-then-read-secret: if code can CanExecuteAs the DWD SA, it inherits
+#     the SA's CanDelegate over all domain users (capability-inheritance traversal).
+#
+# can-control.yaml:
+#   - control-boundary-via-iam-admin: CanGrantPermission(superadmin, org) from
+#     rule 3 collapses to Controls(superadmin, org).
+#   - escalate-via-execute-as: CanExecuteAs(attacker, DWD-SA) + DWD-SA's
+#     CanImpersonate → CanEscalateTo via the capability-inheritance traversal.
+#
+# MISSING ESCALATION ROLLUP FOR CanDelegate:
+#   - credential-chains.yaml's impersonate-is-escalation only fires on CanImpersonate
+#     edges. No linchpin rule currently chains CanDelegate(SA, user) →
+#     CanEscalateTo when privilege(user) > privilege(SA). The DWD → delegate-as-
+#     super-admin → org control path therefore does not surface as CanEscalateTo.
+#   - WORKAROUND: Graph traversal can walk CanExecuteAs(attacker, DWD-SA) then
+#     CanDelegate(DWD-SA, superadmin) then CanGrantPermission(superadmin, org) →
+#     Controls(org), but this requires multi-hop queries. A GCP-specific rule
+#     matching [?sa, CanDelegate, ?user] where privilege(?user) > privilege(?sa)
+#     → CanEscalateTo(sa, user) would complete the escalation chain.
+#   - TODO: Add CanDelegate escalation rule to credential-chains.yaml or create
+#     a gcp-specific linchpin for this path.
+#
+# hierarchy-chains.yaml:
+#   - admin-inherits-down-contains: Controls(superadmin, org) from can-control
+#     propagates to Controls(superadmin, every descendant folder and project).
+#
+# gcp/identity-escalation.yaml:
+#   - gcp-sa-get-access-token (CanImpersonate via getAccessToken): separate from
+#     DWD — this is the GCP IAM impersonation path, not Workspace-level DWD.
+#   - gcp-sa-act-as (CanPassIdentity): deploying a workload as a DWD SA gives the
+#     deploying principal code running as the DWD SA → inherits CanImpersonate.
+#
+# BLOCKED-edge guidance:
+#   - An IAM deny policy denying cloudidentity.groups.memberships.create on a
+#     group → CanAddMember BLOCKED for that group.
+#   - A Workspace org policy preventing DWD authorization → CanModifyTrust BLOCKED.
+#   - Super-admin account suspended → all super-admin-derived edges BLOCKED.
+#   - DWD client ID removed from delegated clients list → CanDelegate BLOCKED.
+# ---------------------------------------------------------------------------

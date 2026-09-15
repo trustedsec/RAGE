@@ -1,0 +1,344 @@
+# GCP Filestore — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:filestore. Emits ONLY common edge types from schema/edges.yaml.
+# All permissions are exact names from the Filestore IAM reference:
+#   cloud.google.com/filestore/docs/iam
+# Access-control semantics from:
+#   cloud.google.com/filestore/docs/access-control
+#
+# KEY ARCHITECTURAL FACTS that discipline every rule here:
+#
+#   1. IAM CONTROLS ONLY THE CONTROL PLANE. file.instances.*, file.backups.*,
+#      file.snapshots.* govern create/update/delete API calls. They do NOT
+#      control NFS data-plane access. A principal with roles/file.viewer can
+#      list every instance but CANNOT mount any share.
+#
+#   2. NFS DATA PLANE IS IP-ADDRESS GATED ONLY. Any VM whose source IP falls
+#      within an exported NFS range may mount the share with the access mode
+#      (READ_WRITE / READ_ONLY) specified in the export rules, regardless of
+#      IAM bindings. There is no per-file IAM, no bearer token, no SA check
+#      at mount time.
+#
+#   3. DEFAULT EXPORT: READ_WRITE + NO_ROOT_SQUASH to all RFC-1918 IPs in the
+#      VPC. All VMs in the same VPC (including Shared VPC service projects)
+#      can mount with full read/write and root access by default.
+#
+#   4. NO CREDENTIAL-GRAB PRIMITIVE. Filestore has no listKeys / SAS token /
+#      HMAC-key equivalent. There is no control-plane action that yields a
+#      credential for another identity. ExposesCredential and CanReadSecret
+#      are NOT emitted here from control-plane facts.
+#
+#   5. NO PUBLIC IP SURFACE. Filestore instances are VPC-private only.
+#      ExposedToInternet MUST NOT be emitted for any Filestore resource.
+#
+#   6. CMEK: the Filestore service agent (not the NFS client) performs KMS
+#      decrypt. Do NOT apply key_permission gates to NFS-mount CanReadData
+#      edges. The mounting VM needs no KMS permission.
+#
+#   7. LOW-RELEVANCE SERVICE. Per Phase 6 theme guidance: 1-2 conservative
+#      rules only. Rules below cover only the highest-value paths.
+#
+# Linchpins cited (not duplicated):
+#   /rules/derived/credential-chains.yaml — ContainsSecret->CredentialsFor->CanImpersonate
+#   /rules/derived/can-control.yaml       — CanAdminister->Controls roll-up
+#   /rules/derived/can-execute-as.yaml    — CanModifyCode/Config+ExecutesAs->CanExecuteAs
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 6-storage-databases
+service: filestore
+applies_to: [gcp]
+
+rules:
+
+  # --- NFS mount = data-plane read/write (network-gated) --------------------
+  # The foundational Filestore attack edge: any in-VPC VM whose source IP is
+  # within an exported NFS range can mount the share and read/write all files.
+  # No IAM action is required at mount time — access is purely IP-address gated.
+  #
+  # This rule does NOT match on a CanNetworkReach graph edge (CanNetworkReach's
+  # target set is [Compute, Data, Network, PrivateEndpoint] which does not include
+  # Storage). Instead it matches on an explicit HasPolicy edge from the instance
+  # to its NFS export config, then qualifies reachability in the where clause.
+  # State is CONDITIONAL(network_reachability) until the source VM's IP is
+  # confirmed within the export CIDR range.
+  - id: gcp-filestore-nfs-data-access
+    emits: [CanReadData, CanWriteData]
+    description: >-
+      A VM whose source IP falls within a Filestore NFS export range can mount
+      the share and read (and write, if READ_WRITE) all files without any IAM
+      check — access is purely IP-address gated. CanWriteData is emitted when
+      accessMode is READ_WRITE; CanReadData for both READ_WRITE and READ_ONLY.
+    match:
+      - [ ?instance, HasPolicy, ?export_policy ]
+    where:
+      - "node_type(?instance) == FileStorage"
+      - "?export_policy is the NFS export-options configuration of ?instance"
+      - "exists ?vm: node_type(?vm) in [VirtualMachine, Container, ContainerTask, KubernetesWorkload]"
+      - "?vm.ip is within at least one ipRange in ?export_policy.nfsExportOptions"
+      - "the matching export rule has accessMode == READ_WRITE or READ_ONLY"
+      - "?vm is in the same VPC (networks[].network) as ?instance, or in a peered/Shared-VPC network with L3 reachability"
+    emit:
+      - edge_type: CanReadData
+        source_type: Compute
+        target_type: FileStorage
+        source: ?vm
+        target: ?instance
+        permissions: []
+        conditions: [network_reachability]
+        state_logic: >-
+          ACTIVE when: (a) the VM's source IP is confirmed within an exported NFS
+          range AND (b) TCP/UDP 2049 is not blocked by VPC firewall rules between
+          the VM and the Filestore instance IP.
+          CONDITIONAL(network_reachability) when VPC topology or CIDR overlap is not
+          fully resolved (e.g. Shared VPC peering unconfirmed, alias-IP ranges not
+          collected).
+          BLOCKED if the VPC firewall explicitly blocks TCP/UDP 2049 from ?vm to the
+          instance IP, or if the nfsExportOptions list is empty.
+          NOTE: Do NOT apply key_permission gating. CMEK decrypt on Filestore is
+          performed by the Filestore service agent — the mounting VM needs no KMS
+          permission. Never emit ExposedToInternet: Filestore has no public-IP surface.
+        confidence: "0.9 when CIDR overlap is confirmed; 0.5 when VPC topology unresolved"
+        derived_from: ["gcp-filestore-explicit-nfs-export-options"]
+        false_positive_note: >-
+          CRITICAL: network_reachability is the sole gate — there is no IAM check at
+          NFS mount time. Confirm the VM's primary NIC IP (or alias IP) overlaps the
+          exported CIDR. Shared VPC: a service-project VM reaches a host-VPC Filestore
+          instance only if the instance's network is the host VPC AND the VM's IP falls
+          in an exported range. Basic-tier instances do not support overlapping IP rules
+          — use the first-matched (most specific) rule only. Default export
+          (READ_WRITE, NO_ROOT_SQUASH, all RFC-1918 VPC IPs) means most same-VPC VMs
+          already qualify; emit as ACTIVE when the default export is confirmed and the
+          VM's IP is RFC-1918 in the same VPC. Never emit ExposedToInternet. With
+          READ_WRITE access and NO_ROOT_SQUASH (the documented default for same-VPC
+          mounting), client root maps to share root: attacker can plant setuid
+          binaries, overwrite configs, or corrupt data.
+        narrative: >-
+          {vm.name} (IP {vm.ip}) is within the NFS export range of {instance.name}
+          and can mount the share over NFS, reading all files without any IAM check.
+      - edge_type: CanWriteData
+        source_type: Compute
+        target_type: FileStorage
+        source: ?vm
+        target: ?instance
+        permissions: []
+        conditions: [network_reachability]
+        match_condition: "?export_policy.nfsExportOptions[].accessMode == READ_WRITE"
+        state_logic: >-
+          ACTIVE when: (a) the VM's source IP is confirmed within an exported NFS
+          range with READ_WRITE access mode AND (b) TCP/UDP 2049 is not blocked.
+          CONDITIONAL(network_reachability) when CIDR overlap is unconfirmed.
+          BLOCKED if the VPC firewall blocks NFS or all export rules are READ_ONLY.
+          NO_ROOT_SQUASH (the default) means client root becomes share root: attackers
+          can plant setuid binaries, overwrite application configs, or corrupt data.
+        confidence: "0.9 when READ_WRITE CIDR overlap is confirmed; 0.5 when topology unresolved"
+        derived_from: ["gcp-filestore-explicit-nfs-export-options"]
+        narrative: >-
+          {vm.name} (IP {vm.ip}) can mount {instance.name} with READ_WRITE access,
+          allowing it to modify or delete all files on the share.
+
+  # --- Export-rule widening escalates to NFS data-access --------------------
+  # The export-rule widening attack documented in filestore.md section 14:
+  # (1) Attacker holds file.instances.update (CanModifyConfiguration edge emitted
+  #     by explicit rule gcp-filestore-export-rule-widen).
+  # (2) Attacker adds their IP to NFS export rules via instances.patch.
+  # (3) Attacker's VM/container can now network-reach the share and mount it.
+  # This derived rule completes the chain from CanModifyConfiguration to CanReadData
+  # and CanWriteData, bridging control-plane escalation to data-plane access.
+  # State is POTENTIAL by default because the export-rule patch must be executed
+  # AND network reachability must be confirmed after the patch.
+  - id: gcp-filestore-export-widen-to-data-access
+    emits: [CanReadData, CanWriteData]
+    description: >-
+      When a principal holds CanModifyConfiguration (file.instances.update) on a
+      Filestore instance and uses it to add an attacker-controlled IP to the NFS
+      export rules, the principal's VM/container gains CanReadData and (if accessMode
+      is READ_WRITE) CanWriteData to all files on the mounted share. This rule
+      derives the data-plane access edges from the control-plane config mutation.
+      State is POTENTIAL because the patch must be executed and network reachability
+      must be confirmed.
+    match:
+      - [ ?principal, CanModifyConfiguration, ?instance ]
+    where:
+      - "node_type(?instance) == FileStorage"
+      - "?principal also has (or controls a VM with) network-reachable IP addressable at the attacker's chosen CIDR range"
+      - "the export-rule patch (instances.patch) has been invoked by ?principal to add ?attacker_cidr"
+      - "?attacker_vm IP falls within ?attacker_cidr"
+    emit:
+      - edge_type: CanReadData
+        source_type: Compute
+        target_type: FileStorage
+        source: ?principal
+        target: ?instance
+        permissions: ["file.instances.update"]
+        conditions: [iam_permission, network_reachability]
+        state_logic: >-
+          POTENTIAL by default: the principal holds file.instances.update
+          (CanModifyConfiguration) but has not yet invoked instances.patch to add
+          their IP. Becomes ACTIVE when: (a) instances.patch has been executed
+          (export rules widened to include attacker CIDR), (b) the attacker's VM IP
+          is confirmed within the new export range, (c) network connectivity
+          (TCP/UDP 2049) is confirmed. BLOCKED if an IAM deny policy blocks
+          file.instances.update or a VPC firewall blocks TCP/UDP 2049 to the
+          instance IP after the export-rule change.
+        confidence: "0.95 when both export-rule patch confirmed and CIDR overlap verified"
+        derived_from: ["gcp-filestore-export-rule-widen"]
+        false_positive_note: >-
+          CRITICAL: this edge is only materialized AFTER the export-rule widening
+          is actually executed. Before the patch, the attacker cannot mount the share.
+          Confirm that instances.patch was called with nfsExportOptions containing
+          the attacker's CIDR and READ_WRITE or READ_ONLY access mode. Network
+          reachability must be independently verified: VM in same VPC, firewall rules
+          allowing TCP/UDP 2049, and no VPC SC perimeter blocking.
+        narrative: >-
+          {principal.name} widened the NFS export rules on {instance.name} to include
+          their IP address {attacker_ip}, and can now mount the share via NFS and read
+          all files.
+      - edge_type: CanWriteData
+        source_type: Compute
+        target_type: FileStorage
+        source: ?principal
+        target: ?instance
+        permissions: ["file.instances.update"]
+        conditions: [iam_permission, network_reachability]
+        match_condition: "the widened export rule has accessMode == READ_WRITE"
+        state_logic: >-
+          POTENTIAL by default. Becomes ACTIVE when export-rule widening has been
+          executed with READ_WRITE access mode and network reachability confirmed.
+          With NO_ROOT_SQUASH (the documented default), the client's root user maps
+          to the share's root: attacker can plant setuid binaries, overwrite configs,
+          or corrupt data. BLOCKED if the export rule is READ_ONLY or firewall blocks
+          TCP/UDP 2049.
+        confidence: "0.95 when widening confirmed with READ_WRITE and network verified"
+        derived_from: ["gcp-filestore-export-rule-widen"]
+        narrative: >-
+          {principal.name} can mount {instance.name} with READ_WRITE access and
+          modify or delete all files on the share.
+
+  # --- Backup restore cross-project exfiltration -------------------------
+  # The cross-project data exfiltration path for Filestore: a principal holding
+  # file.backups.get in a source project can retrieve a backup artifact, then
+  # restore it to an instance in an attacker-controlled destination project
+  # (requires file.instances.create or file.instances.update in the destination).
+  # This is a control-plane chain that moves data across project boundaries.
+  - id: gcp-filestore-backup-exfiltrate
+    emits: CanExfiltrate
+    description: >-
+      A principal holding file.backups.get in the source project plus
+      file.instances.create or file.instances.update in an attacker-controlled
+      destination project can restore a Filestore backup to the destination,
+      exfiltrating all data. This is a multi-project, multi-permission escalation
+      path documented as one of the three central attack primitives for Filestore.
+    match:
+      - [ ?principal, HasPermission, "file.backups.get" ]
+      - [ ?backup, LocatedIn, ?source_project ]
+      - [ ?principal, HasPermission, "file.instances.create" ]
+    where:
+      - "node_type(?backup) == Backup"
+      - "?backup.sourceInstance references ?source_instance: node_type(?source_instance) == FileStorage"
+      - "the third HasPermission edge (?principal -> file.instances.create) is scoped to ?dest_project"
+      - "?principal controls ?dest_project (or is a member of a compromised account there)"
+      - "?dest_project != ?source_project"
+    emit:
+      source_type: Identity
+      target_type: Backup
+      source: ?principal
+      target: ?backup
+      permissions: ["file.backups.get", "file.instances.create", "file.instances.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when both conditions hold: (a) file.backups.get is effective in the
+        source project AND (b) file.instances.create or file.instances.update is
+        effective in the destination project at the same principal scope, AND the
+        destination project is under attacker control. CONDITIONAL(iam_permission) if
+        one permission is confirmed but the other scope is unresolved (e.g. destination-
+        project grant not yet discovered). BLOCKED if an IAM deny policy denies either
+        permission at the effective scope.
+      confidence: "0.95 when both permissions confirmed and projects verified as distinct"
+      derived_from: ["gcp-filestore-backup-exfiltrate"]
+      false_positive_note: >-
+        Both permissions are REQUIRED: read access to the backup in source project +
+        write/create access to instances in destination project at the same principal
+        scope. Confirm the principal (or a group it belongs to) holds both permissions
+        at the right scopes and the destination project is controlled by the attacker
+        (or can be reached via compromise chain). Backups are regional artifacts; the
+        restore can target any GCP region. All data in the backed-up instance is
+        exfiltrated; this is not filtered by IAM or access controls on the destination
+        share. If destination-project permission is unresolved, do not emit as ACTIVE.
+      narrative: >-
+        {principal.name} holds file.backups.get in {source_project.name} and
+        file.instances.create in {dest_project.name}, and can restore the
+        {backup.name} backup to an instance in the destination project, exfiltrating
+        all data from the original {source_instance.name} Filestore instance.
+
+  # --- Snapshot restore cross-project exfiltration -------------------------
+  # Parallel to backup exfiltration: a principal holding file.snapshots.get in a
+  # source project can restore a Filestore snapshot to an instance in an
+  # attacker-controlled destination project (requires file.instances.create or
+  # file.instances.update in the destination). Snapshots represent point-in-time
+  # copies of share state and can be restored cross-project just like backups.
+  # filestore.md section 10 and 14 document this path as equally viable.
+  - id: gcp-filestore-snapshot-exfiltrate
+    emits: CanExfiltrate
+    description: >-
+      A principal holding file.snapshots.get in the source project plus
+      file.instances.create or file.instances.update in an attacker-controlled
+      destination project can restore a Filestore snapshot to the destination,
+      exfiltrating all data. Snapshots are point-in-time copies of a share and can
+      be restored cross-project exactly as with backups, making this an equally
+      viable cross-boundary data exfiltration path.
+    match:
+      - [ ?principal, HasPermission, "file.snapshots.get" ]
+      - [ ?snapshot, LocatedIn, ?source_project ]
+      - [ ?principal, HasPermission, "file.instances.create" ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?snapshot.sourceInstance references ?source_instance: node_type(?source_instance) == FileStorage"
+      - "the third HasPermission edge (?principal -> file.instances.create) is scoped to ?dest_project"
+      - "?principal controls ?dest_project (or is a member of a compromised account there)"
+      - "?dest_project != ?source_project"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["file.snapshots.get", "file.instances.create", "file.instances.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when both conditions hold: (a) file.snapshots.get is effective in the
+        source project AND (b) file.instances.create or file.instances.update is
+        effective in the destination project at the same principal scope, AND the
+        destination project is under attacker control. CONDITIONAL(iam_permission) if
+        one permission is confirmed but the other scope is unresolved. BLOCKED if an
+        IAM deny policy denies either permission at the effective scope.
+      confidence: "0.95 when both permissions confirmed and projects verified as distinct"
+      derived_from: ["gcp-filestore-snapshot-exfiltrate"]
+      false_positive_note: >-
+        Both permissions are REQUIRED: read access to the snapshot in source project +
+        write/create access to instances in destination project at the same principal
+        scope. Snapshots are point-in-time copies and can be restored just like backups.
+        Confirm the principal holds both permissions at the right scopes and the
+        destination project is controlled by the attacker. All data in the snapshot is
+        exfiltrated without IAM filtering. If destination-project permission is
+        unresolved, do not emit as ACTIVE.
+      narrative: >-
+        {principal.name} holds file.snapshots.get in {source_project.name} and
+        file.instances.create in {dest_project.name}, and can restore the
+        {snapshot.name} snapshot to an instance in the destination project,
+        exfiltrating all data from the original {source_instance.name} Filestore
+        instance.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An IAM deny policy or GCP org policy denying file.instances.update at
+#    the project/folder/org scope -> emit gcp-filestore-export-rule-widen
+#    with state: BLOCKED (denied_by=<deny policy>).
+#  - A VPC firewall blocking TCP/UDP 2049 from the attacker's VM to the
+#    Filestore instance IP -> CanNetworkReach is BLOCKED -> gcp-filestore-nfs-
+#    data-access is BLOCKED.
+#  - An empty nfsExportOptions list (no export rules) means the share is not
+#    reachable from any IP -> gcp-filestore-nfs-data-access does not fire.
+#  - CMEK: key_permission gates apply to the Filestore SERVICE AGENT only;
+#    never gate NFS CanReadData on the mounting principal's KMS permissions.
+#  - ExposedToInternet: NEVER emit. Filestore instances are VPC-private only.
+# ---------------------------------------------------------------------------

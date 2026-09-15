@@ -1,0 +1,639 @@
+# GCP Deployment Manager — Phase 9 CI/CD attack-path rules
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:deploymentmanager
+# Phase 9 theme: a deployment config IS the build spec; the actuation runner
+# (Google APIs service agent) IS the service identity. Whoever writes the spec
+# (create/update) or registers the backend (type provider) injects code that
+# runs AS the service agent.
+#
+# THE CLASSIC ESCALATION (per official research + docs):
+#   deploymentmanager.deployments.create
+#     -> submit config that calls setIamPolicy AS cloudservices SA (Editor/Owner)
+#     -> grant attacker roles/owner on the project
+#   No actAs, no PassRole — the delegation gap is structural: DM always uses
+#   the Google APIs service agent, never the caller's identity.
+#
+# Permissions are the EFFECTIVE deploymentmanager.* / iam.* actions the
+# evaluator must confirm at project scope. State: ACTIVE unless a listed
+# condition is unmet (CONDITIONAL/POTENTIAL) or an IAM deny / org policy /
+# VPC-SC perimeter applies (BLOCKED).
+#
+# SCOPE of this file:
+#   * Emits service-FACT edges (ExecutesAs, CanModifyCode,
+#     CanModifyConfiguration, CanGrantPermission, CanAdminister, CanRead,
+#     CanModifyPolicy) observed from DM config and effective-permission data.
+#   * Derived CanExecuteAs edges collapsed from those facts.
+#   * Escalation/entry roll-ups (CanEscalateTo, CanEnterProject) are cited
+#     and delegated to:
+#       - cicd-chains.yaml (rule 1: CanModifyCode + ExecutesAs -> CanExecuteAs)
+#       - can-execute-as.yaml (execute-as-via-code-modify)
+#       - can-control.yaml (escalate-via-execute-as, control-boundary-via-iam-admin)
+#       - hierarchy-chains.yaml (admin-inherits-down-contains -> CanEnterProject)
+#       - identity-escalation.yaml (gcp-set-iam-policy-project for the SA's
+#         setIamPolicy capability; gcp-sa-get-access-token for impersonation)
+#   CITE, DO NOT DUPLICATE those linchpin rules.
+#
+# FALSE-POSITIVE GUARDRAIL (critical — read before evaluating confidence):
+#   The Editor role does NOT include resourcemanager.projects.setIamPolicy at
+#   the PROJECT level. Project-level setIamPolicy requires roles/owner or an
+#   explicit custom role that includes that permission. The service agent
+#   commonly holds Editor, not Owner. Verify the service agent's ACTUAL role
+#   bindings before scoring CanGrantPermission on the Project node. If the
+#   service agent holds only Editor, CanGrantPermission is scoped to resources
+#   it owns (GCS, SA, Pub/Sub) — not the project IAM policy.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 9-cicd-pipelines
+service: deploymentmanager
+applies_to: [gcp]
+
+rules:
+
+  # =========================================================================
+  # EXPLICIT / NORMALIZATION — observable facts from DM config & IAM data
+  # =========================================================================
+
+  # --- Deployment executes as the Google APIs service agent (anchor) ---------
+  - id: gcp-dm-executes-as
+    emits: ExecutesAs
+    description: "Every Deployment Manager deployment runs as the Google APIs service agent (PROJECT_NUMBER@cloudservices.gserviceaccount.com), which by default holds roles/editor at the project."
+    match_record: {resource_type: "google.deploymentmanager.Deployment"}
+    where:
+      - "?sa = PROJECT_NUMBER@cloudservices.gserviceaccount.com (derived from deployment.projectNumber, not operation.user)"
+      - "?sa.privilege_level is elevated (roles/editor) or admin (roles/owner) at project scope"
+    emit:
+      target_type: ServiceAccount
+      source_type: BuildWorker
+      source: "<Deployment node>"
+      target: "<cloudservices ServiceAccount>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the deployment object exists and is not in a terminal-failure
+        state; CONDITIONAL(service_state) if the deployment is in preview mode
+        (actuation has not occurred) or is stopped/cancelled before resource
+        creation. The service agent identity binding is structural — it cannot
+        be changed per-deployment.
+      confidence: 1.0
+      derived_from: []
+      false_positive_note: >-
+        This is a structural fact, not an attack. The edge becomes attack-relevant
+        only when combined with CanModifyCode (deployer can inject a malicious
+        config). The service agent's roles must be resolved from the project IAM
+        policy — do not assume roles/editor is still bound; org policy
+        iam.automaticIamGrantsForDefaultServiceAccounts may have removed it, or
+        the SA may have been restricted by an administrator.
+      narrative: >-
+        Deployment {deployment.name} executes as the Google APIs service agent
+        {sa.name} ({sa.email}), which holds {sa.effective_roles} at the project.
+        Code injected into the deployment config runs with those privileges.
+
+  # --- Create deployment = inject the config the runner executes (CanModifyCode) ---
+  - id: gcp-dm-deployments-create
+    emits: CanModifyCode
+    description: "deploymentmanager.deployments.create allows submitting a new deployment config; DM executes it as the cloudservices service agent. This is the CI/CD CanModifyCode primitive for DM."
+    match_effective_permission:
+      action: "deploymentmanager.deployments.create"
+      resource_type: "google.deploymentmanager.Deployment"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<Deployment node (new or existing project-scoped)>"
+      permissions: ["deploymentmanager.deployments.create"]
+      conditions: [iam_permission, api_enabled]
+      state_logic: >-
+        ACTIVE when the principal holds the effective permission at project scope
+        and the Deployment Manager API is enabled. BLOCKED if an IAM deny policy
+        denies deploymentmanager.deployments.create, an org policy restricts DM
+        usage, or a VPC Service Controls perimeter prevents the DM API call.
+      confidence: 0.97
+      derived_from: []
+      false_positive_note: >-
+        deployments.create alone is the code-injection gate; the downstream
+        escalation (CanExecuteAs, CanGrantPermission) depends on the service
+        agent's actual effective permissions. If the service agent was stripped of
+        roles/editor (via org policy or manual removal), the escalation surface
+        shrinks to whatever roles it does hold. Always resolve sa.effective_roles
+        before asserting privilege escalation strength.
+      narrative: >-
+        {principal.name} can create a Deployment Manager deployment
+        (deploymentmanager.deployments.create), submitting an attacker-controlled
+        config that DM executes as the Google APIs service agent {sa.name}.
+        Any GCP resource or IAM policy the service agent can manage can be
+        provisioned or manipulated by this config.
+
+  # --- Update existing deployment = modify the spec the runner re-executes -----
+  - id: gcp-dm-deployments-update
+    emits: CanModifyCode
+    description: "deploymentmanager.deployments.update allows replacing an existing deployment's config; DM re-executes as the cloudservices SA, enabling injection into an already-provisioned deployment."
+    match_effective_permission:
+      action: "deploymentmanager.deployments.update"
+      resource_type: "google.deploymentmanager.Deployment"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<Deployment node>"
+      permissions: ["deploymentmanager.deployments.update"]
+      conditions: [iam_permission, api_enabled]
+      state_logic: >-
+        ACTIVE when the principal holds deployments.update on the specific
+        deployment (or project-wide). CONDITIONAL(iam_permission) if update
+        is restricted to a specific deployment the evaluator has not confirmed
+        the principal can reach. BLOCKED by deny policy or VPC-SC.
+      confidence: 0.95
+      derived_from: []
+      false_positive_note: >-
+        .update is scoped to existing deployments. An attacker must have write
+        access to the SPECIFIC deployment object. Project-wide deployments.update
+        grants access to all deployments; per-deployment IAM (deployments.setIamPolicy)
+        can restrict it to named deployments. Confirm the scope before emitting.
+      narrative: >-
+        {principal.name} can update deployment {deployment.name}
+        (deploymentmanager.deployments.update), injecting attacker-controlled
+        resources or accessControl bindings that DM re-applies as {sa.name}.
+
+  # --- Update config (stop/cancelPreview) = lesser config mutation -------------
+  - id: gcp-dm-deployments-config
+    emits: CanModifyConfiguration
+    description: "deploymentmanager.deployments.stop / cancelPreview allows aborting or modifying deployment state without full resource creation."
+    match_effective_permission:
+      action: "deploymentmanager.deployments.stop"
+      resource_type: "google.deploymentmanager.Deployment"
+    alt_permission: "deploymentmanager.deployments.cancelPreview"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Deployment node>"
+      permissions: ["deploymentmanager.deployments.stop", "deploymentmanager.deployments.cancelPreview"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE. These are disruption/state-change actions, not code execution.
+        By themselves they do not yield CanExecuteAs; they are useful for
+        sabotage or forcing a deployment into a state another action exploits.
+      confidence: 0.6
+      derived_from: []
+      false_positive_note: >-
+        stop/cancelPreview do NOT execute attacker code. Do not chain to
+        CanExecuteAs derivations. Emit as CanModifyConfiguration only, with
+        a low confidence reflecting the indirect/sabotage nature.
+      narrative: >-
+        {principal.name} can stop or cancel a DM deployment preview
+        ({deployment.name}), disrupting deployment state without creating
+        resources. Not a direct code-execution path.
+
+  # --- TypeProvider create/update = arbitrary REST API call AS service agent ---
+  # Modeling note: CanModifyCode.target set (schema/edges.yaml) admits only
+  # [Compute, ContainerRegistry, ArtifactRepository, KubernetesWorkload]. The
+  # TypeProvider config artifact is a GenericManagement node and NOT a valid
+  # CanModifyCode target. We therefore model the TypeProvider attack as
+  # CanModifyConfiguration on any Deployment (BuildWorker = Compute) that
+  # instantiates the type — registering a malicious type provider backend is
+  # functionally equivalent to modifying the deployment's build spec, because
+  # DM will call the attacker-controlled endpoint AS the SA during actuation.
+  # The CanExecuteAs derivation (gcp-dm-execute-as-via-typeprovider below)
+  # chains CanModifyConfiguration + ExecutesAs -> CanExecuteAs via the same
+  # can-execute-as execute-as-via-code-modify pattern (CanModifyCode replaced
+  # by CanModifyConfiguration here; the escalation is structurally identical).
+  - id: gcp-dm-typeprovider-create
+    emits: CanModifyConfiguration
+    description: "deploymentmanager.typeProviders.create registers a custom type provider backed by an arbitrary HTTPS REST endpoint; when a deployment uses the type, DM calls that endpoint AS the cloudservices service agent. Modeled as CanModifyConfiguration on the Deployment (BuildWorker/Compute) because CanModifyCode.target does not admit the TypeProvider config node (GenericManagement)."
+    match_effective_permission:
+      action: "deploymentmanager.typeProviders.create"
+      resource_type: "google.deploymentmanager.TypeProvider"
+    alt_permission: "deploymentmanager.typeProviders.update"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<Deployment node (BuildWorker) that instantiates this type>"
+      permissions: ["deploymentmanager.typeProviders.create", "deploymentmanager.typeProviders.update"]
+      conditions: [iam_permission, api_enabled, network_reachability, trigger_exists]
+      state_logic: >-
+        CONDITIONAL(trigger_exists, network_reachability) — two gates:
+        (1) a deployment must use a resource of this type to actuate the call
+        (trigger_exists analog); (2) the service agent must be able to reach
+        the attacker-controlled HTTPS endpoint. ACTIVE when the principal can
+        also create/update a deployment that uses the new type (combined with
+        gcp-dm-deployments-create / -update) AND the endpoint is reachable.
+        BLOCKED by VPC Service Controls on the DM API or the external egress.
+      confidence: 0.80
+      derived_from: []
+      false_positive_note: >-
+        Two-step attack: (1) register malicious type provider; (2) a deployment
+        must actuate a resource of that type. If only typeProviders.create is
+        held without deployments.create/update, this stays CONDITIONAL(trigger_exists).
+        typeProviders.update on an EXISTING provider already used by a live deployment
+        is ACTIVE once the backend is swapped — check for existing deployments that
+        reference the type. Network reachability of the external endpoint from the
+        GCP control plane must be confirmed; emit CONDITIONAL(network_reachability)
+        when unknown.
+      narrative: >-
+        {principal.name} can register a custom type provider
+        (deploymentmanager.typeProviders.create) backed by an attacker-controlled
+        HTTPS endpoint. When a DM deployment uses a resource of that type, DM
+        calls the endpoint AS {sa.name}, executing attacker-controlled code with
+        the SA's permissions. Effect is equivalent to modifying the deployment
+        configuration (CanModifyConfiguration) from an escalation-path perspective.
+
+  # --- Service agent's setIamPolicy capability (the DM escalation fact) -------
+  # Split into two emits: (1) resource-level (active when SA holds Editor),
+  # (2) project-level (active only when SA holds Owner). This reflects the
+  # different attack surfaces and prevents false positives targeting Project
+  # when only Editor is held.
+  - id: gcp-dm-sa-can-set-iam-policy-resource
+    emits: CanGrantPermission
+    description: "The Google APIs service agent's effective permissions include *.setIamPolicy on resources it manages when it holds roles/editor (GCS, SA, Pub/Sub, etc.). A DM config can instruct the SA to call setIamPolicy, granting the deployer any role on those resources."
+    match:
+      - [ ?deployment, ExecutesAs, ?sa ]
+    where:
+      - "node_type(?deployment) == BuildWorker  # DM Deployment node"
+      - "?sa is the Google APIs service agent (cloudservices SA) for the project"
+      - "?sa holds roles/editor OR a custom role that includes *.setIamPolicy on resource-level targets"
+      - "a deployment config or accessControl section instructs DM to call setIamPolicy on a resource in the project"
+    emit:
+      source_type: ServiceAccount
+      target_type: Identity
+      source: "<cloudservices ServiceAccount>"
+      target: "<attacker-controlled principal named in the accessControl config binding (on a resource)>"
+      permissions: ["storage.buckets.setIamPolicy", "iam.serviceAccounts.setIamPolicy", "pubsub.topics.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the SA holds roles/editor (includes resource-level setIamPolicy).
+        CONDITIONAL(iam_permission) if the SA's effective roles are unknown or
+        restricted by org policy (iam.automaticIamGrantsForDefaultServiceAccounts).
+        BLOCKED if an IAM deny policy denies setIamPolicy at the resource scope.
+      confidence: 0.90
+      derived_from: ["?deployment ExecutesAs ?sa"]
+      false_positive_note: >-
+        Scoped to resource-level targets only (GCS buckets, SAs, Pub/Sub topics).
+        Editor includes these resource-level permissions. Verify the SA's
+        actual bindings from the project IAM policy. This edge is the SA's
+        capability; the DEPLOYER inherits it transitively via CanExecuteAs
+        (deployer -> SA) -> CanGrantPermission(SA -> resource). The
+        deployer-level CanGrantPermission is produced by the linchpin roll-up,
+        not this rule.
+      narrative: >-
+        The Google APIs service agent {sa.name} (roles/editor) can call
+        setIamPolicy on {resource.name} as part of a Deployment Manager deployment.
+        A deployer can use this to grant any principal elevated roles on that resource.
+
+  - id: gcp-dm-sa-can-set-iam-policy-project
+    emits: CanGrantPermission
+    description: "The Google APIs service agent's effective permissions include resourcemanager.projects.setIamPolicy ONLY when it holds roles/owner. A DM config can instruct the SA to call setIamPolicy at project scope, granting the deployer project-level roles."
+    match:
+      - [ ?deployment, ExecutesAs, ?sa ]
+    where:
+      - "node_type(?deployment) == BuildWorker  # DM Deployment node"
+      - "?sa is the Google APIs service agent (cloudservices SA) for the project"
+      - "?sa holds roles/owner OR a custom role that includes resourcemanager.projects.setIamPolicy"
+      - "a deployment config or accessControl section instructs DM to call setIamPolicy on the project IAM policy"
+    emit:
+      source_type: ServiceAccount
+      target_type: Identity
+      source: "<cloudservices ServiceAccount>"
+      target: "<attacker-controlled principal to grant project-level roles>"
+      permissions: ["resourcemanager.projects.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE ONLY when the SA holds roles/owner or an explicit custom role
+        with resourcemanager.projects.setIamPolicy. CONDITIONAL(iam_permission)
+        if the SA's effective roles are unknown. BLOCKED if an IAM deny policy
+        denies setIamPolicy at the project scope.
+      confidence: 0.90
+      derived_from: ["?deployment ExecutesAs ?sa"]
+      false_positive_note: >-
+        CRITICAL: Editor does NOT include resourcemanager.projects.setIamPolicy.
+        Only emit when the SA provably holds roles/owner (via project IAM policy
+        resolution). Do NOT assume the default binding; org policy
+        iam.automaticIamGrantsForDefaultServiceAccounts may have removed it.
+      narrative: >-
+        The Google APIs service agent {sa.name} (roles/owner) can call
+        setIamPolicy at the project scope as part of a Deployment Manager deployment.
+        A deployer can use this to grant any principal elevated project-level roles.
+
+  # --- Full DM admin -----------------------------------------------------------
+  - id: gcp-dm-admin
+    emits: CanAdminister
+    description: "roles/deploymentmanager.admin grants full control of all DM resources — create, update, delete, and setIamPolicy on DM deployment objects."
+    match_effective_permission:
+      action: "deploymentmanager.deployments.setIamPolicy"
+      resource_type: "google.deploymentmanager.Deployment"
+    where:
+      - "principal also holds deploymentmanager.deployments.{create,update,delete}"
+      - "principal also holds deploymentmanager.typeProviders.{create,update,delete}"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Deployment node>"
+      permissions: ["deploymentmanager.deployments.create", "deploymentmanager.deployments.update", "deploymentmanager.deployments.delete", "deploymentmanager.deployments.setIamPolicy", "deploymentmanager.typeProviders.create"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE when the full admin permission set is confirmed."
+      confidence: 0.97
+      derived_from: []
+      false_positive_note: >-
+        roles/deploymentmanager.admin does not grant project-level IAM control
+        directly — it grants full DM control. Escalation to project admin still
+        requires the service agent's capabilities (Editor/Owner) to be exercised
+        via a malicious deployment config.
+      narrative: >-
+        {principal.name} holds roles/deploymentmanager.admin, giving full control
+        over all DM deployments, type providers, and DM resource policies. Combined
+        with the service agent's project-level roles, this is a complete project
+        takeover primitive.
+
+  # =========================================================================
+  # DERIVED — CanExecuteAs (CI/CD Phase-9 collapse; cites linchpins)
+  # =========================================================================
+
+  # --- Create deployment -> execute as cloudservices SA ---------------------
+  # THE headline DM escalation. Emitted by this file to carry the DM-specific
+  # narrative and the accessControl/setIamPolicy fact; deduplicated against
+  # cicd-chains cicd-modify-buildspec-executes-as and can-execute-as
+  # execute-as-via-code-modify on (CanExecuteAs, ?principal, ?sa).
+  - id: gcp-dm-execute-as-via-create
+    emits: CanExecuteAs
+    description: "A principal with deploymentmanager.deployments.create submits an attacker-controlled config; DM actuates it as the Google APIs service agent, executing code (resource creation, setIamPolicy) as that SA's identity."
+    match:
+      - [ ?principal, CanModifyCode, ?deployment ]
+      - [ ?deployment, ExecutesAs,   ?sa ]
+    where:
+      - "node_type(?deployment) == BuildWorker  # DM Deployment node"
+      - "?deployment is a google.deploymentmanager.Deployment"
+      - "the CanModifyCode edge originates from gcp-dm-deployments-create (deployments.create)"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: ?principal
+      target: ?sa
+      permissions: ["deploymentmanager.deployments.create"]
+      conditions: [api_enabled]
+      state_logic: >-
+        ACTIVE(api_enabled) — unlike a build system where a trigger may be needed
+        to run the job, a DM deployment.create is synchronous: submitting the
+        deployment IS the trigger. The config is actuated immediately (or on
+        preview confirmation). No separate trigger_exists condition. BLOCKED if
+        the DM API is disabled, the principal's permission is denied by an IAM
+        deny policy, or a VPC Service Controls perimeter blocks the
+        cloudresourcemanager / target-service API calls the config makes.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "gcp-dm-deployments-create (CanModifyCode edge)"
+        - "gcp-dm-executes-as (ExecutesAs edge)"
+        - "cicd-chains.yaml cicd-modify-buildspec-executes-as (linchpin, deduped)"
+        - "can-execute-as.yaml execute-as-via-code-modify (linchpin, deduped)"
+      false_positive_note: >-
+        ACTIVE assumes the DM API is enabled and the service agent holds its
+        default roles/editor (or higher). If the service agent's Editor binding
+        was removed by org policy (iam.automaticIamGrantsForDefaultServiceAccounts)
+        or manually, the CanExecuteAs target SA has lower privilege — still emit
+        the edge but score escalation from the SA's actual roles. The DM API
+        being disabled (apis.googleapis.com status) blocks this entirely.
+        Deduplicate: cicd-chains rule 1 fires on the same (CanModifyCode, ExecutesAs)
+        pair — emit once, using the higher-confidence score.
+      narrative: >-
+        {principal.name} can create a Deployment Manager deployment
+        (deploymentmanager.deployments.create), submitting a config that DM
+        immediately actuates as the Google APIs service agent {sa.name}
+        ({sa.email}, roles/{editor|owner}). The config can call setIamPolicy on
+        any resource the SA manages, grant the attacker elevated roles, create
+        new compute resources, or exfiltrate secrets — all AS {sa.name}.
+
+  # --- Update existing deployment -> execute as cloudservices SA ----------------
+  - id: gcp-dm-execute-as-via-update
+    emits: CanExecuteAs
+    description: "A principal with deploymentmanager.deployments.update replaces an existing deployment's config; DM re-executes as the cloudservices SA."
+    match:
+      - [ ?principal, CanModifyCode, ?deployment ]
+      - [ ?deployment, ExecutesAs,   ?sa ]
+    where:
+      - "node_type(?deployment) == BuildWorker"
+      - "the CanModifyCode edge originates from gcp-dm-deployments-update (deployments.update)"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: ?principal
+      target: ?sa
+      permissions: ["deploymentmanager.deployments.update"]
+      conditions: [iam_permission, api_enabled]
+      state_logic: >-
+        ACTIVE — deployments.update triggers synchronous re-actuation. Same
+        state model as gcp-dm-execute-as-via-create. Scope: only the specific
+        deployment the principal can update (may be narrower than all deployments
+        in the project if deployments.setIamPolicy was used to restrict access).
+      confidence: "min(contributing_confidences) * 0.93"
+      derived_from:
+        - "gcp-dm-deployments-update (CanModifyCode edge)"
+        - "gcp-dm-executes-as (ExecutesAs edge)"
+        - "cicd-chains.yaml cicd-modify-buildspec-executes-as (linchpin, deduped)"
+      false_positive_note: >-
+        .update is scoped to the specific deployment(s) the evaluator has confirmed
+        the principal can write. A project-wide deployments.update grant gives access
+        to all deployments; a per-deployment setIamPolicy-restricted grant is narrower.
+        Confirm the effective scope before marking ACTIVE.
+      narrative: >-
+        {principal.name} can update deployment {deployment.name}
+        (deploymentmanager.deployments.update), injecting a malicious resource or
+        accessControl section; DM re-applies the updated config as {sa.name}.
+
+  # --- TypeProvider -> execute as cloudservices SA via external callback --------
+  # Uses CanModifyConfiguration + ExecutesAs -> CanExecuteAs (can-execute-as.yaml
+  # execute-as-via-code-modify also covers CanModifyCode; this rule uses the
+  # CanModifyConfiguration path since typeProviders.create emits that edge).
+  - id: gcp-dm-execute-as-via-typeprovider
+    emits: CanExecuteAs
+    description: "A principal with deploymentmanager.typeProviders.create registers a custom type provider backed by an attacker-controlled endpoint; a DM deployment using that type causes DM to call the endpoint as the cloudservices SA, yielding execution as that SA. Uses CanModifyConfiguration path (typeProviders.create emits CanModifyConfiguration on the Deployment)."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?deployment ]
+      - [ ?deployment, ExecutesAs,            ?sa ]
+    where:
+      - "node_type(?deployment) == BuildWorker  # DM Deployment node"
+      - "the CanModifyConfiguration edge originates from gcp-dm-typeprovider-create (typeProviders.create/update)"
+    optional:
+      - [ ?principal, CanModifyCode, ?deployment ]   # principal can also create/update a deployment (combined path)
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: ?principal
+      target: ?sa
+      permissions: ["deploymentmanager.typeProviders.create", "deploymentmanager.deployments.create"]
+      conditions: [network_reachability, api_enabled, trigger_exists]
+      state_logic: >-
+        CONDITIONAL(trigger_exists, network_reachability) by default — the type
+        provider must be instantiated by a deployment AND the attacker endpoint
+        must be reachable. ACTIVE when the principal also holds deployments.create
+        (matched optional[0]: CanModifyCode on the same deployment) AND the endpoint
+        is reachable. BLOCKED by VPC Service Controls perimeter on the DM API or
+        the external endpoint egress.
+      confidence: "min(contributing_confidences) * 0.80"
+      derived_from:
+        - "gcp-dm-typeprovider-create (CanModifyConfiguration edge on Deployment)"
+        - "gcp-dm-executes-as (ExecutesAs edge)"
+        - "can-execute-as.yaml execute-as-via-code-modify (linchpin, deduped via CanModifyConfiguration variant)"
+      false_positive_note: >-
+        Two-step attack: (1) register malicious type provider, (2) a deployment
+        must actuate a resource of that type. If the principal cannot create
+        deployments (only typeProviders.create without deployments.create), this
+        stays CONDITIONAL(trigger_exists). typeProviders.update on a EXISTING
+        provider already used by a live deployment is ACTIVE once the backend is
+        swapped — check for existing deployments referencing the type.
+        Network reachability of the attacker-controlled endpoint from GCP control
+        plane must be verified before marking ACTIVE.
+      narrative: >-
+        {principal.name} can register a custom type provider
+        (deploymentmanager.typeProviders.create) backed by an attacker-controlled
+        HTTPS endpoint. When a DM deployment uses a resource of that type, DM
+        calls the endpoint AS {sa.name}, executing attacker-controlled code with
+        the SA's permissions (type provider = modified build config for the runner).
+
+  # --- Escalation roll-up: CanExecuteAs (SA more privileged) -> CanEscalateTo --
+  # Cited from can-control.yaml escalate-via-execute-as; no separate rule needed.
+  # The linchpin rule produces CanEscalateTo(principal -> sa) when privilege(sa)
+  # > privilege(principal) and CanExecuteAs(principal -> sa) is matched. The
+  # CanExecuteAs edges emitted above (gcp-dm-execute-as-via-create, -update,
+  # -typeprovider) feed the linchpin derivation automatically. DM-specific
+  # narrative for the CanEscalateTo edge (if needed) is provided by the
+  # CanExecuteAs contributor's narrative field, not a separate rule.
+
+  # --- Deployer's CanGrantPermission on project resources (rolled up) -----------
+  # The deployer -> execute as SA -> SA's setIamPolicy capability = the deployer
+  # can effectively grant permissions. This is the linchpin roll-up path:
+  #   gcp-dm-execute-as-via-create(deployer -> SA)
+  #   + gcp-dm-sa-can-set-iam-policy(SA -> project resource)
+  #   -> CanGrantPermission(deployer -> project resource)
+  # Cited from identity-escalation.yaml gcp-set-iam-policy-project (for project
+  # scope when SA holds owner) and gcp-set-iam-policy-resource (for resource
+  # scope when SA holds editor). NOT re-derived here; cite the linchpins.
+  # This note documents the path for analysts.
+  #
+  # For the GRAPH ENGINE: the path is realized transitively via:
+  #   CanExecuteAs(deployer -> SA)
+  #     -> identity-escalation gcp-set-iam-policy-resource (SA has *.setIamPolicy)
+  #     -> CanGrantPermission(SA -> project resource)
+  #     -> can-control control-boundary-via-iam-admin (CanGrantPermission @project)
+  #     -> Controls(SA -> project)
+  #     -> hierarchy-chains admin-inherits-down-contains
+  #     -> CanEnterProject(deployer -> project) via CanExecuteAs + Controls chain.
+  # No separate rule needed here — cited, not duplicated.
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules for Deployment Manager.
+# These belong in rules/explicit/gcp-deploymentmanager.yaml; recorded here
+# for co-location reference. They map DM API responses to explicit edges.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-dm-norm-executes-as
+    emits: ExecutesAs
+    from_api: "deploymentmanager.deployments.get (GET /v2/projects/{p}/global/deployments/{d})"
+    field: "operation.user (or project number for service agent)"
+    where:
+      - "sa = PROJECT_NUMBER@cloudservices.gserviceaccount.com"
+      - "resolve sa's roles from resourcemanager.projects.getIamPolicy or iam.serviceAccounts.get"
+    note: >-
+      The service agent email is deterministic from the project number
+      (projects.get -> projectNumber). Link the Deployment node (BuildWorker)
+      to the ServiceAccount node for the cloudservices SA. The SA's effective
+      roles at the project determine the escalation privilege level. Collect
+      the SA's IAM bindings from the project policy response.
+
+  - id: gcp-dm-norm-create-permission
+    emits: CanModifyCode
+    from_api: "iam.projects.testIamPermissions or effective-permission evaluator"
+    action: "deploymentmanager.deployments.create"
+    resource_type: "google.deploymentmanager.Deployment"
+    note: >-
+      Test at project scope. A principal with roles/deploymentmanager.editor
+      or roles/deploymentmanager.admin holds this permission. Also check for
+      custom roles and inherited org/folder bindings.
+
+  - id: gcp-dm-norm-update-permission
+    emits: CanModifyCode
+    from_api: "effective-permission evaluator"
+    action: "deploymentmanager.deployments.update"
+    resource_type: "google.deploymentmanager.Deployment"
+    note: >-
+      Test at deployment scope (if the deployment has its own IAM policy via
+      deployments.setIamPolicy) and at project scope. Both may grant update.
+
+  - id: gcp-dm-norm-typeprovider-permission
+    emits: CanModifyConfiguration
+    from_api: "effective-permission evaluator"
+    action: "deploymentmanager.typeProviders.create"
+    resource_type: "google.deploymentmanager.TypeProvider"
+    note: >-
+      Held by roles/deploymentmanager.admin and roles/deploymentmanager.typeEditor.
+      A principal with this permission can register a custom type provider backend
+      that will be instantiated by a deployment. Since TypeProvider is a GenericManagement
+      node and not a valid CanModifyCode target, emit CanModifyConfiguration on the
+      Deployment (BuildWorker) that will instantiate the type.
+      List existing type providers via deploymentmanager.typeProviders.list to
+      find ones with external (non-googleapis.com) descriptor URLs as evidence
+      of existing type provider usage.
+
+  - id: gcp-dm-norm-manifest-read
+    emits: CanRead
+    from_api: "deploymentmanager.manifests.list + .get"
+    resource_type: "google.deploymentmanager.Manifest"
+    note: >-
+      Scan expandedConfig and layout fields for credential patterns (connection
+      strings, API keys, passwords, Secret Manager version paths). If found,
+      emit ContainsSecret or ExposesCredential from the Manifest node.
+
+  - id: gcp-dm-manifest-exposes-secret
+    emits: CanReadSecret
+    description: "A principal with deploymentmanager.manifests.get can read the fully-expanded deployment manifest, which may contain interpolated template secrets, resource outputs (e.g. generated passwords, connection strings, API keys) embedded during config expansion."
+    from_api: "deploymentmanager.manifests.get"
+    action: "deploymentmanager.manifests.get"
+    resource_type: "google.deploymentmanager.Manifest"
+    where:
+      - "manifest.expandedConfig or manifest.layout contains a secret value (heuristic)"
+    note: >-
+      Not every manifest contains secrets. Heuristic scanning of
+      manifest.expandedConfig and manifest.layout is required. Only emit
+      when a credential pattern is detected. Manifests are also accessible
+      to roles/deploymentmanager.viewer and roles/deploymentmanager.editor —
+      assess whether the viewer role is over-granted. Emit CanReadSecret when
+      the manifest contains Secret nodes, or CanReadCredential for generic
+      Credential blobs. The source is the principal holding manifests.get,
+      the target is the Secret node embedded in the manifest.
+      Confidence is CONDITIONAL(iam_permission) until manifest content is
+      scanned.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - IAM deny policy denying deploymentmanager.deployments.create or .update
+#     at project scope -> emit CanModifyCode / CanExecuteAs as BLOCKED with
+#     denied_by=<deny policy resource name>.
+#   - Org policy constraints/deploymentmanager.disableDeployments (if set by
+#     org admin) blocks all DM operations -> BLOCKED.
+#   - VPC Service Controls perimeter around cloudresourcemanager or the target
+#     GCP APIs that the service agent calls -> emit the downstream
+#     CanGrantPermission / CanExecuteAs as BLOCKED(perimeter), noting that
+#     the deployer can bypass this by CanModifyPolicy on the perimeter first
+#     (cite hierarchy-chains guardrail-removal rule).
+#   - Org policy iam.automaticIamGrantsForDefaultServiceAccounts disabled ->
+#     cloudservices SA may not hold Editor; ExecutesAs is still emitted but
+#     CanEscalateTo is scored from actual SA roles (may be non-escalating).
+#
+# COMPOSITION SUMMARY (cited linchpins, not re-derived):
+#   cicd-chains.yaml: cicd-modify-buildspec-executes-as (rule 1) — the generic
+#     CI/CD collapse of CanModifyCode + ExecutesAs -> CanExecuteAs for any
+#     BuildWorker. DM-specific rules add the deployment narrative and the
+#     ACTIVE state reasoning (no separate trigger needed). Deduped.
+#   can-execute-as.yaml: execute-as-via-code-modify — generic form of the same
+#     collapse. Deduped.
+#   can-control.yaml: escalate-via-execute-as — CanExecuteAs -> CanEscalateTo
+#     when SA outranks attacker. Cited in gcp-dm-escalate-rollup.
+#   identity-escalation.yaml: gcp-set-iam-policy-project / -resource — SA's
+#     setIamPolicy capability. The deployer inherits this transitively via
+#     CanExecuteAs; the linchpin emits CanGrantPermission for the SA.
+#   hierarchy-chains.yaml: admin-inherits-down-contains — CanGrantPermission
+#     at project scope rolls up to Controls(project), then CanEnterProject.
+#   credential-chains.yaml: execute-then-read-secret (if the SA can read
+#     Secret Manager secrets) — transitively reachable via CanExecuteAs.
+# ---------------------------------------------------------------------------

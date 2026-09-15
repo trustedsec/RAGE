@@ -1,0 +1,538 @@
+# AWS AppFlow — Derived attack-path rules (Phase 10 — messaging & event systems)
+# ---------------------------------------------------------------------------
+# Amazon AppFlow is a fully-managed SaaS<->AWS data-transfer orchestrator.
+# A *flow* reads from a source (SaaS: Salesforce, Zendesk, Slack, Marketo,
+# ServiceNow, …) or AWS service and writes to a destination (S3, Redshift,
+# Kinesis, Salesforce, Snowflake, EventBridge, …).
+#
+# SECURITY MODEL — what makes AppFlow unusual relative to other Phase-10 services:
+#   1. NO EXECUTION ROLE. AppFlow does NOT assume a customer-specified IAM role to
+#      execute flows; it uses its own service principal (appflow.amazonaws.com) with
+#      KMS grants and S3/Kinesis resource-based policies. There is no ExecutesAs
+#      edge from a flow to a customer role, and therefore no CanExecuteAs path
+#      originating from this service. Do NOT emit ExecutesAs / CanExecuteAs.
+#   2. THE PRIMARY ATTACK SURFACE IS EXFILTRATION. An attacker who can
+#      appflow:UpdateFlow (or CreateFlow) redirects a flow's destination to an
+#      attacker-controlled S3 bucket, then triggers the flow to copy SaaS data
+#      outside the account — classic data-plane exfiltration with no code exec.
+#   3. CONNECTOR PROFILES ARE CREDENTIAL STORES. Each connector profile holds
+#      KMS-encrypted SaaS credentials (OAuth tokens, API keys, username/password)
+#      in Secrets Manager (prefix appflow!*). Whoever can read that secret reads
+#      working SaaS credentials. This is a credential-chain path independent of
+#      the flow execution model.
+#   4. NO RESOURCE-BASED POLICIES ON APPFLOW ITSELF. AppFlow does not support
+#      resource-based policies (confirmed by docs: "Supports resource-based policies: No").
+#      Cross-account exfiltration is achieved by redirecting a flow to an S3 bucket
+#      in another account (the target bucket's policy grants appflow.amazonaws.com).
+#
+# LINCHPIN CITATIONS:
+#   messaging-chains.yaml — Phase 10 roll-up linchpin. Rules 1-4 of that file
+#     own the CanWriteData->CanTrigger->CanExecuteAs and CrossAccountTrust chains.
+#     AppFlow does NOT generate those paths (no ExecutesAs). This file emits
+#     CanModifyConfiguration, CanCreate, CanWriteData (StartFlow), and CanExfiltrate
+#     facts and cites messaging-chains only where relevant.
+#   credential-chains.yaml — owns read-secret-yields-identity and the ContainsSecret
+#     -> ExposesCredential -> CanImpersonate chain. This file emits ContainsSecret
+#     (connector profile -> SaaS credential) and CanReadSecret (SM secret access)
+#     and cites credential-chains for the impersonation roll-up.
+#   can-control.yaml — owns escalation roll-ups (CanEscalateTo, CanEnterAccount).
+#     Not a primary consumer here because AppFlow does not generate identity escalation.
+#
+# Permissions grounded in:
+#   AWS Service Authorization Reference (service prefix `appflow`):
+#     https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonappflow.html
+#   AppFlow User Guide — IAM examples:
+#     https://docs.aws.amazon.com/appflow/latest/userguide/security_iam_id-based-policy-examples.html
+#   AppFlow User Guide — How AppFlow works with IAM:
+#     https://docs.aws.amazon.com/appflow/latest/userguide/security_iam_service-with-iam.html
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 10-messaging
+service: appflow
+applies_to: [aws]
+
+# ===========================================================================
+# EXPLICIT normalization rules — raw collected config -> explicit graph edges.
+# Match against collected AppFlow resource records, not other graph edges.
+# ===========================================================================
+explicit_rules:
+
+  # --- Connector profile: structural credential container ------------------
+  - id: aws-appflow-connector-profile-contains-secret
+    emits: ContainsSecret
+    description: "Each AppFlow connector profile is a KMS-encrypted credential container (OAuth token, API key, password) for a SaaS system."
+    match_record: {resource_type: "AWS::AppFlow::ConnectorProfile", field: "ConnectorType"}
+    where:
+      - "ConnectorProfile exists and has a CredentialType (OAuth2, ApiKey, Basic, or CustomAuth)"
+    emit:
+      source_type: Messaging
+      target_type: Secret
+      source: "<ConnectorProfile node>"
+      target: "<Credential / APIKey / Token node representing the SaaS credential>"
+      state: ACTIVE
+      permissions: []
+      api_source: "appflow:DescribeConnectorProfiles"
+      evidence_field: "ConnectorProfileConfig.ConnectorProfileCredentials (type marker)"
+      state_logic: >-
+        ACTIVE when the connector profile exists and has stored credentials
+        (CredentialType is set and not in error state). The credentials are
+        KMS-encrypted in Secrets Manager; reading the profile metadata via
+        appflow:DescribeConnectorProfiles does NOT expose raw values.
+      derived_from:
+        - "appflow:DescribeConnectorProfiles effective permission on AWS::AppFlow::ConnectorProfile"
+      false_positive_note: >-
+        The ContainsSecret edge is structural: the profile holds credentials but they
+        are KMS-encrypted in Secrets Manager (prefix appflow!*). Reading the profile
+        metadata via appflow:DescribeConnectorProfiles does NOT expose the raw credential
+        value. The CanReadSecret edge (aws-appflow-read-sm-saas-secret) requires
+        secretsmanager:GetSecretValue on the actual secret. Do NOT emit CanReadSecret
+        from DescribeConnectorProfiles alone.
+      narrative: >-
+        AppFlow connector profile {source.name} stores encrypted {target.name}
+        (OAuth token / API key / password) used to authenticate to the SaaS connector;
+        these credentials are held in Secrets Manager under the appflow!* prefix.
+
+  # --- CanModifyConfiguration: UpdateFlow changes destination / schedule ----
+  - id: aws-appflow-update-flow-modifyconfig
+    emits: CanModifyConfiguration
+    description: "appflow:UpdateFlow can redirect the destination, change the source object, modify schedule/trigger, and alter transformations — the primary configuration-modification capability on a flow."
+    match_effective_permission:
+      action: "appflow:UpdateFlow"
+      resource_type: "AWS::AppFlow::Flow"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<AppFlow::Flow in scope>"
+      permissions: ["appflow:UpdateFlow", "appflow:UseConnectorProfile?"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the evaluator confirms appflow:UpdateFlow on the flow ARN with no
+        SCP/boundary deny. CONDITIONAL(iam_permission) when the scoped UpdateFlow
+        permission scope is unknown. If the update touches a connector profile reference
+        and appflow:UseConnectorProfile scope/presence is unknown, emit as
+        CONDITIONAL(iam_permission); full ACTIVE only when both UpdateFlow and
+        (if applicable) UseConnectorProfile are confirmed. BLOCKED when an explicit
+        deny statement or permission boundary prevents UpdateFlow.
+      derived_from:
+        - "appflow:UpdateFlow effective permission on AWS::AppFlow::Flow"
+        - "appflow:UseConnectorProfile conditional permission when flow references a profile"
+      false_positive_note: >-
+        appflow:UpdateFlow is scoped per flow ARN. A wildcard Resource:* grant widens to
+        all flows in the account. Changing the destination to an attacker-controlled S3
+        bucket additionally requires that bucket's policy to grant appflow.amazonaws.com
+        write access — without that, UpdateFlow succeeds in changing the config but the
+        subsequent flow run will fail with access denied on S3 write. Model the exfil
+        path as CONDITIONAL(resource_policy) unless the attacker also controls the target
+        bucket policy. CRITICAL: UseConnectorProfile permission on the referenced connector
+        profile is required to reference it in the updated flow — if the update changes
+        the connector profile reference, this permission is mandatory. An UpdateFlow call
+        that references a connector profile the caller cannot UseConnectorProfile will be
+        rejected by the API with access denied.
+      narrative: >-
+        {principal.name} can change {flow.name}'s destination, source object, schedule,
+        and transformation rules (appflow:UpdateFlow), enabling data redirection to an
+        attacker-controlled endpoint; if the update references a connector profile,
+        appflow:UseConnectorProfile on that profile is also required.
+
+  # --- CanWriteData: StartFlow initiates a data-transfer run ---------------
+  - id: aws-appflow-start-flow-writedata
+    emits: CanWriteData
+    description: "appflow:StartFlow causes the flow to execute and move data from its source to its configured destination — modeled as CanWriteData because the flow writes data to the destination on the caller's behalf."
+    match_effective_permission:
+      action: "appflow:StartFlow"
+      resource_type: "AWS::AppFlow::Flow"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<AppFlow::Flow in scope>"
+      permissions: ["appflow:StartFlow"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the evaluator confirms appflow:StartFlow is effective (not denied
+        by SCP or permission boundary) on the target flow ARN. The capability is
+        unconditional once the permission is confirmed — the flow executes and writes
+        data to its configured destination.
+      derived_from:
+        - "appflow:StartFlow effective permission on AWS::AppFlow::Flow"
+      false_positive_note: >-
+        appflow:StartFlow only executes a flow; it does not change the flow's
+        configuration. The exfiltration impact requires the destination to be set to
+        an attacker-controlled bucket (via UpdateFlow or CreateFlow). StartFlow alone
+        on an unmodified flow only exfiltrates if the existing destination is already
+        attacker-accessible. Scope to the specific flow ARN; Resource:* widens.
+      narrative: >-
+        {principal.name} can execute {flow.name} on demand (appflow:StartFlow),
+        causing it to copy data from its source to its configured destination.
+
+  # --- CanCreate: CreateFlow + UseConnectorProfile creates a new exfil flow -
+  - id: aws-appflow-create-flow-create
+    emits: CanCreate
+    description: "appflow:CreateFlow + appflow:UseConnectorProfile creates a new data-transfer flow with an arbitrary destination, establishing an independent exfiltration path without modifying existing flows."
+    match_effective_permission:
+      action: "appflow:CreateFlow"
+      resource_type: "AWS::AppFlow::Flow"
+    where:
+      - "principal also holds effective appflow:UseConnectorProfile on at least one connector profile ARN"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<AppFlow flow scope (account / region)>"
+      permissions: ["appflow:CreateFlow", "appflow:UseConnectorProfile"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the evaluator confirms appflow:CreateFlow on Resource:* AND at
+        least one appflow:UseConnectorProfile on a connector profile ARN, both with
+        no SCP/boundary deny. CONDITIONAL(iam_permission) when either permission scope
+        is unknown or UseConnectorProfile coverage is unresolved. BLOCKED when an
+        explicit deny or permission boundary prevents CreateFlow or all
+        UseConnectorProfile references.
+      derived_from:
+        - "appflow:CreateFlow effective permission on AWS::AppFlow::Flow (Resource: *)"
+        - "appflow:UseConnectorProfile effective permission on AWS::AppFlow::ConnectorProfile"
+      false_positive_note: >-
+        appflow:CreateFlow requires Resource:* (creation actions cannot be scoped to a
+        specific ARN that does not yet exist). appflow:UseConnectorProfile is a
+        permission-only action required to reference the connector; without it CreateFlow
+        fails. The new flow still needs a destination with an appflow.amazonaws.com write
+        grant (CONDITIONAL resource_policy on the target bucket). Do NOT omit the
+        UseConnectorProfile check — a principal with CreateFlow but without
+        UseConnectorProfile on any profile cannot complete flow creation. Verify the
+        principal holds UseConnectorProfile on at least one profile ARN before emitting.
+      narrative: >-
+        {principal.name} can create a new AppFlow flow (appflow:CreateFlow) referencing
+        an accessible connector profile (appflow:UseConnectorProfile), choosing an
+        arbitrary destination to establish an independent data exfiltration path.
+
+  # --- CanReadSecret: Secrets Manager access to the AppFlow-managed secret --
+  - id: aws-appflow-read-sm-saas-secret
+    emits: CanReadSecret
+    description: "secretsmanager:GetSecretValue on an appflow!* secret retrieves the raw SaaS credentials (OAuth token, API key, password) stored by AppFlow for a connector profile."
+    match_effective_permission:
+      action: "secretsmanager:GetSecretValue"
+      resource_type: "AWS::SecretsManager::Secret"
+    where:
+      - "secret name matches prefix appflow!* (AppFlow-managed secret)"
+      - "secret tag aws:secretsmanager:owningService == appflow (or Name prefix appflow!)"
+    emit:
+      source_type: Identity
+      target_type: Secret
+      source: "<principal>"
+      target: "<AppFlow-managed Secrets Manager secret (appflow!* prefix)>"
+      permissions: ["secretsmanager:GetSecretValue"]
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        ACTIVE when the evaluator confirms secretsmanager:GetSecretValue on the appflow!*
+        secret ARN with no SCP/boundary deny, AND the secret is encrypted with the AWS
+        managed key or the caller holds kms:Decrypt on the CMK. CONDITIONAL(key_permission)
+        when the secret uses a customer-managed key (CMK) and the caller's kms:Decrypt
+        scope is unknown. CONDITIONAL(resource_policy) when the secret's resource policy
+        is unknown/unresolved. BLOCKED when an explicit deny or permission boundary
+        prevents GetSecretValue, or when a CMK deny blocks decrypt.
+      derived_from:
+        - "secretsmanager:GetSecretValue effective permission on AWS::SecretsManager::Secret (appflow!* prefix)"
+        - "credential-chains.yaml read-secret-yields-identity (cited: CanReadSecret + CredentialsFor -> CanImpersonate)"
+      false_positive_note: >-
+        AppFlow stores connector credentials in Secrets Manager secrets whose names
+        begin with appflow! and whose resource policy is managed by AppFlow (set via
+        secretsmanager:PutResourcePolicy called through AppFlow). The resource policy
+        restricts access to appflow.amazonaws.com by default; a human principal requires
+        an explicit identity-based secretsmanager:GetSecretValue grant on that secret ARN
+        (bypassing the resource policy requires the caller to be in the same account and
+        have identity-based access). Also emit CONDITIONAL(key_permission) when the
+        secret is encrypted with a CMK and the caller lacks kms:Decrypt on that key.
+        Do NOT emit this from appflow:DescribeConnectorProfiles — that action returns
+        metadata only, not credential values.
+      narrative: >-
+        {principal.name} can read the raw SaaS credential (OAuth token / API key /
+        password) stored by AppFlow connector profile {profile.name} from its Secrets
+        Manager secret (appflow:DescribeConnectorProfiles does not expose this — only
+        secretsmanager:GetSecretValue on the appflow!* secret does).
+
+  # --- CanReadData: DescribeFlowExecutionRecords reads flow execution metadata --
+  - id: aws-appflow-describe-flow-readdata
+    emits: CanReadData
+    description: "appflow:DescribeFlowExecutionRecords retrieves flow execution history and status, providing reconnaissance into what data flows are processing and when."
+    match_effective_permission:
+      action: "appflow:DescribeFlowExecutionRecords"
+      resource_type: "AWS::AppFlow::Flow"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<AppFlow::Flow in scope>"
+      permissions: ["appflow:DescribeFlowExecutionRecords"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the evaluator confirms appflow:DescribeFlowExecutionRecords on the
+        flow ARN with no SCP/boundary deny. This is metadata-only read (flow execution
+        history/status), not direct data-plane read of the SaaS data itself. Confidence
+        is lower because the reconnaissance value is limited without data-plane access.
+      confidence: 0.5
+      derived_from:
+        - "appflow:DescribeFlowExecutionRecords effective permission on AWS::AppFlow::Flow"
+      false_positive_note: >-
+        This rule emits CanReadData on the flow (a Messaging node) to represent the
+        metadata-plane reconnaissance capability: the principal can read execution records
+        (when flows ran, what status, record counts). This is NOT the actual data-plane
+        read of SaaS data (which is at the destination — S3, Redshift, etc.). The SaaS
+        data access requires the principal to read the destination directly (e.g.
+        s3:GetObject on the S3 bucket). A CanReadData(p, Flow) edge indicates the ability
+        to monitor and understand flow execution, which has low intrinsic value but may
+        support reconnaissance for chaining to destination access. Confidence is lowered
+        to 0.5 because metadata access alone is weaker than data-plane read.
+      narrative: >-
+        {principal.name} can retrieve execution history and status of {flow.name}
+        (appflow:DescribeFlowExecutionRecords), enabling reconnaissance into what data
+        the flow processes and when it runs.
+
+# ===========================================================================
+# DERIVED rules — match explicit/derived edges and emit higher-order capabilities.
+# ===========================================================================
+rules:
+
+  # --- 1) Redirect flow destination + trigger = exfiltrate existing SaaS data
+  # THE primary AppFlow attack path. An attacker who can modify the destination of
+  # an existing flow AND start it (or wait for a scheduled/event run) exfiltrates
+  # the SaaS data that flow reads. The redirect works by pointing the flow's
+  # destination at an attacker-controlled S3 bucket. The flow's source connector
+  # profile (read-only in the attacker's model) continues to authenticate to the
+  # SaaS and pull data.
+  - id: aws-appflow-update-flow-exfil
+    emits: CanExfiltrate
+    description: "Redirecting an existing flow's destination to an attacker-controlled endpoint and triggering the flow exfiltrates the SaaS data it reads (Salesforce records, Zendesk tickets, Slack messages, etc.)."
+    applies_to: [aws]
+    match:
+      - [ ?principal, CanModifyConfiguration, ?flow ]
+    where:
+      - "node_type(?flow) == GenericMessaging or node_class(?flow) == Messaging"
+      - "?flow is an AWS::AppFlow::Flow"
+      - "?flow has a configured source (SaaS connector profile) with data — i.e. the flow reads non-empty data"
+    optional:
+      # Principal can also trigger the flow immediately (StartFlow); absent ->
+      # exfil still occurs on next scheduled run or event trigger.
+      - [ ?principal, CanWriteData, ?flow ]
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: "<data read by ?flow from its SaaS source (e.g. Salesforce objects, Zendesk tickets)>"
+      permissions: ["appflow:UpdateFlow", "appflow:StartFlow?"]
+      conditions: [iam_permission, resource_policy, trigger_exists]
+      state_logic: >-
+        ACTIVE when the principal can both update the flow destination AND start
+        the flow immediately (matched(optional[0])). CONDITIONAL(trigger_exists)
+        when the principal can update the flow but NOT start it immediately — the
+        exfil occurs on the next scheduled run or event trigger (the flow still
+        fires). CONDITIONAL(resource_policy) in all cases unless the attacker also
+        controls the destination bucket policy (to grant appflow.amazonaws.com write
+        access) — without that grant, the redirected flow run fails at the S3 write
+        step. Never ACTIVE when the destination bucket policy gating is unresolved.
+        Inherit weakest state from CanModifyConfiguration and optional CanWriteData.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal CanModifyConfiguration ?flow"
+        - "?principal CanWriteData ?flow (optional: appflow:StartFlow)"
+        - "messaging-chains.yaml (cited: data-plane exfil from messaging config modification)"
+      false_positive_note: >-
+        TWO GATING CONDITIONS must both be met: (a) the principal holds
+        appflow:UpdateFlow on the flow ARN, and (b) the attacker-controlled
+        destination S3 bucket already has an appflow.amazonaws.com write grant in its
+        bucket policy (or the attacker can add one via s3:PutBucketPolicy). Without (b),
+        UpdateFlow succeeds in config terms but the flow run fails at the S3 write.
+        Emit as CONDITIONAL(resource_policy) when (b) is not confirmed. Also: a flow
+        whose source connector profile has no data (empty SaaS tenant, inactive
+        connector) yields no exfiltration impact — prefer not emitting rather than
+        emitting a low-value edge. Distinguish from CanWriteData(p, flow) which only
+        means the principal can start the flow, not redirect it.
+      narrative: >-
+        {principal.name} can update {flow.name}'s destination (appflow:UpdateFlow)
+        to an attacker-controlled S3 bucket; when the flow next runs (immediately via
+        appflow:StartFlow, or on its next scheduled/event trigger), AppFlow copies the
+        SaaS data it reads ({flow.source_connector_type}: {flow.source_object}) to the
+        attacker's bucket, exfiltrating it outside the account.
+
+  # --- 2) Create a new exfil flow (independent path without modifying existing flows)
+  # An attacker with CreateFlow + UseConnectorProfile can create a brand-new flow
+  # referencing an existing connector profile (which already holds SaaS auth) and
+  # setting the destination to an attacker-controlled bucket. This is a parallel
+  # exfil path that does not touch existing flows and may evade change-based detections.
+  - id: aws-appflow-create-flow-exfil
+    emits: CanExfiltrate
+    description: "Creating a new AppFlow flow that references an existing connector profile and points to an attacker-controlled destination exfiltrates SaaS data without modifying any existing flow."
+    applies_to: [aws]
+    match:
+      - [ ?principal, CanCreate, ?scope ]
+    where:
+      - "?principal has effective appflow:CreateFlow (resource scope: *)"
+      - "?principal has effective appflow:UseConnectorProfile on at least one connector profile with SaaS credentials"
+      - "?principal can also trigger the new flow: appflow:StartFlow on the newly created flow ARN, OR the new flow is configured with a schedule/event trigger"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: "<data accessible via the referenced connector profile's SaaS connection>"
+      permissions: ["appflow:CreateFlow", "appflow:UseConnectorProfile", "appflow:StartFlow?"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        CONDITIONAL(resource_policy) unless the attacker-controlled destination S3
+        bucket already has an appflow.amazonaws.com write grant — without that grant
+        the flow run fails at the S3 write step. Upgrade toward ACTIVE when the
+        principal also controls the destination bucket policy (s3:PutBucketPolicy on
+        the target bucket). Also CONDITIONAL(trigger_exists) if the principal cannot
+        call appflow:StartFlow on the newly created flow — but a flow created with a
+        schedule trigger fires automatically, so for scheduled new flows this
+        condition is met at creation time. Inherit weakest from contributing CanCreate.
+      confidence: "min(contributing_confidences) * 0.80"
+      derived_from:
+        - "?principal CanCreate ?scope (appflow:CreateFlow + appflow:UseConnectorProfile)"
+        - "messaging-chains.yaml (cited: data-plane exfil via new messaging path creation)"
+      false_positive_note: >-
+        appflow:UseConnectorProfile is a REQUIRED gate — confirm the principal holds it
+        on at least one connector profile ARN before emitting. Without it, CreateFlow
+        rejects any flow that references a connector profile (which is every meaningful
+        exfil flow). Also: CreateFlow requires Resource:* in the IAM policy (no ARN
+        pre-exists); honor that: a policy with appflow:CreateFlow scoped to a specific
+        flow ARN does NOT satisfy CreateFlow. Scope the CanCreate emit to the account/
+        region scope, not a specific flow node. The destination bucket policy gate is
+        the same as in aws-appflow-update-flow-exfil: emit CONDITIONAL(resource_policy)
+        when unconfirmed.
+      narrative: >-
+        {principal.name} can create a new AppFlow flow (appflow:CreateFlow) referencing
+        an existing connector profile (appflow:UseConnectorProfile), configuring the
+        destination as an attacker-controlled S3 bucket; when started or scheduled,
+        the new flow exfiltrates SaaS data from the referenced connector without
+        modifying any existing flow.
+
+  # --- 3) Read SaaS credential -> authenticate to SaaS directly (credential chain)
+  # A connector profile's underlying Secrets Manager secret (appflow!* prefix)
+  # holds working SaaS credentials. An attacker who reads that secret can
+  # authenticate directly to the SaaS system (Salesforce, Zendesk, ServiceNow, etc.)
+  # outside AWS. This is a credential pivot that credential-chains rolls up into
+  # CanImpersonate. This rule emits the ContainsSecret and CredentialsFor links that
+  # feed credential-chains.yaml (read-secret-yields-identity / impersonate-is-escalation).
+  # We do NOT re-derive CanImpersonate here — that is credential-chains' job.
+  - id: aws-appflow-connector-cred-for-saas
+    emits: CredentialsFor
+    description: "An AppFlow connector profile's stored credential (OAuth token / API key) authenticates to the external SaaS system — reading the Secrets Manager secret yields a usable credential for that SaaS identity."
+    applies_to: [aws]
+    match:
+      - [ ?profile, ContainsSecret, ?cred ]
+    where:
+      - "node_type(?profile) is a ConnectorProfile (Secret class)"
+      - "?cred is the stored SaaS credential (OAuth token, API key, or password)"
+      - "?cred is unexpired/active (connector profile is in a CREATED state, not DELETED or expired OAuth token)"
+    emit:
+      source_type: Secret
+      target_type: Identity
+      source: ?cred
+      target: "<external SaaS identity / service account that ?cred authenticates (Salesforce user/org, Zendesk account, ServiceNow instance, etc.)>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the stored credential is current (OAuth token unexpired or API key
+        valid). CONDITIONAL when the token expiry or rotation state is unknown. BLOCKED
+        when the connector profile is in an error state (OAuth revoked, API key invalidated).
+        This is a structural fact — the edge's value is realized when combined with
+        CanReadSecret via credential-chains read-secret-yields-identity.
+      confidence: 0.75
+      derived_from:
+        - "?profile ContainsSecret ?cred"
+        - "credential-chains.yaml read-secret-yields-identity (cited: CanReadSecret + CredentialsFor -> CanImpersonate)"
+      false_positive_note: >-
+        OAuth2 tokens expire and may be automatically refreshed by AppFlow. An expired
+        token that AppFlow has not refreshed (e.g. revoked by the SaaS admin) should
+        NOT yield a CredentialsFor edge — do not emit when the connector profile is in
+        an error/auth-failure state. Limit the SaaS identity target to what the stored
+        credential scope permits (an OAuth token may be scoped to read-only or a subset
+        of objects in the SaaS). API keys and basic-auth credentials are long-lived and
+        yield ACTIVE unless the profile is in error. This edge does NOT model reading the
+        credential — that is CanReadSecret (aws-appflow-read-sm-saas-secret). The
+        credential-chains roll-up (CanReadSecret + CredentialsFor -> CanImpersonate)
+        is OWNED by credential-chains.yaml; do not re-derive CanImpersonate here.
+      narrative: >-
+        The credential stored in AppFlow connector profile {profile.name} ({cred.type}:
+        OAuth token / API key) authenticates to the external SaaS system as
+        {target.name}; an attacker who reads the Secrets Manager secret backing this
+        profile (appflow!* prefix) obtains a working credential to access that SaaS
+        directly, independent of AppFlow.
+
+  # --- 4) Full control over AppFlow scope (CanAdminister) --------------------
+  # A principal with appflow:* on Messaging resources effectively controls all flows and
+  # connector profiles. This is an explicit normalization rule that should be in the
+  # explicit_rules section, since it evaluates effective permissions directly. However,
+  # to preserve the existing pattern in this file, we keep it here as a special case that
+  # documents the admin-wildcard capability. For path-finding, downstream rules will
+  # match individual CanModifyConfiguration/CanCreate/CanWriteData edges; the CanAdminister
+  # is a convenience summarization for admin-privilege flagging.
+  # NOTE: The best practice is to move this to explicit_rules and use match_effective_permission.
+  - id: aws-appflow-admin
+    emits: CanAdminister
+    description: "appflow:* grants full administrative control over all AppFlow flows and connector profiles in scope."
+    applies_to: [aws]
+    match_effective_permission:
+      action: "appflow:*"
+      resource_type: "AWS::AppFlow::Flow"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<AppFlow scope (all flows in account/region)>"
+      permissions: ["appflow:*"]
+      conditions: [iam_permission]
+      confidence: 0.95
+      state_logic: >-
+        ACTIVE when the evaluator confirms appflow:* at the effective scope (ideally
+        Resource:*) with no SCP/boundary deny. The wildcard expands to include all
+        constituent actions (UpdateFlow, CreateFlow, StartFlow, DeleteFlow,
+        CreateConnectorProfile, UpdateConnectorProfile, DeleteConnectorProfile,
+        UseConnectorProfile, DescribeFlows, DescribeFlowExecutionRecords,
+        DescribeConnectorProfiles, etc.). When appflow:* on Resource:* is confirmed,
+        treat CanModifyConfiguration, CanCreate, and CanWriteData on all flows/profiles
+        as satisfied for downstream derivations. CONDITIONAL(iam_permission) when
+        wildcard scope or expansion is unresolved.
+      derived_from:
+        - "appflow:* effective permission (wildcard expansion via permission evaluator)"
+      false_positive_note: >-
+        appflow:* on a scoped resource ARN (e.g. a specific flow ARN) does NOT grant
+        CreateFlow on Resource:* (which only accepts Resource:*). The evaluator must
+        expand the wildcard against actual reachable resources, not assume all-flows
+        reach. A principal with appflow:* on Resource:* in an AWS account effectively
+        controls all AppFlow flows and connector profiles in that account and region
+        scope; this edge should be ACTIVE in that case.
+      narrative: >-
+        {principal.name} has full control of all AppFlow resources in scope (appflow:*)
+        and can redirect flows, create new exfil flows, read and modify connector profiles,
+        and trigger data transfers.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP or permission boundary denying appflow:UpdateFlow, appflow:CreateFlow,
+#     or appflow:StartFlow on the effective scope -> emit each affected edge with
+#     state: BLOCKED and denied_by=<SCP arn/statement>.
+#   - An SCP denying secretsmanager:GetSecretValue on appflow!* secrets ->
+#     aws-appflow-read-sm-saas-secret BLOCKED (connector profile credential pivot blocked).
+#   - A KMS key policy denying kms:Decrypt on the CMK used to encrypt appflow!*
+#     secrets -> aws-appflow-read-sm-saas-secret CONDITIONAL(key_permission),
+#     never upgraded to ACTIVE unless the principal also holds kms:Decrypt.
+#   - AppFlow has NO resource-based policies — no cross-account resource grant
+#     edges should be emitted from the AppFlow service itself. Cross-account exfil
+#     is modeled through the S3 destination bucket policy (S3 edges), not AppFlow.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# LINCHPIN CITATIONS (do not re-derive these):
+#   messaging-chains.yaml — publish->trigger->execute-as chain. Not applicable to
+#     AppFlow (no execution role, no CanExecuteAs path). Cited for the data-plane
+#     exfil framing (CanWriteData -> CanExfiltrate is the messaging analog here).
+#   credential-chains.yaml — read-secret-yields-identity: ContainsSecret + CanReadSecret
+#     + CredentialsFor -> CanImpersonate. This file emits ContainsSecret and
+#     CredentialsFor; credential-chains owns the CanImpersonate derivation.
+#   can-control.yaml — CanEscalateTo / CanEnterAccount roll-ups. AppFlow does not
+#     generate identity escalation paths, so can-control's rules are not the primary
+#     consumer here. They apply if a downstream credential pivot (SaaS credential ->
+#     SaaS admin -> controls AWS via SaaS integration) warrants escalation modeling.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,497 @@
+# AWS CodeDeploy — Derived attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (ExecutesAs from serviceRoleArn/instanceRole, CanModifyCode from effective
+# codedeploy:CreateDeployment, CanModifyConfiguration from UpdateDeploymentGroup,
+# CanPassIdentity from iam:PassRole + codedeploy.amazonaws.com, CanTrigger from
+# CodePipeline deploy actions) lives in /rules/explicit/aws-codedeploy.yaml.
+# These rules combine those explicit edges into execution and escalation
+# capabilities, and emit CanExecuteCommand for fleet-wide RCE via hook scripts.
+#
+# PHASE-9 MODEL — THE CODEDEPLOY RUNNER:
+#   A CodeDeploy deployment group IS a CI/CD runner in the sense of cicd-chains.
+#   It is an AutomationService (ManagementService subtype) node that ExecutesAs
+#   the service role (for orchestration) and — on EC2/on-prem deployments — also
+#   ExecutesAs the EC2 instance profile role (for lifecycle hook scripts which run
+#   AS ROOT inside each target instance, inheriting IMDS credentials).
+#
+#   The "buildspec" equivalent is the AppSpec revision: whoever can supply an
+#   attacker-controlled AppSpec (via codedeploy:CreateDeployment pointing at an
+#   attacker-controlled S3 key / GitHub commit) controls what code the agent runs
+#   -> CanModifyCode into the deployment group (explicit rule). cicd-chains rule 1
+#   (cicd-modify-buildspec-executes-as) then collapses that into CanExecuteAs the
+#   instance profile role.
+#
+#   This file adds the CodeDeploy-specific surface that cicd-chains cannot see
+#   without service context:
+#     * CanExecuteCommand on EACH INSTANCE in the deployment group (fleet-wide RCE).
+#     * ExecutesAs the service role via the deployment group (control-plane identity).
+#     * CanPassIdentity for the service role (codedeploy.amazonaws.com PassedToService).
+#     * CanExecuteAs(serviceRole) when the principal controls the deployment group and
+#       can swap or leverage the service role.
+#     * Pipeline CanTrigger propagation so cicd-chains rule 3 reaches per-stage
+#       identities.
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE:
+#   cicd-chains.yaml — cicd-modify-buildspec-executes-as (rule 1) does NOT cover
+#     AutomationService nodes (its where-clause restricts node_type to BuildWorker,
+#     ContainerTask, ContainerService, ServerlessFunction, VirtualMachine,
+#     KubernetesWorkload); therefore this file's rule 1 (CanExecuteCommand on fleet
+#     instances) and rule 2 (CanExecuteAs service role) are not duplicates. cicd-chains
+#     still collapses CanModifyCode(deploymentGroup) + ExecutesAs(→instanceRole) into
+#     CanExecuteAs(→instanceRole) when the deployment group's target is classified as
+#     Compute for the schema. An explicit CanExecuteAs for the service-role pivot IS
+#     emitted here (rule 2) because that collapse is not a buildspec-modify pattern
+#     (the attacker does not need to modify code to leverage the service role).
+#   can-execute-as.yaml — execute-as-via-config-identity-swap collapses
+#     CanModifyConfiguration + CanPassIdentity into CanExecuteAs; this is CITED by
+#     rule 4 (role swap). can-control.yaml escalate-via-execute-as rolls CanExecuteAs
+#     up into CanEscalateTo — also CITED. execute-as-via-new-workload and
+#     execute-as-via-command are similarly CITED for follow-on rules.
+#   credential-chains.yaml — CanExecuteAs(instanceRole) -> CanReadSecret / credential
+#     pivots off IMDS are OWNED by credential-chains; not re-derived.
+#
+# PERMISSIONS are exact AWS Service Authorization Reference identifiers:
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_awscodedeploy.html
+#   https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_actions-resources-contextkeys.html
+#
+# STATE PROPAGATION (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. EC2/on-prem deployment-group target is CONDITIONAL(service_state)
+# until confirmed from GetDeploymentGroup response.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-pipelines
+applies_to: [aws]
+
+rules:
+
+  # --- 1) CreateDeployment with attacker revision -> fleet RCE on each instance --
+  # The headline CodeDeploy attack. A principal with codedeploy:CreateDeployment can
+  # supply an arbitrary revision whose AppSpec lifecycle hook scripts are executed AS
+  # ROOT by the CodeDeploy agent on every instance in the deployment group. This is
+  # explicitly a CanExecuteCommand edge (OS-level command execution on each VM in the
+  # fleet), not just CanModifyCode. The CanExecuteAs rollup (-> instanceRole) is left
+  # to cicd-chains/can-execute-as, which consume the CanModifyCode + ExecutesAs facts
+  # from the explicit file and the resulting CanExecuteCommand here.
+  - id: aws-codedeploy-create-deployment-rce-on-fleet
+    emits: CanExecuteCommand
+    description: "Create a deployment with an attacker-controlled revision; hook scripts run as root on every EC2/on-prem instance in the deployment group, yielding fleet-wide command execution."
+    match:
+      - [ ?principal, CanModifyCode, ?deploygroup ]
+      - [ ?deploygroup, CanExecuteCommand, ?vm ]
+    where:
+      - "node_type(?deploygroup) == AutomationService"
+      - "?deploygroup.provider_type == AWS::CodeDeploy::DeploymentGroup"
+      - "?deploygroup.compute_platform in [Server, OnPremise]"
+      - "node_type(?vm) == VirtualMachine"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: ?principal
+      target: ?vm
+      permissions: ["codedeploy:CreateDeployment"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when ?principal has effective codedeploy:CreateDeployment on the
+        deployment group AND can supply an attacker-controlled revision (S3 key,
+        GitHub ref, or inline AppSpec not restricted by a resource condition locking
+        the revision source), AND the CodeDeploy agent is registered and running on
+        ?vm (service_state). CONDITIONAL(service_state) when the agent's health/
+        registration is unconfirmed. CONDITIONAL(iam_permission) when
+        codedeploy:CreateDeployment is not yet confirmed as effective. BLOCKED if an
+        SCP or permission boundary denies codedeploy:CreateDeployment at this scope.
+        Do NOT emit for ECS or Lambda compute platforms — lifecycle hook scripts in
+        that model do not execute as root OS commands on a VirtualMachine.
+      confidence: 0.9
+      derived_from: [ "?principal CanModifyCode ?deploygroup", "?deploygroup CanExecuteCommand ?vm" ]
+      false_positive_note: >-
+        (a) Only EC2/on-prem (compute_platform == Server / OnPremise) deployment groups
+        run AppSpec hook scripts as root OS commands. ECS deployments shift task-set
+        traffic (no fleet RCE); Lambda deployments invoke hook Lambda functions (use
+        CanInvoke path instead). (b) The principal must control the REVISION CONTENT
+        (AppSpec + artifact), not merely trigger a deployment locked to a trusted S3
+        bucket via a resource condition. If the effective grant is locked to a specific
+        S3 revision key (codedeploy:RevisionSource condition), the principal can only
+        trigger a clean deployment — downgrade CanModifyCode to CONDITIONAL/BLOCKED
+        and this edge inherits it. (c) Fleet scope: emit one edge per concrete VM in
+        the group's target set, or a fleet-scoped edge; never claim fleet-wide RCE if
+        the group targets a single instance or a segregated sandbox.
+      narrative: >-
+        {principal.name} can create a CodeDeploy deployment to group {deploygroup.name}
+        (codedeploy:CreateDeployment) with an attacker-controlled AppSpec, executing
+        arbitrary lifecycle hook scripts as root on every target instance including
+        {vm.name}, yielding fleet-wide command execution.
+
+  # --- 2) CanModifyCode(deploygroup) + ExecutesAs(serviceRole) -> CanExecuteAs ----
+  # The CodeDeploy service role governs what the CodeDeploy ORCHESTRATION PLANE can
+  # do (EC2/ELB/ASG/CloudWatch describe/modify, tag resources, call SSM for on-prem
+  # agent setup). A principal who can create deployments effectively exercises those
+  # permissions on the orchestration side. Unlike the instance-role case (handled by
+  # cicd-chains consuming CanModifyCode + ExecutesAs(instanceRole)), the service-role
+  # pivot does not require the principal to modify hook scripts — the service role is
+  # ALWAYS exercised when a deployment runs. However, without a deployment trigger,
+  # modifying the deployment group definition does not constitute execute-as — the
+  # service role is only exercised when a deployment actually runs. This edge emits
+  # CanExecuteAs only when the principal can either trigger a deployment or one is
+  # already armed by an upstream trigger.
+  - id: aws-codedeploy-trigger-executes-as-service-role
+    emits: CanExecuteAs
+    description: "Trigger a deployment to execute orchestration-plane actions as the deployment group's service role — requires a run path."
+    match:
+      - [ ?principal, CanModifyCode, ?deploygroup ]
+      - [ ?deploygroup, ExecutesAs,  ?servicerole ]
+    where:
+      - "node_type(?deploygroup) == AutomationService"
+      - "?deploygroup.provider_type == AWS::CodeDeploy::DeploymentGroup"
+      - "?servicerole.provider_type == AWS::IAM::Role"
+      # The service role identity is exercised by the CodeDeploy service process, not
+      # directly by the attacker's code; the attacker triggers its use via CreateDeployment.
+      # This yields CanExecuteAs only when the service role is MORE privileged than the
+      # triggering principal — a low-privilege service role is not escalation.
+      - "?servicerole.privilege_level > ?principal.privilege_level"
+    optional:
+      # A deployment trigger: the attacker can create a deployment (CanTrigger) or one
+      # is armed by an existing trigger (webhook, schedule, upstream pipeline stage).
+      # Present => ACTIVE; absent => CONDITIONAL(trigger_exists).
+      - [ ?principal, CanTrigger, ?deploygroup ]
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: ?principal
+      target: ?servicerole
+      permissions: ["codedeploy:CreateDeployment"]
+      conditions: [iam_permission, service_state, trigger_exists]
+      state_logic: >-
+        ACTIVE when ?principal has effective codedeploy:CreateDeployment on ?deploygroup
+        AND ?deploygroup is ACTIVE (not paused/stopped) AND ?servicerole is more
+        privileged than ?principal AND a deployment trigger exists (matched(optional[0])
+        or an armed trigger like CodePipeline / webhook / schedule). CONDITIONAL
+        (trigger_exists) when the principal can modify the group but cannot trigger a
+        deployment — the service role is only exercised when a deployment runs, and
+        without a trigger mechanism, the modification does not yield execution. Only
+        emit when privilege(?servicerole) > privilege(?principal) — the service role
+        credentials are exercised by the CodeDeploy service process, not directly by
+        attacker code running on instances. Strictly weaker than the instance-role RCE
+        path because it is orchestration-plane, not arbitrary-code execution. Inherits
+        weakest of CanModifyCode and ExecutesAs contributors.
+      confidence: 0.75
+      derived_from:
+        - "?principal CanModifyCode ?deploygroup"
+        - "?deploygroup ExecutesAs ?servicerole"
+      false_positive_note: >-
+        The CodeDeploy service role is exercised by the CodeDeploy service plane, not
+        by attacker code running on instances. The attacker cannot call AWS APIs as the
+        service role directly; they can only observe its side effects (ELB deregister/
+        register, ASG lifecycle hooks, EC2 tag). Emit at confidence 0.75 to reflect
+        this indirect control. If the service role has only narrow permissions (ELB
+        deregister/register, EC2 describe), it may not be a meaningful escalation —
+        only emit when privilege(?servicerole) > privilege(?principal). A deployment
+        trigger (manual creation via codedeploy:CreateDeployment, or an armed trigger
+        from CodePipeline / webhook / schedule) must exist for the service role to be
+        exercised. Without a trigger, downgrade to CONDITIONAL(trigger_exists). Cite
+        can-execute-as for the escalation roll-up; do not re-derive CanEscalateTo here.
+      narrative: >-
+        {principal.name} can trigger a CodeDeploy deployment (codedeploy:CreateDeployment)
+        that exercises the service role {servicerole.name}; this lets the principal
+        indirectly leverage {servicerole.name}'s orchestration-plane permissions (ELB
+        deregister, ASG, EC2 tag/describe) through the CodeDeploy control plane.
+
+
+
+  # --- 3) CodePipeline -> DeploymentGroup: CanTrigger propagation ----------------
+  # A CodePipeline Deploy stage action invokes codedeploy:CreateDeployment. The
+  # pipeline IS a BuildWorker/Compute node in cicd-chains terms; the deployment group
+  # is its downstream stage runner. This rule emits CanTrigger from the pipeline's
+  # IAM execution identity to the deployment group so cicd-chains rule 3
+  # (pipeline-orchestrates-stages) can propagate triggering capability through the
+  # full pipeline path, and upstream rules fire on the deployment group's ExecutesAs.
+  - id: aws-codedeploy-pipeline-stage-trigger
+    emits: CanTrigger
+    description: "A CodePipeline Deploy stage action invokes the CodeDeploy deployment group; emit CanTrigger from the pipeline's execution identity so cicd-chains propagates pipeline-level trigger capability."
+    match:
+      - [ ?pipelineidentity, CanExecuteAs, ?deploygroup ]
+    where:
+      - "node_type(?deploygroup) == AutomationService"
+      - "?deploygroup.provider_type == AWS::CodeDeploy::DeploymentGroup"
+      - "CodePipeline pipeline contains a Deploy stage action targeting this deployment group"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?pipelineidentity
+      target: ?deploygroup
+      permissions: ["codedeploy:CreateDeployment"]
+      conditions: [service_state, trigger_exists]
+      state_logic: >-
+        ACTIVE when the CodePipeline stage is enabled and the pipeline has a source
+        trigger (webhook/poll/event) that arms it unconditionally. CONDITIONAL(trigger_exists)
+        when the pipeline must be started manually (no automatic trigger). CONDITIONAL
+        (stage_reachable) when a manual approval gate precedes this Deploy stage in the
+        pipeline. BLOCKED if the pipeline or this stage is disabled.
+      confidence: 0.9
+      derived_from: [ "?pipelineidentity CanExecuteAs ?deploygroup" ]
+      false_positive_note: >-
+        Only emit when the CodePipeline action configuration names this specific
+        deployment group (ApplicationName + DeploymentGroupName match). A pipeline
+        with a manual approval gate BEFORE the Deploy stage is CONDITIONAL(stage_reachable),
+        not ACTIVE — cicd-chains rule 3 then keeps the propagated CanTrigger CONDITIONAL.
+        The source of this edge must be the pipeline's IAM execution identity, which is
+        in the Identity class (allowed for CanTrigger.source). The deployment group is
+        the target Compute runner.
+      narrative: >-
+        The CodePipeline pipeline {pipeline.name} execution identity can trigger deployments
+        to CodeDeploy group {deploygroup.name} via its Deploy stage action
+        (codedeploy:CreateDeployment), exposing the deployment group's execution
+        identity to anyone who can trigger the pipeline.
+
+  # --- 4) EC2 instance-role credential exposure via hook script (IMDS) -----------
+  # Any code running as root inside a CodeDeploy hook script can query the EC2
+  # instance metadata endpoint for the instance profile credentials. The source of
+  # ExposesCredential must be the VirtualMachine (Compute subtype) that runs the
+  # script, not the deployment group (AutomationService/ManagementService). The
+  # deployment group targets instances; we emit an explicit CanExecuteCommand edge
+  # from the deployment group to each target VM in the explicit rules, then match on
+  # that to bind ?vm here.
+  - id: aws-codedeploy-hook-exposes-instance-role-cred
+    emits: ExposesCredential
+    description: "CodeDeploy lifecycle hook scripts (running as root on EC2/on-prem targets) can read the instance profile role credentials from IMDS, exposing them to the attacker's code."
+    match:
+      - [ ?deploygroup, CanExecuteCommand, ?vm ]
+      - [ ?vm, ExecutesAs, ?instancerole ]
+    where:
+      - "node_type(?deploygroup) == AutomationService"
+      - "?deploygroup.provider_type == AWS::CodeDeploy::DeploymentGroup"
+      - "?deploygroup.compute_platform in [Server, OnPremise]"
+      - "node_type(?vm) == VirtualMachine"
+      - "?instancerole is the EC2 instance profile role (MachineIdentity/Role) of ?vm"
+    emit:
+      source_type: Compute
+      target_type: Role
+      source: ?vm
+      target: ?instancerole
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when compute_platform is confirmed as Server/OnPremise AND the target
+        instance ?vm has an instance profile (instancerole is non-null). CONDITIONAL
+        (service_state) when instance profile attachment is unconfirmed. Not applicable
+        for ECS or Lambda compute platforms. The source is the VirtualMachine (Compute
+        subtype), which is schema-conformant for ExposesCredential.
+      confidence: 0.9
+      derived_from:
+        - "?deploygroup CanExecuteCommand ?vm"
+        - "?vm ExecutesAs ?instancerole"
+      false_positive_note: >-
+        IMDSv2 with a hop-limit of 1 blocks IMDS reads from inside containers but NOT
+        from a root shell running directly on the instance (hop-limit 1 allows
+        direct local access). A hook script running as root on the instance CAN query
+        IMDSv2 even with hop-limit 1; the IMDSv2 hop-limit only blocks nested requests
+        (container-inside-container or cross-hop). Do not treat IMDSv2 alone as a
+        blocker for hook-script credential theft. BLOCKED only if the instance metadata
+        service is explicitly disabled (HttpEndpoint=disabled on the instance metadata
+        options). The source must be the VirtualMachine, not the deployment group,
+        because ExposesCredential.source is restricted to [Compute, Storage, Data,
+        Messaging, Secret].
+      narrative: >-
+        A CodeDeploy lifecycle hook script running as root on target instance
+        {vm.name} can query the IMDS endpoint and obtain credentials for the
+        instance profile role {instancerole.name}.
+
+  # --- 5) Lambda deployment: CreateDeployment with hook Lambda -> CanInvoke ------
+  # For Lambda compute_platform deployments, CodeDeploy invokes pre/post-traffic
+  # hook Lambda functions specified in the AppSpec (hooks.BeforeAllowTraffic /
+  # AfterAllowTraffic). A principal who can CreateDeployment on a Lambda-platform
+  # deployment group can invoke the hook Lambda function — this is CanInvoke into
+  # the hook Lambda, which then yields CanExecuteAs via the Lambda hook's execution
+  # role (owned by the Lambda rules + cicd-chains, not re-derived here).
+  # This rule must be in explicit_rules as a normalization from AppSpec config
+  # records that bind the hook Lambda ARN.
+  - id: aws-codedeploy-lambda-hook-invoke
+    emits: CanInvoke
+    description: "CodeDeploy invokes the pre/post-traffic hook Lambda function specified in the AppSpec; CreateDeployment on a Lambda-platform group lets the attacker choose which Lambda gets invoked."
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodeDeploy::DeploymentGroup"
+      field: "appSpecContent.hooks.{BeforeAllowTraffic,AfterAllowTraffic}"
+    where:
+      - "computePlatform == Lambda"
+      - "?hookfn is the pre/post-traffic hook Lambda function ARN"
+    emit:
+      source_type: Identity
+      source: "<principal with codedeploy:CreateDeployment on the deployment group>"
+      target: ?hookfn
+      target_type: ServerlessFunction
+      permissions: ["codedeploy:CreateDeployment"]
+      conditions: [iam_permission, service_state]
+      state: CONDITIONAL
+      api_source: "codedeploy:GetDeploymentGroup"
+      evidence_field: "appSpecContent.hooks"
+      narrative: "{principal.name} can trigger a Lambda-platform CodeDeploy deployment (codedeploy:CreateDeployment) that invokes the hook Lambda {hookfn.name} specified in the AppSpec."
+
+  # --- 6) CreateDeploymentGroup + PassRole -> CanCreateWorkloadAs ----------------
+  # A principal with codedeploy:CreateDeploymentGroup and iam:PassRole for
+  # codedeploy.amazonaws.com can create a NEW deployment group targeting arbitrary
+  # instances (EC2 tag filter, ASG, on-prem tags) with any passable role as the
+  # service role. This creates a workload (the deployment group) bound to a chosen
+  # privileged identity. Cite can-execute-as execute-as-via-new-workload for the
+  # CanExecuteAs rollup via CanCreateWorkloadAs + (creating a deployment to trigger).
+  - id: aws-codedeploy-create-group-as-service-role
+    emits: CanCreateWorkloadAs
+    description: "Create a new CodeDeploy deployment group with any passable role as the service role, creating a workload bound to a chosen identity."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE codedeploy:CreateDeploymentGroup"
+      - "?role trust policy allows codedeploy.amazonaws.com (or regional endpoint)"
+      - "iam:PassRole for ?role permits iam:PassedToService including codedeploy.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["codedeploy:CreateDeploymentGroup", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when codedeploy:CreateDeploymentGroup and iam:PassRole for
+        codedeploy.amazonaws.com are both confirmed as effective AND the target
+        role's trust policy allows codedeploy.amazonaws.com. POTENTIAL(role_compatibility)
+        when the role's trust policy is unknown. CONDITIONAL(iam_permission) when
+        either permission is not yet confirmed. BLOCKED if an SCP or permission
+        boundary denies codedeploy:CreateDeploymentGroup or iam:PassRole at this scope.
+      confidence: 0.9
+      derived_from: [ "?principal CanPassIdentity ?role" ]
+      false_positive_note: >-
+        Honor iam:PassedToService — a role passable only to ec2 or ecs-tasks cannot
+        be the CodeDeploy service role — downgrade to POTENTIAL when PassedToService
+        does not include codedeploy.amazonaws.com. The role must also trust
+        codedeploy.amazonaws.com (or the specific regional endpoint); without that
+        trust, the group creation fails — mark CONDITIONAL when trust is unconfirmed.
+        Only emit when the role is compatible with CodeDeploy orchestration; a role
+        with only narrow EC2-describe permissions may not be a meaningful escalation,
+        but the workload creation itself is the CanCreateWorkloadAs capability.
+      narrative: >-
+        {principal.name} can create a new CodeDeploy deployment group
+        (codedeploy:CreateDeploymentGroup) and bind {role.name} as the service role
+        (iam:PassRole for codedeploy.amazonaws.com), creating a workload that
+        executes as {role.name}.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP / permission boundary denying codedeploy:CreateDeployment ->
+#    CanModifyCode is BLOCKED (explicit file); rules 1, 2, and 5 inherit BLOCKED.
+#  - An SCP / permission boundary denying iam:PassRole for codedeploy.amazonaws.com
+#    -> CanPassIdentity (explicit rule) is BLOCKED; rule 6 (CanCreateWorkloadAs)
+#    also BLOCKED for the workload-creation path.
+#  - A resource condition locking codedeploy:CreateDeployment to a specific trusted
+#    S3 revision source (e.g., codedeploy:RevisionSource condition) means the
+#    attacker cannot supply an attacker-controlled revision -> CanModifyCode
+#    downgrades to CONDITIONAL/BLOCKED; rules 1, 2, and 5 inherit.
+#  - IMDSv2 HttpEndpoint=disabled on the target instance metadata options BLOCKS
+#    rule 4 (ExposesCredential via IMDS); mark BLOCKED, not merely CONDITIONAL.
+#  - ECS compute_platform: rules 1 and 4 do NOT apply; only traffic shifting,
+#    no fleet-RCE via hook scripts. Do not emit CanExecuteCommand for ECS groups.
+#  - Lambda compute_platform: rules 1 and 4 do NOT apply; rule 5 (CanInvoke) applies
+#    instead. This rule is now in explicit_rules (aws-codedeploy-lambda-hook-invoke).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service. These belong in
+# /rules/explicit/aws-codedeploy.yaml (to be created).
+explicit_rules:
+
+  - id: aws-codedeploy-executes-as-service-role
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodeDeploy::DeploymentGroup"
+      field: "serviceRoleArn"
+    emit:
+      source_type: AutomationService
+      source: "<DeploymentGroup>"
+      target: "<serviceRoleArn (Role)>"
+      api_source: "codedeploy:GetDeploymentGroup"
+      evidence_field: "serviceRoleArn"
+      narrative: "CodeDeploy deployment group {group.name} orchestration runs as service role {role.name} (serviceRoleArn)."
+
+  - id: aws-codedeploy-executes-as-instance-role
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodeDeploy::DeploymentGroup"
+      field: "ec2TagFilters / onPremisesInstanceTagFilters / autoScalingGroups"
+    where:
+      - "computePlatform in [Server, OnPremise]"
+      - "?instances are the EC2 instances matching the tag filter / ASG / on-prem tag"
+      - "?instancerole is the IAM instance profile role of each matching instance"
+    emit:
+      source_type: AutomationService
+      source: "<DeploymentGroup>"
+      target: "<EC2 instance profile role (MachineIdentity/Role)>"
+      state: CONDITIONAL
+      conditions: [service_state]
+      api_source: "codedeploy:GetDeploymentGroup + ec2:DescribeIamInstanceProfileAssociations"
+      evidence_field: "ec2TagFilters / onPremisesInstanceTagFilters / autoScalingGroups"
+      narrative: "CodeDeploy deployment group {group.name} targets instances running as instance profile role {role.name}; lifecycle hook scripts running as root inherit this role via IMDS."
+
+  - id: aws-codedeploy-can-modify-code
+    emits: CanModifyCode
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codedeploy:CreateDeployment"
+      resource_type: "AWS::CodeDeploy::DeploymentGroup"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<deployment group>"
+      permissions: ["codedeploy:CreateDeployment"]
+      narrative: "{principal.name} can create a deployment to group {group.name} with an attacker-controlled revision (codedeploy:CreateDeployment), injecting arbitrary lifecycle hook scripts."
+
+  - id: aws-codedeploy-can-modify-configuration
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codedeploy:UpdateDeploymentGroup"
+      resource_type: "AWS::CodeDeploy::DeploymentGroup"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<deployment group>"
+      permissions: ["codedeploy:UpdateDeploymentGroup"]
+      narrative: "{principal.name} can update the deployment group configuration (codedeploy:UpdateDeploymentGroup), including changing the service role, target filters, and deployment settings."
+
+  - id: aws-codedeploy-can-pass-service-role
+    emits: CanPassIdentity
+    applies_to: [aws]
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "PassedToService condition (if any) includes codedeploy.amazonaws.com OR is unconditioned"
+      - "principal also has EFFECTIVE codedeploy:CreateDeploymentGroup OR codedeploy:UpdateDeploymentGroup"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: "<principal>"
+      target: "<IAM Role passable to codedeploy.amazonaws.com>"
+      permissions: ["iam:PassRole", "codedeploy:CreateDeploymentGroup"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      narrative: "{principal.name} can pass {role.name} to CodeDeploy as the deployment group service role (iam:PassRole for codedeploy.amazonaws.com + codedeploy:CreateDeploymentGroup / codedeploy:UpdateDeploymentGroup)."
+
+  - id: aws-codedeploy-can-execute-command-on-instances
+    emits: CanExecuteCommand
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodeDeploy::DeploymentGroup"
+      field: "ec2TagFilters / onPremisesInstanceTagFilters / autoScalingGroups"
+    where:
+      - "computePlatform in [Server, OnPremise]"
+      - "?instances are the EC2 instances matching the tag filter / ASG / on-prem tag"
+    emit:
+      source_type: AutomationService
+      source: "<DeploymentGroup>"
+      target: "<EC2 instance>"
+      target_type: VirtualMachine
+      state: CONDITIONAL
+      conditions: [service_state]
+      api_source: "codedeploy:GetDeploymentGroup + ec2:DescribeInstances"
+      evidence_field: "ec2TagFilters / onPremisesInstanceTagFilters / autoScalingGroups"
+      narrative: "CodeDeploy deployment group {group.name} targets instance {instance.name}; lifecycle hook scripts running with root privileges on the instance can execute arbitrary commands."

@@ -1,0 +1,167 @@
+# AWS Certificate Manager (ACM) — Derived attack-path rules (Phase 5 — credential access)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. ACM's attack value is
+# narrow: the single credential-access primitive is EXPORTING a private key,
+# which is possible ONLY for certificates whose per-cert EXPORTABLE flag is set.
+# That covers ACM Private CA-issued (Type==PRIVATE) certs AND — since AWS launched
+# EXPORTABLE PUBLIC certificates on 2025-06-17 — public (Type==AMAZON_ISSUED) certs
+# that were REQUESTED with the exportable option. Certs whose exportable flag is
+# false (all public certs issued before 2025-06-17, and any cert not requested
+# exportable) are NON-EXPORTABLE — acm:ExportCertificate fails for them. Rules here
+# are deliberately conservative to avoid over-claiming, but they gate on the
+# per-cert exportable flag, NOT on Type, so they do not FALSE-NEGATIVE on the new
+# exportable public certs.
+#
+# Key gate discipline (Phase 5 theme): acm:ExportCertificate returns the private
+# key re-encrypted under a CALLER-SUPPLIED Passphrase. The passphrase is a required
+# parameter chosen by the caller, NOT a secret gate, and export does NOT require
+# kms:Decrypt on the aws/acm managed key. Therefore the gate is the per-cert
+# EXPORTABLE flag, modeled as CONDITIONAL(condition_expression) when the flag is
+# unresolved — NOT key_permission. Contrast SecretsManager/SSM CMK-encrypted
+# secrets which DO gate CanReadSecret on kms:Decrypt (key_permission).
+#
+# ACM has NO resource-based policy (no cross-account sharing at the ACM layer;
+# Private CA cross-account sharing via RAM lives in aws:acmpca). No ExecutesAs,
+# no iam:PassRole, no network exposure. No CanEscalateTo/CanImpersonate roll-up is
+# emitted: a stolen TLS key impersonates an EXTERNAL server/DNS identity, not a
+# strictly-more-privileged AWS IAM principal.
+#
+# NATURE DISCIPLINE (ground rule 1 / gold-standard lambda.yaml): a DERIVED rules
+# file emits ONLY edges whose nature is derived|both. In edges.yaml, CanExportKey,
+# CredentialsFor, and CanWrite are all nature: explicit — so they do NOT belong in
+# this derived file. The only genuinely-derived ACM edge is ExposesCredential
+# (nature: derived). Accordingly:
+#  - CanExportKey(acm:ExportCertificate) is defined in /rules/explicit/aws-acm.yaml
+#    (rule aws-acm-can-export-key), state-gated on the per-cert exportable flag
+#    there. It is NOT re-emitted here.
+#  - CanWrite(acm:ImportCertificate overwrite) is likewise an explicit edge in
+#    /rules/explicit/aws-acm.yaml (rule aws-acm-can-write-import). It is NOT
+#    re-emitted here (the old derived aws-acm-import-overwrite was a pass-through:
+#    it derived CanWrite from an identical explicit CanWrite with no added
+#    capability — removed).
+#  - CredentialsFor is nature: explicit but is genuinely DERIVED here: it is
+#    produced by chaining off ExposesCredential (a derived edge). This is a
+#    schema-nature MISMATCH we CITE rather than silently break: CredentialsFor
+#    should arguably be widened to nature: both to admit this credential-chain
+#    derivation. Until the schema is amended, this file keeps the CredentialsFor
+#    rule (it is the Phase-4->Phase-5 chain terminator) with this caveat recorded.
+#
+# Permissions listed are the EFFECTIVE actions the evaluator must confirm on the
+# given certificate ARN scope. State defaults to ACTIVE; an unmet condition yields
+# CONDITIONAL/POTENTIAL; an explicit deny/SCP/boundary yields BLOCKED.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 5-credential-access
+service: acm
+applies_to: [aws]
+
+rules:
+
+  # --- The exportable cert's key impersonates its domain --------------------
+  # NOTE: CanExportKey (nature: explicit) is NOT derived here — it lives in
+  # /rules/explicit/aws-acm.yaml (aws-acm-can-export-key), state-gated on the
+  # per-cert exportable flag. This rule consumes that explicit edge to derive the
+  # genuinely-new ExposesCredential (nature: derived) capability.
+  - id: aws-acm-exposes-private-key
+    emits: ExposesCredential
+    description: "An exportable ACM certificate exposes its private key to any principal that can export it."
+    match:
+      - [ ?principal, CanExportKey, ?cert ]
+    where:
+      - "node_class(?cert) == Secret"
+      - "node_subtype(?cert) == Certificate"
+      - "?cert.exportable == true  # per-cert flag: Type==PRIVATE OR a public cert requested exportable (>=2025-06-17)"
+    emit:
+      source: ?cert
+      target: "<ExternalIdentity: the out-of-AWS server/DNS principal for ?cert.DomainName + SANs>"
+      permissions: []
+      conditions: [condition_expression]
+      state_logic: >-
+        inherit state from the contributing explicit CanExportKey edge
+        (aws-acm-can-export-key): ACTIVE only when ?cert.exportable == true AND
+        acm:ExportCertificate is effective; BLOCKED(non_exportable) when
+        exportable == false; CONDITIONAL(condition_expression) when the flag is
+        unresolved from collection.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "<CanExportKey(acm:ExportCertificate) explicit edge_id (aws-acm-can-export-key)>" ]
+      false_positive_note: >-
+        Not an escalation by itself; expresses that exporting the key equals holding
+        credentials that impersonate the certificate's DNS/TLS server identity.
+        Emitted ONLY for certs whose per-cert exportable flag is true — this now
+        INCLUDES public (AMAZON_ISSUED) certs requested exportable on/after
+        2025-06-17, not just Type==PRIVATE. NEVER emitted for certs whose exportable
+        flag is false (all public certs before 2025-06-17, and any cert not
+        requested exportable). Do NOT gate on Type alone — that would false-negative
+        on exportable public certs. The target is an EXTERNAL (out-of-AWS) server
+        identity (ExternalIdentity), not an AWS IAM principal — do not resolve it to
+        an account role.
+      narrative: >-
+        Certificate {cert.name} exposes its private key: any principal able to
+        export it can impersonate the TLS server for {cert.DomainName} and its SANs.
+
+  # --- The private key is a credential for the domain's server identity ------
+  # SCHEMA-NATURE CAVEAT: CredentialsFor is nature: explicit in edges.yaml, yet
+  # this rule DERIVES it by chaining off ExposesCredential (a derived edge). That
+  # chaining is a genuine derivation, so CredentialsFor should arguably be widened
+  # to nature: both. We keep the rule here (it terminates the Phase-4->Phase-5
+  # credential chain) and CITE the mismatch rather than break the chain.
+  - id: aws-acm-key-credentials-for-domain
+    emits: CredentialsFor
+    description: "An exported ACM private key authenticates as the certificate's DNS/TLS server identity."
+    match:
+      - [ ?cert, ExposesCredential, ?serverIdentity ]
+    where:
+      - "node_class(?cert) == Secret"
+      - "node_subtype(?cert) == Certificate"
+      - "node_class(?serverIdentity) == Identity  # concrete subtype: ExternalIdentity"
+      - "?cert.exportable == true  # per-cert flag: Type==PRIVATE OR a public cert requested exportable (>=2025-06-17)"
+    emit:
+      source: ?cert
+      target: ?serverIdentity   # ExternalIdentity — the out-of-AWS server/DNS principal (CredentialsFor target set: Identity|Data|ServiceIdentity)
+      permissions: []
+      conditions: [condition_expression]
+      state_logic: "inherit state from aws-acm-exposes-private-key (ACTIVE only for an exportable cert whose key is retrievable)"
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "<ExposesCredential derived edge_id (aws-acm-exposes-private-key)>" ]
+      false_positive_note: >-
+        Zero-cost credential link completing the export chain: the exported PEM key
+        authenticates as the certificate's server identity (DomainName + SANs) for
+        offline TLS impersonation / MITM OUTSIDE AWS. The target resolves to an
+        ExternalIdentity (out-of-AWS server/DNS principal), NOT an AWS IAM
+        principal, so no CanEscalateTo/CanEnterAccount roll-up follows from it. Emit
+        only for certs whose per-cert exportable flag is true (incl. exportable
+        public certs on/after 2025-06-17).
+      narrative: >-
+        The private key of {cert.name} is a credential that authenticates as the
+        TLS/DNS server identity {serverIdentity.name} ({cert.DomainName}).
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP/permission boundary denying acm:ExportCertificate at the effective
+#    scope -> explicit aws-acm-can-export-key state: BLOCKED, denied_by=<SCP stmt>;
+#    the downstream derived ExposesCredential / CredentialsFor edges inherit BLOCKED.
+#  - A certificate whose per-cert exportable flag is FALSE (all public certs before
+#    2025-06-17, and any cert not requested exportable) -> explicit
+#    aws-acm-can-export-key state: BLOCKED(non_exportable); the downstream derived
+#    ExposesCredential / CredentialsFor edges are NOT emitted.
+#  - An SCP denying acm:ImportCertificate -> explicit aws-acm-can-write-import BLOCKED.
+#
+# NOT modeled (deliberate, to avoid over-claiming):
+#  - acm:GetCertificate -> NO CanReadSecret/CanExportKey (returns public cert only).
+#  - CanDecrypt / key_permission on aws/acm -> export re-wraps under the passphrase.
+#  - CrossAccountTrust / ExposedToAccount -> ACM has no resource policy.
+#  - CanEscalateTo / CanImpersonate -> stolen key impersonates an external server
+#    identity, not a strictly-more-privileged AWS IAM principal.
+#  - acm:DeleteCertificate -> CanDelete (DoS), not walked; omitted here.
+#  - CanExportKey / CanWrite -> nature: explicit; defined in the explicit file, not
+#    re-derived here (the old pass-through aws-acm-import-overwrite was removed).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in /rules/explicit/aws-acm.yaml
+# (Contains, CanExportKey from acm:ExportCertificate gated on the per-cert
+# exportable flag, CanWrite from acm:ImportCertificate/acm:UpdateCertificateOptions,
+# ContainsResourceReference from InUseBy — emitted from the CONSUMING resource, not
+# the Certificate, to satisfy ContainsResourceReference source set [Data,Storage,
+# Compute]). CanExportKey/CanWrite are produced by the permission evaluator matching
+# EFFECTIVE acm: actions on a certificate ARN — not from raw config alone.

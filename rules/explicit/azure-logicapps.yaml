@@ -1,0 +1,303 @@
+# Azure Logic Apps — explicit normalization rules.
+# Translate raw collected Microsoft.Logic/workflows + Microsoft.Web/connections
+# config and effective-permission facts into common explicit edges consumed by
+# /rules/derived/azure/logicapps.yaml and the provider-agnostic linchpins.
+#
+# TWO tier models are handled here:
+#   Consumption (multi-tenant): Microsoft.Logic/workflows
+#   Standard (single-tenant):   Microsoft.Web/sites (kind=workflowapp)
+#
+# All operation strings verified against the Microsoft.Logic and Microsoft.Web
+# resource-provider operations references, 2026-09 snapshot.
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # Structural: containment and placement
+  # ---------------------------------------------------------------------------
+
+  - id: azure-la-rg-contains-workflow
+    emits: Contains
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Logic/workflows"
+      field: "id"
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: "*"
+      source: "<resource group>"
+      target: "<Logic App workflow>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Logic/workflows"
+      evidence_field: "id"
+      narrative: "{rg.name} contains Logic App workflow {workflow.name}."
+
+  - id: azure-la-region
+    emits: LocatedIn
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Logic/workflows"
+      field: "location"
+    emit:
+      source_type: "*"
+      target_type: AdministrativeBoundary
+      source: "<Logic App workflow>"
+      target: "<Azure region>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Logic/workflows"
+      evidence_field: "location"
+      narrative: "{workflow.name} is located in region {region.name}."
+
+  # ---------------------------------------------------------------------------
+  # ExecutesAs: workflow -> managed identity
+  # (Consumption: Microsoft.Logic/workflows; Standard: Microsoft.Web/sites)
+  # ---------------------------------------------------------------------------
+
+  - id: azure-la-executes-as-system-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Logic/workflows"
+      field: "identity"
+    where:
+      - "identity.type in [SystemAssigned, 'SystemAssigned, UserAssigned']"
+      - "identity.principalId is present and non-empty"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: "<Logic App workflow>"
+      target: "<system-assigned managed identity (Entra SP at identity.principalId)>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Logic/workflows/<name>"
+      evidence_field: "identity.principalId"
+      narrative: "{workflow.name} runs as its system-assigned managed identity (principalId: {identity.principalId})."
+
+  - id: azure-la-executes-as-user-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Logic/workflows"
+      field: "identity.userAssignedIdentities"
+    where:
+      - "identity.type in [UserAssigned, 'SystemAssigned, UserAssigned']"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: "<Logic App workflow>"
+      target: "<each user-assigned MI listed in identity.userAssignedIdentities keys>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Logic/workflows/<name>"
+      evidence_field: "identity.userAssignedIdentities (keys are resource IDs)"
+      note: "Emit one ExecutesAs per user-assigned MI resource ID key."
+      narrative: "{workflow.name} runs as user-assigned managed identity {mi.name}."
+
+  - id: azure-la-mi-attached
+    emits: AttachedTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Logic/workflows"
+      field: "identity.userAssignedIdentities"
+    where:
+      - "identity.type in [UserAssigned, 'SystemAssigned, UserAssigned']"
+    emit:
+      source_type: ManagedIdentity
+      target_type: Compute
+      source: "<user-assigned managed identity>"
+      target: "<Logic App workflow>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Logic/workflows/<name>"
+      evidence_field: "identity.userAssignedIdentities"
+      narrative: "User-assigned MI {mi.name} is attached to Logic App {workflow.name}."
+
+  # ---------------------------------------------------------------------------
+  # HasPolicy: trigger IP allowlist (access control)
+  # ---------------------------------------------------------------------------
+
+  - id: azure-la-trigger-ip-allowlist
+    emits: HasPolicy
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Logic/workflows"
+      field: "properties.accessControl.triggers"
+    where:
+      - "properties.accessControl.triggers.allowedCallerIpAddresses is present and non-empty"
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<Logic App workflow>"
+      target: "<trigger IP allowlist policy (GenericPolicy node)>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Logic/workflows/<name>"
+      evidence_field: "properties.accessControl.triggers.allowedCallerIpAddresses"
+      narrative: "{workflow.name} has an HTTP trigger IP allowlist restricting callers to {policy.allowedRanges}."
+
+  # ---------------------------------------------------------------------------
+  # ContainsSecret / ContainsCredential: API connections store credentials
+  # ---------------------------------------------------------------------------
+
+  - id: azure-la-connection-contains-credential
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Web/connections"
+      field: "properties.statuses"
+    where:
+      - "properties.statuses[*].status contains 'Connected'"
+      - "properties.api.name is present (connector type known)"
+    emit:
+      source_type: Messaging
+      target_type: "*"
+      source: "<API connection (modeled as Messaging/ConnectionString node)>"
+      target: "<embedded service credential for the backend resource (Secret/Credential node)>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Web/connections"
+      evidence_field: "properties.api.name + properties.statuses[].status"
+      note: >-
+        The credential type depends on the connector: serviceBus -> SAS key;
+        azureblob / azuretables -> storage account key; sql -> SQL password;
+        office365 / sharepointonline -> OAuth refresh token. Tag the target Secret
+        node's type accordingly. oauth-backed connections (status=Connected but
+        token may expire) should note expiry risk. ContainsSecret (source: Messaging)
+        is used rather than ContainsCredential because ContainsCredential.source only
+        allows [Storage, Data, Compute]; ContainsSecret allows Messaging.
+      narrative: "API connection {connection.name} ({connector.name}) stores a credential (SAS key / storage key / SQL password / OAuth token) for its backend service."
+
+  - id: azure-la-workflow-http-trigger-contains-callback
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Logic/workflows"
+      field: "properties.definition.triggers"
+    where:
+      - "at least one trigger.type == 'Request' (HTTP trigger present)"
+      - "properties.state == 'Enabled'"
+    emit:
+      source_type: Messaging
+      target_type: "*"
+      source: "<Logic App workflow>"
+      target: "<HTTP trigger callback URL (APIKey node, SAS-signed)>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Logic/workflows/<name>"
+      evidence_field: "properties.definition.triggers[*].type == 'Request'"
+      note: >-
+        The actual callback URL is obtained via
+        listCallbackUrl/action (POST) — the collector should NOT call this.
+        The presence of a Request trigger is sufficient evidence to emit ContainsSecret
+        and flag the existence of the APIKey node. The listCallbackUrl/action permission
+        on a principal creates a CanReadSecret edge (azure-la-callback-url rule).
+      narrative: "{workflow.name} has an HTTP (Request) trigger with a SAS-signed callback URL stored as an APIKey."
+
+  # ---------------------------------------------------------------------------
+  # CanTrigger: event-source bindings (the Phase-10 fact)
+  # ---------------------------------------------------------------------------
+
+  - id: azure-la-servicebus-trigger-binding
+    emits: CanTrigger
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Logic/workflows"
+      field: "properties.definition.triggers"
+    where:
+      - "trigger.type in [ApiConnection, ApiConnectionWebhook]"
+      - "trigger.inputs.host.connection.referenceName references a Service Bus connection (connector == servicebus)"
+    emit:
+      source_type: Messaging
+      target_type: Compute
+      source: "<Service Bus Queue/Topic node referenced by the connection>"
+      target: "<Logic App workflow>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Logic/workflows/<name>"
+      evidence_field: "definition.triggers[*].inputs.host.api.id (servicebus connector)"
+      note: >-
+        Resolve the connection referenceName -> Microsoft.Web/connections resource ->
+        backend Service Bus namespace + entity (queue/topic). Emit CanTrigger from
+        the Queue/Topic node to the workflow. Also needed: CanWriteData(?sender, ?queue)
+        from the Service Bus adapter; messaging-chains messaging-publish-triggers-consumer
+        then collapses to CanTrigger(?sender, ?workflow).
+      narrative: "Service Bus entity {source.name} triggers Logic App {target.name} on each received message (ApiConnection trigger)."
+
+  - id: azure-la-eventgrid-trigger-binding
+    emits: CanTrigger
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Logic/workflows"
+      field: "properties.definition.triggers"
+    where:
+      - "trigger.type in [ApiConnection, ApiConnectionWebhook]"
+      - "trigger references an Event Grid connection (connector == azureeventgrid or via webhook subscription)"
+    emit:
+      source_type: Messaging
+      target_type: Compute
+      source: "<Event Grid topic/domain node>"
+      target: "<Logic App workflow>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Logic/workflows/<name>"
+      evidence_field: "definition.triggers[*] (type ApiConnectionWebhook + eventgrid connector)"
+      note: >-
+        Logic Apps subscribe to Event Grid via webhook (ApiConnectionWebhook). Resolve
+        the subscription to the Event Grid topic node. CanWriteData(?publisher, ?topic)
+        from the Event Grid adapter feeds messaging-chains rule 1.
+      narrative: "Event Grid topic {source.name} triggers Logic App {target.name} on each published event."
+
+  - id: azure-la-storage-blob-trigger-binding
+    emits: CanTrigger
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Logic/workflows"
+      field: "properties.definition.triggers"
+    where:
+      - "trigger.type == ApiConnection"
+      - "trigger references an Azure Blob Storage connection (connector == azureblob)"
+    emit:
+      source_type: Storage
+      target_type: Compute
+      source: "<Azure Storage container (ObjectStorage node)>"
+      target: "<Logic App workflow>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Logic/workflows/<name>"
+      evidence_field: "definition.triggers[*].inputs.host.api.id (azureblob connector)"
+      note: >-
+        Blob trigger polls the container for new/modified blobs. CanWriteData(?writer,
+        ?container) from the Storage adapter feeds messaging-chains rule 1.
+      narrative: "Storage container {source.name} triggers Logic App {target.name} when new blobs are created (azureblob trigger)."
+
+  # ---------------------------------------------------------------------------
+  # CanWrite / CanReadData (data-plane): trigger run action
+  # (Logic App Operator / Contributor can manually trigger via run/action)
+  # ---------------------------------------------------------------------------
+
+  - id: azure-la-trigger-run-action
+    emits: CanInvoke
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Logic/workflows/triggers/run/action"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Workflow
+      source: "<principal>"
+      target: "<Logic App workflow>"
+      permissions:
+        - "Microsoft.Logic/workflows/triggers/run/action"
+      conditions: [network_reachability]
+      narrative: >-
+        {principal.name} can manually trigger Logic App {target.name}
+        (Microsoft.Logic/workflows/triggers/run/action), driving its execution
+        as its managed identity.
+
+  # ---------------------------------------------------------------------------
+  # CanReadData: workflow run history may expose secrets in expression traces
+  # ---------------------------------------------------------------------------
+
+  - id: azure-la-run-history-expression-traces
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Logic/workflows/runs"
+      field: "properties.actions"
+    where:
+      - "action outputs or inputs contain credential material (storage keys, API keys, connection strings, OAuth tokens) in evaluated expressions or HTTP response bodies"
+    emit:
+      source_type: Messaging
+      target_type: "*"
+      source: "<Logic App workflow run history>"
+      target: "<secret exposed in expression trace (Secret/Credential node)>"
+      api_source: "az rest --method GET --url .../providers/Microsoft.Logic/workflows/<name>/runs"
+      evidence_field: "runs[*].properties.actions[*].inputsLink / outputsLink"
+      note: >-
+        Run history stores the evaluated inputs/outputs of each action. If a
+        workflow passes a secret through a variable or an HTTP action response body,
+        the run history may expose it. Requires
+        Microsoft.Logic/workflows/runs/actions/listExpressionTraces/action to read.
+        Emit ContainsSecret only when concrete credential patterns are found in the
+        trace data; do not emit speculatively.
+      narrative: "{workflow.name} run history contains a secret exposed in action expression trace ({secret.name})."

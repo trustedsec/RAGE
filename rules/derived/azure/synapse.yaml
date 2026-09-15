@@ -1,0 +1,895 @@
+# Azure Synapse Analytics — Derived attack-path rules (Phase 11 data/analytics/ML)
+# ---------------------------------------------------------------------------
+# Core Synapse escalation invariant: a Synapse workspace is automatically assigned
+# a system-assigned managed identity (the "workspace MI"). Spark pool jobs,
+# pipeline activities, and notebook batch/scheduled runs ALL execute under this MI.
+# Any path that (a) injects or modifies the code those runtimes execute, or
+# (b) submits a job/trigger to an already-poisoned definition, or (c) reads
+# credentials embedded in linked services, reaches the workspace MI's privileges.
+#
+# Two execution surfaces:
+#   (A) SPARK POOL (bigDataPool): custom library upload via bigDataPools/write ->
+#       Spark job executes the library on workers running as the workspace MI.
+#       Pipeline artifacts published via Synapse Artifact Publisher role carry code
+#       executed by the workspace (Workflow node).
+#   (B) PIPELINE (Workflow): Synapse Artifact Publisher role -> publish pipeline with
+#       arbitrary Spark/custom/web activity -> createPipelineRun triggers execution
+#       as workspace MI. Synapse Compute Operator -> trigger existing pipeline.
+#
+# Secondary modes:
+#   (C) CREDENTIAL THEFT: linked services embed plaintext connection strings, passwords,
+#       storage account keys -> ExposesCredential -> CredentialsFor -> CanImpersonate
+#       (credential-chains rollup).
+#   (D) DATA ACCESS: SQL pools (dedicated/serverless) + Spark pools read ADLS Gen2 data
+#       -> CanReadData; CETAS/UNLOAD to external location -> CanExfiltrate.
+#   (E) IDENTITY ATTACH: workspace/write + assign/action -> attach higher-privilege
+#       user-assigned MI -> new ExecutesAs target -> CanCreateWorkloadAs.
+#
+# LINCHPIN CITATIONS (do NOT re-derive the roll-ups):
+#   * can-execute-as.yaml: execute-as-via-code-modify (CanModifyCode + ExecutesAs ->
+#     CanExecuteAs) and execute-as-via-command (CanExecuteCommand + ExecutesAs ->
+#     CanExecuteAs) and execute-as-via-new-workload (CanCreateWorkloadAs -> CanExecuteAs).
+#     The provider-specific rules here emit the FACTS (CanModifyCode, CanExecuteCommand,
+#     ExecutesAs, CanCreateWorkloadAs); can-execute-as produces CanExecuteAs. Synapse-specific
+#     CanExecuteAs rules are only emitted for chains that involve facts not captured by those
+#     primitives (e.g. IR key -> code execution).
+#   * cicd-chains.yaml: cicd-modify-buildspec-executes-as (CanModifyCode(runner) +
+#     ExecutesAs -> CanExecuteAs) and cicd-trigger-runner-executes-as (CanTrigger +
+#     ExecutesAs -> CanExecuteAs CONDITIONAL) apply here too; the workspace pipeline is
+#     modeled as a BuildWorker/Workflow Compute node for these purposes. Synapse-specific
+#     rules add the Synapse-RBAC-gated job-submission and library-injection facts; the
+#     CanExecuteAs roll-up is CITED, not re-derived, except where the chain involves
+#     an IR auth key (no generic linchpin covers that).
+#   * credential-chains.yaml: ExposesCredential + CredentialsFor -> CanImpersonate
+#     (read-secret-yields-identity) and execute-then-read-secret handle linked-service
+#     credential chains. These rules emit the FACT edges; credential-chains rolls up.
+#   * can-control.yaml: escalate-via-execute-as (CanExecuteAs -> CanEscalateTo) and
+#     control-via-admin (CanAdminister -> Controls) are CITED; not re-derived here.
+#
+# Permission strings verified against Microsoft.Synapse resource-provider operations
+# reference (learn.microsoft.com/azure/role-based-access-control/permissions/analytics).
+# Synapse RBAC roles verified against the Synapse workspace RBAC roles docs.
+# All operation strings are exact; none are invented.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 11-data-analytics-ml
+applies_to: [azure]
+
+rules:
+
+  # === 1) Administrative control over the workspace ===========================
+  - id: azure-synapse-workspace-contributor
+    emits: CanAdminister
+    description: "ARM Contributor/Owner on the Synapse workspace grants full control: create/delete pools, update settings, manage linked services, set AAD admin."
+    match_effective_permission:
+      action: "Microsoft.Synapse/workspaces/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor, Owner, or a custom role granting Microsoft.Synapse/workspaces/* at the scope"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Synapse workspace>"
+      permissions: ["Microsoft.Synapse/workspaces/write"]
+      false_positive_note: >-
+        workspaces/write grants ARM control-plane management but does NOT by itself
+        grant Synapse RBAC data-plane roles (submit jobs, run pipelines, read linked
+        services). Model BOTH planes separately. An ARM Contributor who is not also
+        a Synapse Administrator cannot submit Spark jobs without adding themselves
+        to the Synapse RBAC system. The CanAdminister edge captures that they can
+        grant themselves those roles via workspaces/administrators/write.
+      narrative: "{principal.name} has full ARM control of Synapse workspace {target.name} (Microsoft.Synapse/workspaces/write); can create/delete pools, update all settings, set AAD admin, and attach managed identities."
+
+  # === 2) Code modification: Spark pool custom library upload =================
+  - id: azure-synapse-bigdatapool-write-library
+    emits: CanModifyCode
+    description: "bigDataPools/write allows uploading custom library packages to a Spark pool; those libraries execute on Spark workers running as the workspace MI."
+    match_effective_permission:
+      action: "Microsoft.Synapse/workspaces/bigDataPools/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Spark pool (bigDataPool)>"
+      permissions: ["Microsoft.Synapse/workspaces/bigDataPools/write"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the Spark pool exists and a Spark session/job will run; if the
+        pool is new or currently idle with no scheduled jobs, CONDITIONAL(trigger_exists)
+        — the library injection is planted but requires a subsequent job submission to
+        execute. The library code runs as soon as a Spark session starts on the pool.
+      false_positive_note: >-
+        Library upload executes only when a Spark job or notebook is submitted to the
+        pool; do not emit ACTIVE if no run path exists (no scheduled sessions,
+        no users submitting interactively). bigDataPools/write alone does NOT submit
+        jobs — a Synapse Compute Operator or interactive user must still trigger the
+        session. Pair with a trigger path (Synapse Compute Operator, scheduler) for
+        ACTIVE.
+      narrative: "{principal.name} can upload a malicious custom library to Spark pool {target.name} (Microsoft.Synapse/workspaces/bigDataPools/write); the library executes on Spark workers on the next job run."
+
+  # === 3) Code modification: pipeline artifact publishing =====================
+  - id: azure-synapse-pipeline-artifact-publish
+    emits: CanModifyCode
+    description: "Synapse Artifact Publisher role allows publishing pipelines with arbitrary Spark/custom/web activities; the workspace Workflow node executes them as the workspace MI."
+    match:
+      - [ ?principal, HasRole, "<Synapse Artifact Publisher role on workspace>" ]
+    where:
+      - "Synapse RBAC role: Synapse Artifact Publisher at workspace scope"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Synapse workspace (Workflow/pipeline execution surface)>"
+      permissions: ["Synapse RBAC: Synapse Artifact Publisher"]
+      conditions: [trigger_exists]
+      state_logic: >-
+        ACTIVE if the principal can also trigger the pipeline (Synapse Compute Operator
+        role or an existing/creatable trigger) so the published code actually runs;
+        CONDITIONAL(trigger_exists) if only the publish role is held and no trigger
+        or run permission is confirmed — the code is planted but needs a run path.
+        Inherit weakest with the Synapse RBAC role evidence confidence.
+      false_positive_note: >-
+        Artifact Publisher alone plants the code but does not trigger execution; the
+        Synapse Compute Operator role (or a co-holder of that role) provides the run
+        path. Model these as separate facts; the CanModifyCode edge carries trigger_exists
+        condition. Synapse RBAC is separate from Azure RBAC — an ARM Contributor is NOT
+        automatically an Artifact Publisher.
+      narrative: "{principal.name} has Synapse Artifact Publisher on workspace {target.name}; can publish a pipeline containing attacker-controlled Spark or custom activity code that runs as the workspace MI when triggered."
+
+  # === 4) Config modification: workspace write (identity, firewall, IR) =======
+  - id: azure-synapse-workspace-write-config
+    emits: CanModifyConfiguration
+    description: "workspaces/write allows changing the workspace identity block (attach/detach user-assigned MI), firewall rules, AAD admin, and integration runtime config — all alter execution identity or reach."
+    match_effective_permission:
+      action: "Microsoft.Synapse/workspaces/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Synapse workspace>"
+      permissions: ["Microsoft.Synapse/workspaces/write"]
+      false_positive_note: >-
+        workspaces/write changes the ARM-level configuration; changing the identity block
+        to add a user-assigned MI also requires assign/action on that MI (see
+        azure-synapse-attach-user-mi). Firewall/IR changes are ACTIVE immediately. Identity
+        changes take effect on the next job submission.
+      narrative: "{principal.name} can rewrite the configuration of Synapse workspace {target.name} (workspaces/write), including its managed-identity block, firewall rules, and integration runtime settings."
+
+  # === 5) Identity attachment: add user-assigned MI to workspace ==============
+  - id: azure-synapse-attach-user-mi
+    emits: CanAttachIdentity
+    description: "Attach a user-assigned MI to the workspace (workspaces/write + assign/action); all Spark jobs and pipelines then run as both the system-assigned MI and the newly attached user-assigned MI."
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?userMI"
+      - "?principal has EFFECTIVE Microsoft.Synapse/workspaces/write on the workspace"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Synapse workspace>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Synapse/workspaces/write"]
+      conditions: [role_compatibility, service_state]
+      false_positive_note: >-
+        BOTH permissions are required. assign/action alone does not modify the workspace;
+        workspaces/write alone does not grant rights on the MI. Honor the assign/action
+        resource scope. The new MI becomes an additional ExecutesAs target on the next
+        job submission — existing running sessions do not pick up the new identity
+        immediately (CONDITIONAL(service_state) until the new session starts).
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to Synapse workspace {target.name} (assign/action + workspaces/write); all subsequent Spark jobs and pipeline runs can mint tokens for {userMI.name}."
+
+  # === 6) Credential access: IR auth key retrieval ============================
+  - id: azure-synapse-ir-listkeys
+    emits: CanReadSecret
+    description: "integrationRuntimes/listAuthKeys/action or regenerateAuthKey/action returns keys that can register a self-hosted IR node, giving that node persistent pipeline-execution foothold."
+    match_effective_permission:
+      any_of:
+        - {action: "Microsoft.Synapse/workspaces/integrationRuntimes/listAuthKeys/action", scope_type: "resource|resourceGroup|subscription"}
+        - {action: "Microsoft.Synapse/workspaces/integrationRuntimes/regenerateAuthKey/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: Secret
+      source: "<principal>"
+      target: "<integration runtime auth key (Credential)>"
+      permissions: ["Microsoft.Synapse/workspaces/integrationRuntimes/listAuthKeys/action", "Microsoft.Synapse/workspaces/integrationRuntimes/regenerateAuthKey/action"]
+      state_logic: "ACTIVE via listAuthKeys/action OR regenerateAuthKey/action alone; regenerateAuthKey returns the newly regenerated key value."
+      false_positive_note: >-
+        IR auth keys register self-hosted IR nodes — a node registered with these keys
+        executes pipeline activities in its context. This is a durable persistence
+        mechanism. regenerateAuthKey rotates the key and returns the new value; a principal
+        with only regenerateAuthKey (no listAuthKeys) still obtains a usable key. Only
+        relevant for workspaces that have self-hosted integration runtimes (not the
+        Azure-hosted AutoResolveIntegrationRuntime).
+      narrative: "{principal.name} can retrieve integration runtime auth keys from Synapse workspace (listAuthKeys/action or regenerateAuthKey/action), enabling registration of a persistent self-hosted IR node."
+
+  # === 7) Credential exposure: linked services with embedded credentials =====
+  - id: azure-synapse-linkedservice-exposes-cred
+    emits: ExposesCredential
+    description: "A Synapse linked service that stores credentials as plaintext (SQL auth password, storage key, SAS token) exposes those credentials to any principal with Synapse Linked Data Manager or Synapse Administrator role."
+    match:
+      - [ ?workspace, Contains, ?linkedService ]
+    where:
+      - "node_type(?linkedService) == ConnectionString"
+      - "?linkedService authentication type is NOT ManagedIdentity — it contains embedded credentials (SQL auth, account key, SAS, service principal secret)"
+    emit:
+      source_type: Data
+      target_type: Credential
+      source: "<linked service node>"
+      target: "<embedded credential (ConnectionString / AccessKey)>"
+      permissions: ["Synapse RBAC: Synapse Linked Data Manager or Synapse Administrator (data plane)"]
+      false_positive_note: >-
+        Only emit when the linked service definition contains actual credential material
+        (auth type != ManagedIdentity/MSI). A linked service that uses MI auth exposes
+        no credential. The read path requires a Synapse RBAC role, not just ARM Reader.
+        Presence of a linked service node in the graph is a recon fact; ExposesCredential
+        requires the credential to actually be present in the definition.
+      narrative: "Linked service {linkedService.name} in workspace {workspace.name} contains embedded credentials readable by any Synapse Linked Data Manager or Administrator."
+
+  # === 8) IMDS credential exposure: workspace MI ==============================
+  - id: azure-synapse-workspace-imds-exposescred
+    emits: ExposesCredential
+    description: "The Synapse workspace exposes the workspace managed identity credential to all Spark jobs and pipeline activities via IMDS (169.254.169.254)."
+    match:
+      - [ ?workspace, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?workspace) == AnalyticsService"
+      - "node_type(?mi) == ManagedIdentity"
+    emit:
+      source_type: Data
+      target_type: Credential
+      source: "<Synapse workspace>"
+      target: "<workspace managed identity>"
+      permissions: []
+      note: >-
+        Any code running in a Spark job, pipeline activity, or notebook can GET
+        http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=<aud>
+        with header 'Metadata: true' to mint a token for the workspace MI. The companion
+        CanRetrieveToken(workspace -> MI) edge is emitted by azure-synapse-imds-token.
+      false_positive_note: >-
+        Only fires when the workspace has a system-assigned or user-assigned MI (verify
+        workspace identity.type). This edge alone is not an escalation step; it becomes
+        one when combined with a code-execution or trigger capability.
+      narrative: "Synapse workspace {workspace.name} exposes the credential of its managed identity {mi.name} to all Spark jobs, pipeline activities, and notebooks via IMDS."
+
+  # === 9) IMDS token retrieval ================================================
+  - id: azure-synapse-imds-token
+    emits: CanRetrieveToken
+    description: "Any code running on Synapse Spark/pipeline compute can mint a bearer token for the workspace MI via IMDS."
+    match:
+      - [ ?workspace, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?workspace) == AnalyticsService"
+      - "node_type(?mi) == ManagedIdentity"
+    emit:
+      source_type: Compute  # the actor is the Spark/pipeline compute running on the workspace (per description), not the analytics data plane
+      target_type: Identity
+      source: "<Synapse Spark pool / pipeline compute in the workspace>"
+      target: "<workspace managed identity>"
+      permissions: []
+      schema_note: >-
+        AnalyticsService is classified as a Data node (not Compute) in nodes.yaml.
+        CanRetrieveToken's source constraint is [Identity, Compute, WorkloadIdentity].
+        AnalyticsService does not appear in that set. This rule violates the source
+        type constraint. A schema extension request has been filed to add AnalyticsService
+        to CanRetrieveToken's allowed source types, as AnalyticsService nodes are
+        legitimate execution surfaces that can retrieve tokens via IMDS. See issue: TS-2847.
+      false_positive_note: >-
+        Only fires when the workspace has a system-assigned or user-assigned MI.
+        The token is retrievable from any Spark executor, pipeline compute, or notebook
+        kernel on the workspace. This is a fact edge; the attack value comes from
+        combining it with CanModifyCode/CanTrigger/CanExecuteCommand capabilities.
+      narrative: "Any code executing in Synapse workspace {workspace.name} (Spark job, pipeline, notebook) can retrieve a bearer token for workspace MI {mi.name} from IMDS."
+
+  # === 10) Spark job submission -> execute command on Spark pool ==============
+  - id: azure-synapse-spark-submit-job
+    emits: CanExecuteCommand
+    description: "Synapse Compute Operator role (or Synapse Administrator) allows submitting Spark batch jobs and interactive sessions via the Livy API, running attacker-supplied code on Spark workers."
+    match:
+      - [ ?principal, HasRole, "<Synapse Compute Operator role on workspace>" ]
+    where:
+      - "Synapse RBAC role: Synapse Compute Operator or Synapse Administrator at workspace scope"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Spark pool (bigDataPool)>"
+      permissions: ["Synapse RBAC: Synapse Compute Operator"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when at least one Spark pool exists in the workspace; CONDITIONAL(service_state)
+        when no Spark pool is configured or all pools are in a state that cannot accept
+        new sessions. Synapse Compute Operator allows submitting jobs via Livy REST
+        (POST to <workspace>.dev.azuresynapse.net/livyApi/versions/2019-11-01-preview/sparkPools/<pool>/batches).
+      false_positive_note: >-
+        Synapse RBAC Compute Operator is a data-plane role, separate from Azure RBAC.
+        An ARM Contributor without this Synapse role CANNOT submit Spark jobs. Synapse
+        Administrator implicitly has Compute Operator capabilities. Emitted as
+        CanExecuteCommand because the Spark pool is an AnalyticsService, not a
+        VirtualMachine/ContainerService — the semantic is that arbitrary code runs on
+        the Spark worker nodes. The execution is AS the workspace MI, captured separately
+        by ExecutesAs + can-execute-as.yaml linchpin.
+      narrative: "{principal.name} has Synapse Compute Operator role on workspace {workspace.name}; can submit arbitrary Spark batch jobs or interactive sessions to Spark pool {target.name} via the Livy REST API."
+
+  # === 11) Pipeline trigger / run =============================================
+  - id: azure-synapse-pipeline-trigger
+    emits: CanTrigger
+    description: "Synapse Compute Operator role allows triggering pipeline runs (createPipelineRun) on the workspace, executing whatever pipeline definition is currently published."
+    match:
+      - [ ?principal, HasRole, "<Synapse Compute Operator role on workspace>" ]
+    where:
+      - "Synapse RBAC role: Synapse Compute Operator or Synapse Administrator at workspace scope"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Synapse workspace (pipeline execution surface)>"
+      permissions: ["Synapse RBAC: Synapse Compute Operator"]
+      conditions: [trigger_exists]
+      state_logic: >-
+        ACTIVE when a published pipeline exists in the workspace that the principal can
+        trigger; CONDITIONAL(trigger_exists) if no pipeline is currently published. The
+        trigger alone yields CanExecuteAs only if the current pipeline definition already
+        runs attacker-influenced code (poisoned notebook reference, tampered definition)
+        — see cicd-chains linchpin cicd-trigger-runner-executes-as. If the principal
+        ALSO has Artifact Publisher (CanModifyCode), the combined path is ACTIVE (cicd
+        rule 1).
+      false_positive_note: >-
+        CanTrigger over a clean, trusted, pinned pipeline definition is CONDITIONAL
+        (attacker_influenced_definition) per cicd-chains. Do NOT emit ACTIVE CanExecuteAs
+        merely from CanTrigger; only do so when the definition is attacker-influenced or
+        the principal also holds CanModifyCode on the pipeline. CITE cicd-chains.yaml
+        cicd-trigger-runner-executes-as for the CanExecuteAs roll-up — do not re-derive.
+      narrative: "{principal.name} has Synapse Compute Operator role; can trigger pipeline runs on Synapse workspace {target.name} (createPipelineRun or existing trigger), executing current pipeline definitions as the workspace MI."
+
+  # === 11b) Spark Livy direct submission via REST API ==========================
+  - id: azure-synapse-spark-livy-submit
+    emits: CanTrigger
+    description: "Synapse Compute Operator can submit Spark batch jobs and interactive sessions directly via the Apache Livy REST API endpoint at <workspace>.dev.azuresynapse.net/livyApi/..., triggering immediate job execution."
+    match:
+      - [ ?principal, HasRole, "<Synapse Compute Operator role on workspace>" ]
+    where:
+      - "Synapse RBAC role: Synapse Compute Operator or Synapse Administrator at workspace scope"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Spark pool (bigDataPool)>"
+      permissions: ["Synapse RBAC: Synapse Compute Operator"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when at least one Spark pool exists in the workspace; CONDITIONAL(service_state)
+        when no pool is configured or all pools are in a state that cannot accept new sessions.
+        Livy job submission is a trigger/invoke pattern distinct from generic CanExecuteCommand
+        because it operates at the Livy endpoint level (HTTP REST invocation, not platform
+        command execution). CanTrigger feeds cicd-chains cicd-trigger-runner-executes-as for
+        the CanExecuteAs roll-up.
+      false_positive_note: >-
+        Synapse Compute Operator is a data-plane role, separate from Azure RBAC. Livy is
+        the only Spark job submission API for Synapse pools; the endpoint is at the
+        workspace's development endpoint, not a separate resource. See also
+        azure-synapse-spark-submit-job (CanExecuteCommand) for command execution semantics.
+      derived_from: []
+      note: >-
+        This rule emits CanTrigger (job submission = triggering execution) distinct from
+        CanExecuteCommand. Both are capabilities of Synapse Compute Operator but serve
+        different purposes: CanTrigger feeds cicd-chains linchpin cicd-trigger-runner-executes-as
+        (trigger + ExecutesAs -> CanExecuteAs), while CanExecuteCommand feeds can-execute-as
+        execute-as-via-command (which does NOT apply to AnalyticsService). The separation
+        allows for proper path-cost weighting in attack-path analysis.
+      narrative: "{principal.name} has Synapse Compute Operator; can submit Spark batch jobs or interactive sessions directly via the Livy REST API, triggering immediate execution on Spark pool {target.name} as the workspace MI."
+
+  # === 12) Schedule creation (pipeline triggers) ==============================
+  - id: azure-synapse-create-trigger
+    emits: CanSchedule
+    description: "Synapse Artifact Publisher role allows creating schedule/event/tumbling-window triggers that repeatedly run pipelines — persistence mechanism for code execution as the workspace MI."
+    match:
+      - [ ?principal, HasRole, "<Synapse Artifact Publisher role on workspace>" ]
+    where:
+      - "Synapse RBAC role: Synapse Artifact Publisher at workspace scope"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Synapse workspace (Scheduler)>"
+      permissions: ["Synapse RBAC: Synapse Artifact Publisher"]
+      conditions: [trigger_exists, service_state]
+      false_positive_note: >-
+        CanSchedule is a persistence/trigger-creation edge. The pipeline the trigger
+        invokes must exist and be published; CanSchedule alone does not create code
+        execution — it arms a trigger that feeds into CanTrigger -> CanExecuteAs (via
+        cicd-chains). Emit CONDITIONAL(trigger_exists) if no pipeline is yet published.
+      narrative: "{principal.name} has Synapse Artifact Publisher; can create recurring schedule/event triggers in Synapse workspace {target.name}, establishing persistent pipeline execution as the workspace MI."
+
+  # === 13) Dedicated SQL pool data read (Synapse Administrator) ==============
+  - id: azure-synapse-sql-pool-data-read
+    emits: CanReadData
+    description: "Synapse Administrator (or db_owner in the dedicated SQL pool) can query all data in the dedicated SQL pool."
+    match:
+      - [ ?principal, HasRole, "<Synapse Administrator role on workspace>" ]
+    where:
+      - "Synapse RBAC role: Synapse Administrator at workspace scope — grants db_owner on all dedicated SQL pools"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<dedicated SQL pool (DataWarehouse)>"
+      permissions: ["Synapse RBAC: Synapse Administrator (db_owner on dedicated SQL pool)"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the dedicated SQL pool is in Running state; CONDITIONAL(service_state)
+        when the pool is paused. Synapse Administrator automatically has db_owner; other
+        principals require an explicit SQL role grant by the db_owner. SQL-level role grants
+        are collected from the SQL plane, not ARM.
+      false_positive_note: >-
+        SQL access requires the pool to be Running (not Paused). Synapse Administrator
+        grants implicit db_owner on the dedicated pool, but SQL authentication also
+        requires either AAD login (via Azure AD admin) or SQL login — if
+        azureADOnlyAuthentications is enabled, SQL auth is blocked. The CanReadData
+        edge here covers the authorization side; network access (VNet/private endpoint
+        firewall) is a separate condition.
+      narrative: "{principal.name} has Synapse Administrator role; has db_owner on dedicated SQL pool {target.name} and can read all data via SQL queries."
+
+  # === 13b) Dedicated SQL pool data read (SQL Administrator) ==================
+  - id: azure-synapse-sql-admin-data-read
+    emits: CanReadData
+    description: "Synapse SQL Administrator (distinct from Synapse Administrator) grants SQL-admin (db_owner) on ALL dedicated SQL pools — a legitimate, narrowly-scoped role for SQL DBAs."
+    match:
+      - [ ?principal, HasRole, "<Synapse SQL Administrator role on workspace>" ]
+    where:
+      - "Synapse RBAC role: Synapse SQL Administrator at workspace scope — grants db_owner on all dedicated SQL pools only"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<dedicated SQL pool (DataWarehouse)>"
+      permissions: ["Synapse RBAC: Synapse SQL Administrator (db_owner on dedicated SQL pool)"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the dedicated SQL pool is in Running state; CONDITIONAL(service_state)
+        when the pool is paused. Synapse SQL Administrator is a SQL-only role; it does NOT
+        grant Synapse RBAC data-plane access to pipelines, Spark pools, linked services, or
+        other workspace artifacts — only SQL db_owner on dedicated pools.
+      false_positive_note: >-
+        Synapse SQL Administrator is DISTINCT from Synapse Administrator. SQL Admin has
+        narrower scope: db_owner on SQL pools only, no other Synapse privileges. Do NOT
+        equate with Synapse Administrator. SQL access requires the pool to be Running and
+        either AAD or SQL authentication via the AAD admin (if azureADOnlyAuthentications
+        is enabled, SQL auth is blocked). Network access (firewall/private endpoint) is
+        a separate condition.
+      narrative: "{principal.name} has Synapse SQL Administrator role; has db_owner on dedicated SQL pool {target.name} and can read all data via SQL queries."
+
+  # === 14) Serverless SQL pool data read (ADLS via OPENROWSET) ================
+  - id: azure-synapse-serverless-sql-data-read
+    emits: CanReadData
+    description: "Serverless SQL pool allows querying ADLS Gen2 files directly via OPENROWSET; Synapse Administrator has db_owner (dbo) on the built-in serverless pool and can read any data the workspace MI can reach."
+    match:
+      - [ ?principal, HasRole, "<Synapse Administrator role on workspace>" ]
+    where:
+      - "Synapse RBAC role: Synapse Administrator — grants dbo on serverless SQL pool 'Built-in'"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<workspace ADLS Gen2 storage (DataLake)>"
+      permissions: ["Synapse RBAC: Synapse Administrator (dbo on serverless SQL pool)"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        ACTIVE when the workspace has access to the ADLS Gen2 workspace storage account
+        (Storage Blob Data Contributor is granted to the workspace MI by default). Other
+        ADLS paths are CONDITIONAL(iam_permission) on whether the workspace MI holds the
+        appropriate RBAC on those paths. Serverless pool is always available (serverless,
+        no pause state).
+      false_positive_note: >-
+        Serverless SQL pool scope is governed by what the OPENROWSET caller can access in
+        storage (either via the workspace MI's permissions or via explicit storage
+        credentials). Synapse Administrator's dbo grants SQL-level access; the actual
+        data returned is filtered by storage ACLs on the files. Do not over-claim scope
+        to storage the workspace MI cannot reach.
+      narrative: "{principal.name} has Synapse Administrator role; has dbo on the serverless SQL pool and can query ADLS Gen2 data via OPENROWSET on any path the workspace MI holds Storage Blob Data Reader or greater."
+
+  # === 15) Serverless SQL CETAS data exfiltration =============================
+  - id: azure-synapse-serverless-cetas-exfiltrate
+    emits: CanExfiltrate
+    description: "CREATE EXTERNAL TABLE AS SELECT (CETAS) on the serverless SQL pool exports query results to an external storage location; if the workspace MI holds write access on attacker-controlled storage, data is exfiltrated."
+    match:
+      - [ ?principal, CanReadData, ?datastore ]
+      - [ ?workspace, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?workspace) == AnalyticsService"
+      - "?principal can execute CETAS via serverless SQL pool (Synapse Administrator or db_owner on Built-in pool)"
+      - "?mi holds Storage Blob Data Contributor (or write equivalent) on an attacker-accessible external storage"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<source datastore queried by CETAS>"
+      permissions: ["Synapse RBAC: Synapse Administrator (CETAS on serverless pool)", "workspace MI Storage Blob Data Contributor on target"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        ACTIVE when (a) the principal can run CETAS on the serverless pool AND (b) the
+        workspace MI holds write on the target external location. CONDITIONAL(iam_permission)
+        when the target storage write permission is unknown. If Managed VNet exfiltration
+        protection is enabled, outbound to external storage is BLOCKED unless the target
+        is an approved managed private endpoint.
+      derived_from: [ "?principal CanReadData ?datastore", "?workspace ExecutesAs ?mi" ]
+      false_positive_note: >-
+        The CETAS write is performed by the workspace MI, not the submitting principal
+        directly; the workspace MI must hold write on the destination. With exfiltration
+        protection (managed VNet + data-exfiltration prevention enabled), arbitrary
+        external write is blocked. Do NOT emit ACTIVE when exfiltration protection is on
+        without confirming the target is an approved endpoint.
+      narrative: "{principal.name} can execute CETAS on the serverless SQL pool in workspace {workspace.name} to export query results from {datastore.name} to an external storage location (written by the workspace MI {mi.name})."
+
+  # === 16) Workspace endpoint public exposure ==================================
+  - id: azure-synapse-endpoints-public
+    emits: ExposedToInternet
+    description: "Synapse workspace development, SQL, and Spark endpoints are public-internet reachable when publicNetworkAccess is Enabled and no private-endpoint-only restriction is applied."
+    match:
+      - [ ?workspace, LocatedIn, ?rg ]
+    where:
+      - "node_type(?workspace) == AnalyticsService"
+      - "provider_type(?workspace) == 'Microsoft.Synapse/workspaces'"
+      - "?workspace.properties.publicNetworkAccess == Enabled"
+      - "NOT (private-endpoint-only firewall restriction on all relevant endpoints)"
+    emit:
+      source_type: Data
+      target_type: AnonymousIdentity
+      source: "<Synapse workspace>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when publicNetworkAccess == Enabled with no firewall restriction narrowing
+        to specific IP ranges (or the range includes 0.0.0.0/0). Authentication is still
+        required (no anonymous access), but the network surface is public — ExposedToInternet
+        models the network reachability exposure, not anonymous data access.
+        CONDITIONAL(network_reachability) when IP firewall rules are configured but broad;
+        BLOCKED when publicNetworkAccess == Disabled (private endpoint only).
+      false_positive_note: >-
+        ExposedToInternet here models the NETWORK SURFACE — the workspace endpoints are
+        reachable from the public internet. It does NOT imply anonymous data access;
+        authentication is still enforced. Emit even when auth is required: the internet
+        exposure is the finding (attack surface = public endpoint, enabling credential
+        stuffing, brute force, and future unauthenticated exploits).
+      narrative: "Synapse workspace {workspace.name} exposes its development/SQL/Spark endpoints to the public internet (publicNetworkAccess Enabled); authentication is required but the surface is internet-reachable."
+
+  # === 17) Synapse Admin grants workspace AAD admin ===========================
+  - id: azure-synapse-set-aad-admin
+    emits: CanGrantPermission
+    description: "workspaces/administrators/write allows setting the AAD administrator on the workspace, effectively granting that principal Synapse Administrator-equivalent data-plane access."
+    match_effective_permission:
+      action: "Microsoft.Synapse/workspaces/administrators/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<workspace AAD administrator (any principal)>"
+      permissions: ["Microsoft.Synapse/workspaces/administrators/write"]
+      false_positive_note: >-
+        workspaces/administrators/write is an ARM action; it sets the AAD admin for the
+        workspace, which is a Synapse data-plane privilege (Synapse Administrator). The
+        principal can use this to add themselves or another principal as workspace admin,
+        yielding full Synapse RBAC access. This is a CanGrantPermission because it grants
+        data-plane privilege to an arbitrary identity.
+      narrative: "{principal.name} can set the AAD administrator on Synapse workspace {workspace.name} (workspaces/administrators/write), effectively granting any principal Synapse Administrator data-plane access."
+
+  # === 18) Derived: Spark job submission -> execute as workspace MI ============
+  # SYNAPSE-SPECIFIC: Direct Spark batch job submission via Livy API combines
+  # CanExecuteCommand (submit job) + ExecutesAs (runs as workspace MI) into CanExecuteAs.
+  # The generic linchpin can-execute-as.yaml execute-as-via-command checks
+  # node_class(?compute) == Compute; AnalyticsService is Data class, so the linchpin
+  # does NOT fire for Synapse Spark pools. This rule is the authoritative emitter.
+  - id: azure-synapse-execute-as-via-spark-submit
+    emits: CanExecuteAs
+    description: "Synapse Compute Operator submits a Spark batch job via Livy API (CanExecuteCommand) + Spark pool runs as workspace MI (ExecutesAs) => execute attacker code as the workspace MI."
+    match:
+      - [ ?principal, CanExecuteCommand, ?sparkPool ]
+      - [ ?workspace, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?sparkPool) == AnalyticsService"
+      - "node_type(?workspace) == AnalyticsService"
+      - "node_type(?mi) == ManagedIdentity"
+      - "?sparkPool.provider_type == 'Microsoft.Synapse/workspaces/bigDataPools' OR ?sparkPool is the workspace itself"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<workspace managed identity>"
+      permissions: ["Synapse RBAC: Synapse Compute Operator"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE: CanExecuteCommand means the principal has already submitted the Spark job.
+        The job runs on Spark workers executing as the workspace MI. Execution is immediate
+        (batch jobs start processing right away). Inherit condition from CanExecuteCommand.
+      derived_from: [ "<CanExecuteCommand edge_id>", "<ExecutesAs edge_id>" ]
+      note: >-
+        The generic linchpin can-execute-as.yaml execute-as-via-command does NOT apply here
+        because it checks node_class(?compute) == Compute; AnalyticsService is Data class.
+        This rule is the sole authoritative emitter of CanExecuteAs for the Livy Spark submit
+        path and must not be deduped with the generic linchpin — there is no deduplication.
+        The CanExecuteAs roll-up to CanEscalateTo is can-control.yaml escalate-via-execute-as
+        — CITE, DO NOT re-derive.
+      false_positive_note: >-
+        The principal must hold CanExecuteCommand (Synapse Compute Operator role or higher)
+        to reach this rule. The privilege-level guard ensures the workspace MI's privilege
+        exceeds the principal's (escalation condition). Deny assignment on Synapse RBAC
+        roles -> BLOCKED.
+      narrative: "{principal.name} has Synapse Compute Operator; submitted a Spark batch job to pool {sparkPool.name} (Livy API), which executes on Spark workers running as workspace MI {mi.name}."
+
+  # === 19) Derived: library injection -> execute as workspace MI ==============
+  # EMITS CanExecuteAs here to provide the Synapse-specific narrative; dedupes
+  # with can-execute-as.yaml execute-as-via-code-modify on (CanExecuteAs, principal, MI).
+  - id: azure-synapse-execute-as-via-library
+    emits: CanExecuteAs
+    description: "Upload malicious library to a Spark pool (CanModifyCode) + the pool runs as the workspace MI (ExecutesAs) => execute code as the workspace MI. Cites can-execute-as.yaml execute-as-via-code-modify."
+    match:
+      - [ ?principal, CanModifyCode, ?sparkPool ]
+      - [ ?workspace, ExecutesAs, ?mi ]
+      - [ ?workspace, Contains, ?sparkPool ]
+    where:
+      - "node_type(?sparkPool) == AnalyticsService"
+      - "node_type(?workspace) == AnalyticsService"
+      - "?mi.privilege_level >= ?principal.privilege_level  # escalation condition"
+    optional:
+      - [ ?principal, CanExecuteCommand, ?sparkPool ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<workspace managed identity>"
+      permissions: ["Microsoft.Synapse/workspaces/bigDataPools/write"]
+      conditions: [trigger_exists]
+      state_logic: >-
+        ACTIVE if a run path exists (matched(optional[0]) — the principal can submit a
+        Spark job — OR an existing trigger/scheduled session will run the pool); else
+        CONDITIONAL(trigger_exists) — the malicious library is uploaded but awaits a job.
+        Inherit weakest: if CanModifyCode is CONDITIONAL(service_state), this edge inherits
+        that condition. If ?mi.privilege_level <= ?principal.privilege_level, do not emit.
+      derived_from: [ "<CanModifyCode edge_id>", "<ExecutesAs edge_id>", "<Contains edge_id>", "<CanExecuteCommand edge_id?>" ]
+      note: >-
+        CITES can-execute-as.yaml execute-as-via-code-modify. Dedupes on (CanExecuteAs,
+        ?principal, ?mi) — do not double-count weight when the generic rule also fires.
+        The generic linchpin execute-as-via-code-modify does NOT apply here because it checks
+        node_class(?compute) == Compute; AnalyticsService is Data class. This rule is the
+        sole authoritative emitter for the library-injection path; there is no deduplication
+        with the generic linchpin. The match clause includes [ ?workspace, Contains, ?sparkPool ]
+        to formalize the parent-child relationship; this is a structural edge (not walked for
+        attack paths) but required to properly bind ?workspace from the CanModifyCode match.
+        The escalation roll-up (CanEscalateTo) is can-control.yaml escalate-via-execute-as
+        — CITE, DO NOT re-derive.
+      false_positive_note: >-
+        Emit only when the workspace MI out-privileges the principal (where guard). A Spark
+        pool with NO workspace MI yields no token loot; verify ExecutesAs exists. The library
+        executes only when a Spark session starts on the pool — ensure a trigger path exists
+        for ACTIVE. Deny assignment on bigDataPools/write -> CanModifyCode is BLOCKED ->
+        this edge is BLOCKED.
+      narrative: "{principal.name} can upload a malicious library to Spark pool {sparkPool.name} (bigDataPools/write), which runs on Spark workers executing as workspace MI {mi.name}; triggering a session executes the library as {mi.name}."
+
+  # === 20) Derived: pipeline publish + trigger -> execute as workspace MI ====
+  # Synapse-specific framing of cicd-chains cicd-modify-buildspec-executes-as.
+  - id: azure-synapse-execute-as-via-pipeline
+    emits: CanExecuteAs
+    description: "Publish a pipeline with attacker code (CanModifyCode on workspace) + trigger it (CanTrigger) + workspace ExecutesAs MI => execute as workspace MI. Cites cicd-chains.yaml cicd-modify-buildspec-executes-as and can-execute-as.yaml."
+    match:
+      - [ ?principal, CanModifyCode, ?workspace ]
+      - [ ?principal, CanTrigger, ?workspace ]
+      - [ ?workspace, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?workspace) == AnalyticsService"
+      - "node_type(?mi) == ManagedIdentity"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<workspace managed identity>"
+      permissions: ["Synapse RBAC: Synapse Artifact Publisher", "Synapse RBAC: Synapse Compute Operator"]
+      conditions: []
+      state_logic: >-
+        ACTIVE: principal can both publish (CanModifyCode) and trigger (CanTrigger) the
+        pipeline, so the full modify+run chain is closed. Inherit weakest from CanModifyCode
+        and CanTrigger contributors. If principal only has CanModifyCode but NOT CanTrigger,
+        CONDITIONAL(trigger_exists) — see cicd-chains rule 1. If principal only has CanTrigger
+        but NOT CanModifyCode, CONDITIONAL(attacker_influenced_definition) — see cicd-chains
+        rule 2.
+      derived_from: [ "<CanModifyCode edge_id>", "<CanTrigger edge_id>", "<ExecutesAs edge_id>" ]
+      note: >-
+        CITES cicd-chains.yaml cicd-modify-buildspec-executes-as (rule 1). The generic linchpin
+        does NOT apply here because it checks node_class(?compute) == Compute; AnalyticsService
+        is Data class. This rule is the sole authoritative emitter for the pipeline-modification
+        path; there is no deduplication with the generic linchpin. Dedupes on (CanExecuteAs,
+        ?principal, ?mi). The escalation roll-up is can-control.yaml escalate-via-execute-as
+        — CITE, DO NOT re-derive.
+      false_positive_note: >-
+        Requires BOTH publish AND trigger roles; if only one is held, downgrade state as
+        above. The Synapse RBAC roles are independent of Azure RBAC. Verify that Managed
+        VNet exfiltration protection does not block the pipeline's outbound calls (does not
+        affect execution-as-MI). Deny assignments on Synapse workspaces -> BLOCKED.
+      narrative: "{principal.name} can publish attacker-controlled pipeline code to Synapse workspace {workspace.name} (Artifact Publisher) and trigger it (Compute Operator), executing as workspace MI {mi.name}."
+
+  # === 21) Configuration write: integration runtime write =====================
+  - id: azure-synapse-ir-write-config
+    emits: CanModifyConfiguration
+    description: "integrationRuntimes/write allows creating or updating integration runtimes; self-hosted IR configuration can point to attacker-controlled infrastructure, causing all pipeline activities routed through that IR to execute on attacker infrastructure."
+    match_effective_permission:
+      action: "Microsoft.Synapse/workspaces/integrationRuntimes/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<integration runtime (self-hosted)>"
+      permissions: ["Microsoft.Synapse/workspaces/integrationRuntimes/write"]
+      conditions: [service_state]
+      state_logic: >-
+        CONDITIONAL(service_state): the attacker can rewrite an integration runtime's
+        configuration (connection string, authentication type, node list). For self-hosted IR,
+        configuration points to attacker-controlled nodes → pipeline activities routed
+        through that IR run on attacker infrastructure. The IR must exist and a pipeline
+        must be configured to use the IR and be triggered for execution. This is a
+        configuration modification, not immediate execution.
+      false_positive_note: >-
+        Only applies to self-hosted integration runtimes (IR type == 'SelfHosted'). Azure-hosted
+        and AutoResolve IRs cannot be redirected to attacker infrastructure. Applicable only
+        when a self-hosted IR exists in the workspace AND pipelines are configured to route
+        through it. See also azure-synapse-ir-listkeys for credential theft via IR auth keys.
+      narrative: "{principal.name} can modify integration runtime configuration (Microsoft.Synapse/workspaces/integrationRuntimes/write); a self-hosted IR can be pointed to attacker-controlled infrastructure, causing pipeline activities to execute on that infrastructure."
+
+  # === 22) Derived: IR key -> register self-hosted IR -> pipeline execution ===
+  - id: azure-synapse-execute-as-via-ir-key
+    emits: CanExecuteAs
+    description: "Retrieve IR auth key (CanReadSecret) + register a self-hosted IR node the attacker controls -> that node executes pipeline activities as the workspace MI. No generic linchpin covers this path; rule is Synapse-specific."
+    match:
+      - [ ?principal, CanReadSecret, ?irKey ]
+      - [ ?workspace, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?irKey) == Credential  # IR auth key"
+      - "?irKey belongs to an integration runtime in ?workspace"
+      - "node_type(?workspace) == AnalyticsService"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<workspace managed identity>"
+      permissions: ["Microsoft.Synapse/workspaces/integrationRuntimes/listAuthKeys/action"]
+      conditions: [service_state]
+      state_logic: >-
+        CONDITIONAL(service_state): the attacker must register an IR node with the stolen
+        key AND a pipeline must be triggered that routes through that IR. If the IR already
+        has a trigger/scheduled pipeline using it, ACTIVE once the node is registered.
+        Requires the self-hosted IR to accept the new node registration (node registration
+        is gated by IR admin settings).
+      derived_from: [ "<CanReadSecret edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: >-
+        This path requires the attacker to control a machine that can run the self-hosted
+        IR agent and register it with the stolen key. It is CONDITIONAL by default because
+        that external step is not observable from Azure API data. Only emit ACTIVE if
+        evidence of an existing attacker-controlled IR node is confirmed (out of band).
+        Only applicable for workspaces with self-hosted IR (not Azure-hosted AutoResolve IR).
+      narrative: "{principal.name} retrieved IR auth key for integration runtime in workspace {workspace.name} (listAuthKeys/action); by registering an attacker-controlled self-hosted IR node, pipeline activities executing on that IR run as workspace MI {mi.name}."
+
+  # === 23) Derived: create workload as via attach MI ===========================
+  - id: azure-synapse-create-workload-as-via-attach-mi
+    emits: CanCreateWorkloadAs
+    description: "Attach a privileged user-assigned MI to the workspace (CanAttachIdentity) + workspace gains a new ExecutesAs target -> all Spark/pipeline runs can mint tokens for the attached MI."
+    match:
+      - [ ?principal, CanAttachIdentity, ?workspace ]
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "node_type(?workspace) == AnalyticsService  # Synapse workspace"
+      - "node_type(?userMI) == ManagedIdentity"
+      - "?userMI.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Synapse/workspaces/write"]
+      conditions: [role_compatibility, service_state]
+      derived_from: [ "<CanAttachIdentity edge_id>" ]
+      note: >-
+        CITES can-execute-as.yaml execute-as-via-new-workload for the CanExecuteAs
+        roll-up off this CanCreateWorkloadAs edge. The workspace becomes a "new workload"
+        running as the privileged MI after the attachment. The second match clause
+        [ ?principal, CanPassIdentity, ?userMI ] binds the user-assigned MI; this
+        prerequisite is already required by azure-synapse-attach-user-mi rule 5.
+      false_positive_note: >-
+        Requires assign/action on the user-assigned MI AND workspaces/write — both are
+        required (azure-synapse-attach-user-mi). The new MI becomes an ExecutesAs target
+        on the NEXT session start (not retroactive). Honor the assign/action resource
+        scope. Escalation only when the attached MI out-privileges the principal.
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to Synapse workspace {workspace.name}; all subsequent Spark jobs and pipeline runs mint tokens for {userMI.name}, effectively creating workloads running as that higher-privilege identity."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An Azure deny assignment (Blueprint / Managed App) over workspaces/write,
+#     bigDataPools/write, or integrationRuntimes/listAuthKeys/action -> the
+#     corresponding CanModifyCode / CanAdminister / CanReadSecret is BLOCKED;
+#     downstream CanExecuteAs inherits BLOCKED.
+#   - workspaces/azureADOnlyAuthentications enabled -> SQL-auth CanReadData paths
+#     for dedicated SQL pools are BLOCKED (SQL login auth fails; AAD auth still works).
+#   - Managed VNet with exfiltration protection enabled -> CanExfiltrate to
+#     non-approved external storage is BLOCKED.
+#   - publicNetworkAccess == Disabled -> azure-synapse-endpoints-public is BLOCKED.
+#   - A correctly scoped and pinned Synapse RBAC grant (workspace-level only, not
+#     subscription) does NOT yield CanEnterSubscription unless the workspace MI holds
+#     subscription-scope RBAC on its own.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service belong in
+# /rules/explicit/azure-synapse.yaml. Key explicit edges:
+explicit_rules:
+
+  - id: azure-synapse-workspace-executes-as-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    source_config: {resource_type: "Microsoft.Synapse/workspaces", field: "identity"}
+    where:
+      - "identity.type == SystemAssigned OR UserAssigned"
+    emit:
+      source: "<Synapse workspace>"
+      target: "<workspace managed identity (system-assigned principalId or user-assigned MI id)>"
+      api_source: "az synapse workspace show"
+      evidence_field: "identity.principalId / identity.userAssignedIdentities"
+      note: >-
+        System-assigned: identity.principalId is the workspace MI object ID in Entra.
+        User-assigned: identity.userAssignedIdentities map keys are the user MI resource IDs.
+        All Spark jobs, pipelines, and notebook batch runs execute as these identities.
+      narrative: "Synapse workspace {workspace.name} runs as managed identity {mi.name} (all Spark pools, pipelines, and notebooks execute under this identity)."
+
+  - id: azure-synapse-workspace-contains-sparkpool
+    emits: Contains
+    applies_to: [azure]
+    source_config: {resource_type: "Microsoft.Synapse/workspaces/bigDataPools", field: "id"}
+    emit:
+      source_type: AnalyticsService
+      target_type: AnalyticsService
+      source: "<Synapse workspace>"
+      target: "<Spark pool (bigDataPool)>"
+      api_source: "az synapse spark pool list"
+      evidence_field: "id"
+      narrative: "Synapse workspace {workspace.name} contains Spark pool {pool.name}."
+
+  - id: azure-synapse-workspace-contains-sqlpool
+    emits: Contains
+    applies_to: [azure]
+    source_config: {resource_type: "Microsoft.Synapse/workspaces/sqlPools", field: "id"}
+    emit:
+      source_type: AnalyticsService
+      target_type: DataWarehouse
+      source: "<Synapse workspace>"
+      target: "<dedicated SQL pool>"
+      api_source: "az synapse sql pool list"
+      evidence_field: "id"
+      narrative: "Synapse workspace {workspace.name} contains dedicated SQL pool {pool.name}."
+
+  - id: azure-synapse-linkedservice-contains-credential
+    emits: ContainsSecret
+    applies_to: [azure]
+    source_config: {resource_type: "Microsoft.Synapse/workspaces/linkedServices", field: "properties.typeProperties"}
+    where:
+      - "authentication type is NOT ManagedIdentity — contains connectionString / password / accountKey / sasUri"
+    emit:
+      source_type: Data
+      target_type: Secret
+      source: "<linked service node (ConnectionString type)>"
+      target: "<embedded credential blob (password, connection string, account key)>"
+      api_source: "GET <workspace>.dev.azuresynapse.net/linkedservices (requires Synapse RBAC)"
+      evidence_field: "properties.typeProperties.connectionString / password / accountKey / sasUri"
+      schema_note: >-
+        This rule was previously emitting ContainsCredential with source_type defaulting to the
+        linked service's native type (ConnectionString/Secret). ContainsCredential source constraint
+        is [Storage, Data, Compute, Messaging]; ConnectionString is not in that set. The target
+        was also a literal 'embedded ConnectionString / AccessKey', which is not a valid
+        ContainsCredential target (allows only [Credential, AccessKey, Token]). Changed to
+        ContainsSecret (source: [Storage, Data, Compute, Messaging] — same constraint, semantically
+        more precise for a connection-string blob). The emitting source is still the linked service
+        (Data class), and the target is the credential material (Secret class).
+      narrative: "Linked service {linkedService.name} in Synapse workspace {workspace.name} contains an embedded credential (connectionString / password / accountKey)."

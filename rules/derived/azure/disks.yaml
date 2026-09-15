@@ -1,0 +1,479 @@
+# Azure Managed Disks — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Resource provider: Microsoft.Compute/disks + Microsoft.Compute/snapshots
+# Reference: https://learn.microsoft.com/azure/virtual-machines/managed-disks-overview
+#            https://learn.microsoft.com/azure/virtual-machines/windows/download-vhd
+#            https://learn.microsoft.com/en-us/azure/role-based-access-control/resource-provider-operations#microsoftcompute
+#
+# Headline attack: Microsoft.Compute/disks/beginGetAccess/action mints a
+# time-limited anonymous HTTPS download URL for the full disk VHD. No OS
+# credential, no network path to the VM required — a pure control-plane action
+# that becomes data-plane exfiltration. Snapshot export is the same primitive
+# (Microsoft.Compute/snapshots/beginGetAccess/action).
+#
+# CMK (customer-managed key) gate: when encryption.type ==
+# EncryptionAtRestWithCustomerKey the downloaded VHD blob is ciphertext; the
+# CanReadData / ExposesCredential edges are CONDITIONAL(key_permission) until
+# the decrypt-gates-secret-read rule in credential-chains.yaml upgrades them.
+# Cite credential-chains.yaml for the ContainsSecret -> CredentialsFor ->
+# CanImpersonate roll-up; cite can-control.yaml for the CanEscalateTo objective.
+#
+# Network-access-policy gating:
+#   AllowAll (default) => SAS URL internet-routable => exfil edges ACTIVE
+#   AllowPrivate (DiskAccess PE) => SAS URL VNet-scoped => CONDITIONAL(network_reachability)
+#   DenyAll => beginGetAccess call fails at ARM => emit BLOCKED
+#
+# Explicit normalization (ContainsSecret, AttachedTo, LocatedIn) lives in
+# /rules/explicit/azure-disks.yaml (see explicitPath in the output).
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 6-storage-databases
+applies_to: [azure]
+
+rules:
+
+  # =========================================================================
+  # SECTION 1 — Administrative control
+  # =========================================================================
+
+
+  # =========================================================================
+  # SECTION 2 — SAS export (headline exfiltration path)
+  # =========================================================================
+
+  - id: azure-disk-sas-export-active
+    emits: CanExfiltrate
+    description: >-
+      beginGetAccess/action on a disk with AllowAll (default) network access policy
+      mints an internet-routable anonymous SAS download URL for the full VHD.
+    match_effective_permission:
+      action: "Microsoft.Compute/disks/beginGetAccess/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "disk.networkAccessPolicy in [AllowAll, null/unset]"
+    emit:
+      source_type: Identity
+      target_type: BlockStorage
+      source: "<principal>"
+      target: "<managed disk>"
+      permissions: ["Microsoft.Compute/disks/beginGetAccess/action"]
+      conditions: []
+      state_logic: >-
+        ACTIVE: SAS URL is internet-routable for the SAS duration (default 60 min to 24 h)
+        when disk.networkAccessPolicy is AllowAll (the default). Encryption does not block
+        the SAS download; it gates plaintext readability (see azure-disk-cmk-gated-read for
+        the CONDITIONAL(key_permission) branch).
+      confidence: 0.95
+      derived_from: ["HasPermission(principal, Microsoft.Compute/disks/beginGetAccess/action, disk)"]
+      false_positive_note: >-
+        This rule applies only when networkAccessPolicy is AllowAll or unset (the default).
+        CMK encryption does NOT prevent the SAS download from being minted or fetched;
+        the VHD is downloaded as encrypted blobs. Only the plaintext readability is
+        gated — model that via azure-disk-cmk-gated-read, not here.
+      narrative: >-
+        {principal.name} can call beginGetAccess/action on disk {target.name} (default
+        AllowAll network policy) to mint an internet-routable SAS download URL and copy
+        the entire VHD (including OS secrets such as SAM, NTDS.dit, SSH private keys,
+        or application credentials) to an external location with no OS credential.
+
+  - id: azure-disk-sas-export-conditional
+    emits: CanExfiltrate
+    description: >-
+      beginGetAccess/action on a disk with AllowPrivate network access policy
+      mints a SAS download URL accessible only via the private endpoint.
+    match_effective_permission:
+      action: "Microsoft.Compute/disks/beginGetAccess/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "disk.networkAccessPolicy == AllowPrivate"
+    emit:
+      source_type: Identity
+      target_type: BlockStorage
+      source: "<principal>"
+      target: "<managed disk>"
+      permissions: ["Microsoft.Compute/disks/beginGetAccess/action"]
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): SAS URL is scoped to the associated DiskAccess
+        private endpoint; attacker needs a foothold in the target VNet to fetch the URL.
+      confidence: 0.95
+      derived_from: ["HasPermission(principal, Microsoft.Compute/disks/beginGetAccess/action, disk)"]
+      false_positive_note: >-
+        networkAccessPolicy: AllowPrivate restricts the SAS URL to a private endpoint VNet.
+        Emit CONDITIONAL(network_reachability) unless attacker foothold in VNet is confirmed.
+        The permission scope must cover the specific disk resource (honor RG/sub inheritance
+        but also honor deny assignments scoped to the disk's RG or the disk).
+      narrative: >-
+        {principal.name} can call beginGetAccess/action on disk {target.name} (AllowPrivate
+        network policy) to mint a SAS download URL resolvable only via the private endpoint;
+        exfiltration requires network connectivity to the private endpoint's VNet.
+
+  - id: azure-snapshot-sas-export-active
+    emits: CanExfiltrate
+    description: >-
+      beginGetAccess/action on a snapshot with AllowAll (default) network access policy
+      mints an internet-routable anonymous SAS download URL.
+    match_effective_permission:
+      action: "Microsoft.Compute/snapshots/beginGetAccess/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "snapshot.networkAccessPolicy in [AllowAll, null/unset]"
+      - "snapshot.publicNetworkAccess != Disabled"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: "<principal>"
+      target: "<disk snapshot>"
+      permissions: ["Microsoft.Compute/snapshots/beginGetAccess/action"]
+      conditions: []
+      state_logic: >-
+        ACTIVE: SAS URL is internet-routable for the SAS duration when
+        snapshot.networkAccessPolicy is AllowAll/unset and publicNetworkAccess is not Disabled.
+      confidence: 0.95
+      derived_from: ["HasPermission(principal, Microsoft.Compute/snapshots/beginGetAccess/action, snapshot)"]
+      false_positive_note: >-
+        This rule applies only when networkAccessPolicy is AllowAll/unset (default) AND
+        publicNetworkAccess is not explicitly Disabled. Honor deny assignments on the
+        snapshot RG.
+      narrative: >-
+        {principal.name} can mint a SAS download URL for snapshot {target.name}
+        (snapshots/beginGetAccess/action, default AllowAll policy) and download the
+        point-in-time disk image to any external storage account or local machine.
+
+  - id: azure-snapshot-sas-export-conditional
+    emits: CanExfiltrate
+    description: >-
+      beginGetAccess/action on a snapshot with AllowPrivate network access policy
+      or publicNetworkAccess: Disabled mints a SAS URL accessible only via private endpoint.
+    match_effective_permission:
+      action: "Microsoft.Compute/snapshots/beginGetAccess/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "snapshot.networkAccessPolicy == AllowPrivate OR snapshot.publicNetworkAccess == Disabled"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: "<principal>"
+      target: "<disk snapshot>"
+      permissions: ["Microsoft.Compute/snapshots/beginGetAccess/action"]
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): SAS URL is scoped to private endpoint or
+        public access is disabled; attacker needs VNet connectivity to fetch the URL.
+      confidence: 0.95
+      derived_from: ["HasPermission(principal, Microsoft.Compute/snapshots/beginGetAccess/action, snapshot)"]
+      false_positive_note: >-
+        Applies when networkAccessPolicy is AllowPrivate OR publicNetworkAccess is
+        Disabled. Emit CONDITIONAL(network_reachability) unless attacker foothold in
+        the VNet is confirmed.
+      narrative: >-
+        {principal.name} can mint a SAS download URL for snapshot {target.name}
+        (snapshots/beginGetAccess/action, AllowPrivate or public access disabled);
+        exfiltration requires network connectivity to the private endpoint's VNet.
+
+  # =========================================================================
+  # SECTION 3 — CMK encryption gate on data readability
+  # =========================================================================
+
+  - id: azure-disk-cmk-gated-read
+    emits: CanReadData
+    description: >-
+      An attacker who can SAS-export a CMK-encrypted managed disk downloads encrypted VHD
+      blobs; plaintext read requires decrypt on the wrapping DES key (CONDITIONAL).
+      When the same principal also holds CanDecrypt on the DES Key Vault key the
+      decrypt-gates-secret-read rule in credential-chains.yaml upgrades to ACTIVE.
+    match:
+      - [ ?principal, CanExfiltrate, ?disk ]
+    where:
+      - "node_type(?disk) == BlockStorage"
+      - "?disk.encryption.type == EncryptionAtRestWithCustomerKey"
+      - "?disk.encryption.diskEncryptionSetId != null"
+    emit:
+      source_type: Identity
+      target_type: BlockStorage
+      source: ?principal
+      target: ?disk
+      permissions: ["Microsoft.Compute/disks/beginGetAccess/action"]
+      conditions: [key_permission]
+      state_logic: >-
+        CONDITIONAL(key_permission): the VHD download is feasible (CanExfiltrate ACTIVE)
+        but plaintext data is unavailable without decrypting the data-encryption key via
+        the DES's Key Vault key. The decrypt-gates-secret-read rule in
+        /rules/derived/credential-chains.yaml upgrades this to ACTIVE when the
+        same principal holds CanDecrypt on the wrapping EncryptionKey (DES key).
+        If CanExfiltrate is BLOCKED or CONDITIONAL(network_reachability), inherit that
+        state (weakest-contributor rule).
+      confidence: 0.80
+      derived_from: ["<CanExfiltrate edge_id for ?disk> (with disk.encryption.diskEncryptionSetId property linking to DES)"]
+      false_positive_note: >-
+        1) Platform-managed key (PMK) or server-side encryption with platform key
+           (EncryptionAtRestWithPlatformKey): Azure decrypts transparently; the caller
+           does NOT need Key Vault decrypt -> emit CanReadData as ACTIVE (no key gate).
+        2) EncryptionAtRestWithPlatformAndCustomerKeys (double encryption): both platform
+           and customer key must be satisfied; the key_permission gate still applies to
+           the CMK layer.
+        3) Do NOT emit CanReadData for a PMK-only disk; it is subsumed by CanExfiltrate.
+        4) If the DES is not linked (diskEncryptionSetId absent/null), do not emit this rule.
+        Cite credential-chains.yaml for the upgrade pattern.
+      narrative: >-
+        {principal.name} can download the VHD for disk {target.name} via SAS, but the
+        disk is CMK-encrypted (DES-wrapped Key Vault key); plaintext readability is gated
+        on holding Key Vault decrypt on the wrapping key
+        (CONDITIONAL(key_permission) — see decrypt-gates-secret-read in credential-chains.yaml).
+
+  - id: azure-snapshot-cmk-gated-read
+    emits: CanReadData
+    description: >-
+      An attacker who can SAS-export a CMK-encrypted snapshot downloads encrypted blobs;
+      plaintext read requires decrypt on the wrapping DES key (CONDITIONAL).
+      When the same principal also holds CanDecrypt on the DES Key Vault key the
+      decrypt-gates-secret-read rule in credential-chains.yaml upgrades to ACTIVE.
+    match:
+      - [ ?principal, CanExfiltrate, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?snapshot.encryption.type == EncryptionAtRestWithCustomerKey"
+      - "?snapshot.encryption.diskEncryptionSetId != null"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["Microsoft.Compute/snapshots/beginGetAccess/action"]
+      conditions: [key_permission]
+      state_logic: >-
+        CONDITIONAL(key_permission): the snapshot download is feasible (CanExfiltrate ACTIVE)
+        but plaintext data is unavailable without decrypting the data-encryption key via
+        the DES's Key Vault key. The decrypt-gates-secret-read rule in
+        /rules/derived/credential-chains.yaml upgrades this to ACTIVE when the
+        same principal holds CanDecrypt on the wrapping EncryptionKey (DES key).
+        If CanExfiltrate is BLOCKED or CONDITIONAL(network_reachability), inherit that
+        state (weakest-contributor rule).
+      confidence: 0.80
+      derived_from: ["<CanExfiltrate edge_id for ?snapshot> (with encryption.diskEncryptionSetId property linking to DES)"]
+      false_positive_note: >-
+        1) Platform-managed key (PMK): Azure decrypts transparently; no Key Vault decrypt needed.
+        2) EncryptionAtRestWithPlatformAndCustomerKeys (double encryption): both layers apply.
+        3) If the DES is not linked to the snapshot (encryption.diskEncryptionSetId absent/null), do not emit this rule.
+        Cite credential-chains.yaml for the upgrade pattern.
+      narrative: >-
+        {principal.name} can download the snapshot {target.name} via SAS, but the source
+        disk is CMK-encrypted (DES-wrapped Key Vault key); plaintext readability is gated
+        on holding Key Vault decrypt on the wrapping key
+        (CONDITIONAL(key_permission) — see decrypt-gates-secret-read in credential-chains.yaml).
+
+  - id: azure-disk-pmk-read-active
+    emits: CanReadData
+    description: >-
+      An attacker who can SAS-export a PMK-encrypted or unencrypted managed disk
+      can read the plaintext data immediately upon download (no key gate).
+    match:
+      - [ ?principal, CanExfiltrate, ?disk ]
+    where:
+      - "node_type(?disk) == BlockStorage"
+      - "?disk.encryption.type in [EncryptionAtRestWithPlatformKey, null/unset]"
+    emit:
+      source_type: Identity
+      target_type: BlockStorage
+      source: ?principal
+      target: ?disk
+      permissions: ["Microsoft.Compute/disks/beginGetAccess/action"]
+      conditions: []
+      state_logic: >-
+        ACTIVE: Platform-managed key (PMK) or unencrypted disks require no additional
+        decrypt gate. Azure's platform transparently decrypts the data upon download.
+        The CanExfiltrate edge is the only requirement; plaintext readability is immediate.
+      confidence: 0.95
+      derived_from: ["<CanExfiltrate edge_id for ?disk>"]
+      false_positive_note: >-
+        Applies ONLY to disks with encryption.type in [EncryptionAtRestWithPlatformKey, null/unset].
+        Do NOT emit for CMK-encrypted disks (use azure-disk-cmk-gated-read instead).
+        For EncryptionAtRestWithPlatformAndCustomerKeys (double encryption), use the CMK rule
+        which gates on the customer key layer.
+      narrative: >-
+        {principal.name} can download the VHD for disk {target.name} via SAS and read
+        the plaintext data immediately. The disk uses platform-managed encryption (PMK),
+        so Azure decrypts transparently without requiring customer key access.
+
+  - id: azure-snapshot-pmk-read-active
+    emits: CanReadData
+    description: >-
+      An attacker who can SAS-export a PMK-encrypted or unencrypted snapshot
+      can read the plaintext data immediately upon download (no key gate).
+    match:
+      - [ ?principal, CanExfiltrate, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?snapshot.encryption.type in [EncryptionAtRestWithPlatformKey, null/unset]"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["Microsoft.Compute/snapshots/beginGetAccess/action"]
+      conditions: []
+      state_logic: >-
+        ACTIVE: Platform-managed key (PMK) or unencrypted snapshots require no additional
+        decrypt gate. Azure's platform transparently decrypts the data upon download.
+        The CanExfiltrate edge is the only requirement; plaintext readability is immediate.
+      confidence: 0.95
+      derived_from: ["<CanExfiltrate edge_id for ?snapshot>"]
+      false_positive_note: >-
+        Applies ONLY to snapshots with encryption.type in [EncryptionAtRestWithPlatformKey, null/unset].
+        Do NOT emit for CMK-encrypted snapshots (use azure-snapshot-cmk-gated-read instead).
+      narrative: >-
+        {principal.name} can download snapshot {target.name} via SAS and read
+        the plaintext data immediately. The snapshot uses platform-managed encryption (PMK),
+        so Azure decrypts transparently without requiring customer key access.
+
+  # =========================================================================
+  # SECTION 4 — Secret containment and credential exposure
+  # =========================================================================
+
+  - id: azure-snapshot-contains-secret
+    emits: ContainsSecret
+    description: >-
+      A snapshot of an OS-type disk inherits the OS-disk ContainsSecret classification
+      when the source disk is identified.
+    match:
+      - [ ?disk, ContainsSecret, ?secret ]
+    where:
+      - "node_type(?disk) == BlockStorage"
+      - "?disk.osType in [Windows, Linux]"
+    emit:
+      source_type: Snapshot
+      target_type: Secret
+      source: "<snapshot created from ?disk>"
+      target: ?secret
+      permissions: []
+      state_logic: >-
+        ACTIVE when the source disk is identified as containing secrets.
+        Confidence equals source disk's ContainsSecret confidence (not amplified).
+      confidence: "inherit from source disk's ContainsSecret confidence"
+      derived_from: ["<disk.ContainsSecret edge_id>"]
+      false_positive_note: >-
+        Only emit when snapshot.creationData.sourceUri resolves to a disk with a known
+        OS type and an existing ContainsSecret edge. If the source disk is a pure data
+        disk (no osType), do not propagate unless there is additional evidence of
+        credential content.
+      narrative: >-
+        Snapshot {source.name} is a point-in-time copy of an OS disk; it inherits
+        the credential content of its source disk and is equally exploitable via SAS export.
+
+  - id: azure-disk-exposes-credential
+    emits: ExposesCredential
+    description: >-
+      A disk that can be SAS-exported and contains secrets exposes those credentials
+      as accessible to external parties. The state (ACTIVE vs CONDITIONAL) depends on
+      the CanExfiltrate edge state.
+    match:
+      - [ ?disk,      ContainsSecret, ?secret ]
+      - [ ?principal, CanExfiltrate,  ?disk   ]
+    where:
+      - "node_type(?disk) in [BlockStorage, Snapshot]"
+    emit:
+      source_type: Storage
+      target_type: Secret
+      source: ?disk
+      target: ?secret
+      permissions: ["Microsoft.Compute/disks/beginGetAccess/action (or snapshots/beginGetAccess/action)"]
+      state_logic: >-
+        ExposesCredential represents that the disk (Storage node) contains and can leak
+        the credential material. The state inherits from the contributing CanExfiltrate edge:
+        if CanExfiltrate(principal -> disk) is ACTIVE, then ExposesCredential is ACTIVE.
+        If CanExfiltrate is CONDITIONAL(network_reachability), then ExposesCredential is
+        CONDITIONAL(network_reachability). If the disk is CMK-encrypted and CanReadData is
+        CONDITIONAL(key_permission), the credential plaintext is unreachable without decrypt
+        (see credential-chains.yaml decrypt-gates-secret-read for the upgrade pattern).
+      confidence: "min(contributing_confidences)"
+      derived_from: ["<ContainsSecret edge_id>", "<CanExfiltrate edge_id>"]
+      false_positive_note: >-
+        ExposesCredential on a disk is a structural fact (disk contains & can leak cred).
+        Actual credential access requires CanExfiltrate(principal -> disk) present in the
+        path. Do not over-claim: ExposesCredential stops at the credential artifact;
+        actual impersonation requires an additional CredentialsFor explicit link
+        (credentials-chains.yaml read-secret-yields-identity).
+      narrative: >-
+        Disk {source.name} contains and can expose credential material ({target.name})
+        to any principal with SAS export access (CanExfiltrate).
+        See credential-chains.yaml for the CredentialsFor -> CanImpersonate chain.
+
+  # =========================================================================
+  # SECTION 6 — DES rekey escalation (CMK re-wrap on VM lifecycle)
+  # =========================================================================
+
+  - id: azure-disk-des-rekey-escalation
+    emits: CanReadData
+    description: >-
+      A principal with CanModifyConfiguration(DES) can upgrade a CONDITIONAL(key_permission)
+      CanReadData edge to ACTIVE by pointing the DES at an attacker-controlled Key Vault
+      key and triggering VM lifecycle (re-encrypt under attacker key on next attach/detach).
+    match:
+      - [ ?principal, CanModifyConfiguration, ?des ]
+      - [ ?principal, CanExfiltrate,        ?disk ]
+    where:
+      - "node_type(?des) == EncryptionKey"
+      - "node_type(?disk) in [BlockStorage, Snapshot]"
+      - "?disk.encryption.type == EncryptionAtRestWithCustomerKey"
+      - "?disk.encryption.diskEncryptionSetId == ?des.id"
+    emit:
+      source_type: Identity
+      target_type: BlockStorage
+      source: ?principal
+      target: ?disk
+      permissions: ["Microsoft.Compute/diskEncryptionSets/write", "Microsoft.Compute/disks/beginGetAccess/action"]
+      conditions: [service_state]
+      state_logic: >-
+        CONDITIONAL(service_state): The attacker has CanModifyConfiguration(DES) and
+        CanExfiltrate(disk). By repointing the DES to an attacker-controlled Key Vault
+        key, the next VM lifecycle event re-wraps the DEK under the attacker's key,
+        enabling decryption of the SAS-exported VHD. The condition is that the VM must
+        be running and must undergo a lifecycle event (attach/detach/stop/start).
+      confidence: 0.80
+      derived_from: ["?principal CanModifyConfiguration ?des", "?principal CanExfiltrate ?disk (with disk.encryption.diskEncryptionSetId == ?des.id property match)"]
+      false_positive_note: >-
+        This path requires:
+        1) CanModifyConfiguration(DES) by the principal
+        2) CanExfiltrate(disk) by the same principal
+        3) The disk linked to the DES (disk.encryption.diskEncryptionSetId == DES.id, property-based match)
+        4) A running VM (service_state condition) for the re-wrap to occur
+        If the VM is permanently offline, the re-wrap never happens and this edge
+        remains CONDITIONAL(service_state) indefinitely. Once the VM lifecycle
+        event occurs and re-wrapping completes, decrypt-gates-secret-read
+        (credential-chains.yaml) upgrades this to ACTIVE via CanDecrypt on the
+        attacker-controlled key.
+      narrative: >-
+        {principal.name} can update the DES {des.name} to point at an attacker-controlled
+        Key Vault key (CanModifyConfiguration) and can export disk {disk.name} via SAS
+        (CanExfiltrate). On the next VM lifecycle event (attach/detach/stop/start), the
+        DEK is re-wrapped under the attacker's key, enabling decryption of the exported VHD.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - networkAccessPolicy: DenyAll on a disk or snapshot -> beginGetAccess fails
+#     at ARM -> CanExfiltrate BLOCKED (denied_by: disk.networkAccessPolicy).
+#   - An Azure deny assignment (Blueprint / Managed App) covering
+#     Microsoft.Compute/disks/beginGetAccess/action at the RG or disk scope
+#     -> CanExfiltrate BLOCKED (denied_by: deny assignment ARM ID).
+#   - Azure Policy with deny effect on disks/write (e.g. enforcing DenyAll network
+#     access policy) -> azure-disk-write-network-policy BLOCKED for the escalation
+#     path (attacker cannot downgrade the policy).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Linchpin citations (do NOT duplicate — cite these files):
+#   /rules/derived/credential-chains.yaml:
+#     read-secret-yields-identity: ContainsSecret + CredentialsFor -> CanImpersonate
+#     decrypt-gates-secret-read: CanDecrypt on wrapping key upgrades CONDITIONAL
+#       CanReadData to ACTIVE (relevant for azure-disk-cmk-gated-read)
+#     impersonate-is-escalation: CanImpersonate -> CanEscalateTo when privilege > caller
+#   /rules/derived/can-control.yaml:
+#     control-via-admin: CanAdminister -> Controls
+#     escalate-via-execute-as: CanExecuteAs -> CanEscalateTo
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw config -> explicit edges) live in
+# /rules/explicit/azure-disks.yaml per the explicitPath configuration.
+# ---------------------------------------------------------------------------

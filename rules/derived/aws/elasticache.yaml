@@ -1,0 +1,541 @@
+# AWS ElastiCache — Derived attack-path rules (Phase 6 — Storage & Databases)
+# ---------------------------------------------------------------------------
+# ElastiCache (Redis/Valkey/Memcached) is a VPC-only managed cache service.
+# The Phase-6 attack surface concentrates on THREE primitives:
+#
+#   (1) CREDENTIAL GRAB: elasticache:ModifyReplicationGroup can replace or
+#       disable the Redis AUTH token (AuthTokenUpdateStrategy=SET disables or
+#       resets the token to an attacker-known value). This is the ElastiCache
+#       analog of Azure Cache for Redis listKeys / regenerateKey: a single
+#       control-plane call makes the attacker the holder of the data-plane
+#       credential. Emits ExposesCredential on the cache cluster.
+#
+#   (2) DATA READ (network-gated): Redis/Valkey and Memcached clusters with
+#       no AUTH (or AUTH disabled) are accessible to any VPC-reachable compute
+#       resource. Network reachability (VPC subnet + security group) is the
+#       ONLY gate. Emits CanReadData CONDITIONAL(network_reachability).
+#
+#   (3) DATA EXFIL: elasticache:CopySnapshot exports a Redis RDB snapshot to
+#       an S3 bucket. The RDB file is a complete memory dump — all cached data
+#       including any secrets the application stored. Emits CanExfiltrate.
+#
+# IMPORTANT network gate: ElastiCache is VPC-only (no public IPs). Every
+# data-plane CanReadData rule MUST carry network_reachability as a condition.
+# ExposedToInternet does NOT apply to properly configured ElastiCache clusters.
+#
+# LINCHPIN CITATIONS (do not re-derive here):
+#   * credential-chains.yaml — read-secret-yields-identity
+#     (ContainsSecret(cache, secret) + CanReadSecret(principal, secret) ->
+#      CanImpersonate: handles the path where an AUTH token or ACL password is
+#      stored in Secrets Manager and a principal reads it via
+#      secretsmanager:GetSecretValue; the chain is already collapsed by the
+#      linchpin — no ElastiCache-specific rule needed for that path)
+#   * credential-chains.yaml — decrypt-gates-secret-read
+#     (KMS-encrypted Secrets Manager secrets holding cache credentials)
+#   * can-control.yaml — escalate-via-execute-as / control-via-admin
+#
+# LOW-RELEVANCE SERVICE NOTE: ElastiCache is listed as a service that should
+# have 1-3 conservative rules. This file emits exactly 3 rules, each grounded
+# in confirmed official API behavior with appropriate network gating.
+#
+# PERMISSIONS: exact names from the AWS Service Authorization Reference for
+#   Amazon ElastiCache. No permissions are invented.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # PRIMARY: CREDENTIAL GRAB — AUTH token reset via ModifyReplicationGroup
+  # ===========================================================================
+
+  # --- 1) ModifyReplicationGroup sets AUTH token -> CanModifyConfiguration -----
+  # elasticache:ModifyReplicationGroup accepts AuthToken + AuthTokenUpdateStrategy.
+  # AuthTokenUpdateStrategy=SET replaces the current AUTH token with a new value
+  # supplied by the caller (or, combined with AuthTokenEnabled=false, disables AUTH
+  # entirely). In either case the principal gains the data-plane credential for the
+  # cluster: if SET, the new token is attacker-known; if disabled, no token is needed.
+  #
+  # This is the ElastiCache analog of Cosmos DB listKeys / Azure Cache regenerateKey:
+  # a single control-plane mutation gives the attacker data-plane access. The
+  # CanModifyConfiguration edge models the principal's capability to mutate the
+  # cache configuration (AUTH token specifically). Downstream linchpins (credential-chains)
+  # will derive CanReadData when auth is disabled and network_reachability is present.
+  #
+  # Also applies to:
+  #   - elasticache:ModifyCacheCluster (single-node Redis / Memcached): same
+  #     AuthToken parameter; Memcached does not use AUTH so the action matters for
+  #     single-node Redis clusters not in a replication group.
+  #   - elasticache:ModifyUser (Redis 6+ / Valkey ACL): resets ACL user passwords.
+  #     Folded here for economy — the emitted edge is structurally identical.
+  #   - elasticache:ModifyServerlessCache: exposes the same UserGroupId mutation
+  #     via ModifyServerlessCache action.
+  - id: aws-elasticache-modify-auth-token
+    emits: CanModifyConfiguration
+    description: >-
+      elasticache:ModifyReplicationGroup with AuthToken + AuthTokenUpdateStrategy=SET
+      (or AuthTokenEnabled=false) sets or removes the Redis AUTH token to an
+      attacker-controlled value. elasticache:ModifyUser resets ACL user passwords.
+      elasticache:ModifyServerlessCache modifies UserGroup bindings. The principal
+      gains the capability to mutate cache auth configuration; paired with network
+      reachability, this yields data-plane access.
+    match:
+      - [ ?principal, HasPermission, ?cache ]
+    where:
+      - "generic_type(?cache) == Cache"
+      - "?cache.provider_type in ['AWS::ElastiCache::ReplicationGroup', 'AWS::ElastiCache::CacheCluster', 'AWS::ElastiCache::ServerlessCache']"
+      - >-
+        ?principal has EFFECTIVE elasticache:ModifyReplicationGroup (or
+        elasticache:ModifyCacheCluster for single-node) on ?cache ARN
+        OR ?principal has EFFECTIVE elasticache:ModifyUser on a User attached
+        to ?cache's UserGroup
+        OR ?principal has EFFECTIVE elasticache:ModifyServerlessCache on ?cache ARN
+      - >-
+        ?cache.properties.Engine in ['redis', 'valkey']
+        (AUTH token concept does not apply to Memcached — emit only for Redis/Valkey)
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cache
+      permissions:
+        - "elasticache:ModifyReplicationGroup"
+        - "elasticache:ModifyCacheCluster"
+        - "elasticache:ModifyUser"
+        - "elasticache:ModifyServerlessCache"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when elasticache:ModifyReplicationGroup (or ModifyCacheCluster or
+        ModifyServerlessCache) is confirmed EFFECTIVE on the cache ARN — no SCP denial,
+        no permission boundary block. The AUTH token set, disable, or user password
+        reset is a single API call; no current token is required to change it.
+        CONDITIONAL(iam_permission) when the effective permission is unresolved (e.g.,
+        an SCP is present but not fully evaluated). BLOCKED when an SCP or permission
+        boundary explicitly denies the modify action on the target cluster ARN.
+        Note: the resulting data-plane access is separately CONDITIONAL(network_reachability)
+        — the attacker must hold a VPC foothold to use the new/cleared credential.
+        For AuthTokenUpdateStrategy=ROTATE, verify TransitEncryptionEnabled=true
+        (TLS must be enabled); without TLS, ROTATE is rejected by AWS API. SET and
+        AuthTokenEnabled=false paths require no TLS prerequisite.
+        This CanModifyConfiguration edge models the configuration-mutation capability;
+        downstream linchpins (credential-chains) collapse the auth-disable path to
+        CanReadData when network_reachability is confirmed.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal CanModifyConfiguration ?cache (elasticache:ModifyReplicationGroup / ModifyServerlessCache / ModifyUser effective permission)"
+      false_positive_note: >-
+        This rule applies only to Redis/Valkey clusters — Memcached has no AUTH
+        mechanism. Confirm generic_type == Cache AND engine in ['redis', 'valkey'].
+        AuthTokenUpdateStrategy=ROTATE (not SET) adds a second valid token without
+        invalidating the old one — the attacker gains a new valid token but the
+        cluster remains accessible to existing legitimate clients; treat as
+        ACTIVE for the credential-mutation capability (the new token is still
+        attacker-known and cluster remains accessible). Note: ROTATE strategy requires
+        TransitEncryptionEnabled=true (TLS) per AWS documentation; verify this
+        constraint when evaluating ROTATE-specific paths. AuthTokenEnabled=false
+        fully removes the auth requirement — this is higher impact because any
+        VPC-reachable principal can then connect. Do NOT emit for Memcached (no AUTH),
+        and do NOT confuse the KMS at-rest key with the AUTH token — they are
+        independent; at-rest encryption does not gate wire-protocol access.
+        Honor SCP denials on elasticache:ModifyReplicationGroup.
+      narrative: >-
+        {principal.name} can call elasticache:ModifyReplicationGroup on {cache.name}
+        to set the Redis AUTH token to an attacker-controlled value
+        (AuthTokenUpdateStrategy=SET), or disable AUTH entirely
+        (AuthTokenEnabled=false). Alternatively, {principal.name} can call
+        elasticache:ModifyUser to reset an ACL user password, or
+        elasticache:ModifyServerlessCache to change UserGroup bindings. Any
+        principal with the new/modified credential and VPC network access to
+        {cache.name} can then connect and read or write all cached data.
+
+  # ===========================================================================
+  # USER GROUP ESCALATION: Add attacker-controlled User to authorized UserGroup
+  # ===========================================================================
+
+  # --- 1b) ModifyUserGroup adds attacker User -> CanModifyConfiguration -------
+  # elasticache:ModifyUserGroup allows an attacker to add an attacker-controlled
+  # ACL User to an authorized User Group. Any cache cluster that has that User Group
+  # attached gains access from that user. This is a distinct attack path from the
+  # AUTH token reset (rule 1): it does not require modifying the cache itself, only
+  # the User Group. The attacker creates or controls a User, then adds it to any
+  # Group that is already attached to a cache cluster.
+  #
+  # Gated on: elasticache:ModifyUserGroup permission + knowledge/control of an
+  # attacker-supplied User + a User Group attached to a Redis/Valkey cluster.
+  # The result is data-plane access as that user (CanReadData conditioned on
+  # network_reachability + the user's effective ACL permissions).
+  - id: aws-elasticache-modify-usergroup-escalation
+    emits: CanModifyConfiguration
+    description: >-
+      elasticache:ModifyUserGroup can add an attacker-controlled ACL User to a User
+      Group that is already attached to a Redis/Valkey cluster. The attacker then
+      authenticates as that user to the cluster with the user's effective ACL
+      permissions (which may include allcommands/allkeys for full access). This
+      bypasses the AUTH token and grants data-plane access via the ACL user.
+    match:
+      - [ ?principal, HasPermission, ?usergroup ]
+    where:
+      - "generic_type(?usergroup) == Group"
+      - "?usergroup.provider_type == 'AWS::ElastiCache::UserGroup'"
+      - >-
+        ?principal has EFFECTIVE elasticache:ModifyUserGroup on ?usergroup ARN
+      - >-
+        ?usergroup has ReferencedBy (or AttachedTo/MemberOf) a Redis/Valkey cache
+        (collected via DescribeReplicationGroups UserGroupIds or DescribeServerlessCaches UserGroupId)
+    emit:
+      source_type: Identity
+      target_type: Group
+      source: ?principal
+      target: ?usergroup
+      permissions:
+        - "elasticache:ModifyUserGroup"
+        - "elasticache:CreateUser"  # Required when principal does not control existing User
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        CONDITIONAL(iam_permission) by default. Upgrade to ACTIVE only when the
+        principal is confirmed to hold BOTH elasticache:ModifyUserGroup AND either:
+        (a) control over an existing ACL User, or (b) EFFECTIVE elasticache:CreateUser
+        permission. If only ModifyUserGroup is present, the attack requires the
+        attacker to have a pre-existing controlled User, which must be verified
+        separately. BLOCKED when an SCP or permission boundary explicitly denies
+        elasticache:ModifyUserGroup on the target User Group ARN.
+        The resulting data-plane access is CONDITIONAL(network_reachability) — the
+        attacker must hold a VPC foothold and the user's ACL permissions gate which
+        commands/keys are accessible. This CanModifyConfiguration edge models the
+        User Group mutation capability; downstream rules or linchpins will derive
+        CanReadData when network_reachability and the user's effective ACL scope are
+        confirmed.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal CanModifyConfiguration ?usergroup (elasticache:ModifyUserGroup effective permission)"
+      false_positive_note: >-
+        This rule applies only to Redis 6+ / Valkey clusters using ACL User Groups.
+        Confirm that ?usergroup is actually attached to one or more cache clusters
+        (DescribeReplicationGroups UserGroupIds or DescribeServerlessCaches UserGroupId).
+        The attack requires that the principal either controls an existing User or can
+        create a new User (elasticache:CreateUser permission). Check for both paths.
+        If the User Group is attached to a cache but the principal has no way to create
+        or control a User, emit CONDITIONAL(iam_permission) and note the missing Create
+        permission. The resulting access is CONDITIONAL(network_reachability) — the
+        attacker must reach the cache on port 6379 and be able to authenticate as the
+        added User. Honor SCP denials on elasticache:ModifyUserGroup.
+      narrative: >-
+        {principal.name} can call elasticache:ModifyUserGroup on {usergroup.name}
+        to add an attacker-controlled ACL User to the group. Any Redis/Valkey cache
+        cluster that has {usergroup.name} attached (such as {cache.name}) will then
+        accept connections from that user with the user's effective ACL permissions.
+        If the user has allcommands + allkeys ACL, the attacker gains full read/write
+        access to the cache. If the user has limited permissions, the attacker can
+        perform only those operations. Network reachability to the cache (port 6379)
+        is still required.
+
+  # ===========================================================================
+  # DATA READ: VPC-reachable compute + no/disabled Redis AUTH
+  # ===========================================================================
+
+  # --- 2) No-auth (or AUTH-disabled) cache reachable from VPC -> CanReadData + CanWriteData --
+  # Redis/Valkey and Memcached clusters with no AUTH token required are accessible
+  # to any VPC compute resource with network reachability (matching security group
+  # inbound rule on port 6379/6380 for Redis or 11211 for Memcached).
+  #
+  # This is the dominant low-bar ElastiCache data access path: clusters deployed
+  # in an internal VPC are commonly left without AUTH under the assumption that
+  # VPC network controls are sufficient. Any EC2, Lambda, ECS task, or EKS pod
+  # with a network foothold in the same VPC and SG access can read/write the cache.
+  # No-auth Redis/Memcached clusters are FULLY WRITABLE — attackers can poison
+  # session caches, inject templates, and execute cache-based lateral movement.
+  #
+  # CanReadData and CanWriteData are CONDITIONAL(network_reachability): the capabilities
+  # exist whenever auth is absent AND network reach is confirmed. The source is the
+  # compute resource with VPC access, not directly a human identity. Path-finding
+  # walks: principal -> CanExecuteOn -> compute -> CanReadData/CanWriteData -> cache.
+  # CanNetworkReach source set is [Compute, Network, Identity]; this rule constrains
+  # to Compute sources only to ensure CanReadData/CanWriteData source conformance
+  # (source [Identity, Compute]).
+  #
+  # Memcached: ALWAYS no auth (Memcached has no built-in auth mechanism in the
+  # AWS-managed offering). Any Memcached cluster is implicitly in this rule.
+  - id: aws-elasticache-network-reach-no-auth
+    emits: [CanReadData, CanWriteData]
+    description: >-
+      A Redis/Valkey cluster with AuthTokenEnabled=false (or absent) or a Memcached
+      cluster is accessible to any VPC-reachable compute resource with an inbound
+      security group rule on the cache port (6379 Redis, 11211 Memcached) — no
+      credential is required. Both read and write operations are permitted without
+      authentication, enabling cache poisoning and lateral movement attacks.
+    match:
+      - [ ?compute, CanNetworkReach, ?cache ]
+    where:
+      - "generic_type(?cache) == Cache"
+      - "class(?compute) in [Compute]"
+      - "?cache.provider_type in ['AWS::ElastiCache::ReplicationGroup', 'AWS::ElastiCache::CacheCluster', 'AWS::ElastiCache::ServerlessCache']"
+      - >-
+        (?cache.properties.Engine == 'memcached')
+        OR (?cache.properties.Engine in ['redis', 'valkey']
+            AND (?cache.properties.AuthTokenEnabled == false
+                 OR ?cache.properties.AuthTokenEnabled is null or absent)
+            AND (?cache.properties.UserGroupIds is null or empty))
+        # Redis/Valkey with AuthTokenEnabled=false OR no UserGroup attached == no auth
+    emit:
+      - source_type: Compute
+        target_type: Cache
+        source: ?compute
+        target: ?cache
+        permissions: []
+        conditions: [network_reachability, service_state]
+        state_logic: >-
+          CONDITIONAL(network_reachability): the cache is readable without a
+          credential IF network reachability is confirmed (VPC compute in the same
+          VPC/peered VPC with an SG inbound rule allowing TCP on the cache port from
+          the compute resource's security group or CIDR). Upgrade to ACTIVE only when
+          a CanNetworkReach or CanReachPort edge has been derived confirming TCP access
+          on port 6379 (Redis/Valkey) or 11211 (Memcached) between ?compute and ?cache.
+          CONDITIONAL(service_state) when the cluster is in a non-AVAILABLE state
+          (creating, modifying, deleting). BLOCKED when the cache engine enforces auth
+          (AuthTokenEnabled=true OR UserGroupIds is non-empty for Redis/Valkey) — in
+          that case knowledge of the credential is the gate, not network reachability.
+        confidence: "min(contributing_confidences) * 0.85"
+        edge_type: CanReadData
+        derived_from:
+          - "?compute CanNetworkReach ?cache (port 6379 or 11211 confirmed reachable)"
+          - "?cache.properties.AuthTokenEnabled == false or absent (DescribeReplicationGroups / DescribeCacheClusters evidence)"
+        false_positive_note: >-
+          The most critical gate for this rule is the AUTH status. Check:
+          (1) For Redis/Valkey replication groups: DescribeReplicationGroups returns
+              AuthTokenEnabled (bool). If true or if UserGroupIds is non-empty,
+              auth is ON — do NOT emit ACTIVE; emit BLOCKED or do not emit.
+          (2) For single-node Redis clusters (DescribeCacheClusters): AuthTokenEnabled
+              field is present on the cache cluster object.
+          (3) For Memcached: always no auth — emit regardless of the field value.
+          (4) For Serverless: check UserGroupId in DescribeServerlessCaches.
+          The network_reachability condition is MANDATORY — ElastiCache is VPC-only.
+          Do NOT emit ACTIVE without a confirmed CanNetworkReach or CanReachPort edge
+          for the relevant port from a specific compute resource. KMS at-rest encryption
+          does NOT block wire-protocol access — it encrypts the underlying disk, not the
+          Redis protocol. Do not add key_permission as a condition for this rule.
+          A Redis cluster using TLS (TransitEncryptionEnabled=true) still uses the same
+          AUTH token / ACL mechanism; TLS alone does not grant or deny data access.
+        narrative: >-
+          {cache.name} is a {cache.properties.Engine} cluster with no AUTH requirement
+          and is network-reachable from {compute.name} (TCP port {port}). Any code
+          running on {compute.name} can connect to {cache.name} and read all
+          cached data without providing any credential.
+      - source_type: Compute
+        target_type: Cache
+        source: ?compute
+        target: ?cache
+        permissions: []
+        conditions: [network_reachability, service_state]
+        state_logic: >-
+          CONDITIONAL(network_reachability): the cache is fully writable without a
+          credential IF network reachability is confirmed. A no-auth Redis/Memcached
+          cluster permits any write operation — poisoning session caches, injecting
+          template data, or corrupting application state. This enables lateral
+          movement through cache-based attacks. Upgrade to ACTIVE when CanNetworkReach
+          or CanReachPort is derived. CONDITIONAL(service_state) for non-AVAILABLE
+          clusters. BLOCKED when auth is enforced.
+        confidence: "min(contributing_confidences) * 0.85"
+        edge_type: CanWriteData
+        derived_from:
+          - "?compute CanNetworkReach ?cache (port 6379 or 11211 confirmed reachable)"
+          - "?cache.properties.AuthTokenEnabled == false or absent (DescribeReplicationGroups / DescribeCacheClusters evidence)"
+        false_positive_note: >-
+          Same AUTH status gates as CanReadData apply. No-auth Redis/Memcached
+          clusters permit unrestricted write operations — this CanWriteData path
+          models cache-poisoning and lateral movement attacks via stored cache data.
+        narrative: >-
+          {cache.name} is a {cache.properties.Engine} cluster with no AUTH requirement
+          and is network-reachable from {compute.name} (TCP port {port}). Any code
+          running on {compute.name} can connect to {cache.name} and write all
+          cached data without providing any credential — full cache modification
+          via network reachability alone, enabling cache poisoning and lateral movement.
+
+  # ===========================================================================
+  # EXFILTRATION: snapshot creation and copy to S3
+  # ===========================================================================
+
+  # --- 3a) CreateSnapshot + CopySnapshot on live cache -> CanExfiltrate ------
+  # elasticache:CreateSnapshot combined with elasticache:CopySnapshot allows an
+  # attacker to create a new snapshot from a running cache and immediately export
+  # it to an attacker-accessible S3 bucket. This bypasses the need for pre-existing
+  # snapshots and the typical backup schedule. The RDB file contains full in-memory
+  # dump at creation time.
+  #
+  # Precondition: both permissions must be confirmed EFFECTIVE. This is gated only
+  # on IAM permissions (not on snapshot existence). The attacker can trigger a
+  # fresh snapshot, wait for completion, and export it without operator involvement.
+  - id: aws-elasticache-create-and-exfil
+    emits: CanExfiltrate
+    description: >-
+      elasticache:CreateSnapshot combined with elasticache:CopySnapshot allows
+      creating a fresh Redis RDB snapshot from a running cache and immediately
+      exporting it to an attacker-controlled S3 bucket. The RDB file is a complete
+      serialized dump of all in-memory data at snapshot time, bypassing the need
+      for scheduled snapshots. No live cluster access needed.
+    match:
+      - [ ?principal, HasPermission, ?cache ]
+    where:
+      - "generic_type(?cache) == Cache"
+      - "?cache.provider_type in ['AWS::ElastiCache::ReplicationGroup', 'AWS::ElastiCache::ServerlessCache']"
+      - >-
+        ?principal has EFFECTIVE elasticache:CreateSnapshot on ?cache ARN
+        AND ?principal has EFFECTIVE elasticache:CopySnapshot on snapshots created from ?cache
+      - >-
+        ?cache.properties.Engine in ['redis', 'valkey']
+        (Memcached does not support snapshots; only Redis/Valkey)
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cache
+      permissions:
+        - "elasticache:CreateSnapshot"
+        - "elasticache:CopySnapshot"
+      conditions: [iam_permission, scp_or_org_policy, resource_policy, service_state]
+      state_logic: >-
+        CONDITIONAL(resource_policy): ACTIVE only when BOTH CreateSnapshot and
+        CopySnapshot are confirmed EFFECTIVE on the cache ARN, and the destination
+        S3 bucket is attacker-accessible (attacker controls the bucket OR a
+        confirming CanWriteData edge to a bucket in the attacker's account exists).
+        Without the S3 write gate, the snapshot is creatable but only exportable to
+        an account-internal destination — emit CONDITIONAL(resource_policy) to flag
+        the capability while noting the destination gate. CONDITIONAL(iam_permission)
+        when either permission is unresolved. BLOCKED when an SCP or permission
+        boundary denies either CreateSnapshot or CopySnapshot.
+        CONDITIONAL(service_state) when the cache is in a non-snapshotable state
+        (creating, modifying, deleting).
+      confidence: "min(contributing_confidences) * 0.80"
+      derived_from:
+        - "?principal HasPermission ?cache (elasticache:CreateSnapshot EFFECTIVE)"
+        - "?principal HasPermission ?cache (elasticache:CopySnapshot EFFECTIVE)"
+      false_positive_note: >-
+        Both CreateSnapshot and CopySnapshot are required. Do NOT emit ACTIVE unless
+        both are confirmed effective. The destination S3 bucket must also accept the
+        write (bucket policy must allow s3:PutObject from the ElastiCache service
+        principal or the caller's account). For encrypted caches (AtRestEncryptionEnabled
+        with a CMK), the RDB data in S3 is KMS-encrypted; the attacker additionally
+        needs kms:Decrypt on the CMK. This rule is conservative (Phase-6 guidance for
+        ElastiCache: 1-3 rules); it collapses the two-step create+copy path into a
+        single CanExfiltrate edge, modeling the complete exfiltration capability
+        without requiring pre-existing snapshots. Cached data depends on what the
+        application stores; impact varies (transient data vs. persistent secrets).
+      narrative: >-
+        {principal.name} can call elasticache:CreateSnapshot to create a fresh Redis
+        snapshot from {cache.name}, then elasticache:CopySnapshot to export the
+        resulting RDB file to an S3 bucket. If the destination S3 bucket is
+        attacker-controlled, the full serialized dump of all in-memory cache data —
+        including any application secrets (session tokens, API keys, database passwords)
+        stored by the application — is exfiltrated without ever connecting to the live
+        cluster or waiting for a scheduled backup.
+
+  # --- 3b) CopySnapshot to attacker-accessible S3 -> CanExfiltrate -----------
+  # elasticache:CopySnapshot exports a Redis RDB snapshot to a destination S3 bucket.
+  # The RDB file is a complete serialized dump of all in-memory data at snapshot time,
+  # including any cached application secrets (session tokens, API keys, DB passwords,
+  # OAuth tokens stored by the application). An attacker with CopySnapshot permission
+  # and write access to an external S3 bucket can exfiltrate the full cache contents
+  # without touching the live cluster, bypassing Redis auth entirely.
+  #
+  # This rule gates ONLY on CopySnapshot (which operates on existing snapshots).
+  # elasticache:CreateSnapshot is a separate prerequisite action (creating snapshots
+  # from running clusters); it is neither matched nor modeled here — CopySnapshot
+  # assumes snapshots already exist. Operators typically run CreateSnapshot on a
+  # schedule; attackers copy existing snapshots. The gate is: ?principal has
+  # CopySnapshot on an existing ?snapshot.
+  #
+  # The destination bucket must be accessible to the attacker — this is a
+  # CONDITIONAL(resource_policy) gate: the S3 bucket must either be in the
+  # attacker's account or the bucket policy must allow writes from the caller's
+  # account's ElastiCache service principal.
+  - id: aws-elasticache-snapshot-exfil
+    emits: CanExfiltrate
+    description: >-
+      elasticache:CopySnapshot copies an existing Redis RDB snapshot to an S3 bucket.
+      If the destination bucket is attacker-accessible, the RDB file — containing all
+      cached in-memory data including application secrets — is exfiltrated. No live
+      cluster access needed.
+    match:
+      - [ ?principal, HasPermission, ?snapshot ]
+    where:
+      - "generic_type(?snapshot) == Snapshot"
+      - "?snapshot.provider_type == 'AWS::ElastiCache::Snapshot'"
+      - >-
+        ?principal has EFFECTIVE elasticache:CopySnapshot on ?snapshot ARN
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions:
+        - "elasticache:CopySnapshot"
+      conditions: [iam_permission, scp_or_org_policy, resource_policy, key_permission]
+      state_logic: >-
+        CONDITIONAL(resource_policy): ACTIVE only when the destination S3 bucket is
+        also attacker-accessible (attacker controls the bucket OR a confirming
+        CanWriteData edge to a bucket in the attacker's account exists). Without the
+        S3 write gate, the snapshot is copyable but only to an account-internal
+        destination — emit CONDITIONAL(resource_policy) to flag the capability
+        while noting the destination gate. CONDITIONAL(key_permission) when the
+        source snapshot is encrypted with a CMK: the CopySnapshot call succeeds, but
+        reading the RDB content (S3 object) requires kms:Decrypt on the CMK — the
+        attacker may need to request a cross-account key grant. BLOCKED when an SCP
+        or permission boundary denies elasticache:CopySnapshot.
+        CONDITIONAL(service_state) when the cluster is in a non-snapshotable state
+        (multi-AZ or cluster mode clusters require the cluster to be available for
+        the snapshot to exist and be copyable).
+      confidence: "min(contributing_confidences) * 0.80"
+      derived_from:
+        - "?principal HasPermission ?snapshot (elasticache:CopySnapshot effective permission)"
+      false_positive_note: >-
+        The S3 destination is the key gate. elasticache:CopySnapshot's DestinationS3Location
+        parameter specifies the bucket and prefix. The attacker must have a bucket that
+        accepts the write (bucket policy must allow s3:PutObject from the ElastiCache service
+        principal or the caller's account). Do NOT emit ACTIVE unless the destination bucket
+        ownership is confirmed as attacker-accessible. For encrypted snapshots (AtRestEncryptionEnabled
+        with a CMK), the RDB data in S3 is KMS-encrypted; the attacker additionally needs
+        kms:Decrypt on the CMK or a cross-account key grant — add key_permission condition
+        for encrypted clusters. AWS-managed (default SSE-S3) snapshot encryption does NOT
+        require a key grant. This rule requires an existing snapshot — the elasticache:CreateSnapshot
+        permission is a prerequisite (or a snapshot is already scheduled/available); it is
+        not modeled here.
+        NOTE: This rule is conservative by design (Phase-6 low-relevance guidance for
+        ElastiCache: 1-3 rules). The exfil path is real but requires two permissions
+        (snapshot + S3 write) and is more complex than the AUTH-token-reset path.
+        Cached data in ElastiCache is often transient; impact depends on what the
+        application stores (session tokens expire, API keys may still be valid).
+      narrative: >-
+        {principal.name} can call elasticache:CopySnapshot to export the Redis snapshot
+        {snapshot.name} to an S3 bucket as an RDB file. The RDB file is a complete
+        serialized dump of all in-memory cache data at snapshot time, including any
+        application secrets (session tokens, API keys, database passwords) stored by
+        the application. An attacker who controls the destination S3 bucket can
+        download and parse the RDB file offline to extract cached data without
+        ever connecting to the live Redis cluster.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP or permission boundary denying elasticache:ModifyReplicationGroup ->
+#     rule 1 BLOCKED.
+#   - SCP denying elasticache:CopySnapshot / CreateSnapshot -> rule 3 BLOCKED.
+#   - Redis/Valkey cluster with AuthTokenEnabled=true or non-empty UserGroupIds ->
+#     rule 2 does NOT fire (auth is present; credential knowledge gates access).
+#     The credential-chains linchpin handles the path from ContainsSecret
+#     (AUTH token in Secrets Manager) + CanReadSecret -> CanImpersonate.
+#   - KMS CMK denial (kms:Decrypt denied) -> rule 3 CONDITIONAL(key_permission)
+#     for encrypted snapshots; rule 2 is unaffected (wire-protocol access does
+#     not require kms:Decrypt).
+#   - Cluster in non-AVAILABLE state -> rules 2 and 3 CONDITIONAL(service_state).
+# ---------------------------------------------------------------------------
+
+# Linchpin citations:
+# - credential-chains.yaml:read-secret-yields-identity handles the path:
+#   ContainsSecret(cache, auth_secret) + CanReadSecret(principal, auth_secret)
+#   -> CanImpersonate (conceptual; the cache credential is a Credential node,
+#   not an IAM identity, so the collapse is CanReadData on the cache). Do not
+#   re-derive this chain here — cite and defer.
+# - credential-chains.yaml:decrypt-gates-secret-read handles KMS-gated secrets.
+# - can-control.yaml:escalate-via-execute-as and control-via-admin apply if a
+#   principal gains CanAdminister over the ElastiCache control plane.

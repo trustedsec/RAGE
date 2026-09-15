@@ -1,0 +1,155 @@
+# Normalizing AWS CloudHSM into explicit edges.
+# The adapter emits raw records (DescribeClusters/DescribeBackups + host-config
+# inputs for HSM-user credentials); these rules translate them to common explicit
+# edges. Key-USE capabilities (CanDecrypt/CanSignAs/CanExportKey) are NOT explicit —
+# they depend on credential possession + reachability and are derived in
+# /rules/derived/aws/cloudhsm.yaml.
+#
+# CENTRAL CAVEAT: IAM cloudhsm:* is control-plane ONLY. It never grants key use.
+# HSM keys have no ARN and no IAM policy surface; access is via HSM users
+# (CU/CO/PCO/AU) authenticated inside the cluster.
+
+rules:
+
+  # --- Cluster containment / placement (structural) -------------------------
+  - id: aws-cloudhsm-account-contains-cluster
+    emits: Contains
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudHSM::Cluster", field: "ClusterId"}
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: "*"
+      source: "<account/region boundary node>"
+      target: "<cluster node>"
+      api_source: "cloudhsm:DescribeClusters"
+      evidence_field: "ClusterId"
+      narrative: "Account {account} contains CloudHSM cluster {cluster.name}."
+
+  - id: aws-cloudhsm-cluster-located-in-vpc
+    emits: LocatedIn
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudHSM::Cluster", field: "VpcId"}
+    emit:
+      source_type: "*"
+      source: "<cluster node>"
+      target: "<VPC / subnet network node>"
+      api_source: "cloudhsm:DescribeClusters"
+      evidence_field: "SubnetMapping / VpcId"
+      narrative: "CloudHSM cluster {cluster.name} is deployed in {vpc.name} (VPC-only reachability, TCP 2223-2225)."
+
+  # Contains.source is [AdministrativeBoundary], so the account/region boundary (not
+  # the cluster node) is the Contains source for the backup. The backup->cluster
+  # linkage is expressed with ContainsResourceReference (source [Data,Storage,Compute];
+  # the backup is a Data node) so the derived exfil rule can bind them conformantly.
+  - id: aws-cloudhsm-account-contains-backup
+    emits: Contains
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudHSM::Backup", field: "BackupId"}
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: "*"
+      source: "<account/region boundary node>"
+      target: "<backup node (Data — encrypted key-material image)>"
+      api_source: "cloudhsm:DescribeBackups"
+      evidence_field: "BackupId"
+      narrative: "Account {account} contains CloudHSM backup {backup.name}."
+
+  - id: aws-cloudhsm-backup-references-cluster
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudHSM::Backup", field: "ClusterId"}
+    where: ["backup belongs to a CloudHSM cluster (ClusterId from DescribeBackups)"]
+    emit:
+      source_type: Data
+      target_type: "*"
+      source: "<backup node (Data)>"
+      target: "<cluster node>"
+      api_source: "cloudhsm:DescribeBackups"
+      evidence_field: "ClusterId"
+      narrative: "CloudHSM backup {backup.name} is a backup of cluster {cluster.name}."
+
+  - id: aws-cloudhsm-eni-attached-to-hsm
+    emits: AttachedTo
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::EC2::NetworkInterface", field: "InterfaceType"}
+    where: ["ENI belongs to a CloudHSM HSM (EniId from DescribeClusters Hsms[])"]
+    emit:
+      source: "<HSM ENI node>"
+      target: "<HSM node>"
+      api_source: "cloudhsm:DescribeClusters | ec2:DescribeNetworkInterfaces"
+      evidence_field: "Hsms[].EniId"
+      narrative: "HSM ENI {eni.name} is attached to CloudHSM instance {hsm.name}."
+
+  # --- Cluster administration (control-plane; NOT key access) ---------------
+  - id: aws-cloudhsm-can-administer-cluster
+    emits: CanAdminister
+    applies_to: [aws]
+    match_effective_permission:
+      # Any of the mutating cluster-lifecycle actions; enumerate the common set.
+      action_any:
+        - "cloudhsm:InitializeCluster"
+        - "cloudhsm:CreateHsm"
+        - "cloudhsm:DeleteHsm"
+        - "cloudhsm:DeleteCluster"
+        - "cloudhsm:ModifyCluster"
+        - "cloudhsm:ModifyBackupAttributes"
+        - "cloudhsm:RestoreBackup"
+        - "cloudhsm:DeleteBackup"
+        - "cloudhsm:CopyBackupToRegion"
+      resource_type: "AWS::CloudHSM::Cluster"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<cluster node>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["cloudhsm:ModifyCluster", "cloudhsm:CreateHsm", "cloudhsm:DeleteHsm", "cloudhsm:RestoreBackup"]
+      narrative: "{principal.name} can administer the CloudHSM cluster lifecycle of {cluster.name} (cloudhsm:* control-plane) — this does NOT grant key use."
+
+  # --- HSM user identities and the credentials that authenticate as them ----
+  # HSM users are NOT IAM principals. The adapter records them (and their creds)
+  # only from host/SDK config it can read; AWS APIs cannot enumerate them.
+  # The HSM user (CU/CO/PCO/AU) is modeled as an Identity(MachineIdentity) — NOT a
+  # Credential — so CredentialsFor conforms (source [Secret/Credential...], target
+  # [Identity, Data, ServiceIdentity]) and Controls(hsm_user -> key) conforms
+  # (source [Identity]). The CU/CO login/PIN is the separate Credential node.
+  - id: aws-cloudhsm-cred-authenticates-hsm-user
+    emits: CredentialsFor
+    applies_to: [aws]
+    match_record: {resource_type: "CloudHSM::HsmUserCredential", field: "Username"}
+    emit:
+      source: "<HSM CU/CO login/PIN node (Secret/Credential)>"
+      target: "<HSM user identity node (Identity / MachineIdentity)>"
+      api_source: "host config / SDK pin (CLOUDHSM_PIN, PKCS#11 pin, cloudhsm_mgmt_util config)"
+      evidence_field: "Username / UserType (CU|CO|PCO|AU)"
+      narrative: "Login {cred.name} authenticates as CloudHSM user identity {hsm_user.name} ({usertype})."
+
+  # --- A client host that stores a CU login (feeds ExposesCredential) --------
+  - id: aws-cloudhsm-host-contains-cu-cred
+    emits: ContainsCredential
+    applies_to: [aws]
+    match_record: {resource_type: "CloudHSM::ClientHostConfig", field: "PinMaterial"}
+    where: ["host stores a CU/CO login (hard-coded pin, pin file, mgmt_util config)"]
+    emit:
+      source: "<client host node (Compute)>"
+      target: "<HSM CU/CO login credential node>"
+      api_source: "host inventory (env/config file scan)"
+      evidence_field: "CLOUDHSM_PIN / pkcs11 pin file / cloudhsm_mgmt_util config"
+      narrative: "{host.name} stores a CloudHSM Crypto User login {cred.name} in its configuration."
+
+  # --- Which keys an HSM Crypto User owns/shares (gates key use) ------------
+  # Only collectable WITH CU/CO creds via CloudHSM CLI `key list`; usually UNKNOWN.
+  # When known, this Controls fact is what lets the derived rules bind a CU to a key.
+  - id: aws-cloudhsm-user-controls-key
+    emits: Controls
+    applies_to: [aws]
+    match_record: {resource_type: "CloudHSM::Key", field: "KeyHandle"}
+    where: ["HSM user owns or is shared the key (KeyOwner / SharedUsers includes user)"]
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<HSM user identity node (Identity / MachineIdentity)>"
+      target: "<HSM key node (EncryptionKey/SigningKey)>"
+      api_source: "CloudHSM CLI `key list` (requires CU creds) — often UNKNOWN to collector"
+      evidence_field: "KeyOwner / SharedUsers / attributes (extractable, class)"
+      narrative: "CloudHSM user {hsm_user.name} owns/shares HSM key {key.name}."

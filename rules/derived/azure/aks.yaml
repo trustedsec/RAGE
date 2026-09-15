@@ -1,0 +1,744 @@
+# Azure — AKS (Microsoft.ContainerService/managedClusters) rules (Phase 7)
+# ---------------------------------------------------------------------------
+# AKS exposes three orthogonal escalation surfaces that this file models:
+#
+#   (A) ARM-PLANE CREDENTIAL BYPASS
+#       listClusterAdminCredential/action -> static cluster-admin kubeconfig
+#       that BYPASSES AAD/Entra authentication.  This is the highest-severity
+#       single-action escalation: one ARM permission = unconditional cluster-admin
+#       access regardless of k8s RBAC configuration.  (Rules: azure-aks-list-admin-cred,
+#       azure-aks-admin-cred-execute-command, azure-aks-admin-cred-executes-as)
+#
+#   (B) ARM-PLANE RCE
+#       runCommand/action -> arbitrary kubectl/helm inside the cluster, including
+#       on PRIVATE clusters unreachable on the network plane.  Equivalent to
+#       code-execution as any workload identity the attacker can schedule to.
+#       (Rules: azure-aks-run-command, azure-aks-run-command-executes-as)
+#
+#   (C) WORKLOAD IDENTITY FEDERATION (Phase 7 / Phase 14)
+#       KSA annotated with azure.workload.identity/client-id + federated credential
+#       on the target MI -> the pod's projected SA token is exchanged for an MI token
+#       with NO static secret.  container-chains workload-identity-federates +
+#       federation-chains roll this up to CanFederateAs / CanImpersonate / CanEnter*.
+#       This file only emits the AKS-specific service facts (TrustsExternalIdentity,
+#       ExternalIdentityMapsTo, ExecutesAs) so the linchpins do their job.
+#       (Rules: azure-aks-workload-identity-federates)
+#
+#   Cross-cutting:
+#       - Node MI via IMDS (requires node-level / privileged-pod access).
+#       - ACR push -> supply-chain fan-out (container-chains handles the fan-out;
+#         we only emit the ContainsResourceReference pull facts via explicit rules).
+#       - Azure RBAC Cluster Admin role -> k8s cluster-admin (when Azure RBAC mode on).
+#
+# PERMISSIONS: all operation strings verified against the Azure RBAC permissions
+# reference for Microsoft.ContainerService (learn.microsoft.com, 2026-09 snapshot).
+# Official AKS access-and-identity docs: https://learn.microsoft.com/en-us/azure/aks/
+#
+# LINCHPIN CITATIONS (emit facts; let the linchpins roll up):
+#   container-chains.yaml  — image-push-poisons-consumers, poisoned-image-executes-as,
+#                            cluster-rbac-exec, workload-identity-federates
+#   federation-chains.yaml — federation-maps-to-identity, federate-then-enter-*,
+#                            federate-inherits-capabilities
+#   can-execute-as.yaml    — execute-as-via-code-modify, execute-as-via-command
+#   can-control.yaml       — escalate-via-execute-as, enter-account-via-assume
+#   credential-chains.yaml — impersonate-is-escalation
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 7-containers-k8s
+applies_to: [azure]
+
+rules:
+
+  # =========================================================================
+  # (A) ARM-PLANE CREDENTIAL BYPASS
+  # =========================================================================
+
+  # --- Full cluster-admin credential retrieval --------------------------------
+  # listClusterAdminCredential is the headline AKS escalation: a single ARM
+  # action returns a static client-certificate kubeconfig bound to the
+  # cluster's built-in cluster-admin ClusterRoleBinding.  When local accounts
+  # are enabled (default unless disableLocalAccounts: true) this certificate is
+  # valid unconditionally — Entra auth is completely bypassed.
+  - id: azure-aks-list-admin-cred
+    emits: CanReadCredential
+    description: "listClusterAdminCredential returns a static cluster-admin kubeconfig that bypasses AAD, giving unconditional cluster-admin access to the cluster."
+    match_effective_permission:
+      action: "Microsoft.ContainerService/managedClusters/listClusterAdminCredential/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds the listClusterAdminCredential action at the cluster scope"
+    emit:
+      source_type: Identity
+      target_type: Credential
+      source: "<principal>"
+      target: "<cluster-admin kubeconfig (Credential) for the AKS cluster>"
+      permissions: ["Microsoft.ContainerService/managedClusters/listClusterAdminCredential/action"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the cluster has localAccountsDisabled: false (default) — the returned
+        client certificate is a fully valid static credential that requires no further
+        Entra authentication.  CONDITIONAL(deny_assignment) when localAccountsDisabled:
+        true — the action still succeeds but returns an AAD-interactive kubeconfig, so the
+        static-cert bypass does NOT apply; the cluster-admin cert path requires local
+        accounts to be enabled.  CONDITIONAL(service_state) if the cluster
+        powerState.code is not Running.  BLOCKED if a deny assignment covers this action
+        at the cluster/RG/subscription scope.
+      confidence: 0.97
+      false_positive_note: >-
+        When localAccountsDisabled: true (properties.disableLocalAccounts: true) the returned
+        kubeconfig is AAD-gated, NOT a static cert — do NOT emit ACTIVE for the static-cert
+        bypass; downgrade to CONDITIONAL(deny_assignment) with a note.  Verify the cluster is
+        running (powerState.code == Running) before emitting ACTIVE.  Deny assignments covering
+        this action block it entirely.
+      narrative: >-
+        {principal.name} holds listClusterAdminCredential/action on cluster {target.name}
+        and can retrieve a static client-certificate kubeconfig for cluster-admin, bypassing
+        AAD authentication entirely — any further kubectl command runs with full cluster-admin
+        privilege.
+
+  # --- Low-privilege user kubeconfig retrieval --------------------------------
+  - id: azure-aks-list-user-cred
+    emits: CanReadCredential
+    description: "listClusterUserCredential returns a user-level kubeconfig (AAD-token-gated, lower privilege), providing authenticated access to the cluster API server."
+    match_effective_permission:
+      action: "Microsoft.ContainerService/managedClusters/listClusterUserCredential/action"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Credential
+      source: "<principal>"
+      target: "<user kubeconfig (Credential) for the AKS cluster>"
+      permissions: ["Microsoft.ContainerService/managedClusters/listClusterUserCredential/action"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        CONDITIONAL(iam_permission) — the returned kubeconfig requires the caller to have
+        a valid Entra token AND sufficient k8s RBAC or Azure RBAC assignment to perform
+        kubectl operations; the kubeconfig itself is not a static credential.  The
+        escalation value depends on the k8s RBAC granted to the principal's Entra identity.
+        ACTIVE only when combined with a ClusterRole or Azure RBAC role that grants
+        meaningful k8s verbs.
+      confidence: 0.75
+      derived_from: [ "<HasPermission edge_id (managedClusters/listClusterUserCredential/action)>" ]
+      false_positive_note: >-
+        The user kubeconfig alone is not a privilege escalation; it is an authenticated
+        API-server entry point.  The actual k8s verb access depends on the Entra principal's
+        ClusterRoleBinding / RoleBinding / Azure RBAC assignment.  Do NOT emit CanExecuteCommand
+        solely from listClusterUserCredential without also confirming the principal holds
+        sufficient k8s RBAC (pods/exec or cluster-admin).
+      narrative: >-
+        {principal.name} can obtain a user-level kubeconfig for cluster {target.name}
+        (listClusterUserCredential/action); the actual access is gated by its k8s RBAC grants.
+
+  # --- cluster-admin kubeconfig -> CanExecuteCommand on pods ------------------
+  # Once a principal holds the cluster-admin kubeconfig (CanReadCredential from
+  # azure-aks-list-admin-cred) it can kubectl exec into ANY pod in the cluster.
+  # This emits CanExecuteCommand on the KubernetesCluster node (representing all
+  # pods within).  The linchpin container-chains cluster-rbac-exec then produces
+  # CanExecuteAs for each pod's workload identity.
+  - id: azure-aks-admin-cred-execute-command
+    emits: CanExecuteCommand
+    description: "A cluster-admin kubeconfig (from listClusterAdminCredential) grants kubectl exec into any pod in the cluster."
+    match:
+      - [ ?principal, CanReadCredential, ?admin_kubeconfig ]
+    where:
+      - "node_type(?admin_kubeconfig) == Credential"
+      - "?admin_kubeconfig is a cluster-admin kubeconfig for an AKS managedCluster (produced by azure-aks-list-admin-cred)"
+    emit:
+      source_type: Identity
+      target_type: KubernetesWorkload
+      source: ?principal
+      target: "<every KubernetesWorkload / Container in the cluster associated with ?admin_kubeconfig>"
+      permissions: ["Microsoft.ContainerService/managedClusters/listClusterAdminCredential/action"]
+      conditions: [service_state]
+      state_logic: >-
+        inherit from the contributing CanReadCredential: ACTIVE when the cluster-admin
+        kubeconfig is ACTIVE (local accounts enabled, cluster running); CONDITIONAL when
+        the kubeconfig is CONDITIONAL (local accounts disabled or cluster stopped).
+        BLOCKED if the CanReadCredential is BLOCKED.
+      confidence: 0.95
+      derived_from: [ "<CanReadCredential edge_id (azure-aks-list-admin-cred)>" ]
+      false_positive_note: >-
+        The cluster-admin kubeconfig grants pods/exec on ALL namespaces; each
+        (pod, workload_identity) pair is a distinct CanExecuteCommand edge feeding
+        container-chains cluster-rbac-exec -> CanExecuteAs.  Scope the exec to the
+        ACTUAL pod/namespace pairs in the cluster — not an abstract "cluster node."
+        The CanExecuteCommand source set (schema) admits KubernetesWorkload; target the
+        workload node or a placeholder cluster-wide KubernetesWorkload node depending
+        on how the collector models all-namespace exec.
+        Do NOT emit if CanReadCredential is CONDITIONAL(localAccountsDisabled) — the
+        AAD-gated path requires additional Entra permission checks.
+      narrative: >-
+        {principal.name} retrieved the cluster-admin kubeconfig for {cluster.name}
+        (listClusterAdminCredential/action) and can kubectl exec into any pod in the cluster.
+
+  # --- Missing rule: kubelet MI swap escalation path ---------------------------
+  # A principal with managedClusters/agentPools/write AND assign on a target MI can
+  # bind that MI to the node pool, making all node-level code run as the privileged
+  # MI.  This chains with azure-aks-node-imds-executes-as to complete the escalation.
+  - id: azure-aks-swap-kubelet-mi
+    emits: CanAttachIdentity
+    description: "managedClusters/agentPools/write + assign on a target MI allows swapping the kubelet MI, binding all nodes to a more-privileged identity."
+    match:
+      - [ ?principal, CanModifyCode, ?cluster ]
+      - [ ?principal, CanPassIdentity, ?target_mi ]
+    where:
+      - "?principal holds Microsoft.ContainerService/managedClusters/agentPools/write (or managedClusters/write)"
+      - "?principal holds Microsoft.ManagedIdentity/userAssignedIdentities/assign on ?target_mi"
+      - "node_type(?cluster) in [KubernetesCluster, ContainerCluster]"
+      - "node_type(?target_mi) == ManagedIdentity"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?cluster
+      permissions: ["Microsoft.ContainerService/managedClusters/agentPools/write", "Microsoft.ManagedIdentity/userAssignedIdentities/assign"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        CONDITIONAL(iam_permission) — requires BOTH agentPools/write AND assign on the target MI.
+        ACTIVE when both permissions are present and the cluster/node pool is running.
+        BLOCKED if a deny assignment covers either permission at cluster/RG/subscription scope.
+      confidence: 0.85
+      derived_from: []
+      false_positive_note: >-
+        This escalation requires a two-permission composition: the agentPools write + assign on the
+        target MI. The consequence is that every node in the pool runs as the target MI — which, if
+        more privileged than the attacker's current context, completes an escalation chain via
+        azure-aks-node-imds-executes-as (node-level code reaches node IMDS, mints target-MI token).
+        Verify both permissions are held before emitting.  The target_mi privilege_level should be
+        higher than the principal's for an escalation; see can-control escalate-via-execute-as for the
+        privilege guard.
+      narrative: >-
+        {principal.name} holds agentPools/write on cluster {cluster.name} and assign/action on
+        MI {target_mi.name}; can reconfigure the kubelet identity to {target_mi.name}, binding all
+        node-level code to this identity. Combined with node-level pod access (privileged pod),
+        this enables CanExecuteAs {target_mi.name} via azure-aks-node-imds-executes-as.
+
+  # --- cluster-admin kubeconfig -> CanExecuteAs every workload identity -------
+  # Shortcut roll-up: cluster-admin kubeconfig -> exec any pod -> every pod's
+  # mounted token.  container-chains cluster-rbac-exec already does per-pod edges;
+  # this emits the cluster-wide summary (CanExecuteAs every workload identity),
+  # citing container-chains for the derivation.  Separate per-pod edges are the
+  # granular form; this is the cluster-level objective edge.
+  - id: azure-aks-admin-cred-executes-as
+    emits: CanExecuteAs
+    description: "Cluster-admin kubeconfig -> exec any pod -> execute as every pod workload identity (cluster-wide summary edge; per-pod edges from container-chains cluster-rbac-exec)."
+    match:
+      - [ ?principal, CanExecuteCommand, ?workload ]
+      - [ ?workload,  ExecutesAs,        ?workload_identity ]
+    where:
+      - "node_type(?workload) in [KubernetesWorkload, Container]"
+      - "node_type(?workload_identity) in [WorkloadIdentity, ManagedIdentity, MachineIdentity, ServiceAccount]"
+      - "?workload is a workload in an AKS cluster for which ?principal holds cluster-admin credential or Azure RBAC Cluster Admin"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?workload_identity
+      permissions: ["Microsoft.ContainerService/managedClusters/listClusterAdminCredential/action"]
+      conditions: [service_state, token_mounted]
+      state_logic: >-
+        inherit from CanExecuteCommand: ACTIVE when the cluster-admin credential is ACTIVE
+        and the pod is running with its SA token mounted; CONDITIONAL(token_mounted) when
+        automountServiceAccountToken: false; CONDITIONAL(service_state) when the cluster
+        is stopped.  Dedupes with container-chains cluster-rbac-exec on
+        (CanExecuteAs, ?principal, ?workload_identity) — same collapse, AKS-credential framing.
+      confidence: 0.95
+      derived_from:
+        - "<CanExecuteCommand edge_id (azure-aks-admin-cred-execute-command)>"
+        - "<ExecutesAs edge_id>"
+        - "container-chains.yaml#cluster-rbac-exec"
+        - "can-execute-as.yaml#execute-as-via-command"
+      false_positive_note: >-
+        This dedupes with container-chains cluster-rbac-exec on
+        (CanExecuteAs, ?principal, ?workload_identity) — emit once, do not double-count
+        weight.  The escalation consequence (privilege_level guard) is can-control's
+        escalate-via-execute-as — not re-derived here.  Honor automountServiceAccountToken:
+        false — no token mount means no identity to execute as (CONDITIONAL(token_mounted)).
+      narrative: >-
+        {principal.name} holds the cluster-admin kubeconfig for {cluster.name} and can exec
+        into {workload.name}, which runs as {workload_identity.name}; the mounted SA token
+        is readable from inside the container, so {principal.name} executes as
+        {workload_identity.name}.
+
+  # =========================================================================
+  # (B) ARM-PLANE RCE — runCommand
+  # =========================================================================
+
+  # --- runCommand -> CanExecuteCommand on the cluster -------------------------
+  # runCommand/action is an ARM action that proxies kubectl/helm commands into
+  # the cluster on behalf of the caller.  It works even on private clusters
+  # (API server not network-reachable).  From a security model perspective
+  # it is equivalent to holding cluster-level kubectl exec capability.
+  - id: azure-aks-run-command
+    emits: CanExecuteCommand
+    description: "managedClusters/runCommand/action runs arbitrary kubectl/helm inside the cluster, bypassing network isolation; equivalent to cluster-wide kubectl exec."
+    match_effective_permission:
+      action: "Microsoft.ContainerService/managedClusters/runCommand/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds runCommand/action at the cluster scope"
+    emit:
+      source_type: Identity
+      target_type: KubernetesWorkload
+      source: "<principal>"
+      target: "<KubernetesCluster (representing all workloads within)>"
+      permissions: ["Microsoft.ContainerService/managedClusters/runCommand/action"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the cluster powerState.code == Running.  CONDITIONAL(service_state)
+        when the cluster is stopped.  runCommand bypasses API-server network restrictions
+        (private clusters, authorized-IP ranges) — do NOT downgrade to
+        CONDITIONAL(network_reachability) for private clusters.  BLOCKED if a deny
+        assignment covers runCommand/action at the cluster/RG/subscription scope.
+      confidence: 0.95
+      false_positive_note: >-
+        runCommand operates on the ARM plane, not the network plane — it reaches private
+        clusters that are not network-accessible.  Do NOT treat network isolation as a
+        blocker.  The command runs in a temporary pod in the kube-system namespace as a
+        privileged identity; the effective authorization depends on the cluster's RBAC
+        mode (Azure RBAC or k8s RBAC).  When Azure RBAC is enabled, the caller's
+        ARM RBAC on the cluster determines what runCommand can perform — but in practice
+        `runCommand` itself is an administrative action; treat it as cluster-admin equiv
+        for path-finding purposes.
+      narrative: >-
+        {principal.name} holds managedClusters/runCommand/action on cluster {target.name}
+        and can run arbitrary kubectl / helm commands inside the cluster from the ARM plane,
+        bypassing network isolation and achieving cluster-wide code execution.
+
+  # --- runCommand -> CanModifyCode on the cluster ----------------------------
+  # runCommand can `kubectl apply` an attacker manifest — new Deployments, patched
+  # existing Deployments, or DaemonSets.  This is code-modification: whatever
+  # KubernetesWorkload runs next will execute the attacker's container spec.
+  # CanModifyCode on the KubernetesCluster is then consumed by container-chains
+  # execute-as-via-code-modify (via can-execute-as.yaml) -> CanExecuteAs the
+  # workload's identity.
+  - id: azure-aks-run-command-modifycode
+    emits: CanModifyCode
+    description: "runCommand/action can kubectl-apply attacker manifests — new/patched Deployments — changing what code runs as each workload identity."
+    match:
+      - [ ?principal, CanExecuteCommand, ?cluster ]
+    where:
+      - "node_type(?cluster) == KubernetesCluster"
+      - "?principal's CanExecuteCommand on ?cluster was produced by azure-aks-run-command (runCommand/action)"
+    emit:
+      source_type: Identity
+      target_type: KubernetesWorkload
+      source: ?principal
+      target: "<any KubernetesWorkload within ?cluster>"
+      permissions: ["Microsoft.ContainerService/managedClusters/runCommand/action"]
+      conditions: [service_state]
+      state_logic: >-
+        inherit from the contributing CanExecuteCommand (azure-aks-run-command): ACTIVE when
+        the cluster is running; CONDITIONAL(service_state) when stopped; BLOCKED when the
+        CanExecuteCommand is BLOCKED.
+      confidence: 0.95
+      derived_from: [ "<CanExecuteCommand edge_id (azure-aks-run-command)>" ]
+      false_positive_note: >-
+        CanModifyCode on the cluster represents the ability to inject arbitrary pod manifests
+        via kubectl apply.  The fan-out (which workloads are affected) is determined by which
+        workloads the attacker targets with their manifest — in practice, any KubernetesWorkload
+        in the cluster.  The can-execute-as execute-as-via-code-modify linchpin then produces
+        CanExecuteAs for each workload's identity.  Do not double-count with azure-aks-run-command-executes-as
+        on the same (principal, identity) pair.
+      narrative: >-
+        {principal.name} can run kubectl apply via runCommand on cluster {target.name},
+        injecting attacker-controlled container specs into new or existing workloads.
+
+  # --- runCommand -> CanExecuteAs every workload identity ----------------------
+  # Shortcut roll-up: runCommand -> kubectl exec ANY pod -> execute as any
+  # workload identity.  Cites container-chains cluster-rbac-exec for the per-pod
+  # derivation; this is the cluster-level summary.
+  - id: azure-aks-run-command-executes-as
+    emits: CanExecuteAs
+    description: "runCommand grants cluster-wide kubectl exec; any pod's workload identity is reachable by exec-ing into the pod (container-chains cluster-rbac-exec)."
+    match:
+      - [ ?principal, CanExecuteCommand, ?workload ]
+      - [ ?workload,  ExecutesAs,        ?workload_identity ]
+    where:
+      - "node_type(?workload) in [KubernetesWorkload, Container]"
+      - "?principal's CanExecuteCommand is from azure-aks-run-command (runCommand/action)"
+      - "node_type(?workload_identity) in [WorkloadIdentity, ManagedIdentity, MachineIdentity, ServiceAccount]"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?workload_identity
+      permissions: ["Microsoft.ContainerService/managedClusters/runCommand/action"]
+      conditions: [service_state, token_mounted]
+      state_logic: >-
+        inherit from CanExecuteCommand: ACTIVE when the cluster is running and the SA token
+        is mounted; CONDITIONAL(token_mounted) when automountServiceAccountToken: false;
+        CONDITIONAL(service_state) when cluster is stopped.
+      confidence: 0.95
+      derived_from:
+        - "<CanExecuteCommand edge_id (azure-aks-run-command)>"
+        - "<ExecutesAs edge_id>"
+        - "container-chains.yaml#cluster-rbac-exec"
+        - "can-execute-as.yaml#execute-as-via-command"
+      false_positive_note: >-
+        Dedupes with container-chains cluster-rbac-exec and azure-aks-admin-cred-executes-as
+        on (CanExecuteAs, ?principal, ?workload_identity); emit once.  The escalation
+        roll-up is can-control escalate-via-execute-as — not re-derived here.  Honor
+        automountServiceAccountToken: false (CONDITIONAL(token_mounted)).
+      narrative: >-
+        {principal.name} can exec into {workload.name} via runCommand on the cluster;
+        {workload.name} runs as {workload_identity.name}; the mounted SA token is
+        readable from inside the exec session, so {principal.name} executes as
+        {workload_identity.name}.
+
+  # =========================================================================
+  # AZURE RBAC CLUSTER ADMIN ROLE (k8s cluster-admin via Entra RBAC)
+  # =========================================================================
+
+  # When Azure RBAC for Kubernetes is enabled (aadProfile.enableAzureRBAC: true),
+  # the built-in "Azure Kubernetes Service RBAC Cluster Admin" role
+  # (b1ff04bb-8a4e-4dc4-8eb5-8693973ce19a) maps to k8s cluster-admin ClusterRoleBinding.
+  # This gives kubectl exec on every pod WITHOUT needing listClusterAdminCredential.
+
+  # --- Grant RBAC Cluster Admin role to a principal --------------------------
+  # A principal holding Microsoft.Authorization/roleAssignments/write at the cluster scope
+  # or holding the Owner role can assign the AKS RBAC Cluster Admin role to any principal,
+  # enabling them to execute commands on any pod.
+  - id: azure-aks-rbac-cluster-admin-grant
+    emits: CanGrantPermission
+    description: "A principal with roleAssignments/write or Owner role can grant the Azure Kubernetes Service RBAC Cluster Admin role to any principal."
+    match_effective_permission:
+      action: "Microsoft.Authorization/roleAssignments/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Microsoft.Authorization/roleAssignments/write at the cluster scope or ResourceGroup/subscription"
+      - "cluster has aadProfile.enableAzureRBAC: true (Azure RBAC mode enabled)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<any Identity that can be assigned the RBAC Cluster Admin role>"
+      permissions: ["Microsoft.Authorization/roleAssignments/write"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the principal holds roleAssignments/write at cluster/RG/subscription scope
+        and Azure RBAC mode is enabled. CONDITIONAL(iam_permission) when the scope is uncertain.
+        BLOCKED if a deny assignment covers roleAssignments/write or if Azure RBAC mode is
+        disabled (enableAzureRBAC: false).
+      confidence: 0.90
+      derived_from: []
+      false_positive_note: >-
+        roleAssignments/write at the cluster scope allows role assignment specifically for RBAC
+        roles defined in that cluster's Azure RBAC scope. The grantee must hold a compatible
+        assignable role (e.g., not system-internal roles). Verify the principal's scope when
+        evaluating the blast radius — subscription-level roleAssignments/write is broader than
+        cluster-level.
+      narrative: >-
+        {principal.name} holds Microsoft.Authorization/roleAssignments/write on cluster
+        {cluster.name} and can grant the Azure Kubernetes Service RBAC Cluster Admin role to
+        any principal, enabling that principal to execute commands on any pod in the cluster.
+
+  # --- Execute via RBAC Cluster Admin role -----------------------------------
+  - id: azure-aks-rbac-cluster-admin-exec
+    emits: CanExecuteCommand
+    description: "Azure Kubernetes Service RBAC Cluster Admin role (Azure RBAC mode) maps to k8s cluster-admin, granting kubectl exec on every pod."
+    match_effective_permission:
+      role_definition_id: "b1ff04bb-8a4e-4dc4-8eb5-8693973ce19a"
+      scope_type: "resource|resourceGroup|subscription"
+      note: "The RBAC Cluster Admin role is detected by role-assignment lookup (roleDefinitionId b1ff04bb-…), not by checking a specific data-plane action. The canonical data-plane permission for pods/exec is Microsoft.ContainerService/managedClusters/pods/exec/action."
+    where:
+      - "principal holds the 'Azure Kubernetes Service RBAC Cluster Admin' role (b1ff04bb-8a4e-4dc4-8eb5-8693973ce19a) on the cluster"
+      - "cluster has aadProfile.enableAzureRBAC: true (Azure RBAC mode enabled)"
+    emit:
+      source_type: Identity
+      target_type: KubernetesWorkload
+      source: "<principal>"
+      target: "<every KubernetesWorkload in the cluster>"
+      permissions: ["Microsoft.ContainerService/managedClusters/pods/exec/action"]
+      conditions: [service_state, iam_permission]
+      state_logic: >-
+        ACTIVE when the cluster has enableAzureRBAC: true AND the principal's role
+        assignment is effective (not denied) AND the cluster is running.
+        CONDITIONAL(iam_permission) when enableAzureRBAC status is unknown.
+        BLOCKED if a deny assignment covers the role or if the cluster uses k8s-only
+        RBAC mode (enableAzureRBAC: false) — in that case this Entra role has NO
+        in-cluster authorization effect.
+      confidence: 0.90
+      derived_from: []
+      false_positive_note: >-
+        This is ONLY valid when the cluster's aadProfile.enableAzureRBAC is true.
+        On a cluster with only k8s RBAC (Kubernetes-native ClusterRoleBindings), the
+        "Azure Kubernetes Service RBAC Cluster Admin" Entra role DOES NOT grant any
+        k8s authorization — do NOT emit.  Verify enableAzureRBAC: true before emitting.
+        If unsure, emit CONDITIONAL(iam_permission).
+      narrative: >-
+        {principal.name} holds the Azure Kubernetes Service RBAC Cluster Admin role on
+        cluster {target.name} (Azure RBAC mode enabled), which maps to k8s cluster-admin
+        and grants kubectl exec on every pod in the cluster.
+
+  # =========================================================================
+  # CLUSTER WRITE — CanAdminister / CanModifyConfiguration
+  # =========================================================================
+
+  - id: azure-aks-admin-action
+    emits: CanAdminister
+    description: "Microsoft.ContainerService/managedClusters/* grants full control of the cluster (create/update/delete/stop/rotate/upgradeNodeImageVersion/etc.)."
+    match_effective_permission:
+      action: "Microsoft.ContainerService/managedClusters/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds the managedClusters/* wildcard (Azure Kubernetes Service Contributor / Contributor / Owner)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<managedCluster>"
+      permissions: ["Microsoft.ContainerService/managedClusters/write"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the principal's role assignment is effective (not denied by a deny assignment)
+        and the cluster is running.  CONDITIONAL(deny_assignment) when a deny assignment covers
+        managedClusters/write at the cluster/RG/subscription scope.  CONDITIONAL(service_state)
+        when the cluster is stopped.  BLOCKED if covered by an effective deny assignment.
+      confidence: 0.90
+      derived_from: []
+      false_positive_note: >-
+        Azure Kubernetes Service Contributor (managedClusters/* write) does NOT include
+        Microsoft.Authorization/*/write; the principal cannot grant itself or others RBAC
+        unless it also holds User Access Administrator.  It is still sufficient to call
+        managedClusters/write to disable localAccountsDisabled, enabling listClusterAdminCredential
+        to return a static cert.
+      narrative: >-
+        {principal.name} has full management control of AKS cluster {target.name}
+        (managedClusters/write), including update, upgrade, and configuration changes.
+
+  - id: azure-aks-write-config
+    emits: CanModifyConfiguration
+    description: "managedClusters/write can disable local account restrictions, change the OIDC issuer, swap kubelet MI, or alter network egress — configuration changes that unlock or change escalation paths."
+    match_effective_permission:
+      action: "Microsoft.ContainerService/managedClusters/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<managedCluster>"
+      permissions: ["Microsoft.ContainerService/managedClusters/write"]
+      conditions: [service_state, iam_permission]
+      state_logic: >-
+        CONDITIONAL(service_state, iam_permission) — the config change is an indirect escalation requiring
+        further steps: setting disableLocalAccounts: false unlocks azure-aks-list-admin-cred; swapping kubelet MI
+        unlocks azure-aks-node-imds-executes-as (requires Microsoft.ManagedIdentity/.../assign on target MI);
+        disabling Azure RBAC downgrades cluster-admin enforcement; modifying authorizedIPRanges extends network
+        reachability. The escalation path is CONDITIONAL on the downstream exploitation step.
+      confidence: 0.85
+      derived_from: []
+      false_positive_note: >-
+        managedClusters/write grants configuration change, not direct code execution — the
+        escalation is indirect (changes unlock other paths).  Model as CONDITIONAL(service_state)
+        when downstream exploitation of the config change requires additional steps.
+        Downstream paths: (1) disableLocalAccounts: false + azure-aks-list-admin-cred; (2) kubelet MI swap
+        requires Microsoft.ManagedIdentity/.../assign on the target MI + azure-aks-node-imds-executes-as;
+        (3) disabling enableAzureRBAC bypasses Azure RBAC cluster-admin enforcement; (4) authorizedIPRanges
+        changes unlock network reachability for unauthenticated clients.  See azure-aks-swap-kubelet-mi
+        for the composed escalation path (managedClusters/agentPools/write + assign on MI).
+      narrative: >-
+        {principal.name} can update the configuration of AKS cluster {target.name}
+        (managedClusters/write), enabling escalation by re-enabling local accounts (unlocking
+        azure-aks-list-admin-cred static cert), swapping the kubelet MI to a more-privileged identity,
+        altering RBAC mode (Azure RBAC → k8s-only), or modifying authorized IP ranges.
+
+  # =========================================================================
+  # (C) WORKLOAD IDENTITY FEDERATION
+  # =========================================================================
+
+  # AKS Workload Identity: a KSA annotated with azure.workload.identity/client-id
+  # has a corresponding federated credential on an Azure MI whose issuer is the
+  # cluster OIDC issuer URL and subject is system:serviceaccount:<ns>:<sa>.
+  # The projection webhook injects AZURE_CLIENT_ID and a projected token volume
+  # into every pod running as that KSA.  The pod uses that token to exchange for
+  # an MI access token via Azure AD OIDC.
+  #
+  # This rule asserts the CanFederateAs edge directly (container-chains
+  # workload-identity-federates also fires; they dedupe on the same edge).
+  # federation-chains then rolls up to CanImpersonate / CanEnterSubscription.
+  # NOTE: azure-aks-workload-identity-federates is removed. The explicit rules
+  # (azure-aks-mi-trusts-ksa and azure-aks-ksa-maps-to-mi) emit TrustsExternalIdentity
+  # and ExternalIdentityMapsTo, which are consumed by the linchpin container-chains
+  # workload-identity-federates to produce CanFederateAs. Per Phase 7 guidance, this
+  # file should emit facts and cite linchpins, not re-derive their output.
+  # If AKS-specific state logic is needed (e.g., BLOCKED when oidcIssuerProfile.enabled: false),
+  # embed it in the explicit rules as a where/state gate. Trust the linchpin.
+
+  # =========================================================================
+  # NODE MI — IMDS TOKEN FROM NODE-LEVEL ACCESS
+  # =========================================================================
+
+  # Every AKS node (VMSS instance) has a system-assigned MI (or a user-assigned
+  # kubelet MI).  Code with node-level access (privileged pod, hostNetwork+hostPID,
+  # exec into a DaemonSet on the node) can reach the node IMDS at
+  # 169.254.169.254 and mint a token for the node MI.
+  # Node-level access is NOT available to regular unprivileged pods.
+  - id: azure-aks-node-imds-executes-as
+    emits: CanExecuteAs
+    description: "Node-level code execution (privileged pod, hostPID, DaemonSet exec) reaches the node IMDS and mints a token for the node system-assigned / kubelet MI."
+    match:
+      - [ ?principal, CanExecuteCommand, ?pod ]
+      - [ ?pod, LocatedIn, ?node ]
+      - [ ?node, ExecutesAs, ?node_mi ]
+    where:
+      - "node_type(?pod) in [KubernetesWorkload, Container]"
+      - "?pod runs with hostNetwork: true OR hostPID: true OR is a privileged container OR is exec-accessible on the node"
+      - "node_type(?node) in [VirtualMachine, ContainerCluster]  # the specific VMSS instance the pod runs on"
+      - "node_type(?node_mi) in [ManagedIdentity, MachineIdentity]"
+      - "?node_mi is the system-assigned MI or kubelet user-assigned MI on the node"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?node_mi
+      permissions: ["<pods/exec create on ?pod | runCommand | listClusterAdminCredential>"]
+      conditions: [service_state, iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal can exec into a pod with node-level access (hostNetwork/hostPID/privileged)
+        on a specific node, that node is running, and it has an ExecutesAs edge to ?node_mi.
+        CONDITIONAL(iam_permission) when the pod's level of node access is unknown or the node's MI binding is unconfirmed
+        (standard unprivileged pods do NOT reach the node IMDS).  BLOCKED if the cluster enforces Azure Policy /
+        Pod Security Standards that prohibit privileged pods.
+      confidence: 0.80
+      derived_from:
+        - "<CanExecuteCommand edge_id>"
+        - "<LocatedIn edge_id (pod -> node)>"
+        - "<ExecutesAs edge_id (node -> node MI)>"
+        - "can-execute-as.yaml#execute-as-via-command"
+      false_positive_note: >-
+        Node IMDS (169.254.169.254) is reachable only from the node itself or from
+        pods with hostNetwork: true or other host-level access.  Regular unprivileged pods
+        do NOT reach the node IMDS — they can only access their projected SA token.
+        Only emit when the exec target pod actually has node-level access (hostNetwork/
+        hostPID/privileged) on the SPECIFIC node where the ExecutesAs binding exists.
+        Do NOT Cartesian-product every CanExecuteCommand pod with every node MI in the cluster —
+        enforce the pod-to-node placement via LocatedIn.  Do NOT emit for standard restricted pods.
+        Escalation guard: emit only when the node MI privilege_level >= principal's.
+        The escalation roll-up is can-control escalate-via-execute-as — not re-derived.
+      narrative: >-
+        {principal.name} can exec into a node-level pod ({pod.name}, hostNetwork/
+        privileged) on node {node.name} in cluster {cluster.name}; from inside, the node IMDS endpoint
+        (169.254.169.254) returns a token for the node MI {node_mi.name}, so {principal.name}
+        executes as {node_mi.name}.
+
+  # =========================================================================
+  # ACR PULL — supply-chain connection (ContainsResourceReference emitted
+  # by explicit rules; container-chains image-push-poisons-consumers consumes it)
+  # =========================================================================
+
+  # No derived rule needed here: the supply-chain fan-out is already handled by
+  # container-chains image-push-poisons-consumers (who has AcrPush on ACR) +
+  # poisoned-image-executes-as (workload pulls the image -> CanExecuteAs its MI).
+  # The explicit normalization rules below emit the ContainsResourceReference
+  # (workload -> ACR image) edge that container-chains consumes.
+
+  # =========================================================================
+  # NETWORK EXPOSURE
+  # =========================================================================
+
+  # NOTE: azure-aks-public-api-server moved to explicit rules (azure-aks.yaml explicit file)
+  # It is derived purely from static ARM config properties (apiServerAccessProfile,
+  # publicFQDN, privateLinkResources) and does not match a chain of other graph edges.
+  # Per RULE-FORMAT.md, rules require a match block binding variables from existing edges;
+  # a where-only rule cannot be evaluated by the fixpoint engine. Restructured as an
+  # explicit rule reading from ARM config.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - Deny assignment covering listClusterAdminCredential/action or runCommand/action
+#    at the cluster / RG / subscription scope -> emit BLOCKED.
+#  - localAccountsDisabled: true -> azure-aks-list-admin-cred static-cert path is
+#    CONDITIONAL(deny_assignment); the AAD-gated path remains but needs Entra auth.
+#  - aadProfile.enableAzureRBAC: false -> azure-aks-rbac-cluster-admin-exec does NOT fire.
+#  - oidcIssuerProfile.enabled: false -> azure-aks-workload-identity-federates BLOCKED.
+#  - Azure Policy / Pod Security Standards blocking privileged pods ->
+#    azure-aks-node-imds-executes-as CONDITIONAL/BLOCKED.
+#  - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization (raw config -> explicit edges).
+# These belong in /rules/explicit/azure-aks.yaml (see explicitPath).
+# Listed here for completeness; they emit the ExecutesAs / TrustsExternalIdentity /
+# ExternalIdentityMapsTo / ContainsResourceReference facts the derived rules consume.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: azure-aks-cluster-executes-as-control-plane-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.ContainerService/managedClusters"
+      field: "identity"
+    where: ["identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned']"]
+    emit:
+      source: "<managedCluster>"
+      target: "<system-assigned SP (principalId) or userAssignedIdentities keys>"
+      narrative: "AKS cluster {cluster.name} runs its control plane as managed identity {mi.name}."
+
+  - id: azure-aks-nodepool-executes-as-kubelet-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.ContainerService/managedClusters"
+      field: "properties.identityProfile.kubeletidentity"
+    emit:
+      source: "<agentPool VMSS node>"
+      target: "<kubelet user-assigned MI (clientId / resourceId)>"
+      narrative: "AKS node pool nodes run as kubelet MI {mi.name}."
+
+  - id: azure-aks-workload-trusts-ksa
+    emits: TrustsExternalIdentity
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.ManagedIdentity/userAssignedIdentities"
+      field: "federatedIdentityCredentials"
+    where:
+      - "federatedIdentityCredential.issuer matches cluster oidcIssuerProfile.issuerURL"
+      - "federatedIdentityCredential.subject matches system:serviceaccount:<namespace>:<sa-name>"
+    emit:
+      source: "<managed identity>"
+      target: "<Kubernetes ServiceAccount (WorkloadIdentity) matching subject>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/{name}/federatedIdentityCredentials"
+      narrative: "MI {mi.name} trusts KSA {ksa.name} (workload identity federation via cluster OIDC issuer)."
+
+  - id: azure-aks-ksa-maps-to-mi
+    emits: ExternalIdentityMapsTo
+    applies_to: [azure]
+    source_config:
+      resource_type: "k8s/ServiceAccount"
+      field: "metadata.annotations['azure.workload.identity/client-id']"
+    where:
+      - "annotation azure.workload.identity/client-id is set (non-empty)"
+    emit:
+      source: "<Kubernetes ServiceAccount (WorkloadIdentity)>"
+      target: "<Azure Managed Identity matching the client-id annotation>"
+      api_source: "kubectl get serviceaccount -n <ns> <name> -o yaml"
+      narrative: "KSA {ksa.name} is annotated to federate as MI {mi.name} (AKS Workload Identity)."
+
+  - id: azure-aks-workload-pulls-image
+    emits: ContainsResourceReference
+    applies_to: [azure]
+    source_config:
+      resource_type: "k8s/Deployment|k8s/DaemonSet|k8s/StatefulSet|k8s/Job"
+      field: "spec.template.spec.containers[].image"
+    emit:
+      source: "<KubernetesWorkload>"
+      target: "<ContainerRegistry (ACR) that hosts the image>"
+      reference_kind: "runs_image"
+      api_source: "kubectl get <kind> -n <ns> <name> -o yaml"
+      narrative: "{workload.name} pulls its container image from {registry.name}."
+
+  - id: azure-aks-pod-executes-as-ksa
+    emits: ExecutesAs
+    applies_to: [azure]
+    source_config:
+      resource_type: "k8s/Pod|k8s/Deployment|k8s/DaemonSet|k8s/StatefulSet|k8s/Job"
+      field: "spec.serviceAccountName"
+    emit:
+      source: "<KubernetesWorkload / Container>"
+      target: "<Kubernetes ServiceAccount (WorkloadIdentity)>"
+      api_source: "kubectl get pod -n <ns> <name> -o yaml"
+      narrative: "{workload.name} runs as Kubernetes ServiceAccount {ksa.name}."

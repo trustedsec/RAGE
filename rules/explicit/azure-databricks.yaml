@@ -1,0 +1,454 @@
+# Azure Databricks — explicit normalization rules.
+# Translate raw collected Microsoft.Databricks/workspaces and
+# Microsoft.Databricks/accessConnectors ARM config, plus Databricks REST API
+# responses, into common explicit edges consumed by derived rules in
+# /rules/derived/azure/databricks.yaml.
+#
+# TWO normalization areas:
+#   1. ExecutesAs / AttachedTo — cluster/job/pipeline identity binding via
+#      Access Connector MI or cluster-level user-assigned MI.
+#   2. ContainsSecret / ContainsCredential — Spark config embedded keys, PATs,
+#      secret scope facts for downstream credential-chain derivation.
+#
+# Collection APIs (read-only, no secrets retrieved):
+#   ARM:
+#     az databricks workspace list / show                (workspace ARM resource)
+#     az databricks access-connector list / show         (accessConnectors)
+#     az role assignment list --scope <workspace>        (RBAC at workspace/RG/sub)
+#   Databricks REST (adb-<id>.azuredatabricks.net/api/):
+#     GET /api/2.0/clusters/list                         (cluster config + MI)
+#     GET /api/2.1/jobs/list                             (job + cluster reference)
+#     GET /api/2.0/workspace/list (recursive)            (notebook paths)
+#     GET /api/2.0/secret/scopes/list                   (scope list)
+#     GET /api/2.0/secret/scopes/acls/list              (scope ACLs)
+#     GET /api/2.0/pipelines                            (DLT pipeline list)
+#     GET /api/2.0/sql/warehouses                       (SQL warehouse list)
+#     GET /api/2.0/token-management/tokens  (admin)     (PAT list; no values)
+#     GET /api/2.1/unity-catalog/metastores             (UC metastore config)
+#     GET /api/2.1/unity-catalog/storage-credentials    (UC storage credentials)
+#
+# NOTE: do NOT collect GET /api/2.0/secrets/get (secret values) in the
+# read-only collector — that is a credential-access action, not discovery.
+
+rules:
+
+  # ===========================================================================
+  # STRUCTURAL: workspace containment
+  # ===========================================================================
+
+  - id: azure-dbx-workspace-in-rg
+    emits: LocatedIn
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Databricks/workspaces"
+      field: "id"
+    emit:
+      source_type: AnalyticsService
+      target_type: AdministrativeBoundary
+      source: "<Databricks workspace node>"
+      target: "<resource group containing the workspace>"
+      api_source: "az databricks workspace list"
+      evidence_field: "id"
+      narrative: "Databricks workspace {workspace.name} is located in resource group {rg.name}."
+
+  - id: azure-dbx-workspace-contains-cluster
+    emits: Contains
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::Cluster"
+      field: "cluster_id"
+    where:
+      - "cluster belongs to the parent workspace"
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: "*"
+      source: "<Databricks workspace node>"
+      target: "<cluster node (BatchJob/GenericCompute)>"
+      api_source: "GET /api/2.0/clusters/list"
+      evidence_field: "cluster_id"
+      narrative: "Databricks workspace {workspace.name} contains cluster {cluster.name}."
+
+  - id: azure-dbx-workspace-contains-job
+    emits: Contains
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::Job"
+      field: "job_id"
+    where:
+      - "job belongs to the parent workspace"
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: "*"
+      source: "<Databricks workspace node>"
+      target: "<job node (BatchJob)>"
+      api_source: "GET /api/2.1/jobs/list"
+      evidence_field: "job_id"
+      narrative: "Databricks workspace {workspace.name} contains job {job.name}."
+
+  - id: azure-dbx-workspace-contains-notebook
+    emits: Contains
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::Notebook"
+      field: "path"
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: "*"
+      source: "<Databricks workspace node>"
+      target: "<notebook node (Notebook)>"
+      api_source: "GET /api/2.0/workspace/list (recursive)"
+      evidence_field: "path"
+      narrative: "Databricks workspace {workspace.name} contains notebook {notebook.path}."
+
+  - id: azure-dbx-workspace-contains-secret-scope
+    emits: Contains
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::SecretScope"
+      field: "name"
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: "*"
+      source: "<Databricks workspace node>"
+      target: "<secret scope node (Secret)>"
+      api_source: "GET /api/2.0/secret/scopes/list"
+      evidence_field: "name"
+      narrative: "Databricks workspace {workspace.name} contains secret scope {scope.name}."
+
+  # ===========================================================================
+  # EXECUTION IDENTITY: ExecutesAs / AttachedTo
+  # ===========================================================================
+
+  - id: azure-dbx-cluster-executes-as-access-connector-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::Cluster"
+      field: "azure_attributes.access_connector_id"
+    where:
+      - "cluster azure_attributes.access_connector_id is set"
+      - "the referenced Access Connector (Microsoft.Databricks/accessConnectors) has identity.userAssignedIdentities or systemAssigned MI"
+    emit:
+      source_type: GenericCompute
+      target_type: ManagedIdentity
+      source: "<cluster node (BatchJob/GenericCompute)>"
+      target: "<MI on the referenced Access Connector (ManagedIdentity)>"
+      api_source: "GET /api/2.0/clusters/list + az databricks access-connector show"
+      evidence_field: "azure_attributes.access_connector_id -> accessConnectors identity"
+      note: >-
+        The Access Connector MI is the canonical execution identity for clusters configured
+        with Unity Catalog or credential passthrough. The MI resource is resolved from the
+        accessConnectors ARM resource identity block (system-assigned principalId or
+        userAssignedIdentities keys). Every cluster using this connector inherits the MI.
+      narrative: >-
+        Cluster {cluster.name} executes as managed identity {mi.name} via Access Connector
+        {connector.name}.
+
+  - id: azure-dbx-cluster-executes-as-cluster-level-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::Cluster"
+      field: "azure_attributes.msi_resource_id"
+    where:
+      - "cluster spark_conf has spark.databricks.azure.msi.enabled = true"
+      - "azure_attributes.msi_resource_id is set to a user-assigned MI resource id"
+    emit:
+      source_type: GenericCompute
+      target_type: ManagedIdentity
+      source: "<cluster node (BatchJob/GenericCompute)>"
+      target: "<user-assigned MI (ManagedIdentity)>"
+      api_source: "GET /api/2.0/clusters/list"
+      evidence_field: "azure_attributes.msi_resource_id"
+      note: >-
+        Cluster-level user-assigned MI (Azure MI auth mode): the cluster nodes expose
+        this MI via IMDS (169.254.169.254). Only valid when spark.databricks.azure.msi.enabled
+        is true and the cluster profile permits it (singleUser or compatible profile).
+      narrative: >-
+        Cluster {cluster.name} executes as user-assigned MI {mi.name} (cluster-level
+        Azure MI auth mode, IMDS at 169.254.169.254).
+
+  - id: azure-dbx-job-executes-as-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::Job"
+      field: "settings.job_clusters OR settings.tasks[].existing_cluster_id"
+    where:
+      - "job uses a new_cluster (settings.job_clusters[].new_cluster) or an existing cluster with a bound MI"
+      - "the cluster (new or existing) has an Access Connector MI or cluster-level MI (resolved via azure-dbx-cluster-executes-as-* rules)"
+    emit:
+      source_type: BatchJob
+      target_type: ManagedIdentity
+      source: "<job node (BatchJob)>"
+      target: "<MI of the job cluster (ManagedIdentity)>"
+      api_source: "GET /api/2.1/jobs/list + cluster MI resolution"
+      evidence_field: "settings.job_clusters[].new_cluster or tasks[].existing_cluster_id"
+      note: >-
+        A Databricks job inherits the MI of its compute cluster. For new_cluster, resolve
+        the MI from the cluster spec's azure_attributes. For existing_cluster_id, look up
+        the cluster's MI from the cluster-level ExecutesAs edges. Emit for each MI-bearing
+        cluster reference in the job.
+      narrative: >-
+        Databricks job {job.name} executes as MI {mi.name} via its cluster.
+
+  - id: azure-dbx-pipeline-executes-as-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::Pipeline"
+      field: "spec.clusters OR cluster"
+    where:
+      - "DLT pipeline has a cluster configuration referencing an Access Connector MI or cluster-level MI"
+    emit:
+      source_type: BatchJob
+      target_type: ManagedIdentity
+      source: "<DLT pipeline node (BatchJob)>"
+      target: "<MI of the pipeline cluster (ManagedIdentity)>"
+      api_source: "GET /api/2.0/pipelines + cluster MI resolution"
+      evidence_field: "spec.clusters[].azure_attributes.access_connector_id"
+      narrative: >-
+        DLT pipeline {pipeline.name} executes as MI {mi.name} via its cluster.
+
+  - id: azure-dbx-sql-warehouse-executes-as-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::SQLWarehouse"
+      field: "warehouse_type|cluster_size"
+    where:
+      - "SQL Warehouse is created in a workspace with an Access Connector MI (the workspace default execution identity)"
+      - "the workspace has configured an Access Connector or cluster-level MI for SQL query execution"
+    emit:
+      source_type: DataWarehouse
+      target_type: ManagedIdentity
+      source: "<SQL Warehouse node (DataWarehouse)>"
+      target: "<MI of the workspace Access Connector (ManagedIdentity)>"
+      api_source: "GET /api/2.0/sql/warehouses + workspace Access Connector resolution"
+      evidence_field: "warehouse_id from /api/2.0/sql/warehouses"
+      note: >-
+        Databricks SQL Warehouses execute queries using the workspace's configured Access
+        Connector MI. Unlike clusters, SQL Warehouse execution identity is not independently
+        configurable per warehouse; it is a workspace-level setting. Any SQL queries
+        executed on the warehouse run as the workspace's Access Connector MI.
+      narrative: >-
+        SQL Warehouse {source.name} executes queries as MI {target.name} via the workspace
+        Access Connector, enabling IMDS-based Azure resource access for SQL query workloads.
+
+  - id: azure-dbx-access-connector-mi-attached
+    emits: AttachedTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Databricks/accessConnectors"
+      field: "identity.userAssignedIdentities"
+    where:
+      - "identity.type includes UserAssigned"
+    emit:
+      source_type: ManagedIdentity
+      target_type: Compute
+      source: "<user-assigned MI (ManagedIdentity)>"
+      target: "<Access Connector>"
+      api_source: "az databricks access-connector show"
+      evidence_field: "identity.userAssignedIdentities"
+      narrative: "User-assigned MI {mi.name} is attached to Access Connector {connector.name}."
+
+  # ===========================================================================
+  # ADMINISTRATIVE CONTROL
+  # ===========================================================================
+
+  - id: azure-dbx-workspace-contributor
+    emits: CanAdminister
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Databricks/workspaces/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor, Owner, or a custom role granting Microsoft.Databricks/workspaces/* at the scope"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Databricks workspace (Microsoft.Databricks/workspaces)>"
+      permissions: ["Microsoft.Databricks/workspaces/write"]
+      api_source: "ARM role assignment"
+      evidence_field: "roleAssignments[].properties.roleDefinitionId"
+      note: >-
+        This is an explicit normalization rule that reads ARM role-assignment data
+        to emit the CanAdminister capability. The match_effective_permission pattern
+        evaluates the effective ARM RBAC permission directly from collected configuration.
+      false_positive_note: >-
+        workspaces/write grants ARM-level control of the workspace object and parameters;
+        it does NOT grant Microsoft.Authorization/*/write (no self role-assignment). The
+        escalation path is via the workspace's Access Connector MI, not direct role
+        assignment. Databricks workspace Admin role (data-plane) is a separate grant.
+      narrative: >-
+        {principal.name} has full ARM control of Databricks workspace {target.name}
+        (Microsoft.Databricks/workspaces/write), enabling workspace reconfiguration and
+        escalation via the Access Connector managed identity.
+
+  # ===========================================================================
+  # CREDENTIAL CONTAINMENT: ContainsSecret / ContainsCredential
+  # ===========================================================================
+
+  - id: azure-dbx-cluster-spark-conf-contains-key
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::Cluster"
+      field: "spark_conf"
+    where:
+      - "spark_conf has a key matching spark.hadoop.fs.azure.account.key.*, fs.azure.sas.*, spark.hadoop.fs.azure.account.oauth2.*, or similar credential patterns"
+      - "the value is a non-empty string (not a Key Vault reference like {{secrets/<scope>/<key>}})"
+    emit:
+      source_type: GenericCompute
+      target_type: Secret
+      source: "<cluster node (BatchJob/GenericCompute)>"
+      target: "<embedded storage credential (Credential/AccessKey)>"
+      api_source: "GET /api/2.0/clusters/list"
+      evidence_field: "spark_conf[spark.hadoop.fs.azure.account.key.*]"
+      note: >-
+        Inline credentials in Spark config are returned in the clusters/list response
+        body (readable by any cluster viewer). Key Vault references using the
+        {{secrets/<scope>/<key>}} interpolation syntax are NOT inline credentials —
+        the actual value is in the secret scope, not the Spark config.
+      narrative: >-
+        Cluster {cluster.name} contains a storage credential in spark_conf
+        ({spark_conf_key}); readable via GET /api/2.0/clusters/get.
+
+  - id: azure-dbx-workspace-contains-pat
+    emits: ContainsCredential
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::Workspace"
+      api: "GET /api/2.0/token-management/tokens"
+    where:
+      - "response includes active PAT records (admin listing — requires workspace Admin)"
+      - "token_info[].expiry_time is in the future or -1 (non-expiring)"
+    emit:
+      source_type: AnalyticsService
+      target_type: Credential
+      source: "<Databricks workspace node>"
+      target: "<PAT token (Token)>"
+      api_source: "GET /api/2.0/token-management/tokens (workspace Admin)"
+      evidence_field: "token_info[].token_id"
+      note: >-
+        PAT tokens authenticate to the Databricks REST API as the issuing user. The
+        token VALUE is not returned by the list API (only the token_id and metadata);
+        the existence fact is still security-relevant (shows persistent credential material).
+        A workspace Admin can create tokens for other users (CanCreateCredentialFor) and
+        revoke all tokens.
+      narrative: >-
+        Databricks workspace {workspace.name} has active PAT tokens
+        ({count} tokens); these authenticate to the workspace REST API as their issuing users.
+
+  - id: azure-dbx-admin-pat-mint
+    emits: CanCreateCredentialFor
+    applies_to: [azure]
+    match_effective_permission:
+      action: "databricks:token-management:create"
+      scope_type: "workspace"
+    where:
+      - "principal is a Databricks workspace Admin (POST /api/2.0/token-management/tokens with user_id)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<Databricks Admin principal>"
+      target: "<any Databricks workspace user (HumanIdentity/MachineIdentity)>"
+      permissions: ["databricks:token-management:create (workspace Admin — POST /api/2.0/token-management/tokens)"]
+      api_source: "Databricks SCIM / workspace role list"
+      evidence_field: "workspace_admin_role assignment"
+      note: >-
+        This is an explicit normalization rule that reads the workspace Admin role
+        assignment data to emit CanCreateCredentialFor. Admin role status is an
+        explicit permission fact (not derived).
+      false_positive_note: >-
+        Only workspace Admins can create tokens for OTHER users via the token-management
+        API. Regular users can only create tokens for themselves (POST /api/2.0/token/create).
+        Admin token creation for another user yields a PAT that authenticates as that user
+        to the Databricks REST API -> full impersonation of the target user's workspace
+        permissions. The minted PAT is a long-lived credential.
+      narrative: >-
+        {principal.name} is a Databricks workspace Admin and can create a PAT for any
+        user (POST /api/2.0/token-management/tokens), yielding a long-lived token that
+        impersonates that user in the workspace REST API.
+
+  - id: azure-dbx-secret-scope-kv-backed
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::SecretScope"
+      field: "backend_type"
+    where:
+      - "backend_type == AZURE_KEYVAULT"
+      - "keyvault_metadata.dns_name and resource_id are set"
+    emit:
+      source_type: Storage
+      target_type: Secret
+      source: "<Databricks secret scope node (Secret/Databricks-KV-backed)>"
+      target: "<Azure Key Vault referenced (Secret/KeyVaultVault)>"
+      api_source: "GET /api/2.0/secret/scopes/list"
+      evidence_field: "backend_azure_keyvault.dns_name"
+      note: >-
+        A KV-backed scope proxies reads to the Azure Key Vault via the Access Connector MI.
+        The MI must have Key Vault Secret Get permission for the scope reads to succeed.
+        Recording the ContainsSecret link enables credential-chains to reason about the
+        Key Vault as the ultimate secret store and the MI as the required decryptor.
+      narrative: >-
+        Databricks secret scope {scope.name} is backed by Azure Key Vault {kv.name};
+        reads are proxied through the Access Connector MI.
+
+  - id: azure-dbx-cluster-init-script-uri
+    emits: ContainsResourceReference
+    applies_to: [azure]
+    match_record:
+      resource_type: "Databricks::Cluster"
+      field: "init_scripts"
+    where:
+      - "init_scripts is non-empty (contains workspace, dbfs, abfss, s3, file, or gcs URIs)"
+    emit:
+      source_type: GenericCompute
+      target_type: "*"
+      source: "<cluster node>"
+      target: "<init-script storage resource (ObjectStorage/FileStorage)>"
+      api_source: "GET /api/2.0/clusters/list"
+      evidence_field: "init_scripts[].dbfs OR .abfss OR .workspace"
+      note: >-
+        Init scripts run as root before user code on each node start. The reference URI
+        points to a storage location (ADLS Gen2 abfss://, DBFS, workspace files).
+        Whoever can write to that URI AND set it as an init_scripts entry (cluster edit)
+        can inject code — captured by azure-dbx-cluster-init-script in the derived rules.
+      narrative: >-
+        Cluster {cluster.name} references init script at {init_script_uri}; write access
+        to that URI + cluster edit enables code injection.
+
+  - id: azure-dbx-job-run-now
+    emits: CanTrigger
+    applies_to: [azure]
+    match_effective_permission:
+      action: "databricks:jobs:run"
+      scope_type: "job"
+    where:
+      - "principal has CAN_MANAGE_RUN or CAN_MANAGE on the target job (POST /api/2.1/jobs/run-now)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Databricks Job (BatchJob)>"
+      permissions: ["databricks:jobs:run (CAN_MANAGE_RUN or CAN_MANAGE — POST /api/2.1/jobs/run-now)"]
+      api_source: "Databricks workspace object ACL (job permissions)"
+      evidence_field: "job.permissions[].permission_level"
+      note: >-
+        This is an explicit normalization rule that reads Databricks job ACL data
+        to emit CanTrigger. The CAN_MANAGE_RUN / CAN_MANAGE permission on a job is
+        an explicit data-plane permission fact (not derived).
+      false_positive_note: >-
+        CAN_MANAGE_RUN is the trigger-only privilege; it allows run-now and cancel but
+        NOT job definition update (that requires CAN_MANAGE). Trigger-only yields
+        CanExecuteAs only via cicd-chains cicd-trigger-runner-executes-as, which is
+        CONDITIONAL(attacker_influenced_definition) — only if the job's CURRENT definition
+        already runs attacker-influenced code. Do NOT derive ACTIVE CanExecuteAs from
+        trigger-only without evidence of attacker code already in the definition.
+      narrative: >-
+        {principal.name} can trigger an immediate run of Databricks job {target.name}
+        (CAN_MANAGE_RUN, /api/2.1/jobs/run-now), causing it to execute on its configured
+        cluster and run as the cluster's managed identity.

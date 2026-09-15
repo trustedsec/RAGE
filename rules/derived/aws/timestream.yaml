@@ -1,0 +1,202 @@
+# AWS Timestream (for LiveAnalytics) — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Timestream is a serverless time-series database. Its IAM permission namespace
+# is `timestream:` (split: `timestream-query:` for reads, `timestream-write:`
+# for ingest, though IAM actions are referenced without the sub-namespace prefix).
+# All data-plane access is IAM-gated (SigV4); there are no resource-based policies
+# and no execution identity on tables.
+#
+# ATTACK SURFACE SUMMARY (low — 1 conservative rule):
+#   (1) DATA READ: timestream:Select -> CanReadData on the table. If the table
+#       is encrypted with a customer-managed KMS key (CMK), the read is
+#       CONDITIONAL(key_permission) — Timestream decrypts on the caller's behalf
+#       but requires the caller's effective policy to allow kms:Decrypt on the CMK.
+#       Table data may contain application secrets -> ContainsSecret.
+#       Roll-up (ContainsSecret + CredentialsFor -> CanImpersonate) is handled by
+#       the provider-agnostic linchpin: credential-chains:read-secret-yields-identity.
+#
+# WHAT THIS FILE DOES NOT DERIVE:
+#   - ExecutesAs: Timestream tables run no user-supplied code.
+#   - ExposedToInternet: the service endpoint requires SigV4; unauthenticated
+#     access is not possible.
+#   - CrossAccountTrust: Timestream has no resource-based policies and no
+#     cross-account sharing primitives.
+#   - CanExfiltrate: scheduled-query UNLOAD to S3 exists but is modeled generically
+#     via IAM PassRole / CanPassIdentity (see the can-control and credential-chains
+#     linchpins for PassRole semantics). The permission timestream:CreateScheduledQuery
+#     should be checked in the IAM PassRole rules file; without iam:PassRole, the query
+#     engine cannot attach a role to the scheduled execution context.
+#   - CanWriteData: timestream:WriteRecords is low-severity (data poisoning only,
+#     no credential harvest) and out of scope for the single conservative rule
+#     allocated to this low-relevance service.
+#
+# LINCHPIN CITATIONS (do not re-derive here):
+#   * aws-timestream-read-data-contains-secret (bridge rule in this file)
+#       CanReadData(?principal, ?table) + ContainsSecret(?table, ?secret)
+#       -> CanReadSecret(?principal, ?secret) — essential bridge to credential-chains.
+#   * credential-chains.yaml:read-secret-yields-identity
+#       CanReadSecret(?principal, ?secret) + CredentialsFor(?secret, ?identity)
+#       -> CanImpersonate(?principal, ?identity) — credit to linchpin for the full pivot.
+#   * credential-chains.yaml:decrypt-gates-secret-read
+#       When CanReadSecret is CONDITIONAL(key_permission) on a CMEK-wrapped secret,
+#       the same principal must also hold CanDecrypt on the CMK for the state to
+#       upgrade to ACTIVE.
+#
+# PERMISSIONS: from the AWS Service Authorization Reference — Amazon Timestream.
+#   timestream:Select — grants data-plane query access; maps to the Timestream Query
+#   API action that executes a SQL-like query and returns time-series data rows.
+#
+# NOTE on endpoint discovery: every Timestream API call first requires
+#   timestream:DescribeEndpoints (the SDK calls it automatically). The permission
+#   evaluator MUST confirm this action is also present in the effective policy;
+#   without it the Select call cannot succeed. Model this as an implicit condition
+#   on the HasPermission edge rather than a separate rule.
+#
+# STATE CONVENTIONS (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. CONDITIONAL contributors cap output at CONDITIONAL.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # --- 1) timestream:Select -> data-plane read ---------------------------------
+  # The primary Timestream attack-path primitive: IAM-effective timestream:Select
+  # on a table ARN allows the caller to run arbitrary SQL-like queries against the
+  # table's time-series data (SELECT * FROM "db"."table" WHERE ...). The result
+  # includes all measure values and dimension attributes stored in the table.
+  #
+  # If the table is encrypted with a customer-managed KMS key (ENCRYPTION_TYPE =
+  # AWS_OWNED_KMS means AWS-managed key and is transparent; SSE_S3 or a
+  # KMS_KEY_ID value indicating a CMK requires the caller's effective policy to
+  # allow kms:Decrypt on that key). Emit CONDITIONAL(key_permission) for CMK
+  # tables; cite credential-chains:decrypt-gates-secret-read for the upgrade.
+  #
+  # timestream:DescribeEndpoints must also be effective (required for SDK endpoint
+  # discovery before any query API call). Honor as an implicit iam_permission gate.
+  - id: aws-timestream-select-read-data
+    emits: CanReadData
+    description: >-
+      IAM-effective timestream:Select on a Timestream table allows full data-plane
+      read (SQL-like query), yielding all time-series records including any secret
+      or credential material stored as measures or dimensions.
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_type(?table) == Data"
+      - "?table.provider_type == 'AWS::Timestream::Table'"
+      - "effective_action(?principal, ?table) includes 'timestream:Select'"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: ?table
+      permissions: ["timestream:Select"]
+      conditions: [iam_permission]
+      state_logic: >-
+        (1) If timestream:DescribeEndpoints is NOT present in the effective policy
+        on resource '*': CONDITIONAL(iam_permission) — endpoint discovery will fail
+        before Select is attempted. Evaluator must check:
+        effective_action(?principal, "*") includes 'timestream:DescribeEndpoints'.
+        (2) If ?table.encryptionSpec.kmsKeyId is a customer-managed key (i.e., the
+        EncryptionType is CUSTOMER_MANAGED_KEY and kmsKeyId is not the AWS-owned
+        default alias): Emitted edge is CONDITIONAL(iam_permission, key_permission)
+        — the caller needs kms:Decrypt on the CMK; cite credential-chains:decrypt-
+        gates-secret-read to upgrade when CanDecrypt on the CMK is confirmed.
+        (3) Otherwise (AWS_OWNED_KMS or no KMS key specified, and DescribeEndpoints
+        on '*' is confirmed): ACTIVE on iam_permission alone.
+      confidence: "contributing_confidence * 0.95"
+      derived_from: [ "<HasPermission edge for timestream:Select on ?table>" ]
+      false_positive_note: >-
+        Honor the exact resource ARN scope of the timestream:Select grant — the ARN
+        format is arn:aws:timestream:<region>:<account>:database/<db>/table/<table>;
+        a grant scoped to a specific table does not cover other tables in the same
+        database unless the ARN uses a wildcard (database/*/table/*). Do not emit
+        ACTIVE when the table has a customer-managed KMS key and the principal's
+        kms:Decrypt on that key has not been confirmed; emit CONDITIONAL(key_permission)
+        and rely on credential-chains:decrypt-gates-secret-read for the state upgrade.
+        The DescribeEndpoints condition (resource '*') is verified in state_logic and
+        may gate the emission to CONDITIONAL(iam_permission) if absent; evaluator must
+        check effective_action(?principal, "*") includes 'timestream:DescribeEndpoints'.
+      narrative: >-
+        {principal.name} can execute SQL-like SELECT queries against {table.name}
+        (timestream:Select), reading all time-series records stored in the table.
+        If {table.name} contains credentials or secret material ingested as measure
+        values or dimension attributes, this yields further pivots via
+        credential-chains:read-secret-yields-identity.
+
+  # --- 2) Bridge: CanReadData on table + ContainsSecret -> CanReadSecret ------
+  # Essential bridge rule that converts the data-plane read capability into
+  # credential-access language. When a principal can read data from a table, and
+  # that table is known (via ContainsSecret) to store credential material, the
+  # principal can effectively read those credentials.
+  #
+  # This rule fires AFTER the primary rule and is prerequisite to the credential-
+  # chains linchpins (read-secret-yields-identity, decrypt-gates-secret-read).
+  # Without this bridge, the path-finder can walk CanReadData→ContainsSecret→
+  # CredentialsFor only as a raw graph traversal; the collapsed CanImpersonate
+  # edge will not be derived by the linchpin.
+  #
+  # SCHEMA COMPLIANCE: The ContainsSecret edge allows only target: [Secret, Credential],
+  # per edges.yaml:819-826. The CanReadSecret edge allows target: [Secret, ConnectionString,
+  # Password, APIKey, Certificate], per edges.yaml:521. Since this rule derives CanReadSecret
+  # from ContainsSecret matches, we can only emit CanReadSecret edges whose targets are in
+  # the intersection: [Secret] (only Secret is common to both). Credential targets from
+  # ContainsSecret cannot be emitted as CanReadSecret (the schemas don't align). If credential
+  # reads are needed, emit CanReadCredential instead (target: [Credential, AccessKey, Token]).
+  - id: aws-timestream-read-data-contains-secret
+    emits: CanReadSecret
+    description: >-
+      Reading data from a Timestream table that contains secret material yields
+      the ability to read those secrets, enabling credential-chain pivots.
+    match:
+      - [ ?principal, CanReadData, ?table ]
+      - [ ?table, ContainsSecret, ?secret ]
+    where:
+      - "node_type(?table) == Data"
+      - "?table.provider_type == 'AWS::Timestream::Table'"
+      - "node_type(?secret) == Secret"
+    emit:
+      source_type: Identity
+      target_type: Secret
+      source: ?principal
+      target: ?secret
+      permissions: []
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        INHERIT_WEAKEST(CanReadData, ContainsSecret): if CanReadData is
+        CONDITIONAL(key_permission) (table encrypted with CMK, decrypt not yet
+        confirmed) then CONDITIONAL(key_permission); if CanReadData is BLOCKED
+        then BLOCKED; else ACTIVE. ContainsSecret is a zero-cost structural link
+        and never downgrades on its own.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "?principal CanReadData ?table", "?table ContainsSecret ?secret" ]
+      false_positive_note: >-
+        Only emit when the ContainsSecret link is explicitly evidenced (analyst or
+        automated scan asserted that the table's data includes credential material);
+        do not emit speculatively. Inherit the key_permission gate from CanReadData:
+        if the table is CMK-encrypted and CanReadData is CONDITIONAL(key_permission),
+        so is CanReadSecret; cite credential-chains:decrypt-gates-secret-read to
+        upgrade when the decrypt is confirmed.
+      narrative: >-
+        {principal.name} can read data from {table.name} ({perm:CanReadData}), and
+        {table.name} contains {secret.name} (secret material ingested as measures
+        or dimensions); {principal.name} can therefore read {secret.name}.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying timestream:Select at the account scope -> emit the edge with
+#     state: BLOCKED and denied_by = <SCP arn/statement>.
+#   - An SCP denying timestream:DescribeEndpoints -> timestream:Select is
+#     effectively unreachable regardless of table-level grants; emit BLOCKED.
+#   - A KMS key policy or SCP denying kms:Decrypt on the table's CMK leaves
+#     CanReadData CONDITIONAL(key_permission) and blocks the
+#     credential-chains:decrypt-gates-secret-read upgrade.
+# ---------------------------------------------------------------------------
+
+# No explicit normalization records are required for Timestream.
+# The service contributes no ExecutesAs, no resource-based policy CrossAccountTrust,
+# no CanTrigger, and no ExposesCredential edges beyond what the standard
+# ContainsSecret/CredentialsFor path (handled by the linchpins) provides.

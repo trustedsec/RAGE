@@ -1,0 +1,624 @@
+# GCP Dataproc — Derived attack-path rules (Phase 11 — Data / Analytics / ML)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:dataproc
+# Official docs: https://cloud.google.com/dataproc/docs/concepts/iam/iam
+#                https://cloud.google.com/dataproc/docs/reference/rest/v1/projects.regions.clusters
+#
+# CENTRAL ESCALATION INVARIANT (Phase 11 theme):
+#   Every Dataproc cluster VM (master + workers) runs AS a service account
+#   (config.gceClusterConfig.serviceAccount; default = Compute Engine default SA).
+#   Any attacker who can submit a job (dataproc.jobs.create) executes arbitrary
+#   Spark/PySpark/Hive/Pig code on those VMs and reads the cluster SA's OAuth
+#   token from the GCE metadata server -> CanExecuteCommand on the cluster ->
+#   CanExecuteAs(clusterSA).
+#
+#   Creating a cluster (dataproc.clusters.create + iam.serviceAccounts.actAs on
+#   the chosen SA) is the GCP-analytics analog of iam:PassRole: the attacker
+#   binds a privileged SA to a new cluster and submits a job -> CanCreateWorkloadAs
+#   -> CanExecuteAs. This mirrors can-execute-as execute-as-via-new-workload and
+#   cicd-chains cicd-modify-buildspec-executes-as.
+#
+# SECONDARY ATTACK MODES:
+#   (2) CLUSTER SA SWAP: dataproc.clusters.update + actAs on a new SA swaps the
+#       cluster's runtime identity -> CanModifyConfiguration + CanAttachIdentity.
+#   (3) INIT-SCRIPT INJECTION: dataproc.clusters.update on initializationActions
+#       or GCS init-script path = code injected on every future node join ->
+#       CanModifyCode (CONDITIONAL on node restart/scale-out).
+#   (4) WORKFLOW TEMPLATE CODE CONTROL: dataproc.workflowTemplates.update lets an
+#       attacker modify the job graph (steps, jars, main class, args) that the
+#       workflow template executes as the cluster SA -> CanModifyCode.
+#   (5) IAM POLICY ON CLUSTER: dataproc.clusters.setIamPolicy lets an attacker
+#       self-grant dataproc.jobs.create -> CanModifyPolicy -> CanGrantPermission.
+#   (6) SERVERLESS BATCH: dataproc.batches.create + actAs -> code runs as the
+#       batch runtime SA immediately (same as Batch, no trigger needed).
+#   (7) CREDENTIAL EXPOSURE: cluster SA token exposed via GCE metadata server
+#       to any code in a submitted job -> ExposesCredential.
+#   (8) NETWORK EXPOSURE: default dataproc-* firewall rules may leave master VM
+#       YARN UI / Spark History Server reachable from the internet.
+#
+# LINCHPIN DELEGATION (CITE, DO NOT RE-DERIVE):
+#   can-execute-as.yaml   execute-as-via-code-modify: CanModifyCode(cluster) +
+#                         ExecutesAs(cluster, SA) -> CanExecuteAs. Rule (4) here
+#                         emits CanModifyCode; the linchpin collapses it.
+#   can-execute-as.yaml   execute-as-via-command: CanExecuteCommand(cluster) +
+#                         ExecutesAs(cluster, SA) -> CanExecuteAs. Rule (2) here
+#                         emits CanExecuteCommand; the linchpin collapses it.
+#   can-execute-as.yaml   execute-as-via-config-identity-swap: CanModifyConfiguration
+#                         (cluster) + CanPassIdentity(SA) -> CanExecuteAs. Rule (5)
+#                         here emits CanModifyConfiguration; the linchpin handles it.
+#   can-execute-as.yaml   execute-as-via-new-workload: CanCreateWorkloadAs(SA) ->
+#                         CanExecuteAs. Rule (3) here emits CanCreateWorkloadAs.
+#   can-control.yaml      escalate-via-execute-as: CanExecuteAs -> CanEscalateTo
+#                         when the SA is strictly more privileged than the principal.
+#   cicd-chains.yaml      cicd-modify-buildspec-executes-as: an alternative framing
+#                         of the CanModifyCode + ExecutesAs collapse (workflow
+#                         templates are CI/CD-style job definitions).
+#   credential-chains.yaml execute-then-read-secret: CanExecuteAs -> CanReadSecret
+#                         propagation for secrets the cluster SA can access.
+#
+# PERMISSION IDENTIFIERS are verbatim from the Dataproc IAM reference and the
+# IAM service-accounts reference. No permissions are hallucinated.
+#
+# STATE DISCIPLINE:
+#   - Job submission is ACTIVE (no trigger_exists condition): dataproc.jobs.create
+#     is a synchronous API call; the job starts immediately.
+#   - Cluster creation is ACTIVE when dataproc.clusters.create + actAs on the
+#     SA are confirmed; POTENTIAL when actAs is unconfirmed.
+#   - Init-script injection (CanModifyCode on init actions) is CONDITIONAL
+#     (service_state): the injected code runs only on the next node join/restart.
+#   - Workflow-template modification is ACTIVE when a run path exists
+#     (instantiate permission or existing schedule).
+#   - Org policy constraints can BLOCK specific paths (see blocked-edge guidance).
+#
+# IAM deny policies and org policies that deny an action emit the edge as
+# BLOCKED with denied_by=<deny/org policy arn>.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 11-data-analytics-ml
+service: dataproc
+applies_to: [gcp]
+
+rules:
+
+  # --------------------------------------------------------------------------
+  # 1. ExecutesAs fact — cluster VMs run as the cluster SA
+  # --------------------------------------------------------------------------
+  # Zero-cost structural fact. Feeds all downstream CanExecuteAs derivations
+  # via can-execute-as linchpins. Not an attack step by itself.
+  # NOTE: ExecutesAs is emitted by gcp-dataproc-explicit-executes-as in
+  # rules/explicit/gcp-dataproc.yaml (nature: explicit, sourced from cluster config).
+  # This rule is retained in the derived section for documentation; derived rules
+  # match on the ExecutesAs edge produced by the explicit normalizer.
+
+  # --------------------------------------------------------------------------
+  # 2. Job submission -> CanExecuteCommand (the primary escalation primitive)
+  # --------------------------------------------------------------------------
+  # dataproc.jobs.create lets a principal submit a Spark/PySpark/Hive/Pig/Hadoop
+  # job to an EXISTING cluster. The job code is fully attacker-controlled and runs
+  # on the cluster's master/worker VMs. This is direct RCE on the cluster, feeding
+  # can-execute-as execute-as-via-command + ExecutesAs -> CanExecuteAs(clusterSA).
+  - id: gcp-dataproc-jobs-create-execute-command
+    emits: CanExecuteCommand
+    description: "dataproc.jobs.create on an existing cluster lets the principal submit arbitrary Spark/PySpark/Hive code that runs on cluster VMs -> RCE as the cluster SA."
+    match_effective_permission:
+      action: "dataproc.jobs.create"
+      resource_type: "google.dataproc.Cluster"
+    where:
+      - "cluster is RUNNING (state == RUNNING); submit to a STOPPED cluster returns an error"
+      - "the effective permission may be scoped at project OR cluster level (per-resource IAM)"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Dataproc cluster>"
+      permissions: ["dataproc.jobs.create"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when dataproc.jobs.create is confirmed (effective permission; honor project-
+        and cluster-level IAM) and the cluster is RUNNING. CONDITIONAL(service_state) when
+        the cluster is STOPPED or CREATING (job submit fails). BLOCKED if an IAM deny or
+        org policy denies dataproc.jobs.create at the effective scope. Per-resource IAM
+        on the cluster (dataproc.clusters.use or jobs.create binding) narrows or expands
+        access — resolve both project-level and cluster-level bindings.
+      false_positive_note: >-
+        Only ACTIVE for RUNNING clusters; STOPPED/CREATING clusters reject job submissions.
+        Resolve the cluster-level IAM policy (dataproc.clusters.getIamPolicy) — a
+        cluster-level DENY for the principal overrides a project-level allow.
+        dataproc.jobs.create alone gives RCE but only yields privilege escalation if the
+        cluster SA is more privileged than the attacker (resolve actual SA roles). Submit
+        to the CORRECT cluster — cross-cluster job submission is not possible with only a
+        project-level binding if a cluster-level IAM deny blocks it. CITE can-control
+        escalate-via-execute-as for the privilege-level check; CanEscalateTo is derived
+        automatically when the cluster SA privilege_level > principal.privilege_level.
+      narrative: >-
+        {principal.name} can submit a Dataproc job (dataproc.jobs.create) to
+        {cluster.name}, executing arbitrary Spark/PySpark/Hive/Pig code on the cluster
+        VMs as cluster SA {sa.name}. CITE can-execute-as execute-as-via-command for
+        the CanExecuteAs collapse.
+
+  # --------------------------------------------------------------------------
+  # 3. Cluster creation with a chosen SA -> CanCreateWorkloadAs
+  # --------------------------------------------------------------------------
+  # dataproc.clusters.create + iam.serviceAccounts.actAs on a target SA lets an
+  # attacker create a cluster bound to that SA, then submit a job -> code runs as
+  # the chosen SA. This is the GCP-analytics iam:PassRole analog. The CanPassIdentity
+  # fact is established in the explicit normalizer; this rule derives CanCreateWorkloadAs.
+  # NOTE: CanPassIdentity is emitted by gcp-dataproc-explicit-can-pass-identity in
+  # rules/explicit/gcp-dataproc.yaml (match_effective_permission on actAs + dataproc.clusters.create check).
+
+  - id: gcp-dataproc-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new Dataproc cluster whose VMs run as a chosen SA (clusters.create + actAs); submit a job to execute code as that SA."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has dataproc.clusters.create in the target project/region"
+      - "?principal has iam.serviceAccounts.actAs on ?sa"
+      - "node_type(?sa) == ServiceAccount"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "?principal"
+      target: "?sa"
+      permissions: ["dataproc.clusters.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when both CanPassIdentity and dataproc.clusters.create are confirmed;
+        POTENTIAL(iam_permission) when either permission is unconfirmed; BLOCKED when
+        org policy restricts SA or IAM deny blocks clusters.create or actAs. Submit a
+        job to the newly created cluster to trigger code execution (job submission itself
+        is ACTIVE, no trigger_exists condition — cluster starts running on creation).
+      derived_from: ["?principal CanPassIdentity ?sa (gcp-dataproc-explicit-can-pass-identity)"]
+      false_positive_note: >-
+        CITE can-execute-as execute-as-via-new-workload for the CanExecuteAs
+        derivation. actAs is per-SA; without it -> POTENTIAL. Org policy
+        dataproc.clusterProjectScopeServiceAccountUsage can block cross-project SA use.
+      narrative: >-
+        {principal.name} can create a Dataproc cluster (dataproc.clusters.create) whose
+        VMs run as {sa.name} (iam.serviceAccounts.actAs), then submit a job to execute
+        arbitrary code as {sa.name}.
+
+  # --------------------------------------------------------------------------
+  # 4. Cluster SA swap via clusters.update -> CanModifyConfiguration + CanAttachIdentity
+  # --------------------------------------------------------------------------
+  # dataproc.clusters.update can update config.gceClusterConfig.serviceAccount.
+  # Combined with actAs on the new SA, this swaps the cluster's runtime identity
+  # for all future jobs. can-execute-as execute-as-via-config-identity-swap then
+  # derives CanExecuteAs from CanModifyConfiguration + CanPassIdentity.
+  - id: gcp-dataproc-cluster-update-modify-config
+    emits: CanModifyConfiguration
+    description: "dataproc.clusters.update allows changing the cluster's service account (and other runtime config), which with actAs on the new SA swaps the cluster's execution identity."
+    match_effective_permission:
+      action: "dataproc.clusters.update"
+      resource_type: "google.dataproc.Cluster"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Dataproc cluster>"
+      permissions: ["dataproc.clusters.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when dataproc.clusters.update is confirmed (project- or cluster-level).
+        BLOCKED if an IAM deny or org policy denies the action. Swapping the cluster SA
+        additionally requires iam.serviceAccounts.actAs on the new SA (gated by
+        CanPassIdentity). Note: not all update fields are security-relevant; only
+        config.gceClusterConfig.serviceAccount and config.gceClusterConfig.metadata are
+        direct escalation paths — the rule conservatively emits CanModifyConfiguration
+        for all dataproc.clusters.update grants.
+      false_positive_note: >-
+        dataproc.clusters.update without actAs on the new SA cannot change the cluster SA
+        (the API rejects the request). Do not emit CanAttachIdentity or CanExecuteAs
+        from this rule alone; the CanPassIdentity edge is required to complete the chain.
+        CITE can-execute-as execute-as-via-config-identity-swap for the CanExecuteAs
+        collapse when CanModifyConfiguration + CanPassIdentity both exist.
+      narrative: >-
+        {principal.name} can update {cluster.name}'s configuration (dataproc.clusters.update),
+        including swapping the cluster SA; combined with actAs on a chosen SA, this
+        changes the execution identity for all future jobs on the cluster.
+
+  - id: gcp-dataproc-cluster-update-attach-identity
+    emits: CanAttachIdentity
+    description: "clusters.update + actAs on the new SA attaches (swaps) the cluster's runtime SA — all future jobs run as the new SA."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?cluster ]
+      - [ ?principal, CanPassIdentity, ?newsa ]
+    where:
+      - "node_type(?cluster) == AnalyticsService  # Dataproc Cluster"
+      - "node_type(?newsa) == ServiceAccount"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "?principal"
+      target: "?cluster"
+      permissions: ["dataproc.clusters.update", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when both CanModifyConfiguration and CanPassIdentity on ?newsa are
+        confirmed. POTENTIAL(iam_permission) if actAs on the new SA is unconfirmed.
+        BLOCKED if IAM deny prevents clusters.update or actAs. The swap takes effect on
+        the running cluster; new jobs submitted after the swap run as ?newsa.
+      derived_from: ["?principal CanModifyConfiguration ?cluster", "?principal CanPassIdentity ?newsa"]
+      false_positive_note: >-
+        The cluster SA swap applies to FUTURE jobs, not currently running ones. On a
+        STOPPED cluster, the swap still applies to jobs submitted after the cluster
+        restarts. CITE can-execute-as execute-as-via-config-identity-swap for the
+        CanExecuteAs derivation — this rule only emits the fact; the linchpin collapses it.
+      narrative: >-
+        {principal.name} can swap {cluster.name}'s service account to {newsa.name}
+        (dataproc.clusters.update + iam.serviceAccounts.actAs); all future jobs on
+        the cluster execute as {newsa.name}.
+
+  # --------------------------------------------------------------------------
+  # 5. Init-script injection via clusters.update -> CanModifyCode (CONDITIONAL)
+  # --------------------------------------------------------------------------
+  # Init scripts (config.initializationActions) run on every node at boot/join.
+  # Updating them (or the GCS path they reference) injects code that runs on the
+  # NEXT node addition or cluster restart. CONDITIONAL(service_state) because the
+  # code runs on node join, not immediately.
+  - id: gcp-dataproc-init-action-inject-code
+    emits: CanModifyCode
+    description: "dataproc.clusters.update on initializationActions (or the GCS path they reference) injects code that executes as the cluster SA on the next node join or cluster restart."
+    match_effective_permission:
+      action: "dataproc.clusters.update"
+      resource_type: "google.dataproc.Cluster"
+    where:
+      - "the update targets config.initializationActions (shell scripts executed on node start)"
+      - "OR the principal can write to the GCS path referenced by an init action (storage.objects.create on the init-script GCS path)"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Dataproc cluster>"
+      permissions: ["dataproc.clusters.update"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        CONDITIONAL(service_state): the injected init script runs only on the NEXT node
+        join (scale-out) or full cluster restart — not on currently running nodes. Upgrade
+        to ACTIVE if the attacker can also trigger a cluster restart (dataproc.clusters.start
+        after stop) or if the cluster auto-scales (which adds nodes, running init scripts).
+        BLOCKED if an IAM deny prevents clusters.update. Also CONDITIONAL when the attack
+        vector is a GCS-write to the init-script path (requires CanWriteData on the GCS
+        bucket separately).
+      false_positive_note: >-
+        This is a DEFERRED code execution path, not immediate RCE like job submission.
+        The injected init script only runs when a node starts (new node added, or cluster
+        restarted). Do NOT emit ACTIVE unless a node-join or restart is confirmed to
+        follow. For a static, fully provisioned cluster with no auto-scaling, this may
+        never trigger until an operator action. CITE can-execute-as execute-as-via-code-
+        modify + cicd-chains cicd-modify-buildspec-executes-as for the CanExecuteAs
+        collapse once the code runs.
+      narrative: >-
+        {principal.name} can inject code into {cluster.name}'s initialization actions
+        (dataproc.clusters.update on initializationActions); the injected script will
+        run as {sa.name} on the next node join or cluster restart.
+
+  # --------------------------------------------------------------------------
+  # 6. Workflow template modification -> CanModifyCode
+  # --------------------------------------------------------------------------
+  # dataproc.workflowTemplates.update lets a principal change the job DAG:
+  # step jars, main class, args, job type. The workflow executes the modified
+  # definition as the cluster SA when instantiated. This is the CI/CD-analog path
+  # (workflow template = build spec; cicd-chains handles the collapse).
+  - id: gcp-dataproc-workflow-template-modify-code
+    emits: CanModifyCode
+    description: "dataproc.workflowTemplates.update lets the principal modify the job DAG (steps, jars, main class) a workflow template runs as the cluster SA."
+    match_effective_permission:
+      action: "dataproc.workflowTemplates.update"
+      resource_type: "google.dataproc.WorkflowTemplate"
+    emit:
+      source_type: Identity
+      target_type: BatchJob
+      source: "<principal>"
+      target: "<Dataproc WorkflowTemplate>"
+      permissions: ["dataproc.workflowTemplates.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) when workflowTemplates.update is confirmed but no
+        established instantiation path exists (neither a Cloud Scheduler/Pub/Sub trigger
+        nor the attacker's own instantiate permission). Upgrade to ACTIVE when the same
+        principal also holds dataproc.workflowTemplates.instantiate (can both modify AND
+        run the template). BLOCKED if deny prevents the update.
+      false_positive_note: >-
+        Workflow template modification does not immediately run the template; it runs
+        when instantiated (dataproc.workflowTemplates.instantiate or
+        workflowTemplates.instantiateInline). If the attacker cannot instantiate and no
+        existing trigger does so, state is CONDITIONAL(trigger_exists). CITE
+        can-execute-as execute-as-via-code-modify + cicd-chains
+        cicd-modify-buildspec-executes-as for the CanExecuteAs collapse. The cluster
+        the workflow targets must also have an ExecutesAs edge to the cluster SA.
+      narrative: >-
+        {principal.name} can modify the job DAG of workflow template {template.name}
+        (dataproc.workflowTemplates.update); when instantiated, the modified jobs run
+        as the cluster SA. CITE can-execute-as execute-as-via-code-modify for the
+        CanExecuteAs collapse.
+
+  # Workflow template instantiation — explicit CanTrigger fact
+  - id: gcp-dataproc-workflow-template-instantiate
+    emits: CanTrigger
+    description: "dataproc.workflowTemplates.instantiate directly runs the workflow template, feeding cicd-chains trigger-then-executes-as."
+    match_effective_permission:
+      action: "dataproc.workflowTemplates.instantiate"
+      resource_type: "google.dataproc.WorkflowTemplate"
+    emit:
+      source_type: Identity
+      target_type: BatchJob
+      source: "<principal>"
+      target: "<Dataproc WorkflowTemplate>"
+      permissions: ["dataproc.workflowTemplates.instantiate"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed. BLOCKED if deny prevents it.
+        This CanTrigger feeds cicd-chains cicd-trigger-runner-executes-as:
+        CONDITIONAL(attacker_influenced_definition) — triggering runs the CURRENT
+        template; it is only a CanExecuteAs pivot if the current definition is attacker-
+        influenced (the principal also holds workflowTemplates.update -> ACTIVE via
+        can-execute-as; otherwise CONDITIONAL).
+      false_positive_note: >-
+        Triggering a workflow template alone is CONDITIONAL — the current job DAG must
+        already contain attacker-controlled code for this to be a meaningful execution
+        pivot. Cite cicd-chains cicd-trigger-runner-executes-as (CONDITIONAL by
+        default) rather than asserting ACTIVE unless the template definition is also
+        attacker-controlled.
+      narrative: >-
+        {principal.name} can instantiate workflow template {template.name}
+        (dataproc.workflowTemplates.instantiate); this runs the current job DAG on the
+        attached cluster SA.
+
+  # --------------------------------------------------------------------------
+  # 7. Cluster IAM policy modification -> CanModifyPolicy
+  # --------------------------------------------------------------------------
+  # dataproc.clusters.setIamPolicy lets a principal rewrite the cluster's
+  # resource-level IAM policy, self-granting dataproc.jobs.create and thus
+  # converting a "no job submit" situation into a direct RCE path.
+  - id: gcp-dataproc-cluster-set-iam-policy
+    emits: CanModifyPolicy
+    description: "dataproc.clusters.setIamPolicy lets a principal rewrite the cluster's IAM policy — self-granting dataproc.jobs.create -> CanExecuteCommand -> CanExecuteAs."
+    match_effective_permission:
+      action: "dataproc.clusters.setIamPolicy"
+      resource_type: "google.dataproc.Cluster"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Dataproc cluster>"
+      permissions: ["dataproc.clusters.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed. BLOCKED if an IAM deny or
+        org policy blocks setIamPolicy. This is a CanGrantPermission primitive:
+        the principal can grant dataproc.jobs.create to itself on the cluster, then
+        proceed to submit a job -> CanExecuteAs(clusterSA). The CanGrantPermission
+        collapse is handled by can-control control-boundary-via-iam-admin.
+      false_positive_note: >-
+        setIamPolicy on a cluster grants CLUSTER-LEVEL IAM only; it cannot grant
+        project-level roles (resourcemanager.projects.setIamPolicy is separate).
+        The granted jobs.create is cluster-scoped, so the principal can submit jobs
+        to this specific cluster. This is high-value because it bypasses needing
+        pre-existing job-submit rights.
+      narrative: >-
+        {principal.name} can rewrite {cluster.name}'s IAM policy
+        (dataproc.clusters.setIamPolicy), self-granting dataproc.jobs.create to
+        execute arbitrary code as the cluster SA.
+
+  # --------------------------------------------------------------------------
+  # 8. Serverless Batch (dataproc.batches.create + actAs) -> CanCreateWorkloadAs
+  # --------------------------------------------------------------------------
+  # Dataproc Serverless Batch (batches API) runs a Spark job WITHOUT provisioning
+  # a cluster. The runtime SA is specified in runtimeConfig.serviceAccount and
+  # requires actAs. The job runs immediately on creation (same as Cloud Batch).
+  # NOTE: CanPassIdentity is emitted by gcp-dataproc-explicit-can-pass-identity in
+  # rules/explicit/gcp-dataproc.yaml (match_effective_permission on actAs + batches.create check).
+
+  - id: gcp-dataproc-batch-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a serverless Dataproc Batch job bound to a passable SA; the job runs as that SA immediately on creation."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has dataproc.batches.create in the target project/location"
+      - "?principal has iam.serviceAccounts.actAs on ?sa"
+      - "node_type(?sa) == ServiceAccount"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "?principal"
+      target: "?sa"
+      permissions: ["dataproc.batches.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when both CanPassIdentity and dataproc.batches.create are confirmed;
+        POTENTIAL(iam_permission) when either permission is unconfirmed. No
+        trigger_exists condition: batch jobs run on creation. CITE can-execute-as
+        execute-as-via-new-workload for the CanExecuteAs collapse.
+      derived_from: ["?principal CanPassIdentity ?sa (gcp-dataproc-explicit-can-pass-identity)"]
+      false_positive_note: >-
+        The CanPassIdentity edge must be established via the explicit normalizer
+        (gcp-dataproc-explicit-can-pass-identity), which confirms both actAs and
+        batches.create. actAs per-SA — no blanket SA-service actAs available. The
+        runnable is fully attacker-controlled.
+      narrative: >-
+        {principal.name} can create a serverless Dataproc Batch job (dataproc.batches.create)
+        whose Spark job runs immediately as {sa.name} with attacker-controlled code.
+
+  # --------------------------------------------------------------------------
+  # 9. ExposesCredential — cluster SA token accessible from job code
+  # --------------------------------------------------------------------------
+  # Any code running in a submitted Dataproc job can read the cluster SA's OAuth
+  # token from the GCE metadata server. This is a structural fact that feeds
+  # credential-chains execute-then-read-secret.
+  - id: gcp-dataproc-exposes-cluster-sa-cred
+    emits: ExposesCredential
+    description: "A Dataproc cluster exposes its service account's OAuth token to any code running in submitted jobs via the GCE metadata server."
+    match:
+      - [ ?cluster, ExecutesAs, ?sa ]
+    where:
+      - "node_type(?cluster) == AnalyticsService  # Dataproc Cluster"
+    emit:
+      source_type: AnalyticsService
+      target_type: ServiceAccount
+      source: "?cluster"
+      target: "?sa"
+      permissions: []
+      derived_from: ["?cluster ExecutesAs ?sa (gcp-dataproc-explicit-executes-as)"]
+      false_positive_note: >-
+        Not an escalation by itself; becomes an attack step only when combined with
+        CanExecuteCommand (job submission). The exposed credential is a short-lived
+        OAuth 2.0 access token (1-hour TTL), not a long-lived key. The credential is
+        only accessible from code running inside a job on the cluster — it is NOT
+        accessible from the Dataproc control plane or the jobs.get API.
+      narrative: >-
+        {cluster.name} exposes the OAuth token of {sa.name} to any code running in a
+        submitted job via the GCE metadata endpoint (http://metadata.google.internal/
+        computeMetadata/v1/instance/service-accounts/default/token). Any attacker code
+        in a job obtains a usable access token for {sa.name}.
+
+  # --------------------------------------------------------------------------
+  # 10. CanRetrieveToken — attacker executing in a job can mint the SA token
+  # --------------------------------------------------------------------------
+  # REMOVED: gcp-dataproc-retrieve-cluster-sa-token re-derived CanRetrieveToken from
+  # CanExecuteCommand + ExecutesAs, which duplicates credential-chains execute-then-read-secret.
+  # The file header explicitly cites credential-chains execute-then-read-secret as the
+  # canonical linchpin for this derivation (line 56–57). The linchpin will handle the
+  # CanRetrieveToken propagation automatically for any CanExecuteAs pair where the target
+  # SA can access secrets (including its own OAuth token via the GCE metadata server).
+  #
+  # The ExposesCredential edge (gcp-dataproc-exposes-cluster-sa-cred) documents the
+  # structural fact that the cluster exposes the SA's token to job code; credential-chains
+  # will derive CanRetrieveToken(principal, SA) when CanExecuteAs(principal, SA) is
+  # established.
+
+  # --------------------------------------------------------------------------
+  # 11. ExposedToInternet — cluster master VM with public IP and open firewall
+  # --------------------------------------------------------------------------
+  # Default Dataproc clusters provision VMs with public IPs; the generated
+  # dataproc-* firewall rules may leave the YARN ResourceManager UI and Spark
+  # History Server accessible from the internet (port 8088, 18080 etc.) when
+  # the firewall is default-open.
+  - id: gcp-dataproc-public-master-ui
+    emits: ExposedToInternet
+    description: "Dataproc cluster master VM with a public IP and permissive dataproc-* firewall rules exposes the YARN UI / Spark History Server to the internet."
+    match_record:
+      resource_type: "google.dataproc.Cluster"
+      field: "config.gceClusterConfig.internalIpOnly"
+    where:
+      - "config.gceClusterConfig.internalIpOnly == false (default: cluster VMs have public IPs)"
+      - "AND a compute.Firewall rule in the dataproc-* set allows ingress from 0.0.0.0/0 or ::/0 on relevant ports (YARN: 8088, Spark History Server: 18080, or other UI ports)"
+      - "AND Component Gateway is NOT enabled (when enabled, web UIs are proxied behind auth)"
+    emit:
+      source_type: AnalyticsService
+      target_type: AnonymousIdentity
+      source: "<Dataproc cluster>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when both conditions hold: (a) the cluster has public IPs
+        (internalIpOnly == false) AND (b) firewall rules allow internet ingress on the
+        YARN or Spark UI ports AND (c) the Component Gateway is not enabled (Component
+        Gateway proxies UIs behind IAP/auth). CONDITIONAL(network_reachability) when
+        firewalls exist but are ambiguous. BLOCKED when internalIpOnly == true or when
+        no firewall rule allows internet ingress.
+      false_positive_note: >-
+        Do NOT emit for clusters with internalIpOnly == true (private clusters: no public
+        IPs, master UI accessible only via Cloud IAP tunnel or internal VPC). Do NOT
+        emit for Component Gateway-enabled clusters (the gateway enforces authentication
+        via Cloud IAP; the underlying ports are not directly reachable from the internet).
+        Verify the dataproc-* firewall rules — Dataproc creates rules named
+        dataproc-CLUSTER_NAME-* scoped to the cluster's network tag; confirm internet
+        ingress (0.0.0.0/0 source) is actually present on the relevant port. A VPC-SC
+        perimeter does not protect against direct VM port access.
+      narrative: >-
+        {cluster.name}'s master VM has a public IP (internalIpOnly == false) and the
+        Dataproc firewall rules allow internet ingress on the YARN/Spark UI ports; the
+        cluster management UI is reachable from the public internet without authentication.
+
+  # --------------------------------------------------------------------------
+  # 12. CrossProjectTrust — cluster in project A with SA from project B
+  # --------------------------------------------------------------------------
+  # When a cluster's SA email domain differs from the cluster's project, the cluster
+  # represents a cross-project SA usage. If org policy restricts cross-project SA
+  # usage, this is BLOCKED.
+  - id: gcp-dataproc-cross-project-trust
+    emits: CrossProjectTrust
+    description: "A Dataproc cluster whose service account belongs to a different project creates a cross-project trust; code in jobs runs as a SA from another project."
+    match_record:
+      resource_type: "google.dataproc.Cluster"
+      field: "config.gceClusterConfig.serviceAccount"
+    where:
+      - "the SA's project (parsed from SA email: sa-name@PROJECT_ID.iam.gserviceaccount.com) != the cluster's project"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<cluster's project>"
+      target: "<SA's home project>"
+      permissions: []
+      conditions: [role_compatibility]
+      state_logic: >-
+        ACTIVE when the cross-project SA usage is confirmed (SA email domain != cluster
+        project). BLOCKED when org policy dataproc.clusterProjectScopeServiceAccountUsage
+        is active (it restricts cluster SAs to the same project as the cluster).
+      derived_from: ["config.gceClusterConfig.serviceAccount cross-project SA email"]
+      false_positive_note: >-
+        Parse the SA email to determine the SA's home project. User-managed SAs follow
+        NAME@PROJECT.iam.gserviceaccount.com; verify the PROJECT part differs from the
+        cluster project. Default Compute Engine SAs are always same-project (format:
+        PROJECT_NUMBER-compute@developer.gserviceaccount.com). Org policy
+        dataproc.clusterProjectScopeServiceAccountUsage -> BLOCKED. Note that cross-
+        project SA usage requires the SA to have been granted actAs to the actor who
+        created the cluster — not just actAs at the cluster level.
+      narrative: >-
+        {cluster.name} (project {cluster_project}) runs as {sa.name} from project
+        {sa_project}; jobs executed on the cluster operate under a cross-project SA,
+        linking the two projects in the attack graph.
+
+  # --------------------------------------------------------------------------
+  # 13. CanEscalateTo roll-up — CanExecuteAs a more-privileged cluster SA
+  # --------------------------------------------------------------------------
+  # REMOVED: gcp-dataproc-escalate-to-cluster-sa re-derived CanEscalateTo from
+  # CanExecuteCommand + ExecutesAs, which duplicates can-control escalate-via-execute-as.
+  # The file header explicitly cites can-control escalate-via-execute-as as the
+  # canonical linchpin for this derivation (line 51–52). Running both rules produces
+  # duplicates and violates the CITE-not-re-derive invariant.
+  #
+  # The can-control linchpin will handle the CanEscalateTo derivation automatically
+  # for any CanExecuteCommand + ExecutesAs pair where the target SA has higher
+  # privilege_level than the source principal. Dataproc-specific narrative is embedded
+  # in false_positive_note of gcp-dataproc-jobs-create-execute-command instead.
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules
+# (raw Dataproc API config -> explicit edges that feed the derived rules above)
+# MOVED TO: /rules/explicit/gcp-dataproc.yaml
+# This file now imports those rules via the explicit_rules section.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#
+#   Org policy constraints:
+#     dataproc.clusterProjectScopeServiceAccountUsage — restricts cluster SAs to
+#     same project as the cluster -> CrossProjectTrust BLOCKED, CanPassIdentity to
+#     cross-project SA BLOCKED.
+#     dataproc.requireClusterVmServiceAccount — requires a user-specified SA
+#     (not the default CE SA) -> CanExecuteAs via default SA BLOCKED.
+#     iam.disableServiceAccountKeyCreation — disallows key creation; does not
+#     directly block Dataproc but limits downstream key-based pivots.
+#
+#   IAM deny policies:
+#     An IAM deny on dataproc.jobs.create -> gcp-dataproc-jobs-create-execute-command BLOCKED.
+#     An IAM deny on iam.serviceAccounts.actAs -> CanPassIdentity BLOCKED.
+#     An IAM deny on dataproc.clusters.update -> CanModifyConfiguration BLOCKED.
+#     An IAM deny on dataproc.clusters.setIamPolicy -> CanModifyPolicy BLOCKED.
+#     An IAM deny on dataproc.batches.create -> gcp-dataproc-batch-create-passidentity BLOCKED.
+#
+#   Network controls:
+#     internalIpOnly == true -> gcp-dataproc-public-master-ui BLOCKED.
+#     Component Gateway enabled -> gcp-dataproc-public-master-ui BLOCKED (proxied + auth).
+#
+#   VPC Service Controls:
+#     A VPC-SC perimeter restricting the dataproc.googleapis.com service -> all
+#     dataproc.* API calls from outside the perimeter BLOCKED.
+#     Note: VPC-SC does NOT protect against direct VM-level access (port-based exposure).
+# ---------------------------------------------------------------------------

@@ -1,0 +1,1147 @@
+# AWS S3 — Derived attack-path rules (Phase 6 — Storage & Databases)
+# ---------------------------------------------------------------------------
+# S3 is the canonical AWS object store and a Phase-6 storage target. Its attack
+# surface spans five overlapping primitives (per the Phase 6 theme):
+#
+#   (1) DATA READ + EXFIL: s3:GetObject -> CanReadData; bulk GetObject or
+#       s3:PutReplicationConfiguration to an external bucket -> CanExfiltrate.
+#
+#   (2) DATA WRITE / SUPPLY-CHAIN POISON: s3:PutObject on a bucket holding code
+#       artifacts (Lambda packages, CI/CD sources, CloudFormation templates) ->
+#       CanModifyCode on the downstream Compute / CI/CD workload.
+#
+#   (3) PUBLIC EXPOSURE: bucket policy with Principal:* + Block Public Access
+#       disabled -> ExposedToInternet. BPA is the authoritative gate; always check
+#       RestrictPublicBuckets / BlockPublicPolicy before emitting.
+#
+#   (4) CROSS-BOUNDARY SHARING: bucket policy naming another account ->
+#       CrossAccountTrust. s3:PutBucketPolicy -> CanModifyPolicy (self-grant).
+#
+#   (5) CREDENTIAL GRAB (via secret-bearing objects): S3 objects frequently hold
+#       credentials (Terraform state, .env files, kubeconfigs, DB dumps). Objects
+#       containing secrets drive ContainsSecret -> CredentialsFor -> CanImpersonate
+#       via the credential-chains linchpin (cited, not re-derived here).
+#       SSE-KMS encrypted data: CanReadData is CONDITIONAL(key_permission) until
+#       decrypt-gates-secret-read upgrades it.
+#
+# LINCHPIN CITATIONS (do not re-derive):
+#   * credential-chains.yaml — read-secret-yields-identity (ContainsSecret bucket
+#     -> CredentialsFor secret -> CanImpersonate identity)
+#   * credential-chains.yaml — decrypt-gates-secret-read (SSE-KMS CanReadData
+#     CONDITIONAL(key_permission) -> ACTIVE when CanDecrypt on CMK confirmed)
+#   * can-control.yaml — control-via-admin / escalate-via-execute-as
+#   * can-execute-as.yaml — execute-as-via-code-modify (PutObject on artifact
+#     bucket + downstream Compute ExecutesAs role -> CanExecuteAs)
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml):
+#   CanReadData:      source [Identity, Compute]        target [Storage, Data, Messaging]
+#   CanWriteData:     source [Identity, Compute]        target [Storage, Data, Messaging]
+#   CanExfiltrate:    source [Identity, Compute]        target [Storage, Data, Snapshot]
+#   ExposedToInternet:source [Compute, Data, Storage, Messaging, PublicEndpoint, LoadBalancer]
+#                                                       target [AnonymousIdentity]
+#   CrossAccountTrust:source [Account, Role, ResourcePolicy, Data, Snapshot, DataLake]
+#                                                       target [Account, ExternalIdentity]
+#   CanModifyPolicy:  source [Identity]                 target [Policy, Identity, "*"]
+#   CanModifyCode:    source [Identity]                 target [Compute, ContainerRegistry,
+#                       ArtifactRepository, KubernetesWorkload, Messaging, AnalyticsService]
+#   ContainsSecret:   source [Storage, Data, Compute, Messaging]  target [Secret, Credential]
+#   CanTrigger:       source [Identity, Messaging, Storage, Network]
+#                                                       target [Compute, Messaging, AnalyticsService]
+#   CanCreateWorkloadAs: source [Identity]              target [Identity]
+#
+# NOTE: CanReadData / CanWriteData / CanExfiltrate target ObjectStorage
+# (a Storage subtype) per the task ground rules; the bucket IS the storage node.
+#
+# STATE CONVENTIONS (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. CONDITIONAL contributors cap the output at CONDITIONAL.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # (1) DATA READ — s3:GetObject -> CanReadData
+  # ===========================================================================
+
+  # --- 1) GetObject -> CanReadData (SSE-S3 / no encryption / transparent) ----
+  # A principal with EFFECTIVE s3:GetObject on a bucket can read any object the
+  # bucket policy and IAM policy jointly permit. For SSE-S3 (AES-256) and for
+  # buckets with no encryption the decryption is transparent (AWS-managed key) —
+  # no caller-held kms:Decrypt is needed. Emit ACTIVE.
+  #
+  # For SSE-KMS (CMK) buckets the caller must also hold kms:Decrypt on the
+  # wrapping CMK; emit CONDITIONAL(key_permission) (see rule 2 below).
+  #
+  # NOTE: the credential pivot from CanReadData + ContainsSecret -> CanImpersonate
+  # requires an intermediate bridge rule (aws-s3-read-data-contains-secret-yields-read-secret)
+  # that converts CanReadData + ContainsSecret into CanReadSecret. Once CanReadSecret
+  # is established, credential-chains:read-secret-yields-identity completes the chain
+  # via CanReadSecret + CredentialsFor -> CanImpersonate.
+  - id: aws-s3-read-data-get-object
+    emits: CanReadData
+    description: "s3:GetObject on a bucket grants full data-plane read of stored objects (SSE-S3/no-encryption path — AWS-managed decryption, no caller kms:Decrypt needed)."
+    match:
+      - [ ?principal, HasPermission, ?bucket ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+      - "?principal has EFFECTIVE s3:GetObject on ?bucket ARN (identity-based policy + bucket policy jointly permit; Block Public Access evaluated)"
+      - "?bucket.encryption NOT in ['aws:kms', 'aws:kms:dsse'] OR ?bucket.properties.KMSMasterKeyID is null (service-managed key)"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: ?principal
+      target: ?bucket
+      permissions: ["s3:GetObject"]
+      conditions: [iam_permission, resource_policy, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when s3:GetObject is confirmed EFFECTIVE (identity-based policy +
+        bucket policy jointly permit; no SCP or permission-boundary deny). Bucket
+        policy with aws:PrincipalOrgID / aws:SourceVpc conditions: honor those
+        conditions — only ACTIVE for principals that satisfy them. BLOCKED when an
+        SCP or explicit bucket-policy Deny overrides the grant.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?bucket (s3:GetObject effective permission)"
+        - "aws-s3-read-data-contains-secret-yields-read-secret (bridge rule — converts CanReadData + ContainsSecret to CanReadSecret)"
+        - "credential-chains:read-secret-yields-identity (cited not re-derived — CanReadSecret + CredentialsFor -> CanImpersonate)"
+      false_positive_note: >-
+        For SSE-KMS encrypted buckets, s3:GetObject alone is insufficient — the
+        caller cannot decrypt the ciphertext without kms:Decrypt on the wrapping CMK;
+        use rule aws-s3-read-data-sse-kms (CONDITIONAL key_permission) instead.
+        Bucket policy conditions (aws:PrincipalOrgID, aws:SourceVpc, aws:SourceAccount)
+        restrict who the grant actually covers — honor them. Block Public Access
+        RestrictPublicBuckets=true overrides even an explicit bucket-policy allow for
+        anonymous/unauthenticated principals; do not emit for anonymous callers when
+        BPA is active. s3:GetObject scoped to a specific object prefix (Resource:
+        arn:aws:s3:::bucket/prefix/*) limits the read to that prefix — scope the
+        edge to that prefix, not the whole bucket.
+      narrative: >-
+        {principal.name} has s3:GetObject on {bucket.name} and can read any object
+        in the bucket (AWS-managed or no encryption — decryption is transparent).
+
+  # --- 2) GetObject on SSE-KMS bucket -> CONDITIONAL CanReadData -----------
+  # When the bucket uses SSE-KMS (aws:kms or DSSE-KMS), the caller must also
+  # hold kms:Decrypt on the specific CMK that wraps the object's data-encryption
+  # key. Without it, GetObject returns an encrypted blob the caller cannot use.
+  # Emit CONDITIONAL(key_permission); credential-chains:decrypt-gates-secret-read
+  # upgrades to ACTIVE when CanDecrypt on the CMK is confirmed.
+  - id: aws-s3-read-data-sse-kms
+    emits: CanReadData
+    description: "s3:GetObject on a SSE-KMS bucket: read is CONDITIONAL on kms:Decrypt for the wrapping CMK. Cite credential-chains:decrypt-gates-secret-read to upgrade to ACTIVE."
+    match:
+      - [ ?principal, HasPermission, ?bucket ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+      - "?principal has EFFECTIVE s3:GetObject on ?bucket ARN"
+      - "?bucket.properties.ServerSideEncryptionRule.KMSMasterKeyID is not null (SSE-KMS with CMK)"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: ?principal
+      target: ?bucket
+      permissions: ["s3:GetObject", "kms:Decrypt"]
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        CONDITIONAL(key_permission): the caller holds s3:GetObject (IAM + bucket
+        policy confirmed) but kms:Decrypt on the wrapping CMK is NOT yet confirmed.
+        The edge is BLOCKED when the KMS key policy or an SCP explicitly denies
+        kms:Decrypt to this principal. Upgrade to ACTIVE via
+        credential-chains:decrypt-gates-secret-read when the same principal also
+        holds CanDecrypt on the specific CMK referenced in
+        ?bucket.properties.KMSMasterKeyID. The kms:ViaService condition on the key
+        policy (kms:ViaService: s3.*.amazonaws.com) is automatically satisfied by
+        S3-mediated decryption; do not treat it as a block.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?bucket (s3:GetObject effective permission)"
+        - "?bucket properties.ServerSideEncryptionRule.KMSMasterKeyID (SSE-KMS CMK)"
+        - "credential-chains:decrypt-gates-secret-read (upgrade to ACTIVE — cited not re-derived)"
+      false_positive_note: >-
+        Do NOT emit this as ACTIVE — always CONDITIONAL(key_permission) when the
+        bucket uses a CMK and the caller's kms:Decrypt is unconfirmed. SSE-S3
+        (aws:s3) and service-managed KMS keys are transparent — use rule
+        aws-s3-read-data-get-object (ACTIVE) for those. DSSE-KMS (dual-layer SSE)
+        requires TWO distinct CMK decryptions; apply the same gate. A CMK in a
+        different account (cross-account KMS key) additionally requires the key
+        policy in that account to grant kms:Decrypt to this principal — honor it.
+        The kms:ViaService condition (kms:ViaService: s3.*.amazonaws.com) does NOT
+        require the caller to explicitly include a ViaService context — S3 sets it
+        automatically. Do NOT treat it as an additional caller requirement.
+      narrative: >-
+        {principal.name} has s3:GetObject on {bucket.name} (SSE-KMS encrypted with
+        CMK {bucket.kmsKeyId}), but decryption is gated on kms:Decrypt for that CMK.
+        The read capability is CONDITIONAL(key_permission) until
+        credential-chains:decrypt-gates-secret-read confirms decrypt access.
+
+  # ===========================================================================
+  # (2) DATA WRITE — s3:PutObject -> CanWriteData + supply-chain code injection
+  # ===========================================================================
+
+  # --- 3) PutObject -> CanWriteData ------------------------------------------
+  # s3:PutObject grants data-plane write to the bucket. High impact when the
+  # bucket holds code artifacts, config, or secrets that other services consume.
+  # The CanWriteData edge is a prerequisite for the supply-chain CanModifyCode
+  # rule (4) and for poisoning downstream workloads.
+  - id: aws-s3-write-data-put-object
+    emits: CanWriteData
+    description: "s3:PutObject on a bucket grants data-plane write, enabling object creation/overwrite — including code artifact poisoning."
+    match:
+      - [ ?principal, HasPermission, ?bucket ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+      - "?principal has EFFECTIVE s3:PutObject on ?bucket ARN (identity-based policy + bucket policy jointly permit)"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: ?principal
+      target: ?bucket
+      permissions: ["s3:PutObject"]
+      conditions: [iam_permission, resource_policy, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when s3:PutObject is confirmed EFFECTIVE (identity policy + bucket
+        policy; no SCP or boundary deny). Object Lock (COMPLIANCE or GOVERNANCE mode)
+        prevents overwriting locked objects — downgrade to CONDITIONAL(iam_permission)
+        for locked objects; unlocked objects are ACTIVE. BLOCKED by an explicit SCP
+        or bucket-policy Deny on s3:PutObject.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?bucket (s3:PutObject effective permission)"
+      false_positive_note: >-
+        S3 Object Lock (retention policy in COMPLIANCE mode) prevents overwriting
+        or deleting objects during the retention period — the write is BLOCKED for
+        locked objects; ACTIVE for unlocked/unversioned objects in the same bucket.
+        If the bucket has Versioning=Enabled, a PutObject creates a new version but
+        does not delete the previous one: downstream services that resolve the latest
+        version are still poisoned; services with pinned version IDs are not.
+        s3:PutObject scoped by key prefix limits impact to that prefix scope.
+      narrative: >-
+        {principal.name} has s3:PutObject on {bucket.name} and can create or
+        overwrite any object in the bucket — including code artifacts consumed by
+        downstream services.
+
+  # --- 4) PutObject on code-artifact bucket -> CanModifyCode -----------------
+  # When a bucket stores code artifacts that a downstream Compute or CI/CD
+  # service deploys/executes (Lambda packages, CodePipeline sources, CloudFormation
+  # templates, EC2 user-data scripts), PutObject on the bucket equals modifying
+  # the code of that downstream workload.
+  #
+  # CRITICAL: The code-artifact relationship MUST be explicitly detected from:
+  #   - Lambda GetFunctionConfiguration → CodeLocation.S3Bucket / S3Key (code package source)
+  #   - CodePipeline GetPipeline → Stages[].Actions[].Configuration.S3Bucket / S3ObjectKey
+  #   - CloudFormation GetStackTemplate → TemplateDescription / TemplateURL (template source)
+  #   - EC2 LaunchTemplate / RunInstances → UserData references to S3 URIs
+  # NOT from S3 event notifications (CanTrigger), which merely indicate that Lambda
+  # subscribes to bucket events (a distinct, less-sensitive pattern: Lambda processes
+  # uploaded files but is not deployed FROM this bucket).
+  #
+  # Explicit normalization rule aws-s3-code-source-lambda (below) reads the config
+  # and emits ContainsResourceReference(?bucket, ?compute) when the bucket is
+  # confirmed as the deployment source. This derived rule then matches:
+  #   [ ?principal, CanWriteData, ?bucket ]
+  #   + [ ?bucket, ContainsResourceReference, ?compute ]
+  # to emit CanModifyCode.
+  #
+  # can-execute-as:execute-as-via-code-modify rolls up: CanModifyCode(?principal,
+  # ?compute) + ExecutesAs(?compute, ?role) -> CanExecuteAs(?principal, ?role).
+  - id: aws-s3-modify-code-artifact
+    emits: CanModifyCode
+    description: "s3:PutObject on a bucket that is a verified code-artifact deployment source (Lambda, CodePipeline, CloudFormation) for a compute workload equals modifying that workload's code."
+    match:
+      - [ ?principal, CanWriteData, ?bucket ]
+      - [ ?bucket,    ContainsResourceReference, ?compute ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "node_class(?compute) in [Compute, AnalyticsService]  OR  node_type(?compute) in [ServerlessFunction, BuildWorker, BatchJob, ApplicationPlatform]"
+      - "the ContainsResourceReference edge is typed as 'CodeSourceFor' or 'DeploymentSourceFor' (explicit evidence from config)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?compute
+      permissions: ["s3:PutObject"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the CanWriteData(principal, bucket) edge is ACTIVE AND the
+        ?bucket -> ?compute ContainsResourceReference edge is confirmed (code-source
+        detected from Lambda GetFunctionConfiguration, CodePipeline config, or
+        CloudFormation template). Inherits weakest state from the contributing
+        CanWriteData edge. BLOCKED when CanWriteData is BLOCKED.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal CanWriteData ?bucket (s3:PutObject)"
+        - "?bucket ContainsResourceReference ?compute (code-artifact source via explicit normalization)"
+        - "can-execute-as:execute-as-via-code-modify (roll-up — cited not re-derived)"
+      false_positive_note: >-
+        This rule ONLY matches when ContainsResourceReference is present with code-source
+        evidence. S3 event notifications (CanTrigger) are NOT sufficient — they indicate
+        that a Lambda subscribes to bucket events but do NOT prove the bucket is the
+        deployment source for the Lambda's code. Lambda event-triggered execution and
+        Lambda code deployment are distinct patterns; do not conflate them. Versioned
+        buckets: if the compute uses a pinned s3ObjectVersion, a new PutObject creates
+        an unreferenced version (not injected); in that case downgrade to
+        CONDITIONAL(trigger_exists).
+      narrative: >-
+        {principal.name} can write to {bucket.name} (s3:PutObject), which is the
+        verified code-artifact deployment source for {compute.name} — overwriting the
+        artifact injects attacker code that runs as {compute.name}'s execution identity.
+
+  # ===========================================================================
+  # (3) PUBLIC EXPOSURE — bucket policy Principal:* + BPA disabled
+  # ===========================================================================
+
+  # --- 5) Public bucket policy -> ExposedToInternet --------------------------
+  # A bucket whose policy contains a Principal:* (or Principal:{AWS:*}) Allow
+  # statement for s3:GetObject (or s3:*) AND whose Block Public Access settings
+  # do NOT override it (RestrictPublicBuckets=false at both bucket and account
+  # level) is accessible to any internet client without authentication.
+  #
+  # GetBucketPolicyStatus returns IsPublic:true as the authoritative AWS signal;
+  # honor it. The BPA flags are the definitive gate.
+  - id: aws-s3-public-bucket
+    emits: ExposedToInternet
+    description: "S3 bucket with a Principal:* bucket policy allowing s3:GetObject and Block Public Access disabled (RestrictPublicBuckets=false) is readable by any internet client."
+    match:
+      - [ ?bucket, HasPolicy, ?policy ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+      - "?policy has a statement: Effect=Allow, Principal=* (or Principal={AWS:*}), Action includes s3:GetObject (or s3:*)"
+      - "?bucket.properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == false  (bucket-level BPA)"
+      - "account-level BPA RestrictPublicBuckets == false"
+      - "?policy statement has NO aws:PrincipalOrgID / aws:SourceVpc / aws:PrincipalAccount condition restricting access to authenticated principals"
+    emit:
+      source_type: ObjectStorage
+      target_type: AnonymousIdentity
+      source: ?bucket
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [resource_policy, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when BOTH conditions hold: (1) bucket policy has Principal:* Allow on
+        s3:GetObject with no restricting condition, AND (2) Block Public Access
+        RestrictPublicBuckets=false at both bucket AND account level (or account-level
+        is not evaluated / not collected, default to bucket-level).
+        CONDITIONAL(resource_policy) when BPA status is unknown (not collected) —
+        flag for analyst review. BLOCKED when RestrictPublicBuckets=true at either
+        level (BPA overrides the policy). BLOCKED when an SCP denies s3:GetObject
+        for Principal:*. Do not emit when the Allow statement includes a
+        aws:PrincipalOrgID condition — that restricts to org principals, not the
+        public internet.
+      confidence: "min(contributing_confidences) * 0.98"
+      derived_from:
+        - "?bucket HasPolicy ?policy (GetBucketPolicy + GetBucketPolicyStatus evidence)"
+        - "?bucket.properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == false"
+      false_positive_note: >-
+        Block Public Access is the AUTHORITATIVE override — it takes precedence over
+        any bucket or object ACL, and (for RestrictPublicBuckets) also over bucket
+        policies. Check BOTH account-level BPA (via s3control:GetPublicAccessBlock)
+        AND bucket-level BPA (via s3:GetBucketPublicAccessBlock). A bucket policy with
+        Principal:* BUT with an aws:PrincipalOrgID condition is NOT internet-public —
+        only authenticated AWS principals in the org can access it; emit ExposedToTenant
+        instead. A Principal:* Allow restricted by aws:SourceVpc is private-only (emit
+        PrivateReachability). The IsPublic flag from GetBucketPolicyStatus is the
+        reliable shortcut when available. Static website endpoints (GetBucketWebsite)
+        are a separate public exposure vector (see rule aws-s3-static-website-public),
+        independent of the bucket policy public-access flag. Note: s3:ListBucket (if
+        also public) exposes object keys — flag as ContainsResourceReference on the
+        bucket node.
+      narrative: >-
+        {bucket.name} has a bucket policy granting s3:GetObject to Principal:'*' and
+        Block Public Access is disabled — any unauthenticated internet client can read
+        all objects in the bucket.
+
+  # --- 5b) PutBucketAcl -> expose via legacy ACL (precondition for ACL-based public) --
+  # s3:PutBucketAcl allows setting AllUsers READ grant on a bucket via the legacy
+  # ACL system. This exposes the bucket publicly when:
+  #   (1) ObjectOwnership != BucketOwnerEnforced (ACLs are honored)
+  #   (2) Block Public Access IgnorePublicAcls=false
+  # The bucket may currently NOT be public (ACL is private), but an attacker with
+  # s3:PutBucketAcl can immediately make it public. This is a high-value escalation
+  # path — it bypasses bucket policy restrictions and grants direct public read access.
+  - id: aws-s3-put-bucket-acl-can-expose
+    emits: ExposedToInternet
+    description: "s3:PutBucketAcl on a bucket with ObjectOwnership != BucketOwnerEnforced and Block Public Access IgnorePublicAcls=false enables ACL-based public exposure."
+    match:
+      - [ ?principal, HasPermission, ?bucket ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+      - "?principal has EFFECTIVE s3:PutBucketAcl on ?bucket ARN"
+      - "?bucket.properties.ObjectOwnership != 'BucketOwnerEnforced'  (ACLs are honored)"
+      - "?bucket.properties.PublicAccessBlockConfiguration.IgnorePublicAcls == false  (bucket-level BPA)"
+      - "account-level PublicAccessBlockConfiguration.IgnorePublicAcls == false  (or not collected)"
+    emit:
+      source_type: ObjectStorage
+      target_type: AnonymousIdentity
+      source: ?bucket
+      target: "<AnonymousIdentity>"
+      permissions: ["s3:PutBucketAcl"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        POTENTIAL when s3:PutBucketAcl is confirmed EFFECTIVE, ObjectOwnership is
+        not BucketOwnerEnforced, and account-level + bucket-level IgnorePublicAcls
+        are both false. The bucket is NOT currently exposed, but the attacker can
+        unconditionally grant AllUsers READ via PutBucketAcl, bypassing bucket policy
+        restrictions. Upgrade to ACTIVE via rule aws-s3-acl-public-exposure when
+        the ACL is actually written with AllUsers READ. BLOCKED when IgnorePublicAcls=true
+        (at account or bucket level) or ObjectOwnership=BucketOwnerEnforced (ACLs
+        silently ignored). BLOCKED when an SCP denies s3:PutBucketAcl.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal HasPermission ?bucket (s3:PutBucketAcl effective permission)"
+      false_positive_note: >-
+        This edge models the CAPABILITY to grant public access via ACL (state POTENTIAL),
+        not the current state. The bucket is not yet public; the attacker must execute
+        the PutBucketAcl call with AllUsers READ to actualize this path. ObjectOwnership
+        is the gating factor: if ObjectOwnership=BucketOwnerEnforced, all ACL grants
+        are ignored (silently rejected). Check this field carefully — it was introduced
+        in 2020 and many older buckets do not set it (default is ObjectOwnershipRecommended,
+        which honors ACLs). Block Public Access IgnorePublicAcls is the secondary gate;
+        if set at account or bucket level, even a public ACL is overridden. Distinguish
+        this from rule aws-s3-acl-public-exposure, which detects the CURRENT state
+        (ACL already contains AllUsers READ). This rule surfaces the capability to
+        CREATE that state.
+      narrative: >-
+        {principal.name} has s3:PutBucketAcl on {bucket.name}; the principal can grant
+        AllUsers READ via the legacy ACL system (ObjectOwnership != BucketOwnerEnforced,
+        IgnorePublicAcls=false), bypassing bucket policy restrictions to expose the
+        bucket to the internet.
+
+  # --- 6) Static website hosting -> ExposedToInternet -------------------------
+  # An S3 bucket with static website hosting enabled publishes a public HTTP(S)
+  # endpoint (bucket-name.s3-website-region.amazonaws.com). Objects in the bucket
+  # are served publicly if the bucket ACL or bucket policy permits. Unlike the
+  # policy-based public exposure, the static website endpoint is HTTP-only and
+  # follows legacy ACL/policy rules. The website endpoint bypasses signed-URL
+  # authentication; even authenticated S3 API endpoints may be private while the
+  # website endpoint is public.
+  - id: aws-s3-static-website-public
+    emits: ExposedToInternet
+    description: "S3 static website hosting publishes a public HTTP endpoint serving bucket objects, independent of the bucket policy's API access controls."
+    match:
+      - [ ?bucket, HasPolicy, ?public_grant ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+      - "?bucket.properties.WebsiteConfiguration.IndexDocument is set (website hosting enabled)"
+      - "?public_grant represents a bucket policy or bucket ACL granting s3:GetObject to Principal:* (or allUsers grantee in ACL)"
+      - "?bucket.properties.PublicAccessBlockConfiguration.BlockPublicAcls == false AND ?bucket.properties.ObjectOwnership != 'BucketOwnerEnforced' OR access is via bucket policy (not ACL)"
+    emit:
+      source_type: ObjectStorage
+      target_type: AnonymousIdentity
+      source: ?bucket
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when BOTH conditions hold: (1) website hosting is confirmed
+        (GetBucketWebsite succeeds with IndexDocument set) AND (2) the bucket allows
+        object reads to unauthenticated principals via bucket policy OR via ACL when
+        ObjectOwnership != BucketOwnerEnforced. CONDITIONAL(resource_policy) when
+        website hosting is enabled but the access control configuration is not yet
+        resolved. BLOCKED when BlockPublicAcls=true AND the only public grant is via
+        ACL (policy-based grants are separate). BLOCKED when ObjectOwnership=BucketOwnerEnforced
+        AND no bucket-policy public allow exists.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?bucket HasPolicy ?public_grant (GetBucketPolicy + bucket ACL evidence)"
+        - "?bucket.properties.WebsiteConfiguration.IndexDocument (GetBucketWebsite)"
+      false_positive_note: >-
+        Static website hosting alone does not guarantee objects are publicly readable;
+        the bucket policy or ACL must also permit GetObject to Principal:* or allUsers.
+        If ObjectOwnership=BucketOwnerEnforced, ACL grants are silently ignored; in that
+        case only a bucket-policy public allow makes objects readable — do NOT emit
+        based on ACL when ObjectOwnership is enforced. Block Public Access BlockPublicAcls=true
+        blocks ACL-based grants (the engine should BLOCK the output when only ACL permits
+        access). The website endpoint serves objects over HTTP (not HTTPS) unless a
+        CloudFront distribution fronts it; the ExposedToInternet fact is still valid.
+        Do NOT emit if the only public path is via an authenticated S3 API call (signed URL).
+      narrative: >-
+        {bucket.name} has S3 static website hosting enabled and allows unauthenticated
+        public read — the bucket's contents are served publicly via the S3 website
+        endpoint URL.
+
+  # ===========================================================================
+  # (4) POLICY MUTATION & CROSS-BOUNDARY
+  # ===========================================================================
+
+  # --- 7) PutBucketPolicy -> CanModifyPolicy (self-grant primitive) -----------
+  # s3:PutBucketPolicy lets a principal rewrite the bucket's resource policy in
+  # full. This is the canonical S3 privilege escalation: add yourself (or anyone)
+  # as a principal with s3:GetObject/PutObject/DeleteObject/*, making a private
+  # bucket accessible or a public bucket, and bypassing any existing restrictions.
+  # CanModifyPolicy -> CanGrantPermission -> CanEscalateTo (can-control linchpin).
+  - id: aws-s3-modify-policy
+    emits: CanModifyPolicy
+    description: "s3:PutBucketPolicy lets a principal rewrite the bucket policy in full, self-granting any S3 permission including making the bucket public."
+    match:
+      - [ ?principal, HasPermission, ?bucket ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+      - "?principal has EFFECTIVE s3:PutBucketPolicy on ?bucket ARN"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: ?principal
+      target: ?bucket
+      permissions: ["s3:PutBucketPolicy"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when s3:PutBucketPolicy is confirmed EFFECTIVE on the bucket ARN
+        (identity policy + any existing bucket policy allow; no SCP deny; no
+        permission boundary deny). CONDITIONAL(iam_permission) when a resource policy
+        or SCP may restrict but isn't resolved. BLOCKED when an SCP or permission
+        boundary explicitly denies s3:PutBucketPolicy. Note: BlockPublicPolicy=true
+        prevents writing a policy with Principal:* (the write call FAILS for public
+        statements), but the principal can still write non-public policy modifications;
+        if the goal is to write a public-grant statement AND BlockPublicPolicy=true,
+        the attacker must first clear that BPA flag (s3:PutBucketPublicAccessBlock) —
+        emit CONDITIONAL(iam_permission) for the public-grant goal when
+        BlockPublicPolicy=true.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?bucket (s3:PutBucketPolicy effective permission)"
+      false_positive_note: >-
+        s3:PutBucketPolicy requires that the bucket policy does not have a Deny on
+        the action for this principal — an existing bucket policy Deny on
+        PutBucketPolicy itself blocks the modification (bucket-policy self-denial).
+        BlockPublicPolicy=true causes the API to reject policy writes that contain
+        Principal:* statements; this does not block non-public policy writes. An SCP
+        mandating that bucket policies must include aws:PrincipalOrgID blocks the
+        Principal:* self-grant path. Model the CanModifyPolicy edge as ACTIVE for
+        any structural policy modification (the attacker CAN change the policy);
+        the downstream ExposedToInternet / CrossAccountTrust depends on whether BPA
+        and SCPs also allow the resulting policy to take effect.
+      narrative: >-
+        {principal.name} has s3:PutBucketPolicy on {bucket.name} and can rewrite
+        the bucket policy — self-granting any S3 permission, including full public
+        access (if BPA permits it) or cross-account access to a chosen principal.
+
+  # --- 8) Bucket policy naming another account -> CrossAccountTrust -----------
+  # DELETED: This derived rule was a functional duplicate of the explicit
+  # normalization rule aws-s3-cross-account-policy-trust (below in explicit_rules).
+  # Both match the same evidence (bucket policy Principal from another account) and
+  # emit identical CrossAccountTrust edges. Per the 'one canonical source per edge
+  # type' principle, the explicit normalization rule is the appropriate mechanism
+  # for direct config extraction. Removed to prevent duplicate edges in the graph.
+
+  # ===========================================================================
+  # (5) EXFILTRATION
+  # ===========================================================================
+
+  # --- 9) Bulk GetObject -> CanExfiltrate -------------------------------------
+  # A principal with s3:GetObject and s3:ListBucket can enumerate and download
+  # all objects in a bucket — equivalent to exfiltrating the entire dataset.
+  # ListBucket is required to enumerate object keys; GetObject to download each.
+  # Together they constitute a complete data exfiltration capability.
+  - id: aws-s3-exfiltrate-bulk-get
+    emits: CanExfiltrate
+    description: "s3:ListBucket + s3:GetObject on a bucket enables enumeration and download of all objects — a complete bucket exfiltration."
+    match:
+      - [ ?principal, CanReadData, ?bucket ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+      - "?principal has EFFECTIVE s3:ListBucket on ?bucket ARN (or bucket policy grants ListBucket)"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: ?principal
+      target: ?bucket
+      permissions: ["s3:GetObject", "s3:ListBucket"]
+      conditions: [iam_permission, resource_policy, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when both CanReadData(?principal, ?bucket) is ACTIVE AND s3:ListBucket
+        is EFFECTIVE on the bucket ARN. CONDITIONAL(key_permission) when the contributing
+        CanReadData is CONDITIONAL(key_permission) (SSE-KMS encrypted — downloaded
+        objects are ciphertext until decrypt is confirmed). BLOCKED when CanReadData
+        is BLOCKED. Note: even without s3:ListBucket, an attacker with a known object
+        key list can still exfiltrate individual objects — treat as CONDITIONAL
+        (iam_permission) with a note that bulk enumeration requires ListBucket.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal CanReadData ?bucket (s3:GetObject)"
+        - "?principal HasPermission ?bucket (s3:ListBucket effective)"
+      false_positive_note: >-
+        s3:ListBucket is a BUCKET-level action (Resource: arn:aws:s3:::bucket-name),
+        while s3:GetObject is an OBJECT-level action (Resource: arn:aws:s3:::bucket-name/*).
+        A policy granting s3:GetObject on objects but NOT s3:ListBucket on the bucket
+        still allows GetObject of known-key objects, but not enumeration. Emit
+        CanExfiltrate ACTIVE only when both permissions are confirmed; otherwise
+        CONDITIONAL(iam_permission) for the list-less path. SSE-KMS encrypted objects:
+        the caller downloads ciphertext; exfiltration of plaintext is CONDITIONAL on
+        kms:Decrypt (same gate as CanReadData rule 2). S3 Glacier archived objects
+        require a Restore first (s3:RestoreObject); downloading an archived object
+        without a restore attempt yields a 403 — CONDITIONAL for that object tier.
+      narrative: >-
+        {principal.name} has s3:GetObject + s3:ListBucket on {bucket.name} and can
+        enumerate and download all objects — a complete bucket exfiltration path.
+
+  # --- 10) PutReplicationConfiguration -> CanExfiltrate ----------------------
+  # s3:PutReplicationConfiguration lets a principal configure continuous S3
+  # Replication from this bucket to a destination bucket in another account or
+  # region. Once configured, every new (and optionally existing) object is
+  # automatically copied to the destination — a persistent, ongoing exfiltration
+  # channel that survives principal credential rotation.
+  #
+  # This requires:
+  #   (1) s3:PutReplicationConfiguration on the SOURCE bucket.
+  #   (2) The source's replication IAM role must have s3:GetObject on the source
+  #       bucket and s3:ReplicateObject on the destination bucket (verified via
+  #       the role's policy; the destination bucket policy must also allow the
+  #       source role).
+  #   (3) iam:PassRole for the replication role (if creating/modifying the
+  #       replication config to specify a new role).
+  - id: aws-s3-exfiltrate-replication
+    emits: CanExfiltrate
+    description: "s3:PutReplicationConfiguration sets up continuous S3 Replication to an external/attacker-controlled destination bucket, establishing a persistent data exfiltration channel."
+    match:
+      - [ ?principal, HasPermission, ?bucket ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+      - "?principal has EFFECTIVE s3:PutReplicationConfiguration on ?bucket ARN"
+      - "?principal has EFFECTIVE iam:PassRole for a replication IAM role (required for every PutReplicationConfiguration call to pass the role ARN)"
+      - "?bucket.properties.VersioningStatus == 'Enabled'  (replication requires versioning on source bucket)"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: ?principal
+      target: ?bucket
+      permissions: ["s3:PutReplicationConfiguration", "iam:PassRole"]
+      conditions: [iam_permission, scp_or_org_policy, role_compatibility]
+      state_logic: >-
+        ACTIVE when s3:PutReplicationConfiguration AND iam:PassRole (for the replication
+        role) are both EFFECTIVE, and bucket versioning is enabled. CONDITIONAL
+        (role_compatibility) when the replication role or its destination permissions
+        are unknown. CONDITIONAL(iam_permission) when s3:PutReplicationConfiguration
+        is effective but iam:PassRole for a replication role with destination write
+        access is not confirmed. BLOCKED by an SCP deny on PutReplicationConfiguration
+        or iam:PassRole. Note: the destination bucket policy must also grant
+        s3:ReplicateObject to the source replication role — if it does not, replication
+        fails at the first object (emit CONDITIONAL(role_compatibility) when destination
+        policy is unknown).
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal HasPermission ?bucket (s3:PutReplicationConfiguration effective permission)"
+        - "iam:PassRole for replication IAM role"
+      false_positive_note: >-
+        Replication requires SOURCE bucket versioning to be enabled (VersioningStatus:
+        Enabled) — without it the API call succeeds but replication never starts. Check
+        the bucket's VersioningConfiguration before emitting ACTIVE. The replication
+        IAM role must have s3:GetObject / s3:GetObjectVersion on the source AND
+        s3:ReplicateObject on the destination bucket; without both, objects fail to
+        replicate. The DESTINATION bucket policy must allow the source role's account/
+        principal to write (s3:ReplicateObject) — cross-account replication requires
+        the destination to explicitly grant this; if the destination is in the same
+        account, the role's identity policy may be sufficient. SSE-KMS source objects
+        also require the replication role to have kms:Decrypt on the source CMK and
+        kms:GenerateDataKey on the destination CMK — CONDITIONAL(key_permission) when
+        CMKs are involved and the role's key access is unconfirmed.
+      narrative: >-
+        {principal.name} can configure S3 Replication on {bucket.name}
+        (s3:PutReplicationConfiguration + iam:PassRole) to continuously copy all new
+        objects to an external destination bucket — establishing a persistent
+        exfiltration channel that survives credential rotation.
+
+  # ===========================================================================
+  # (6) TRIGGER HIJACKING — PutBucketNotification
+  # ===========================================================================
+
+  # --- 10b) PutBucketPublicAccessBlock + PutBucketPolicy -> expose via BPA clear
+  # A principal with s3:PutBucketPublicAccessBlock can disable Block Public Access
+  # flags (e.g., set BlockPublicPolicy=false). When combined with s3:PutBucketPolicy,
+  # this enables a two-step escalation: clear BPA, then write a public policy, or
+  # vice versa. This path is documented in false_positive_note of aws-s3-modify-policy
+  # but not modeled as an explicit rule; add it to surface the combined capability.
+  #
+  # CRITICAL: The bucket is NOT currently exposed to the internet (the BPA flags are
+  # still active). The attacker HAS the capability to make it exposed but has NOT yet
+  # exercised it. Emit state POTENTIAL (capability exists but not yet realized), not
+  # ACTIVE (currently exposed). Do not conflate 'attacker can expose' with 'currently exposed'.
+  - id: aws-s3-disable-bpa-then-expose
+    emits: ExposedToInternet
+    description: "s3:PutBucketPublicAccessBlock + s3:PutBucketPolicy enables a two-step escalation to expose the bucket — attacker CAN expose the bucket but it is NOT currently exposed."
+    match:
+      - [ ?principal, HasPermission, ?bucket ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+      - "?principal has EFFECTIVE s3:PutBucketPublicAccessBlock on ?bucket ARN"
+      - "?principal has EFFECTIVE s3:PutBucketPolicy on ?bucket ARN"
+    emit:
+      source_type: ObjectStorage
+      target_type: AnonymousIdentity
+      source: ?bucket
+      target: "<AnonymousIdentity>"
+      permissions: ["s3:PutBucketPublicAccessBlock", "s3:PutBucketPolicy"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        POTENTIAL when both s3:PutBucketPublicAccessBlock AND s3:PutBucketPolicy are
+        confirmed EFFECTIVE on the bucket (identity policy + any bucket policy allow;
+        no SCP deny). The bucket is NOT currently exposed, but the attacker can
+        unconditionally make it public via a two-step escalation (clear BPA flags,
+        then write public policy), regardless of the current BPA state. Upgrade to
+        ACTIVE via rule aws-s3-public-bucket when both steps are executed and the
+        policy is actually written. BLOCKED when an SCP denies either action.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal HasPermission ?bucket (s3:PutBucketPublicAccessBlock effective permission)"
+        - "?principal HasPermission ?bucket (s3:PutBucketPolicy effective permission)"
+      false_positive_note: >-
+        This edge models the CAPABILITY to perform both actions, emitted as POTENTIAL
+        (not ACTIVE) because the bucket is not yet exposed. The state represents an
+        attack precondition: the attacker can clear BPA, then write a public policy,
+        but these steps must be taken sequentially and the policy write must succeed.
+        If an SCP or permission boundary blocks EITHER action, the path is BLOCKED.
+        Account-level Block Public Access (s3control:PutPublicAccessBlock / account
+        PublicAccessBlockConfiguration) may also apply; this rule covers bucket-level
+        BPA only. When account-level BPA is enabled at RestrictPublicBuckets=true,
+        even clearing the bucket-level BPA and writing a public policy will be
+        overridden — emit BLOCKED in that case. This complements rule aws-s3-modify-policy
+        (which emits CanModifyPolicy ACTIVE even when BlockPublicPolicy=true,
+        acknowledging that BPA is a separate gate the attacker can clear).
+      narrative: >-
+        {principal.name} has both s3:PutBucketPublicAccessBlock and s3:PutBucketPolicy
+        on {bucket.name}; the principal CAN clear Block Public Access flags and then
+        write a public bucket policy, but the bucket is not currently exposed.
+
+  # --- 11) PutBucketNotification -> CanModifyConfiguration (trigger hijack) --
+  # s3:PutBucketNotification (previously s3:PutBucketNotification, now mapped to
+  # s3:PutBucketNotificationConfiguration in some contexts) lets a principal
+  # reconfigure which Lambda/SQS/SNS/EventBridge targets receive S3 event
+  # notifications. An attacker can redirect notifications to an attacker-controlled
+  # Lambda or SQS queue, effectively hijacking all object-created/removed events.
+  - id: aws-s3-hijack-notification-config
+    emits: CanModifyConfiguration
+    description: "s3:PutBucketNotification lets a principal reconfigure event notification targets (Lambda/SQS/SNS/EventBridge) for a bucket, redirecting all S3 events to attacker-controlled destinations."
+    match:
+      - [ ?principal, HasPermission, ?bucket ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+      - "?principal has EFFECTIVE s3:PutBucketNotification on ?bucket ARN"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: ?principal
+      target: ?bucket
+      permissions: ["s3:PutBucketNotification"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when s3:PutBucketNotification is confirmed EFFECTIVE on the bucket ARN.
+        BLOCKED by an SCP or permission boundary deny. The actual trigger-hijacking
+        impact depends on existing event notification consumers — if the bucket has no
+        consumers, the configuration change has no immediate execution impact
+        (CONDITIONAL(trigger_exists) for the downstream CanTrigger consequence);
+        if existing Lambda/SQS targets depend on the bucket's events, redirecting
+        them is immediately impactful (ACTIVE). Emit CanModifyConfiguration regardless;
+        the downstream impact is analyzed separately.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?bucket (s3:PutBucketNotification effective permission)"
+      false_positive_note: >-
+        s3:PutBucketNotification (the action name in IAM) controls notification
+        configuration writes. The Lambda/SQS/SNS destination must grant S3 permission
+        to invoke it (Lambda: resource-based policy; SQS: SQS queue policy; SNS: SNS
+        policy). When redirecting to an attacker Lambda, the attacker's Lambda must
+        allow s3.amazonaws.com to invoke it — but the attacker controls that Lambda
+        and can configure it freely. When redirecting an existing notification, the
+        existing consumer LOSES its events (disruption); when adding a duplicate
+        target, both fire (stealth). Note that EventBridge (s3:PutBucketNotification
+        for EventBridge configuration) routes events to EventBridge rules, not a
+        specific target — the impact depends on existing EventBridge rules.
+      narrative: >-
+        {principal.name} has s3:PutBucketNotification on {bucket.name} and can
+        reconfigure S3 event notification targets — redirecting all object-created
+        or removed events to an attacker-controlled Lambda, SQS queue, or SNS topic.
+
+  # ===========================================================================
+  # (7) BATCH OPERATIONS — CanCreateWorkloadAs (iam:PassRole + s3:CreateJob)
+  # ===========================================================================
+
+  # --- 12) S3 Batch Operations + PassRole -> CanCreateWorkloadAs -------------
+  # s3:CreateJob creates an S3 Batch Operations job. The caller must provide
+  # an IAM role ARN (iam:PassRole required) that the Batch job assumes to perform
+  # the operation. A principal with iam:PassRole for a privileged IAM role +
+  # s3:CreateJob can create a job that runs s3:PutObject / s3:CopyObject /
+  # s3:DeleteObject on any object the role can access — as that privileged role.
+  # This is equivalent to CanCreateWorkloadAs for the S3 service context.
+  - id: aws-s3-batch-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "s3:CreateJob + iam:PassRole for a privileged IAM role creates an S3 Batch Operations job that runs as that role — a CanCreateWorkloadAs pattern for S3 Batch."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE s3:CreateJob (resource scope)"
+      - "?role trust policy allows batchoperations.s3.amazonaws.com as service principal"
+      - "iam:PassRole for ?role permits iam:PassedToService including batchoperations.s3.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "s3:CreateJob"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when iam:PassRole is effective for ?role with iam:PassedToService
+        admitting batchoperations.s3.amazonaws.com AND the principal has
+        s3control:CreateJob. CONDITIONAL(role_compatibility) when the role trust policy
+        or iam:PassedToService admission for batchoperations.s3.amazonaws.com is
+        unresolved. BLOCKED when an SCP or permission boundary denies iam:PassRole or
+        s3control:CreateJob. Cite can-execute-as:execute-as-via-new-workload for
+        the escalation roll-up when the role's privilege exceeds the caller's.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal CanPassIdentity ?role"
+        - "can-execute-as:execute-as-via-new-workload (roll-up — cited not re-derived)"
+      false_positive_note: >-
+        The role trust policy must name batchoperations.s3.amazonaws.com (not
+        s3.amazonaws.com); these are distinct service principals. If iam:PassedToService
+        is conditioned to another service (e.g. lambda.amazonaws.com only), this path
+        does NOT apply — downgrade to POTENTIAL(role_compatibility). The Batch
+        Operations job has a scope (the manifest/report output bucket and the operation
+        type — PutObject, CopyObject, DeleteObject, InvokeFunction, etc.); the
+        attacker-chosen operation determines the impact. CreateJob requires a manifest
+        (list of objects to operate on) and a report destination bucket — both are
+        attacker-controlled when the attacker creates the job. Batch operations against
+        a compliance-locked bucket (Object Lock) will fail for locked objects.
+      narrative: >-
+        {principal.name} can pass {role.name} to S3 Batch Operations
+        (s3:CreateJob + iam:PassRole) and create a batch job that runs as
+        {role.name}, operating on any S3 objects that role can access.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP denying s3:GetObject -> rules 1/2 BLOCKED.
+#   - SCP denying s3:PutObject -> rule 3 BLOCKED.
+#   - SCP denying s3:PutBucketPolicy -> rule 7 BLOCKED.
+#   - SCP denying s3:CreateJob or iam:PassRole -> rule 12 BLOCKED.
+#   - RestrictPublicBuckets=true (BPA) -> rule 5 (ExposedToInternet) BLOCKED.
+#   - BlockPublicPolicy=true -> rule 7 CanModifyPolicy still ACTIVE for non-public
+#     writes; CONDITIONAL(iam_permission) for the public-grant sub-goal.
+#   - KMS key policy deny on kms:Decrypt -> rule 2 CanReadData stays BLOCKED for
+#     ciphertext (decrypt-gates-secret-read from credential-chains.yaml upgrades
+#     CONDITIONAL -> ACTIVE when decrypt is confirmed; does not fire on BLOCKED).
+#   - iam:PassedToService condition excluding batchoperations.s3.amazonaws.com ->
+#     rule 12 POTENTIAL(role_compatibility), not ACTIVE.
+#   - VersioningStatus != Enabled on source bucket -> rule 10 replication
+#     CONDITIONAL(iam_permission): API call succeeds but replication does not start.
+#   - S3 Object Lock COMPLIANCE mode -> rule 3 CanWriteData BLOCKED for locked
+#     objects; the edge state is per-object-class, not bucket-wide.
+#   - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# LINCHPIN CITATIONS (rules in other files this service depends on):
+#   * credential-chains:read-secret-yields-identity
+#       ContainsSecret(bucket, secret) + CredentialsFor(secret, identity)
+#       -> CanImpersonate(principal, identity). Triggered when s3:GetObject
+#       gives access to a bucket that ContainsSecret.
+#   * credential-chains:decrypt-gates-secret-read
+#       Upgrades aws-s3-read-data-sse-kms CONDITIONAL(key_permission) -> ACTIVE
+#       when the same principal holds CanDecrypt on the SSE-KMS CMK.
+#   * can-execute-as:execute-as-via-code-modify
+#       CanModifyCode(principal, compute) + ExecutesAs(compute, role)
+#       -> CanExecuteAs(principal, role). Triggered by aws-s3-modify-code-artifact.
+#   * can-execute-as:execute-as-via-new-workload
+#       CanCreateWorkloadAs(principal, role) -> CanExecuteAs(principal, role).
+#       Triggered by aws-s3-batch-create-workload-as.
+#   * can-control:escalate-via-execute-as
+#       CanExecuteAs(principal, role) + privilege(role) > privilege(principal)
+#       -> CanEscalateTo. Triggered by the above CanExecuteAs chain.
+# ---------------------------------------------------------------------------
+
+# Bridge rule: convert CanReadData + ContainsSecret -> CanReadSecret
+# (needed to complete the credential-chains pivot path)
+  - id: aws-s3-read-data-contains-secret-yields-read-secret
+    emits: CanReadSecret
+    description: "A principal that can read a bucket's data (CanReadData) and the bucket contains secrets (ContainsSecret) can read those secrets via s3:GetObject."
+    match:
+      - [ ?principal, CanReadData, ?bucket ]
+      - [ ?bucket, ContainsSecret, ?secret ]
+    where:
+      - "node_type(?bucket) == ObjectStorage"
+      - "?bucket.provider_type == 'AWS::S3::Bucket'"
+    emit:
+      source_type: Identity
+      target_type: Secret
+      source: ?principal
+      target: ?secret
+      permissions: ["s3:GetObject"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        inherit_weakest(CanReadData, ContainsSecret): if either contributor is
+        CONDITIONAL or BLOCKED, inherit that state. ACTIVE only when both CanReadData
+        and ContainsSecret are ACTIVE. The edge carries the same key_permission gate
+        as the CanReadData input if the bucket uses SSE-KMS.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanReadData ?bucket (s3:GetObject)"
+        - "?bucket ContainsSecret ?secret (heuristic or Macie findings)"
+      false_positive_note: >-
+        Only emit when ContainsSecret is explicitly evidenced (heuristic patterns or
+        Macie findings), not inferred. The CanReadData input may be CONDITIONAL
+        (key_permission) if the bucket is SSE-KMS encrypted — inherit that gate; the
+        secret read is then CONDITIONAL(key_permission) until decrypt-gates-secret-read
+        upgrades it. This bridge rule feeds credential-chains:read-secret-yields-identity.
+      narrative: >-
+        {principal.name} can read {bucket.name} (s3:GetObject) and the bucket contains
+        secrets ({secret.name}); reading the bucket yields the secret material.
+
+# Explicit normalization records for S3 (emitted from raw collected config):
+explicit_rules:
+
+  - id: aws-s3-bucket-policy-has-policy
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::S3::Bucket"
+      field: "Policy"
+    emit:
+      source_type: ObjectStorage
+      target_type: ResourcePolicy
+      source: "<S3 Bucket (ObjectStorage)>"
+      target: "<Bucket Policy (ResourcePolicy)>"
+      api_source: "s3:GetBucketPolicy"
+      evidence_field: "Policy"
+      narrative: "{bucket.name} has a bucket resource policy (GetBucketPolicy)."
+
+  - id: aws-s3-website-config-has-policy
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::S3::Bucket"
+      field: "WebsiteConfiguration"
+    where: ["WebsiteConfiguration.IndexDocument is set"]
+    emit:
+      source_type: ObjectStorage
+      target_type: GenericPolicy
+      source: "<S3 Bucket (ObjectStorage)>"
+      target: "<WebsiteConfiguration (GenericPolicy)>"
+      api_source: "s3:GetBucketWebsite"
+      evidence_field: "WebsiteConfiguration"
+      narrative: "{bucket.name} has static website hosting enabled with IndexDocument={value.IndexDocument}."
+
+  - id: aws-s3-public-access-block
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::S3::Bucket"
+      field: "PublicAccessBlockConfiguration"
+    emit:
+      source_type: ObjectStorage
+      target_type: GenericPolicy
+      source: "<S3 Bucket (ObjectStorage)>"
+      target: "<PublicAccessBlockConfiguration>"
+      api_source: "s3:GetBucketPublicAccessBlock"
+      evidence_field: "PublicAccessBlockConfiguration"
+      narrative: "{bucket.name} has Block Public Access configuration: RestrictPublicBuckets={value.RestrictPublicBuckets}, BlockPublicPolicy={value.BlockPublicPolicy}."
+
+  - id: aws-s3-acl-public-exposure
+    emits: ExposedToInternet
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::S3::Bucket"
+      field: "BucketAcl"
+    where:
+      - "BucketAcl.Grants contains a grantee with URI='http://acs.amazonaws.com/groups/global/AllUsers' AND Permission includes 'READ'"
+      - "PublicAccessBlockConfiguration.IgnorePublicAcls == false"
+      - "ObjectOwnership != 'BucketOwnerEnforced'"
+    emit:
+      source_type: ObjectStorage
+      target_type: AnonymousIdentity
+      source: "<S3 Bucket (ObjectStorage)>"
+      target: "<AnonymousIdentity>"
+      api_source: "s3:GetBucketAcl"
+      evidence_field: "BucketAcl.Grants"
+      narrative: "{bucket.name} has a bucket ACL granting READ to AllUsers and Block Public Access IgnorePublicAcls is disabled — objects are publicly readable via legacy ACL."
+
+  - id: aws-s3-acl-authenticated-access
+    emits: ExposedToAccount
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::S3::Bucket"
+      field: "BucketAcl"
+    where:
+      - "BucketAcl.Grants contains a grantee with URI='http://acs.amazonaws.com/groups/global/AuthenticatedUsers' AND Permission includes 'READ'"
+      - "PublicAccessBlockConfiguration.IgnorePublicAcls == false"
+      - "ObjectOwnership != 'BucketOwnerEnforced'"
+    emit:
+      source_type: ObjectStorage
+      target_type: Account
+      source: "<S3 Bucket (ObjectStorage)>"
+      target: "<AWS Account (any authenticated principal in any AWS account)>"
+      api_source: "s3:GetBucketAcl"
+      evidence_field: "BucketAcl.Grants"
+      narrative: "{bucket.name} has a bucket ACL granting READ to AuthenticatedUsers and Block Public Access IgnorePublicAcls is disabled — any AWS account holder can read objects."
+
+  - id: aws-s3-notification-can-trigger
+    emits: CanTrigger
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::S3::Bucket"
+      field: "NotificationConfiguration"
+    emit:
+      source_type: ObjectStorage
+      target_type: "*"
+      source: "<S3 Bucket (ObjectStorage)>"
+      target: "<Lambda/SQS/SNS/EventBridge destination from NotificationConfiguration>"
+      api_source: "s3:GetBucketNotificationConfiguration"
+      evidence_field: "NotificationConfiguration.LambdaFunctionConfigurations[].LambdaFunctionArn | .QueueConfigurations[].QueueArn | .TopicConfigurations[].TopicArn | .EventBridgeConfiguration"
+      narrative: "{bucket.name} sends {event.name} events to {destination.name} (S3 event notification). Destinations: Lambda (Compute), SQS (Messaging), SNS (Messaging), EventBridge (Messaging)."
+
+  - id: aws-s3-cross-account-policy-trust
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::S3::Bucket"
+      field: "Policy"
+    where: ["principal in Policy Statement belongs to a different AWS account than ?bucket.account"]
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<Bucket Policy (ResourcePolicy) of the S3 Bucket>"
+      target: "<external account from bucket policy Principal ARN>"
+      api_source: "s3:GetBucketPolicy"
+      evidence_field: "Policy.Statement[].Principal (cross-account ARN)"
+      narrative: "{bucket.policy.name} (bucket policy on {bucket.name}) grants access to principal in external account {account.id}."
+
+  - id: aws-s3-contains-secret-heuristic
+    emits: ContainsSecret
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::S3::Bucket"
+      field: "ObjectKeyPatterns"
+    where: ["object key matches credential patterns: terraform.tfstate, *.env, *.pem, kubeconfig, *credentials*, *secrets*, *.tfvars, CloudFormation parameter files"]
+    emit:
+      source_type: ObjectStorage
+      target_type: Secret
+      source: "<S3 Bucket (ObjectStorage)>"
+      target: "<Secret / Credential (inferred from object key pattern)>"
+      api_source: "s3:ListObjectsV2 (object key enumeration) OR Macie findings"
+      evidence_field: "Object key pattern match"
+      narrative: "{bucket.name} contains objects matching credential key patterns ({pattern}) — reading them via s3:GetObject may yield usable credentials. Cite credential-chains:read-secret-yields-identity for the impersonation roll-up."
+
+  - id: aws-s3-replication-cross-account
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::S3::Bucket"
+      field: "ReplicationConfiguration.Rules[].Destination.Bucket"
+    where: ["destination bucket ARN account ID differs from ?bucket.account"]
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<ReplicationConfiguration (GenericPolicy) on S3 Bucket — modeled as ResourcePolicy>"
+      target: "<external account from replication destination bucket ARN>"
+      api_source: "s3:GetBucketReplication"
+      evidence_field: "ReplicationConfiguration.Rules[].Destination.Bucket"
+      narrative: "{bucket.name} replication configuration copies objects to a destination bucket in external account {account.id} — ongoing cross-account data transfer."
+
+  - id: aws-s3-can-get-object
+    emits: CanReadData
+    applies_to: [aws]
+    match_effective_permission:
+      action: "s3:GetObject"
+      resource_type: "AWS::S3::Bucket"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: "<principal>"
+      target: "<bucket node>"
+      permissions: ["s3:GetObject"]
+      narrative: "{principal.name} has effective s3:GetObject on {bucket.name}."
+
+  - id: aws-s3-can-put-object
+    emits: CanWriteData
+    applies_to: [aws]
+    match_effective_permission:
+      action: "s3:PutObject"
+      resource_type: "AWS::S3::Bucket"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: "<principal>"
+      target: "<bucket node>"
+      permissions: ["s3:PutObject"]
+      narrative: "{principal.name} has effective s3:PutObject on {bucket.name}."
+
+  - id: aws-s3-can-put-bucket-policy
+    emits: CanModifyPolicy
+    applies_to: [aws]
+    match_effective_permission:
+      action: "s3:PutBucketPolicy"
+      resource_type: "AWS::S3::Bucket"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: "<principal>"
+      target: "<bucket node>"
+      permissions: ["s3:PutBucketPolicy"]
+      narrative: "{principal.name} has effective s3:PutBucketPolicy on {bucket.name} and can rewrite the bucket policy."
+
+  # --- CODE ARTIFACT SOURCE NORMALIZATION (feeds aws-s3-modify-code-artifact) ---
+  # These rules extract deployment-source relationships from service configs
+  # and emit ContainsResourceReference edges. The derived rule aws-s3-modify-code-artifact
+  # then matches these edges (not CanTrigger) to emit CanModifyCode.
+
+  - id: aws-s3-code-source-lambda
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Lambda::Function"
+      field: "CodeLocation"
+    where: ["CodeLocation.S3Bucket is set (Lambda deployment source is an S3 bucket)"]
+    emit:
+      source_type: ObjectStorage
+      target_type: ServerlessFunction
+      source: "<S3 Bucket ARN from CodeLocation.S3Bucket>"
+      target: "<Lambda Function (ServerlessFunction)>"
+      api_source: "lambda:GetFunctionConfiguration"
+      evidence_field: "CodeLocation.S3Bucket / CodeLocation.S3ObjectKey"
+      edge_metadata: {reference_type: "CodeSourceFor", typed: true}
+      narrative: "{bucket.name} contains the code package deployed by {lambda.name} (CodeLocation: s3://{bucket.name}/{key})."
+
+  - id: aws-s3-code-source-codepipeline
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodePipeline::Pipeline"
+      field: "Stages"
+    where:
+      - "Stages[].Actions[].Configuration.S3Bucket is set (S3 source artifact)"
+      - "Actions[].ActionTypeId.Provider == 'S3' (source provider is S3)"
+    emit:
+      source_type: ObjectStorage
+      target_type: BuildWorker
+      source: "<S3 Bucket ARN from Actions[].Configuration.S3Bucket>"
+      target: "<CodePipeline Stage / Build Job (BuildWorker)>"
+      api_source: "codepipeline:GetPipeline"
+      evidence_field: "Stages[].Actions[].Configuration.S3Bucket / S3ObjectKey"
+      edge_metadata: {reference_type: "CodeSourceFor", typed: true}
+      narrative: "{bucket.name} is configured as the source artifact store for {pipeline.name} (CodePipeline source stage)."
+
+  - id: aws-s3-code-source-cloudformation
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CloudFormation::Stack"
+      field: "TemplateURL"
+    where: ["TemplateURL contains s3:// or starts with an S3 bucket ARN (template is stored in S3)"]
+    emit:
+      source_type: ObjectStorage
+      target_type: ApplicationPlatform
+      source: "<S3 Bucket ARN extracted from TemplateURL>"
+      target: "<CloudFormation Stack (ApplicationPlatform)>"
+      api_source: "cloudformation:GetStackTemplate"
+      evidence_field: "TemplateURL"
+      edge_metadata: {reference_type: "CodeSourceFor", typed: true}
+      narrative: "{bucket.name} contains the CloudFormation template deployed by stack {stack.name} (TemplateURL: {url})."

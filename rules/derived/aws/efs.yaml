@@ -1,0 +1,626 @@
+# AWS EFS (Elastic File System) — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# EFS is a managed NFS service. Its security signature differs from object
+# storage (S3) and databases: data access is EXCLUSIVELY via NFS mounts over
+# TCP/UDP port 2049 to VPC mount targets. The unique control surface:
+#
+#  (1) DATA READ VIA MOUNT (highest-frequency path):
+#      An IAM principal (or workload) that holds elasticfilesystem:ClientMount
+#      in the file system's resource policy AND can network-reach the mount
+#      target on port 2049 can mount the file system and read all files.
+#      ClientWrite additionally permits write. ClientRootAccess permits UID 0
+#      access, allowing POSIX permission bypass.
+#
+#  (2) BROAD / DEFAULT POLICY EXPOSURE:
+#      The DEFAULT EFS file system policy (when no explicit policy is set —
+#      DescribeFileSystemPolicy returns PolicyNotFound) grants ALL THREE client
+#      actions (ClientMount, ClientWrite, ClientRootAccess) to ANY principal
+#      that can reach the mount target. A policy with Principal:"*" has the
+#      same effect for the named actions. Both are ExposedToAccount (all same-
+#      account IAM principals) and potentially broader if the mount target SG
+#      and subnet allow external NFS reach.
+#
+#  (3) FILE SYSTEM POLICY SELF-GRANT (CanModifyPolicy):
+#      elasticfilesystem:PutFileSystemPolicy lets a principal rewrite the
+#      entire resource policy, self-granting ClientMount/ClientWrite/
+#      ClientRootAccess. Modeled as explicit CanModifyPolicy; consequence
+#      (CanReadData/CanWriteData) follows from the new effective policy.
+#
+#  (4) CROSS-ACCOUNT TRUST VIA FILE SYSTEM POLICY:
+#      A file system policy that names a Principal in another account grants
+#      that external account NFS mount access, creating a cross-account data
+#      path. Explicit CrossAccountTrust; CanReadData follows for the named
+#      external principal.
+#
+# IMPORTANT CONSTRAINTS (prevent false positives):
+#  - NFS data decryption happens SERVER-SIDE (kms:ViaService); NFS clients do
+#    NOT need kms:Decrypt. Do NOT gate CanReadData on key_permission for EFS.
+#  - ClientMount alone is CONDITIONAL(network_reachability): NFS port 2049
+#    must be open from the client to the mount target ENI. Always annotate
+#    this condition.
+#  - Access points narrow (chroot + POSIX user enforcement), they do not
+#    broaden access. A mount via an access point only accesses the access
+#    point's configured root directory subtree.
+#  - Replication destination file systems are WRITE-LOCKED for NFS clients;
+#    regular principals cannot write there. The replica CanReadData edge
+#    (via ClientMount in destination policy) is still valid if granted.
+#
+# LINCHPIN CITATIONS (do not re-derive):
+#  - credential-chains.yaml: ContainsSecret(fs -> secret) + CanReadData(p -> fs)
+#    -> read-secret-yields-identity if the file system stores credentials.
+#    EFS files commonly hold DB passwords, SSH keys, API tokens.
+#  - can-control.yaml: CanModifyPolicy(p -> fs_policy) does not directly derive
+#    Controls; after the policy rewrite a fresh CanReadData/CanWriteData edge
+#    is emitted by the updated policy, then the path-finder continues.
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml):
+#   CanReadData:      source [Identity, Compute]  target [Storage, Data, Messaging]
+#   CanWriteData:     source [Identity, Compute]  target [Storage, Data, Messaging]
+#   CrossAccountTrust: source [Account, Role, ResourcePolicy, Data, Snapshot, DataLake]
+#                      target [Account, ExternalIdentity]
+#   CanModifyPolicy:  source [Identity]            target [Policy, Identity, "*"]
+#   ExposedToAccount: source ["*"]                target [Account, Subscription, Project]
+#   ContainsSecret:   source [Storage, Data, Compute, Messaging] target [Secret, Credential]
+#
+# FileStorage (EFS) is Storage class; all CanReadData/CanWriteData/
+# ExposedToAccount/ContainsSecret edges correctly target/source Storage.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # --- 1) ClientMount in file system policy -> NFS data read -----------------
+  # THE primary EFS data-access path. A principal granted
+  # elasticfilesystem:ClientMount in the file system policy can mount the file
+  # system via any reachable mount target and read all files/metadata on it.
+  # ClientWrite additionally enables write; ClientRootAccess bypasses POSIX
+  # root-squash, giving UID 0 access and effectively defeating POSIX ACLs.
+  #
+  # CRITICAL gate: NFS is ONLY reachable via the mount target ENI (VPC, port
+  # 2049). ClientMount is CONDITIONAL(network_reachability) unless the caller
+  # is a workload in the same VPC/peered VPC with an open SG on port 2049.
+  #
+  # IMPORTANT: EFS is mounted almost exclusively by Compute workloads (EC2 instance
+  # profiles, ECS task roles, Lambda execution roles), not by bare IAM Identities.
+  # This rule emits TWO variants to capture both paths: Identity and Compute sources.
+  - id: aws-efs-client-mount-read-data
+    emits: CanReadData
+    description: "A principal with elasticfilesystem:ClientMount in the EFS file system policy can mount the file system and read all file data via NFS."
+    match:
+      - [ ?principal, HasPermission, ?filesystem ]
+    where:
+      - "node_type(?filesystem) == FileStorage"
+      - "?filesystem.provider_type == 'AWS::EFS::FileSystem'"
+      - "?principal has EFFECTIVE elasticfilesystem:ClientMount on ?filesystem (via identity policy OR file system resource policy — EFS uses allow-in-either logic)"
+      - "a reachable mount target exists in a VPC/subnet accessible to ?principal (NFS port 2049)"
+    emit:
+      - source_type: Identity
+        target_type: FileStorage
+        source: ?principal
+        target: ?filesystem
+        permissions: ["elasticfilesystem:ClientMount"]
+        conditions: [iam_permission, resource_policy, network_reachability]
+        state_logic: >-
+          if network_reachability(?principal, ?filesystem mount target, port 2049)
+          is confirmed: ACTIVE; else CONDITIONAL(network_reachability). BLOCKED if
+          an explicit Deny in the file system policy or an SCP/permission boundary
+          denies elasticfilesystem:ClientMount for this principal. Note: EFS
+          data encryption is transparent server-side (kms:ViaService); the caller
+          does NOT need kms:Decrypt — do not add key_permission to the gate.
+          If the file system policy enforces aws:SecureTransport (TLS), the caller
+          must use the EFS mount helper with TLS; without the helper the mount
+          fails — model as CONDITIONAL(network_reachability) with a tls_required
+          annotation if enforced.
+        confidence: 0.95
+        derived_from: [ "<HasPermission(ClientMount) edge_id>", "<mount_target_reachability>" ]
+        false_positive_note: >-
+          ClientMount alone is NFS read access to the ENTIRE file system (all
+          directories, files, metadata) unless the mount uses an access point that
+          enforces a chroot root directory. When the effective grant is through a
+          file system policy `Principal: "*"` (anonymous), every same-account IAM
+          principal qualifies — but NFS reachability (port 2049 from the client to
+          the mount target ENI) is still mandatory. Do not emit ACTIVE for a
+          cross-account principal whose VPC is not peered/connected to the EFS VPC.
+          Also: using the EFS mount helper without "-o iam" skips IAM enforcement
+          entirely; the rule models the IAM-authorized path. Without the mount
+          helper, any principal that can reach port 2049 can mount if the POSIX
+          permissions allow — that is a separate, network-only path not modeled here.
+        narrative: >-
+          {principal.name} holds elasticfilesystem:ClientMount on {filesystem.name}
+          and can reach its VPC mount target (NFS port 2049); mounting the file
+          system grants read access to all files and metadata stored on it.
+      - source_type: Compute
+        target_type: FileStorage
+        source: ?principal
+        target: ?filesystem
+        permissions: ["elasticfilesystem:ClientMount"]
+        conditions: [iam_permission, resource_policy, network_reachability]
+        state_logic: >-
+          if network_reachability(?principal, ?filesystem mount target, port 2049)
+          is confirmed: ACTIVE; else CONDITIONAL(network_reachability). Compute workloads
+          (EC2, ECS, Lambda, etc.) with ClientMount permission can mount and read
+          all file data via NFS. BLOCKED if an explicit Deny in the file system policy
+          or an SCP/permission boundary denies elasticfilesystem:ClientMount.
+        confidence: 0.95
+        derived_from: [ "<HasPermission(ClientMount) edge_id>", "<mount_target_reachability>" ]
+        false_positive_note: >-
+          This variant models the most common real-world EFS access pattern:
+          Compute workloads (EC2 instance profiles, ECS task roles, Lambda execution roles,
+          etc.) that mount and read from shared EFS volumes. The same caveats apply:
+          network reachability to port 2049 is mandatory, and using the EFS mount helper
+          without "-o iam" bypasses IAM enforcement.
+        narrative: >-
+          {principal.name} (Compute workload) holds elasticfilesystem:ClientMount on {filesystem.name}
+          and can reach its VPC mount target (NFS port 2049); the workload can mount and read
+          all files and metadata stored on it.
+
+  # --- 1b) ClientWrite in file system policy -> NFS data write ----------------
+  # A principal granted elasticfilesystem:ClientWrite in the file system policy
+  # can mount the file system via any reachable mount target and WRITE files.
+  # This is a lateral movement vector: a principal with write access can plant
+  # malicious files (executables, configuration, credentials) on a shared EFS
+  # volume that other workloads (EC2/ECS/Lambda) mount and execute. Combined
+  # with ContainsSecret and credential-chains, this is a high-value escalation path.
+  #
+  # CRITICAL gate: like ClientMount, ClientWrite is CONDITIONAL(network_reachability)
+  # unless the caller is a workload in the same VPC/peered VPC with an open SG.
+  #
+  # IMPORTANT: Like ClientMount, ClientWrite is most commonly used by Compute workloads.
+  # This rule emits TWO variants to capture both Identity and Compute sources.
+  - id: aws-efs-client-write-data
+    emits: CanWriteData
+    description: "A principal with elasticfilesystem:ClientWrite in the EFS file system policy can mount the file system and write data via NFS."
+    match:
+      - [ ?principal, HasPermission, ?filesystem ]
+    where:
+      - "node_type(?filesystem) == FileStorage"
+      - "?filesystem.provider_type == 'AWS::EFS::FileSystem'"
+      - "?principal has EFFECTIVE elasticfilesystem:ClientWrite on ?filesystem (via identity policy OR file system resource policy)"
+      - "a reachable mount target exists in a VPC/subnet accessible to ?principal (NFS port 2049)"
+    emit:
+      - source_type: Identity
+        target_type: FileStorage
+        source: ?principal
+        target: ?filesystem
+        permissions: ["elasticfilesystem:ClientWrite"]
+        conditions: [iam_permission, resource_policy, network_reachability]
+        state_logic: >-
+          if network_reachability(?principal, ?filesystem mount target, port 2049)
+          is confirmed: ACTIVE; else CONDITIONAL(network_reachability). BLOCKED if
+          an explicit Deny in the file system policy or an SCP/permission boundary
+          denies elasticfilesystem:ClientWrite for this principal. For replication
+          destination file systems locked to read-only, upgrade to CONDITIONAL or
+          BLOCKED despite the policy grant (the EFS service enforces write-lock).
+        confidence: 0.95
+        derived_from: [ "<HasPermission(ClientWrite) edge_id>", "<mount_target_reachability>" ]
+        false_positive_note: >-
+          ClientWrite on a shared EFS volume grants write capability across all
+          files and directories (unless the mount uses an access point that enforces
+          a chroot + POSIX user enforcement). A principal with ClientWrite can
+          overwrite existing files, create new files, or plant executable content
+          to be picked up by workloads running as privileged roles. This is a
+          high-value lateral movement vector when combined with workloads that
+          mount the same EFS (model via credential-chains for credential files,
+          or standalone for configuration/executable injection). Do not emit ACTIVE
+          for a cross-account principal whose VPC is not peered/connected to the
+          EFS VPC.
+        narrative: >-
+          {principal.name} holds elasticfilesystem:ClientWrite on {filesystem.name}
+          and can reach its VPC mount target (NFS port 2049); mounting the file
+          system grants write access to all files and can plant malicious content
+          for workloads that mount and execute files on the same EFS.
+      - source_type: Compute
+        target_type: FileStorage
+        source: ?principal
+        target: ?filesystem
+        permissions: ["elasticfilesystem:ClientWrite"]
+        conditions: [iam_permission, resource_policy, network_reachability]
+        state_logic: >-
+          if network_reachability(?principal, ?filesystem mount target, port 2049)
+          is confirmed: ACTIVE; else CONDITIONAL(network_reachability). Compute workloads
+          with ClientWrite can mount and write all file data via NFS, enabling lateral
+          movement through shared EFS volumes. BLOCKED if an explicit Deny in the file
+          system policy or an SCP/permission boundary denies elasticfilesystem:ClientWrite.
+        confidence: 0.95
+        derived_from: [ "<HasPermission(ClientWrite) edge_id>", "<mount_target_reachability>" ]
+        false_positive_note: >-
+          This variant models Compute workloads (EC2, ECS, Lambda) with ClientWrite
+          permission on shared EFS volumes. This is a high-value lateral movement path:
+          the workload can write malicious files/configuration that other workloads
+          mounting the same EFS will execute or depend on.
+        narrative: >-
+          {principal.name} (Compute workload) holds elasticfilesystem:ClientWrite on {filesystem.name}
+          and can reach its VPC mount target (NFS port 2049); the workload can mount and write
+          to all files on the EFS, enabling lateral movement to other workloads sharing the volume.
+
+  # --- 2) Default (no explicit) file system policy -> account-wide exposure --
+  # When DescribeFileSystemPolicy returns PolicyNotFound, EFS applies the
+  # default policy: full access (ClientMount + ClientWrite + ClientRootAccess)
+  # to ANY IAM principal that can network-reach the mount target. This is
+  # equivalent to a policy with Principal:"AWS":"*" and all three actions.
+  # Model as ExposedToAccount (any same-account identity can read/write) rather
+  # than ExposedToInternet (NFS mount still requires VPC network reach).
+  #
+  # This is the single most common EFS misconfiguration: newly created file
+  # systems have no policy and are therefore fully open to all same-account
+  # identities that can get network access to the mount target.
+  - id: aws-efs-default-policy-exposed-to-account
+    emits: ExposedToAccount
+    description: "An EFS file system with no explicit file system policy (PolicyNotFound) is fully accessible to any same-account IAM principal that can network-reach the mount target."
+    match:
+      - "NOT EXISTS [ ?filesystem, HasPolicy, ?any_policy ]"
+    where:
+      - "node_type(?filesystem) == FileStorage"
+      - "?filesystem.provider_type == 'AWS::EFS::FileSystem'"
+      - "?filesystem.policy_status == 'PolicyNotFound' OR DescribeFileSystemPolicy returns PolicyNotFound for ?filesystem"
+    emit:
+      source_type: FileStorage
+      target_type: Account
+      source: ?filesystem
+      target: "<AWS account that owns ?filesystem>"
+      permissions: ["elasticfilesystem:ClientMount", "elasticfilesystem:ClientWrite", "elasticfilesystem:ClientRootAccess"]
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when mount is performed WITHOUT the EFS mount helper (no IAM enforcement).
+        CONDITIONAL(iam_permission, network_reachability) when mount helper with "-o iam"
+        is used — in that case the default policy is evaluated but IAM identity policy
+        must also allow ClientMount. The default EFS policy grants all three client actions
+        (ClientMount, ClientWrite, ClientRootAccess) at the NFS protocol level; however,
+        when the mount helper is used with "-o iam", the IAM permission evaluator is
+        invoked, making it CONDITIONAL on identity policy rather than ACTIVE. This rule
+        models the STRUCTURAL misconfiguration (absence of an explicit policy), and the
+        effective attack path depends on the mount method used. BLOCKED if an SCP
+        enforces elasticfilesystem:ClientMount only for specific principals.
+      confidence: 0.90
+      derived_from: [ "<PolicyNotFound observation on ?filesystem>" ]
+      false_positive_note: >-
+        The default policy does NOT make the file system reachable from the
+        internet; EFS has no public endpoint. Internet exposure requires
+        additionally: (a) a mount target ENI in a public subnet, (b) a security
+        group allowing inbound NFS (2049) from 0.0.0.0/0, and (c) an NFS client
+        that can reach a public IP. That scenario (ExposedToInternet) would need
+        an independent network analysis rule. This rule emits ExposedToAccount —
+        the blast radius is same-account — NOT ExposedToInternet. Replication
+        destination file systems that are locked for user writes should set
+        state to CONDITIONAL for CanWriteData derivations.
+      narrative: >-
+        {filesystem.name} has no explicit file system policy (PolicyNotFound);
+        AWS applies the default policy granting ClientMount, ClientWrite, and
+        ClientRootAccess to all same-account IAM principals that can reach the
+        mount target — any workload in the account's VPC can mount and
+        fully access this file system without any IAM check.
+
+
+  # --- 4) PutFileSystemPolicy self-grant -> read/write data ------------------
+  # A principal with elasticfilesystem:PutFileSystemPolicy can rewrite the
+  # file system's resource policy to grant themselves ClientMount, ClientWrite,
+  # and ClientRootAccess, then mount and read/write all data. This is the EFS
+  # control-plane-to-data-plane escalation primitive: the self-grant rewrites
+  # a resource policy → then the updated policy makes CanReadData ACTIVE.
+  #
+  # The explicit CanModifyPolicy edge (from PutFileSystemPolicy) is emitted by
+  # the explicit normalization rule aws-efs-can-modify-policy. This derived
+  # rule models the CONSEQUENCE: an attacker who can rewrite the policy can
+  # then immediately read (and write) all file data.
+  #
+  # IMPORTANT: Compute workloads with PutFileSystemPolicy are a common real-world
+  # attack pattern. This rule emits TWO variants: Identity and Compute sources.
+  - id: aws-efs-put-fs-policy-grants-data-access
+    emits: CanReadData
+    description: "A principal with elasticfilesystem:PutFileSystemPolicy can self-grant ClientMount and read all file data on the EFS file system."
+    match:
+      - [ ?principal, CanModifyPolicy, ?fspolicy ]
+    where:
+      - "?fspolicy is a ResourcePolicy on a FileStorage node (?filesystem)"
+      - "node_type(?filesystem) == FileStorage"
+      - "?filesystem.provider_type == 'AWS::EFS::FileSystem'"
+      - "?principal has EFFECTIVE elasticfilesystem:PutFileSystemPolicy on ?filesystem"
+    emit:
+      - source_type: Identity
+        target_type: FileStorage
+        source: ?principal
+        target: ?filesystem
+        permissions: ["elasticfilesystem:PutFileSystemPolicy"]
+        conditions: [iam_permission, network_reachability]
+        state_logic: >-
+          CONDITIONAL(network_reachability) — PutFileSystemPolicy alone grants the
+          ABILITY to self-grant ClientMount; the actual data read requires a
+          subsequent NFS mount via a network-reachable mount target (port 2049).
+          If network reachability is confirmed (principal is a workload in the
+          same VPC as the mount target): upgrade to ACTIVE. BLOCKED if an SCP
+          or permission boundary denies elasticfilesystem:PutFileSystemPolicy
+          (the self-grant action itself is blocked).
+        confidence: 0.85
+        derived_from: [ "<CanModifyPolicy(PutFileSystemPolicy) edge_id>" ]
+        false_positive_note: >-
+          PutFileSystemPolicy is a two-step escalation: (1) rewrite the policy,
+          (2) mount via NFS. Step 2 requires network reach to the mount target.
+          A principal with PutFileSystemPolicy but no VPC connectivity to any
+          mount target has the CONTROL-PLANE capability but not immediate data
+          access — set CONDITIONAL(network_reachability). Note that the attacker
+          can also create a new mount target (elasticfilesystem:CreateMountTarget)
+          in their own VPC to gain network reach; this is a POTENTIAL follow-on
+          step, not modeled here. Do not emit CanWriteData from PutFileSystemPolicy
+          alone (write also needs ClientWrite in the new policy AND network reach);
+          CanReadData is the conservative floor capability from this self-grant.
+        narrative: >-
+          {principal.name} can rewrite the file system policy of {filesystem.name}
+          (elasticfilesystem:PutFileSystemPolicy) to self-grant
+          elasticfilesystem:ClientMount, then mount the file system via NFS and
+          read all stored files and metadata.
+      - source_type: Compute
+        target_type: FileStorage
+        source: ?principal
+        target: ?filesystem
+        permissions: ["elasticfilesystem:PutFileSystemPolicy"]
+        conditions: [iam_permission, network_reachability]
+        state_logic: >-
+          CONDITIONAL(network_reachability) for Compute workloads with PutFileSystemPolicy.
+          The workload can rewrite the file system policy to self-grant ClientMount, then
+          mount and read all data via NFS. If the workload is in the same VPC as the mount
+          target or has existing network connectivity: upgrade to ACTIVE. BLOCKED if an SCP
+          or permission boundary denies elasticfilesystem:PutFileSystemPolicy.
+        confidence: 0.85
+        derived_from: [ "<CanModifyPolicy(PutFileSystemPolicy) edge_id>" ]
+        false_positive_note: >-
+          This variant models Compute workloads (EC2, ECS, Lambda) with PutFileSystemPolicy.
+          The workload can immediately rewrite the policy and mount if network-reachable,
+          making this a high-value escalation when the workload is in the same VPC as the
+          mount target.
+        narrative: >-
+          {principal.name} (Compute workload) can rewrite the file system policy of {filesystem.name}
+          (elasticfilesystem:PutFileSystemPolicy) to self-grant ClientMount and read all file data.
+
+  # --- 4b) PutFileSystemPolicy self-grant -> write/root access ---------------
+  # A principal with elasticfilesystem:PutFileSystemPolicy can also self-grant
+  # ClientWrite and ClientRootAccess in addition to ClientMount. This rule models
+  # the write escalation consequence: after policy rewrite, the attacker can write
+  # all data and execute as UID 0.
+  #
+  # IMPORTANT: Like the read variant, this emits both Identity and Compute sources.
+  - id: aws-efs-put-fs-policy-grants-write-access
+    emits: CanWriteData
+    description: "A principal with elasticfilesystem:PutFileSystemPolicy can self-grant ClientWrite and write all file data on the EFS file system."
+    match:
+      - [ ?principal, CanModifyPolicy, ?fspolicy ]
+    where:
+      - "?fspolicy is a ResourcePolicy on a FileStorage node (?filesystem)"
+      - "node_type(?filesystem) == FileStorage"
+      - "?filesystem.provider_type == 'AWS::EFS::FileSystem'"
+      - "?principal has EFFECTIVE elasticfilesystem:PutFileSystemPolicy on ?filesystem"
+    emit:
+      - source_type: Identity
+        target_type: FileStorage
+        source: ?principal
+        target: ?filesystem
+        permissions: ["elasticfilesystem:PutFileSystemPolicy"]
+        conditions: [iam_permission, network_reachability]
+        state_logic: >-
+          CONDITIONAL(network_reachability) — PutFileSystemPolicy alone grants the
+          ABILITY to self-grant ClientWrite; the actual data write requires a
+          subsequent NFS mount via a network-reachable mount target (port 2049).
+          If network reachability is confirmed: upgrade to ACTIVE. BLOCKED if an SCP
+          or permission boundary denies elasticfilesystem:PutFileSystemPolicy.
+        confidence: 0.85
+        derived_from: [ "<CanModifyPolicy(PutFileSystemPolicy) edge_id>" ]
+        false_positive_note: >-
+          PutFileSystemPolicy is a two-step escalation: (1) rewrite the policy to
+          include ClientWrite, (2) mount via NFS with write capability. Step 2
+          requires network reach to the mount target. A principal with PutFileSystemPolicy
+          but no VPC connectivity has the CONTROL-PLANE capability but not immediate
+          write access — set CONDITIONAL(network_reachability). This is a lateral
+          movement amplifier: the attacker can write malicious files on a shared
+          EFS volume picked up by other workloads, or corrupt existing data.
+        narrative: >-
+          {principal.name} can rewrite the file system policy of {filesystem.name}
+          (elasticfilesystem:PutFileSystemPolicy) to self-grant
+          elasticfilesystem:ClientWrite, then mount the file system via NFS and
+          write/corrupt all files and metadata.
+      - source_type: Compute
+        target_type: FileStorage
+        source: ?principal
+        target: ?filesystem
+        permissions: ["elasticfilesystem:PutFileSystemPolicy"]
+        conditions: [iam_permission, network_reachability]
+        state_logic: >-
+          CONDITIONAL(network_reachability) for Compute workloads with PutFileSystemPolicy.
+          The workload can rewrite the file system policy to self-grant ClientWrite, then
+          mount and write all data via NFS. If the workload is in the same VPC: upgrade to ACTIVE.
+          BLOCKED if an SCP or permission boundary denies elasticfilesystem:PutFileSystemPolicy.
+        confidence: 0.85
+        derived_from: [ "<CanModifyPolicy(PutFileSystemPolicy) edge_id>" ]
+        false_positive_note: >-
+          This variant models Compute workloads with PutFileSystemPolicy. The workload can
+          rewrite the policy to grant ClientWrite and immediately write to the EFS volume
+          if network-reachable, enabling lateral movement through shared EFS.
+        narrative: >-
+          {principal.name} (Compute workload) can rewrite the file system policy of {filesystem.name}
+          to self-grant ClientWrite and write/corrupt all file data on the EFS volume.
+
+  # --- 5) ModifyMountTargetSecurityGroups network escalation --------------------
+  # A principal with elasticfilesystem:ModifyMountTargetSecurityGroups can alter
+  # the security group rules controlling inbound NFS access (port 2049) to mount
+  # targets. This permission converts a CONDITIONAL(network_reachability)
+  # CanReadData/CanWriteData edge into ACTIVE by opening the network path.
+  #
+  # This is a CONDITIONAL-to-ACTIVE escalation: if a principal has ClientMount
+  # permission but cannot network-reach the mount target, ModifyMountTargetSecurityGroups
+  # enables them to open port 2049 inbound from their own network, upgrading the
+  # effective capability from CONDITIONAL to ACTIVE.
+  #
+  # NOTE: The match clause `?principal has CanModifyConfiguration on ?mounttarget`
+  # is the authoritative permission trigger. The derived rule trusts the explicit
+  # edge rather than re-evaluating elasticfilesystem:ModifyMountTargetSecurityGroups
+  # in the where clause to avoid duplicate permission checks.
+  - id: aws-efs-modifymounttarget-sg-network-escalation
+    emits: CanNetworkReach
+    description: "A principal with elasticfilesystem:ModifyMountTargetSecurityGroups can modify mount target security groups to enable NFS access, converting conditional data-access edges to active."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?mounttarget ]
+    where:
+      - "node_type(?mounttarget) == Network"
+      - "?mounttarget.provider_type == 'AWS::EFS::MountTarget'"
+      - "?mounttarget is attached to a FileSystem (?filesystem)"
+      - "node_type(?filesystem) == FileStorage"
+      - "?filesystem.provider_type == 'AWS::EFS::FileSystem'"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: ?principal
+      target: ?mounttarget
+      permissions: ["elasticfilesystem:ModifyMountTargetSecurityGroups"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        ACTIVE — the principal can modify the mount target's security group to
+        allow NFS traffic (port 2049 TCP/UDP) from their own network CIDR.
+        This capability upgrades any CONDITIONAL(network_reachability) CanReadData
+        or CanWriteData edge on the associated file system to ACTIVE, provided
+        the principal also holds the client-action permission (ClientMount,
+        ClientWrite, etc.) in the file system policy or a connected identity policy.
+        BLOCKED if an SCP or permission boundary denies the ModifyMountTargetSecurityGroups action.
+      confidence: 0.90
+      derived_from: [ "<CanModifyConfiguration(ModifyMountTargetSecurityGroups) edge_id>", "<mount_target_to_filesystem attachment>" ]
+      false_positive_note: >-
+        This permission allows MODIFYING network access (opening port 2049), not
+        directly reading/writing data. The full escalation chain is: (1) principal
+        has ClientMount CONDITIONAL on network reach, (2) principal has
+        ModifyMountTargetSecurityGroups, (3) principal modifies the SG to allow
+        inbound 2049 from their network, (4) CanReadData becomes ACTIVE.
+        This is a two-step escalation that requires both the network permission
+        AND the existing client-action grant. Do not emit for a principal that
+        lacks the underlying ClientMount/ClientWrite permission.
+      narrative: >-
+        {principal.name} can modify the security group on mount targets of
+        {filesystem.name} to enable inbound NFS traffic (port 2049), converting
+        network-conditional data access to active reachability.
+
+  # --- 6) ClientRootAccess -> POSIX permission bypass ----------------------
+  # ClientRootAccess is a distinct permission that bypasses POSIX root-squash,
+  # granting UID 0 (root) access to the NFS mount. This allows reading files owned
+  # by root that would normally be protected by POSIX mode bits under regular
+  # ClientMount (which typically enforces root-squash, mapping root to nobody).
+  #
+  # This is a high-value capability: root-squash bypass allows reading
+  #   - Files in root-owned directories (/etc, /opt, etc.)
+  #   - Application secrets stored in root-owned paths
+  #   - SSH authorized_keys and other sensitive configuration files
+  #   - Database initialization scripts and connection strings
+  #
+  # ClientRootAccess should always be paired with ClientMount or ClientWrite
+  # in a file system policy; it grants no independent mount capability.
+  - id: aws-efs-client-root-access-posix-bypass
+    emits: CanReadData
+    description: "A principal with elasticfilesystem:ClientRootAccess can bypass POSIX root-squash and read all file data including root-owned files."
+    match:
+      - [ ?principal, HasPermission, ?filesystem ]
+    where:
+      - "node_type(?filesystem) == FileStorage"
+      - "?filesystem.provider_type == 'AWS::EFS::FileSystem'"
+      - "?principal has EFFECTIVE elasticfilesystem:ClientRootAccess on ?filesystem"
+      - "?principal also has EFFECTIVE (elasticfilesystem:ClientMount OR elasticfilesystem:ClientWrite) on ?filesystem"
+      - "a reachable mount target exists in a VPC/subnet accessible to ?principal (NFS port 2049)"
+    emit:
+      - source_type: Identity
+        target_type: FileStorage
+        source: ?principal
+        target: ?filesystem
+        permissions: ["elasticfilesystem:ClientRootAccess", "elasticfilesystem:ClientMount"]
+        conditions: [iam_permission, resource_policy, network_reachability]
+        state_logic: >-
+          ACTIVE when both ClientRootAccess and ClientMount (or ClientWrite) are granted
+          and network reachability is confirmed. Indicates POSIX root-squash bypass:
+          the principal can mount the file system as UID 0 and access all files
+          regardless of POSIX mode bits. This is distinct from the regular ClientMount
+          edge (which assumes POSIX enforcement). CONDITIONAL if network reachability
+          is unconfirmed.
+        confidence: 0.98
+        derived_from: [ "<HasPermission(ClientRootAccess) + ClientMount edges>" ]
+        false_positive_note: >-
+          ClientRootAccess is a privileged mount mode that requires BOTH the
+          ClientRootAccess AND one of ClientMount/ClientWrite in the same principal's
+          effective grant. Do not emit if only ClientRootAccess is granted without
+          a mount action. This rule emits with high confidence (0.98) to surface
+          the POSIX-bypass consequence distinctly from regular ClientMount.
+        narrative: >-
+          {principal.name} holds elasticfilesystem:ClientRootAccess on {filesystem.name}
+          and can bypass POSIX root-squash, mounting the file system as UID 0 and
+          reading all files including those owned by root.
+      - source_type: Compute
+        target_type: FileStorage
+        source: ?principal
+        target: ?filesystem
+        permissions: ["elasticfilesystem:ClientRootAccess", "elasticfilesystem:ClientMount"]
+        conditions: [iam_permission, resource_policy, network_reachability]
+        state_logic: >-
+          ACTIVE when Compute workload has both ClientRootAccess and ClientMount/ClientWrite
+          and network reachability is confirmed. The workload can mount as UID 0 and access
+          all files, enabling reading of root-owned secrets, configuration, and metadata.
+        confidence: 0.98
+        derived_from: [ "<HasPermission(ClientRootAccess) + ClientMount edges>" ]
+        false_positive_note: >-
+          Compute workloads with ClientRootAccess (EC2 instances, ECS tasks, Lambda functions)
+          can access sensitive root-owned files on shared EFS volumes, defeating standard
+          POSIX permission protections.
+        narrative: >-
+          {principal.name} (Compute workload) holds elasticfilesystem:ClientRootAccess on {filesystem.name}
+          and can bypass POSIX root-squash, accessing all files including root-owned secrets and configuration.
+
+# ---------------------------------------------------------------------------
+# EXPLICIT normalization rules (emit explicit edges — add to
+# /rules/explicit/aws-efs.yaml; listed here for completeness):
+#
+#   aws-efs-can-modify-policy:
+#     emits: CanModifyPolicy
+#     trigger: elasticfilesystem:PutFileSystemPolicy
+#     emit source: <principal>, target: <ResourcePolicy on FileSystem>
+#
+#   aws-efs-client-mount-explicit:
+#     emits: HasPermission   (feeds rule 1 above)
+#     trigger: effective elasticfilesystem:ClientMount in the file system policy
+#     (resource policy scanner: for each Statement.Principal + Action)
+#     emit source: <principal node>, target: <FileSystem node>
+#
+#   aws-efs-cross-account-principal:
+#     emits: CrossAccountTrust  (nature: explicit, feeds rule 3 above)
+#     trigger: file system policy Statement with a cross-account Principal
+#     emit source: <ResourcePolicy node>, target: <ExternalIdentity or Account>
+#
+#   aws-efs-default-policy:
+#     emits: HasPolicy (absence annotation)
+#     trigger: DescribeFileSystemPolicy returns PolicyNotFound
+#     annotates: no ResourcePolicy edge exists for the FileSystem
+#     (feeds rule 2 above)
+#
+# BLOCKED-edge guidance:
+#   - SCP or permission boundary denying elasticfilesystem:ClientMount
+#     -> CanReadData edge: state BLOCKED (denied_by=<SCP arn/statement>).
+#   - Explicit Deny in file system policy for elasticfilesystem:ClientMount
+#     on the principal's ARN -> BLOCKED (resource_policy deny).
+#   - SCP denying elasticfilesystem:PutFileSystemPolicy -> rule 4 BLOCKED.
+#   - KMS key disabled/deleted on the EFS file system (aws/elasticfilesystem
+#     or CMEK) -> file system becomes inaccessible; emit all CanReadData
+#     edges with state BLOCKED and condition key_permission.
+#
+# NOT-YET-MODELED:
+#   - ContainsSecret: requires out-of-band content scan; no structural API
+#     reveals what credentials are stored on EFS. Emit after scan/intel.
+#   - EFS DataSync replication to S3: modeled under DataSync, not EFS.
+#
+# NOW-MODELED (adversarial review fixes, Phase 6 verification):
+#   - aws-efs-client-write-data: CanWriteData from ClientWrite permission.
+#   - aws-efs-put-fs-policy-grants-write-access: PutFileSystemPolicy → CanWriteData.
+#   - aws-efs-modifymounttarget-sg-network-escalation: ModifyMountTargetSecurityGroups
+#     converts CONDITIONAL(network_reachability) to ACTIVE.
+#   - aws-efs-cross-account-fs-policy moved to /rules/explicit/aws-efs.yaml (was
+#     incorrectly in derived; CrossAccountTrust nature is explicit, not derived).
+# ---------------------------------------------------------------------------
+
+# Provider-agnostic linchpins cited (do NOT re-derive here):
+#   * credential-chains.yaml: read-secret-yields-identity collapses
+#     ContainsSecret(efs -> secret) + CanReadData(p -> efs) -> CanImpersonate
+#     when the file system contains credentials for a higher-privilege identity.
+#   * can-control.yaml: no Controls derivation directly from CanReadData;
+#     use read-secret -> impersonate -> escalate chain for privilege rollup.

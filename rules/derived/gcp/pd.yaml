@@ -1,0 +1,460 @@
+# GCP Persistent Disk / Snapshots — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Central attack surface: disk data exfiltration via snapshots. The dominant
+# paths are:
+#   (1) Create + share a snapshot cross-project -> CanExfiltrate + CrossProjectTrust
+#   (2) Access a shared/public snapshot -> CanReadData (CONDITIONAL if CMEK-gated)
+#   (3) setIamPolicy on an existing snapshot -> CanModifyPolicy (self-grant / cross-project)
+#   (4) Disk/snapshot ContainsSecret -> credential-chains roll-up to CanImpersonate
+#       (Phase 5 linchpin — cited, NOT duplicated here)
+#
+# What this file does NOT duplicate:
+#   - CanExfiltrate / CanModifyCode paths from GCE image creation (in gce.yaml:
+#     gcp-gce-snapshot-cross-project, gcp-gce-image-share, gcp-gce-image-poison)
+#   - CanReadSecret -> CanImpersonate roll-up (credential-chains.yaml)
+#   - decrypt-gates-secret-read gate resolution (credential-chains.yaml)
+#   - CanEnterProject derivation (can-control-gcp.yaml)
+#
+# Explicit normalization (ContainsSecret, AttachedTo, CrossProjectTrust from
+# snapshot IAM) belongs in /rules/explicit/ — referenced in explicit_rules below.
+#
+# Permissions used: exact names from the GCP Compute Engine IAM reference
+#   https://cloud.google.com/compute/docs/access/iam
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 6-storage-databases
+applies_to: [gcp]
+
+rules:
+
+  # --- (1) Create a snapshot and share it cross-project ----------------------
+  # The high-value exfiltration path: attacker creates a snapshot of a victim
+  # disk they can see (compute.snapshots.create) AND can set its IAM policy
+  # (compute.snapshots.setIamPolicy on the resulting snapshot), then grants a
+  # principal in their own project compute.snapshots.useReadOnly. The external
+  # principal creates a disk from the snapshot and mounts it to read all data.
+  #
+  # NOTE: This rule supersedes gcp-gce-snapshot-cross-project in gce.yaml for the
+  # snapshot-specific case. The pd rule is more precise: it requires BOTH
+  # compute.snapshots.create AND setIamPolicy (the cross-project share gate),
+  # not just create+useReadOnly assumption. gce.yaml's version is less precise
+  # and can produce false positives. Consolidate snapshot exfiltration here.
+  - id: gcp-pd-snapshot-create-and-share
+    emits: CanExfiltrate
+    description: >-
+      Create a snapshot of a disk and grant a cross-project principal access to
+      it, enabling the attacker to restore it as a disk in their own project and
+      read all on-disk data (secrets, credentials, database files).
+    applies_to: [gcp]
+    match_effective_permission:
+      - action: "compute.snapshots.create"
+        resource_type: "compute.googleapis.com/Disk"
+      - action: "compute.snapshots.setIamPolicy"
+        resource_type: "compute.googleapis.com/Snapshot"
+    where:
+      - "?principal has EFFECTIVE BOTH compute.snapshots.create on the disk AND compute.snapshots.setIamPolicy on the resulting snapshot (the latter held at project scope, which grants it on snapshots created in that project)"
+      - "?principal (or an identity they control in another project) has compute.disks.create and compute.snapshots.useReadOnly to restore the snapshot"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: "<principal>"
+      target: "<disk data via created snapshot>"
+      permissions:
+        - "compute.snapshots.create"
+        - "compute.snapshots.setIamPolicy"
+        - "compute.disks.create"
+        - "compute.snapshots.useReadOnly"
+      conditions: [iam_permission, region_or_boundary]
+      state_logic: >-
+        CONDITIONAL(iam_permission, region_or_boundary) by default: evidence of
+        compute.snapshots.create + setIamPolicy in source project is confirmed,
+        but destination-project permissions (compute.disks.create + useReadOnly)
+        are typically unobservable from victim-side collection; upgrade to ACTIVE
+        only when the attacker's project permissions are confirmed (via cross-project
+        collection or org-scope Asset Inventory). BLOCKED if an Org Policy
+        (constraints/compute.storageResourceUseRestrictions) prevents cross-project
+        snapshot sharing, or if the disk is CSEK-encrypted (key not accessible via IAM).
+        If disk is CMEK-encrypted (diskEncryptionKey.kmsKeyName present), emit as
+        CONDITIONAL(key_permission) in addition to the above — cite decrypt-gates-secret-read
+        in /rules/derived/credential-chains.yaml for the KMS gate resolution.
+      false_positive_note: >-
+        Same-project snapshotting without an external IAM grant is NOT exfiltration.
+        Emit CrossProjectTrust and CanExfiltrate only when there is evidence that
+        the snapshot is or will be shared with a principal outside the source project
+        boundary. compute.snapshots.create alone without compute.snapshots.setIamPolicy
+        is insufficient — the snapshot must be accessible from the attacker's project.
+        CMEK-encrypted disks: a snapshot inherits the disk's CMEK binding;
+        compute.disks.create from such a snapshot requires cloudkms.cryptoKeyVersions.useToDecrypt
+        on the wrapping key — downgrade to CONDITIONAL(key_permission) until the
+        decrypt-gates-secret-read linchpin resolves it.
+        CSEK-encrypted disks: the caller must supply the raw 256-bit key in the
+        API request; this is not expressible as a GCP IAM permission path — emit BLOCKED.
+        Org Policy constraints/compute.storageResourceUseRestrictions may restrict
+        the destination projects allowed; honor it as BLOCKED when in place.
+      derived_from:
+        - "<compute.snapshots.create effective permission on source disk>"
+        - "<compute.snapshots.setIamPolicy effective permission on created snapshot>"
+        - "<cross-project compute.snapshots.useReadOnly + compute.disks.create grant>"
+      narrative: >-
+        {principal.name} can create a snapshot of {disk.name} (compute.snapshots.create)
+        and grant a principal in another project access to it (compute.snapshots.setIamPolicy),
+        enabling full read of all on-disk data — including secrets, credentials, and
+        database files — by restoring the snapshot as a new disk
+        (compute.snapshots.useReadOnly + compute.disks.create).
+
+
+  # --- (2) Read data from an already-shared snapshot --------------------------
+  # An identity in project B holds compute.snapshots.useReadOnly on a snapshot
+  # from project A (either via the snapshot IAM or via a project-level grant).
+  # They can create a disk from it and mount it -> CanReadData.
+  - id: gcp-pd-snapshot-use-cross-project
+    emits: CanReadData
+    description: >-
+      A principal with compute.snapshots.useReadOnly on a shared snapshot and
+      compute.disks.create can restore it as a disk and read all on-disk data
+      across project boundaries.
+    applies_to: [gcp]
+    match:
+      - [ ?snapshot, CrossProjectTrust, ?external_project ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?principal (in ?external_project) has EFFECTIVE compute.snapshots.useReadOnly on ?snapshot"
+      - "?principal has EFFECTIVE compute.disks.create in their project"
+      - "?principal has EFFECTIVE compute.instances.attachDisk OR can create an instance to attach the new disk"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: "<principal in external project>"
+      target: "<snapshot (disk data)>"
+      permissions:
+        - "compute.snapshots.useReadOnly"
+        - "compute.disks.create"
+        - "compute.instances.attachDisk"
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        ACTIVE if all three permissions confirmed and snapshot IAM grants the
+        principal access; CONDITIONAL(key_permission) if the source disk was
+        CMEK-encrypted (snapshot inherits the kmsKeyName) — the principal must
+        also hold cloudkms.cryptoKeyVersions.useToDecrypt on the wrapping key
+        to read the plaintext data (cite decrypt-gates-secret-read in
+        credential-chains.yaml); BLOCKED if the disk was CSEK-encrypted
+        (requires caller-supplied key bytes, not IAM-controllable).
+      false_positive_note: >-
+        compute.snapshots.useReadOnly alone is insufficient — compute.disks.create
+        is also required to instantiate a disk from the snapshot, and
+        compute.instances.attachDisk (or compute.instances.create) is needed to
+        mount it. Confirm all three in the effective permission set. CMEK gate:
+        diskEncryptionKey.kmsKeyName on the source disk propagates to the snapshot;
+        without KMS decrypt on that key the raw snapshot data cannot be decrypted ->
+        downgrade to CONDITIONAL(key_permission). CSEK: immediately BLOCKED.
+      derived_from:
+        - "<CrossProjectTrust edge: snapshot -> external_project>"
+        - "<compute.snapshots.useReadOnly effective permission on ?snapshot>"
+        - "<compute.disks.create + compute.instances.attachDisk effective permissions>"
+      narrative: >-
+        {principal.name} can create a disk from {snapshot.name}
+        (compute.snapshots.useReadOnly + compute.disks.create) and attach it to an
+        instance in their project (compute.instances.attachDisk), reading all
+        on-disk data including secrets, credentials, and database files.
+
+  # --- (2b) Read data from a snapshot within the same project -----------------
+  # An intra-project privilege escalation: a principal who can list/describe
+  # snapshots in their project (compute.snapshots.get or a role granting view access)
+  # and who holds compute.snapshots.useReadOnly + compute.disks.create can restore
+  # any snapshot (including snapshots of disks they do not directly have access to)
+  # and read all on-disk data. This is NOT cross-project but is a meaningful escalation
+  # within a project (e.g., narrowly scoped service account gaining read access to
+  # another team's encrypted-at-rest data disk via snapshot restore).
+  - id: gcp-pd-snapshot-use-same-project
+    emits: CanReadData
+    description: >-
+      A principal within the same project with compute.snapshots.useReadOnly and
+      compute.disks.create can restore any project snapshot as a disk and read
+      all on-disk data, escalating access to disks they don't directly have
+      read permissions on.
+    applies_to: [gcp]
+    match:
+      - [ ?snapshot, LocatedIn, ?project ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?principal (in ?project) has EFFECTIVE compute.snapshots.useReadOnly on ?snapshot"
+      - "?principal has EFFECTIVE compute.disks.create in ?project"
+      - "?principal has EFFECTIVE compute.instances.attachDisk OR can create an instance to attach the new disk in ?project"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: "<principal in same project>"
+      target: "<snapshot (disk data)>"
+      permissions:
+        - "compute.snapshots.useReadOnly"
+        - "compute.disks.create"
+        - "compute.instances.attachDisk"
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE if all three permissions confirmed within the same project and the
+        principal can describe the snapshot. This is an intra-project escalation:
+        a narrowly-scoped principal gains read access to encrypted-at-rest data
+        or other team's data by restoring snapshots. CONDITIONAL(key_permission) if
+        the source disk was CMEK-encrypted (snapshot inherits the kmsKeyName) —
+        the principal must also hold cloudkms.cryptoKeyVersions.useToDecrypt on the
+        wrapping key to read the plaintext data (cite decrypt-gates-secret-read in
+        credential-chains.yaml); BLOCKED if the disk was CSEK-encrypted.
+      false_positive_note: >-
+        Emit only when all three permissions are confirmed in the same project.
+        This rule covers intra-project snapshot restore escalation. Cross-project
+        scenarios are covered by gcp-pd-snapshot-use-cross-project. CMEK gate:
+        diskEncryptionKey.kmsKeyName on the source disk propagates to the snapshot;
+        without KMS decrypt on that key the raw snapshot data cannot be decrypted ->
+        downgrade to CONDITIONAL(key_permission). CSEK: immediately BLOCKED.
+      derived_from:
+        - "<LocatedIn edge: snapshot -> project>"
+        - "<compute.snapshots.useReadOnly effective permission on ?snapshot>"
+        - "<compute.disks.create + compute.instances.attachDisk effective permissions>"
+      narrative: >-
+        {principal.name} in {project.name} can create a disk from {snapshot.name}
+        (compute.snapshots.useReadOnly + compute.disks.create) and attach it to an
+        instance within the same project (compute.instances.attachDisk), gaining read
+        access to on-disk data they would not otherwise be able to access directly.
+
+  # --- (3) Modify snapshot IAM -> self-grant or cross-project grant -----------
+  # An identity with compute.snapshots.setIamPolicy on a snapshot can modify the
+  # snapshot's IAM policy to grant themselves or an external principal access.
+  # This is CanModifyPolicy (on the snapshot as a Policy-bearing resource).
+  - id: gcp-pd-snapshot-set-iam-policy
+    emits: CanModifyPolicy
+    description: >-
+      A principal with compute.snapshots.setIamPolicy can grant themselves or
+      a cross-project principal access to the snapshot, enabling data exfiltration
+      or unauthorized cross-project reads.
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "compute.snapshots.setIamPolicy"
+      resource_type: "compute.googleapis.com/Snapshot"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: "<principal>"
+      target: "<snapshot (IAM policy)>"
+      permissions:
+        - "compute.snapshots.setIamPolicy"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when compute.snapshots.setIamPolicy is confirmed in the effective
+        permission set for the snapshot (either per-snapshot binding or project-scope
+        binding). No additional prerequisites — IAM policy modification itself is
+        always immediately effective once the permission is held.
+        Downstream CanExfiltrate/CanReadData edges are CONDITIONAL on the attacker
+        also having compute.snapshots.useReadOnly + compute.disks.create in a
+        destination project (see gcp-pd-snapshot-use-cross-project).
+      false_positive_note: >-
+        compute.snapshots.setIamPolicy granted at project scope applies to ALL
+        snapshots in the project. Per-snapshot grants scope to one snapshot — honor
+        the scope boundary. This rule models the ability to grant access, not the
+        act of reading data; the exfiltration chain requires the subsequent
+        useReadOnly + disks.create permissions in a destination project.
+      derived_from:
+        - "<compute.snapshots.setIamPolicy effective permission on snapshot>"
+      narrative: >-
+        {principal.name} can modify the IAM policy of {snapshot.name}
+        (compute.snapshots.setIamPolicy), enabling a self-grant or a grant to a
+        cross-project principal for compute.snapshots.useReadOnly, which allows
+        full restoration and reading of the disk data.
+
+  # --- (4) Snapshot public tenant exposure (allAuthenticatedUsers) -----------
+  # When a snapshot IAM grants allAuthenticatedUsers or allUsers, it is exposed
+  # to identities according to the binding. Both allAuthenticatedUsers and allUsers
+  # require GCP authentication + compute.disks.create to consume (block storage
+  # always requires GCP auth), so both emit ExposedToTenant. The key distinction:
+  # allAuthenticatedUsers explicitly requires GCP authentication; allUsers is
+  # nominally unauthenticated but practically also requires GCP auth in this
+  # context (compute.disks.create requires a valid OAuth token).
+  # Derived from explicit HasPolicy edge.
+  - id: gcp-pd-snapshot-public-tenant
+    emits: ExposedToTenant
+    description: >-
+      A snapshot with allAuthenticatedUsers or allUsers in its IAM policy is
+      exposed to all GCP identities (authenticated or nominally public) across
+      all projects/organizations.
+    applies_to: [gcp]
+    match:
+      - [ ?snapshot, HasPolicy, ?policy ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?policy contains a member in [allAuthenticatedUsers, allUsers]"
+      - "the member's role grants compute.snapshots.useReadOnly"
+    emit:
+      source_type: Snapshot
+      target_type: Organization
+      source: "<snapshot>"
+      target: "<GCP organization / all-authenticated-tenant>"
+      permissions:
+        - "compute.snapshots.useReadOnly"
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the snapshot IAM policy contains an allAuthenticatedUsers or
+        allUsers binding with a role that grants compute.snapshots.useReadOnly
+        (e.g., roles/compute.storageAdmin, roles/owner, custom roles). Both
+        members are emitted as ExposedToTenant because both require GCP
+        authentication to consume the snapshot (compute.disks.create requires a
+        valid credential). allAuthenticatedUsers explicitly requires GCP auth;
+        allUsers is nominally public-facing but in practice also requires GCP auth
+        for block storage snapshot restoration.
+      false_positive_note: >-
+        Emit ExposedToTenant for both allAuthenticatedUsers and allUsers. While
+        allUsers nominally suggests internet exposure, block storage access always
+        requires GCP authentication (compute.disks.create API requires an OAuth
+        token). The snapshot is thus exposed to all authenticated GCP principals
+        (allAuthenticatedUsers) and, in theory, anyone with GCP credentials
+        (allUsers — though this is a rare misconfiguration pattern). Do not
+        downgrade to ExposedToInternet; GCP auth is a hard requirement.
+      derived_from:
+        - "<snapshot HasPolicy edge>"
+        - "<snapshot IAM getIamPolicy response with allAuthenticatedUsers or allUsers>"
+      narrative: >-
+        {snapshot.name} has an IAM binding granting {principal} read access
+        (compute.snapshots.useReadOnly), exposing the snapshot's contents to all
+        GCP-authenticated identities (or all holders of GCP credentials for
+        allUsers). Any GCP-authenticated identity across accounts/projects can
+        create a disk from this snapshot and read its data.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance for PD/Snapshots:
+#
+#   - Org Policy constraints/compute.storageResourceUseRestrictions restricting
+#     snapshot sharing to specific projects/orgs -> gcp-pd-snapshot-create-and-share
+#     and gcp-pd-snapshot-cross-project-trust emit with state: BLOCKED (org_policy).
+#
+#   - CMEK-encrypted disk (diskEncryptionKey.kmsKeyName present): CanReadData
+#     and ContainsSecret paths emit as CONDITIONAL(key_permission); they upgrade
+#     to ACTIVE only when the decrypt-gates-secret-read rule in credential-chains.yaml
+#     confirms the principal also holds cloudkms.cryptoKeyVersions.useToDecrypt on
+#     the wrapping key. Do NOT auto-upgrade without that confirmation.
+#
+#   - CSEK-encrypted disk (diskEncryptionKey.sha256 present, no kmsKeyName):
+#     All CanReadData / CanExfiltrate paths are BLOCKED — the caller must supply
+#     the 256-bit raw AES key in every API request; this is not expressible as a
+#     GCP IAM path and is effectively unreachable through IAM-based attack paths.
+#
+#   - compute.snapshots.setIamPolicy denied by an IAM deny policy on the project
+#     -> gcp-pd-snapshot-set-iam-policy emits with state: BLOCKED, denied_by=<deny policy>.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules needed in /rules/explicit/gcp-pd.yaml:
+#
+#   (A) AttachedTo(disk -> instance)
+#       Source: compute.instances.get disks[].source field.
+#
+#   (B) CrossProjectTrust(snapshot -> ExternalProject)
+#       Source: compute.snapshots.getIamPolicy; emit when a member's project
+#       differs from the snapshot's project.
+#
+#   (C) ContainsSecret(disk/snapshot -> Secret) [analyst/collector asserted]
+#       Source: disk label "contains-secret=true", analyst_flag, or collector
+#       pattern scan (see gcp-pd-disk-data-contains-secret above).
+#
+#   (D) HasPolicy(snapshot -> ResourcePolicy)
+#       Source: compute.snapshots.getIamPolicy; emit the policy node so that
+#       gcp-pd-snapshot-cross-project-trust can match on it.
+#
+# See also:
+#   /rules/derived/credential-chains.yaml  — read-secret-yields-identity,
+#       decrypt-gates-secret-read, execute-then-read-secret, impersonate-is-escalation
+#   /rules/derived/gcp/gce.yaml            — gcp-gce-snapshot-cross-project,
+#       gcp-gce-image-share, gcp-gce-image-poison (upstream of PD supply chain)
+#   /rules/derived/can-control.yaml        — CanEscalateTo from CanExecuteAs
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-pd-attach-to-instance
+    emits: AttachedTo
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/Instance"
+      field: "disks[].source"
+    emit:
+      source_type: BlockStorage
+      target_type: Compute
+      source: "<persistent disk>"
+      target: "<instance>"
+      api_source: "compute.instances.get"
+      evidence_field: "disks[].source"
+      narrative: "{disk.name} is attached to {instance.name} as a block device."
+
+  - id: gcp-pd-snapshot-cross-project-iam
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/Snapshot"
+      field: "iamPolicy.bindings[role IN (roles/compute.storageAdmin, roles/compute.admin, roles/owner, roles/editor) OR role matches 'projects/.*/roles/.*'].members[]"
+    where:
+      - "member's project != snapshot's project"
+      - "the member's role grants compute.snapshots.useReadOnly (per effective permissions via Cloud Asset API)"
+    emit:
+      source_type: Snapshot
+      target_type: Project
+      source: "<snapshot>"
+      target: "<project of the external member>"
+      api_source: "compute.snapshots.getIamPolicy"
+      evidence_field: "bindings[].members[]"
+      note: "This rule matches predefined roles (storageAdmin, admin, owner, editor) and custom roles that INCLUDE compute.snapshots.useReadOnly permission. Roles like compute.viewer are excluded (they only grant get/list, not useReadOnly). Use Cloud Asset API effective-permissions data for definitive permission confirmation before emitting the edge."
+      narrative: "{snapshot.name} grants {external_member.name} (project {external_project.name}) snapshot-restoration access via {role_name}, establishing a cross-project data trust."
+
+  - id: gcp-pd-snapshot-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/Snapshot"
+      field: "iamPolicy"
+    emit:
+      source: "<snapshot>"
+      target: "<snapshot IAM policy node>"
+      api_source: "compute.snapshots.getIamPolicy"
+      evidence_field: "iamPolicy"
+      narrative: "{snapshot.name} has a per-resource IAM policy governing who can use or administer it."
+
+  # --- Snapshot/Disk contains secret (explicit normalization) ----------------
+  # ContainsSecret is an explicit fact asserted by the collector or analyst
+  # from disk metadata, labels, or known patterns. Emitted for both BlockStorage
+  # and Snapshot nodes. This feeds the credential-chains linchpin for roll-up to
+  # CanImpersonate when the disk/snapshot becomes readable.
+  - id: gcp-pd-disk-contains-secret
+    emits: ContainsSecret
+    applies_to: [gcp]
+    description: >-
+      A disk or snapshot flagged as containing credential material (SA key files,
+      SSH private keys, database passwords, API keys) links the storage node to a
+      Secret node, enabling the credential-chains linchpin to roll up to
+      CanImpersonate when the disk/snapshot is readable by an attacker.
+    match_record:
+      resource_type: ["compute.googleapis.com/Disk", "compute.googleapis.com/Snapshot"]
+      evidence: "labels[contains-secret=true] OR analyst_flag[contains_secret] OR known_secret_pattern"
+    where:
+      - "node_type matches (BlockStorage | Snapshot)"
+      - "?secret is a known Secret / Credential node inferred from the resource's name, labels, or metadata"
+    emit:
+      source_type: Storage
+      target_type: Secret
+      source: "<disk or snapshot>"
+      target: "<secret node (SA key, SSH key, API key, password, etc.)>"
+      api_source: "compute.disks.get / compute.snapshots.get (labels, name pattern)"
+      evidence_field: "labels[contains-secret], description, name"
+      state_logic: >-
+        ACTIVE when the disk/snapshot is confirmed to contain the secret material
+        via analyst flag, label (contains-secret=true), or collector pattern match.
+        Confidence is reduced (0.7) when evidence is label-only (pattern-based),
+        raised (0.95) when the collector has confirmed the specific file path or
+        SA key file presence. Inherits CONDITIONAL(key_permission) if disk is
+        CMEK-encrypted (the secret is on-disk but inaccessible without KMS decrypt).
+      false_positive_note: >-
+        Do NOT emit speculatively for every disk. Emit only when there is positive
+        evidence: an analyst-set flag, a label (e.g., contains-secret=true), a disk
+        name pattern confirmed by triage (e.g., "prod-db-backup", "credentials-disk"),
+        or a collector that has scanned metadata and found embedded keys.
+        The credential-chains linchpin (read-secret-yields-identity in credential-chains.yaml)
+        handles the CanReadSecret -> CanImpersonate derivation — do not duplicate it here.
+      narrative: >-
+        {disk_or_snapshot.name} contains credential material ({secret.type}: {secret.name}).
+        An attacker who gains read access to this disk (via snapshot exfiltration or
+        direct attachment) can extract these credentials and authenticate as the
+        associated identity.

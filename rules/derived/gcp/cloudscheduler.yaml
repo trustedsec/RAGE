@@ -1,0 +1,660 @@
+# GCP Cloud Scheduler — Derived attack-path rules (Phase 10 — messaging & event systems)
+# ---------------------------------------------------------------------------
+# Catalog key gcp:cloudscheduler. Emits ONLY common edge types from schema/edges.yaml.
+# All permission identifiers are verbatim from:
+#   cloud.google.com/scheduler/docs/access-control  (IAM roles / permissions)
+#   cloud.google.com/scheduler/docs/http-target-auth  (OIDC/OAuth2 actAs requirement)
+#   cloud.google.com/scheduler/docs/reference/rest/v1/projects.locations.jobs  (Job schema)
+#
+# Central escalation invariant:
+#   Cloud Scheduler fires a cron-scheduled HTTP / Pub/Sub / App Engine request. For
+#   HTTP targets the job carries an OIDC or OAuth2 bearer token generated for a
+#   user-specified SA (oidcToken.serviceAccountEmail / oauthToken.serviceAccountEmail).
+#   The job creator MUST hold iam.serviceAccounts.actAs on that SA (confirmed by
+#   cloud.google.com/scheduler/docs/http-target-auth). This yields:
+#
+#     cloudscheduler.jobs.create + actAs(SA)  =>  CanSchedule + CanPassIdentity
+#       -> messaging-chains rule 3 (messaging-schedule-persists-executes-as):
+#          CanSchedule + CanPassIdentity => CanExecuteAs(SA)   [PERSISTENCE]
+#
+#     cloudscheduler.jobs.update + actAs(new SA)  =>  CanModifyConfiguration + CanPassIdentity
+#       -> can-execute-as execute-as-via-config-identity-swap:
+#          CanModifyConfiguration + CanPassIdentity => CanExecuteAs(new SA)
+#
+#     cloudscheduler.jobs.update (URI-only, SA unchanged)  =>  CanModifyConfiguration
+#       -> retarget existing authenticated job to attacker endpoint
+#          => CanRetrieveToken(attacker_endpoint receives the existing SA's OIDC token)
+#
+#     cloudscheduler.jobs.create (Pub/Sub target)  =>  CanWriteData(job -> topic)
+#       -> messaging-chains rule 1 + rule 2:
+#          CanWriteData + CanTrigger(topic->consumer) + ExecutesAs(consumer->SA)
+#          => CanExecuteAs(consumer SA)   [CONDITIONAL(trigger_exists)]
+#
+# LINCHPINS — cite, do NOT duplicate:
+#   messaging-chains.yaml  — publish-to-trigger (rule 1), trigger-executes-as (rule 2),
+#                             schedule-persists-executes-as (rule 3). This file emits
+#                             CanSchedule, CanPassIdentity, CanWriteData, CanTrigger
+#                             (the binding facts) and lets messaging-chains roll them up.
+#                             CanExecuteAs / CanEscalateTo / CanEnter* are CITED, not
+#                             re-derived here except for the URI-retarget token-theft path
+#                             (CanRetrieveToken, which is not a messaging-chains collapse).
+#   can-execute-as.yaml    — execute-as-via-config-identity-swap (CanModifyConfiguration
+#                             + CanPassIdentity -> CanExecuteAs). Not re-derived here for
+#                             the SA-swap path — messaging-chains rule 3 owns the
+#                             CanSchedule+CanPassIdentity collapse; can-execute-as owns
+#                             the CanModifyConfiguration+CanPassIdentity collapse.
+#                             Both dedupe on (CanExecuteAs, principal, SA).
+#   can-control.yaml       — CrossProjectTrust -> CanEnterProject rollup. This file emits
+#                             the CrossProjectTrust fact; can-control produces CanEnterProject.
+#   credential-chains.yaml — ContainsSecret / ExposesCredential / CredentialsFor chain.
+#                             This file emits ContainsSecret; credential-chains rolls up.
+#
+# State discipline (RULE-FORMAT.md):
+#   - job.state != ENABLED -> CanSchedule / CanTrigger CONDITIONAL(service_state).
+#   - actAs unknown/unresolved -> CanPassIdentity POTENTIAL(role_compatibility).
+#   - IAM deny / org policy denying an action -> BLOCKED (denied_by=...).
+#   - Derived edge state never exceeds weakest contributor.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 10-messaging
+service: cloudscheduler
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # EXPLICIT-LIKE FACTS (raw config -> common explicit edges)
+  # These match resource records rather than combining existing edges.
+  # ---------------------------------------------------------------------------
+
+  # --- Job creation capability -> CanSchedule ---------------------------------
+  - id: gcp-cloudscheduler-can-schedule
+    emits: CanSchedule
+    description: "cloudscheduler.jobs.create lets a principal create a new cron job — the persistence and event-source creation primitive. This feeds messaging-chains rule 3 (messaging-schedule-persists-executes-as) when paired with CanPassIdentity."
+    match_effective_permission:
+      action: "cloudscheduler.jobs.create"
+      resource_type: "google.cloud.scheduler.v1.Job"
+    emit:
+      source_type: Identity
+      target_type: Scheduler
+      source: "<principal>"
+      target: "<Cloud Scheduler job (Scheduler node) in scope>"
+      permissions: ["cloudscheduler.jobs.create"]
+      derived_from: ["effective permission: cloudscheduler.jobs.create on the project/location"]
+      conditions: [iam_permission, api_enabled]
+      state_logic: >-
+        ACTIVE when the principal holds cloudscheduler.jobs.create at project scope AND the
+        Cloud Scheduler API is enabled. The created job starts ENABLED by default. BLOCKED if
+        an IAM deny or org policy denies cloudscheduler.jobs.create.
+      false_positive_note: >-
+        cloudscheduler.jobs.create is a project-level permission (Cloud Scheduler jobs have no
+        individual resource IAM policy). Confirm the Cloud Scheduler API
+        (cloudscheduler.googleapis.com) is enabled in the project. The created job is ENABLED
+        immediately after creation and fires on its next scheduled time.
+      narrative: >-
+        {principal.name} can create a Cloud Scheduler job (cloudscheduler.jobs.create) — a
+        persistent scheduled trigger that fires on its cron cadence without further attacker
+        action. Combined with CanPassIdentity (actAs on the OIDC/OAuth2 SA), messaging-chains
+        rule 3 rolls this up to CanExecuteAs(SA).
+
+  # --- actAs on the HTTP target SA -> CanPassIdentity -------------------------
+  # NOTE: the generic gcp-sa-act-as rule in identity-escalation.yaml already emits
+  # CanPassIdentity for all iam.serviceAccounts.actAs grants. This scoped alias records
+  # the Cloud Scheduler-specific pairing for narrative clarity. Dedupe on edge_id
+  # (type|source|target|scope) — the two collapse to one CanPassIdentity edge.
+  - id: gcp-cloudscheduler-passidentity-actas
+    emits: CanPassIdentity
+    alias_of: gcp-sa-act-as
+    dedupe_on: edge_id
+    description: "actAs on a SA that the principal names in an HTTP job's oidcToken.serviceAccountEmail or oauthToken.serviceAccountEmail is the GCP PassRole analog for Cloud Scheduler. Required to create or update a job with an authenticated HTTP target."
+    match_effective_permission:
+      action: "iam.serviceAccounts.actAs"
+      resource_type: "google.iam.ServiceAccount"
+    where:
+      - "principal can create or update a Cloud Scheduler job (cloudscheduler.jobs.create or cloudscheduler.jobs.update in scope)"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "<principal>"
+      target: "<service account named in oidcToken.serviceAccountEmail or oauthToken.serviceAccountEmail>"
+      permissions: ["iam.serviceAccounts.actAs"]
+      derived_from: ["effective permission: iam.serviceAccounts.actAs on the service account"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds iam.serviceAccounts.actAs on the specified SA AND
+        can create or update a Cloud Scheduler job. POTENTIAL(role_compatibility) when the
+        actAs grant on the SA is unknown/unresolved.
+      false_positive_note: >-
+        Scoped alias of gcp-sa-act-as — dedupe on edge_id so no duplicate CanPassIdentity
+        edge is produced. actAs is per-SA: actAs on SA-A does NOT grant actAs on SA-B.
+        This actAs requirement applies ONLY to HTTP-authenticated jobs (oidcToken or
+        oauthToken set). Pub/Sub target jobs do NOT require actAs — the Cloud Scheduler
+        service agent publishes via its own managed identity; only cloudscheduler.jobs.create
+        is needed for a Pub/Sub job. Do not emit CanPassIdentity for Pub/Sub-only jobs.
+      narrative: >-
+        {principal.name} holds iam.serviceAccounts.actAs on {sa.name} and can bind it as
+        the OIDC/OAuth2 authentication identity of a Cloud Scheduler HTTP job it creates
+        or updates. Every scheduled HTTP request will carry {sa.name}'s bearer token.
+
+  # --- Job config update -> CanModifyConfiguration ----------------------------
+  - id: gcp-cloudscheduler-update-config
+    emits: CanModifyConfiguration
+    description: "cloudscheduler.jobs.update lets a principal change an existing job's URI, headers, body, schedule, or OIDC/OAuth2 SA. This is the configuration-change primitive; URI-retarget (no new actAs needed) and SA-swap (actAs required) are the two attack patterns."
+    match_effective_permission:
+      action: "cloudscheduler.jobs.update"
+      resource_type: "google.cloud.scheduler.v1.Job"
+    emit:
+      source_type: Identity
+      target_type: Scheduler
+      source: "<principal>"
+      target: "<Cloud Scheduler job (Scheduler node)>"
+      permissions: ["cloudscheduler.jobs.update"]
+      derived_from: ["effective permission: cloudscheduler.jobs.update on the job resource"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the principal holds cloudscheduler.jobs.update on the job AND the job
+        exists and is not in UPDATE_FAILED state. CONDITIONAL(service_state) if the job is
+        PAUSED or DISABLED (update succeeds but the job must be re-enabled to fire). BLOCKED
+        by an IAM deny or org policy denying cloudscheduler.jobs.update.
+      false_positive_note: >-
+        cloudscheduler.jobs.update is a project-level permission; the update applies to any
+        job in the project within the effective scope. Two distinct attack patterns branch
+        from this edge:
+        (a) URI-only retarget: attacker changes httpTarget.uri to their endpoint. The
+            existing SA's OIDC/OAuth2 token continues to be sent — NO new actAs required.
+            This yields CanRetrieveToken (the attacker endpoint receives the SA's bearer
+            token on the next scheduled invocation) but NOT CanPassIdentity on a new SA.
+        (b) SA-swap: attacker changes oidcToken.serviceAccountEmail to a new (more privileged)
+            SA they can actAs. This requires CanPassIdentity on the new SA and yields
+            CanExecuteAs via can-execute-as execute-as-via-config-identity-swap.
+        Model both branches; the actAs gate differentiates them. A PAUSED/DISABLED job that
+        is updated does not fire until re-enabled (re-enable requires cloudscheduler.jobs.enable
+        or cloudscheduler.jobs.pause to be called; admin/update is sufficient in practice via
+        the API state field).
+      narrative: >-
+        {principal.name} can update {job.name} (cloudscheduler.jobs.update), changing its
+        HTTP target URI, payload, headers, or OIDC/OAuth2 service account — enabling URI
+        retargeting to receive the existing SA's token, or swapping the SA (with actAs) to
+        pivot the execution identity.
+
+  # --- Manual job trigger -> CanSchedule (immediate run) ----------------------
+  # cloudscheduler.jobs.run fires the current job definition immediately, bypassing
+  # the cron schedule. The semantic target is the Scheduler node itself (the attacker
+  # is causing the schedule to execute now). CanSchedule.target = [Scheduler, EventRule,
+  # Workflow] per schema/edges.yaml — Scheduler is in scope.
+  - id: gcp-cloudscheduler-run-job
+    emits: CanSchedule
+    description: "cloudscheduler.jobs.run triggers an immediate execution of the current job definition, bypassing the cron schedule — the on-demand CanSchedule primitive for an existing Cloud Scheduler job."
+    match_effective_permission:
+      action: "cloudscheduler.jobs.run"
+      resource_type: "google.cloud.scheduler.v1.Job"
+    emit:
+      source_type: Identity
+      target_type: Scheduler
+      source: "<principal>"
+      target: "<Cloud Scheduler job (Scheduler node)>"
+      permissions: ["cloudscheduler.jobs.run"]
+      derived_from: ["effective permission: cloudscheduler.jobs.run on the job resource"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the principal holds cloudscheduler.jobs.run AND the job state is ENABLED
+        (or PAUSED — paused jobs can still be manually triggered via the run method). BLOCKED
+        when the job state is DISABLED or UPDATE_FAILED. BLOCKED by IAM deny on jobs.run.
+      false_positive_note: >-
+        jobs.run triggers the CURRENT job definition immediately. If the attacker previously
+        updated the job (cloudscheduler.jobs.update) to retarget or swap the SA, jobs.run
+        activates that modified configuration without waiting for the next scheduled time.
+        This CanSchedule (immediate run) feeds the same messaging-chains roll-ups as the
+        create-based CanSchedule: combined with an existing CanTrigger(job -> compute) and
+        ExecutesAs(compute -> SA) it yields CanExecuteAs via messaging-chains rules 1+2.
+        PAUSED state: the API docs confirm paused jobs can be run manually via the run
+        method (the pause only stops scheduled firing, not on-demand runs).
+      narrative: >-
+        {principal.name} can immediately trigger {job.name} (cloudscheduler.jobs.run),
+        bypassing the cron schedule and forcing the job to fire against its current target
+        with its configured OIDC/OAuth2 SA credentials.
+
+  # --- Pub/Sub target job -> CanWriteData (publish to topic via job creation) -
+  # NOTE: Pub/Sub target jobs publish via the Cloud Scheduler service agent (not the
+  # creator). The CanWriteData emitted here is from the JOB (Scheduler node) to the TOPIC.
+  # The creator can trigger the job (via schedule or jobs.run), which publishes to the topic.
+  # The derived rule gcp-cloudscheduler-create-pubsub-job-write emits CanWriteData from
+  # the PRINCIPAL (creator) to the TOPIC. These two facts chain via messaging-chains:
+  #   - Explicit: CanWriteData(Scheduler -> Topic) (this rule, from explicit_rules section)
+  #   - Derived: CanWriteData(Identity -> Topic) (from gcp-cloudscheduler-create-pubsub-job-write)
+  #   - Messaging-chains rule 1: CanWriteData + CanTrigger => CanTrigger propagation
+  # This is handled by the explicit rule (gcp-cloudscheduler-explicit-pubsub-trigger, now
+  # emitting CanWriteData) so do NOT emit a separate rule here. Remove this placeholder.
+
+  # --- HTTP target binding -> CanTrigger (job -> compute) ---------------------
+  - id: gcp-cloudscheduler-http-trigger-binding
+    emits: CanTrigger
+    description: "A Cloud Scheduler HTTP job binds to a compute target (Cloud Run, Cloud Functions, App Engine, or other HTTP endpoint). The job fires on schedule sending the OIDC/OAuth2 bearer — this is the CanTrigger binding fact consumed by messaging-chains."
+    match_record:
+      resource_type: "google.cloud.scheduler.v1.Job"
+      field: "httpTarget.uri"
+    where:
+      - "httpTarget.uri resolves to a known Compute node (Cloud Run service URL, Cloud Functions gen1/gen2 endpoint, App Engine URL, Workflows executions.create endpoint)"
+      - "job.state == ENABLED"
+    emit:
+      source_type: Scheduler
+      target_type: Compute
+      source: "<Cloud Scheduler job (Scheduler node)>"
+      target: "<HTTP target compute node (ServerlessFunction / ContainerService / ApplicationPlatform / Workflow)>"
+      permissions: []
+      derived_from: ["job.httpTarget.uri resolved to compute node self-link; job.state == ENABLED"]
+      conditions: [service_state, network_reachability]
+      state_logic: >-
+        ACTIVE when job.state == ENABLED and the URI resolves to a known compute target node.
+        CONDITIONAL(service_state) when the job is PAUSED (manual trigger via jobs.run still
+        works). CONDITIONAL(network_reachability) when the target is a private endpoint
+        (Cloud Scheduler cannot reach private VPC IPs — only publicly addressed endpoints
+        are reachable). BLOCKED when job.state is DISABLED or UPDATE_FAILED.
+      false_positive_note: >-
+        Cloud Scheduler sends HTTP requests from Google's infrastructure IP ranges (not the
+        project VPC). Only publicly addressed endpoints are reachable (Cloud Run default
+        URLs, Cloud Functions HTTPS triggers, App Engine default URLs, public googleapis.com
+        endpoints). Do NOT emit ACTIVE for VPC-internal targets (no public IP, no Cloud
+        Endpoints). Resolve httpTarget.uri to a known node via URL pattern matching; unresolved
+        URIs (external third-party endpoints) should not produce a CanTrigger edge to an
+        internal compute node.
+      narrative: >-
+        {job.name} fires an HTTP request to {target.name} on its cron schedule, carrying
+        the OIDC/OAuth2 token of the configured SA. This CanTrigger feeds messaging-chains
+        rules 1+2 for the CanExecuteAs roll-up when {target.name} ExecutesAs a runtime SA.
+
+  # --- App Engine HTTP target binding -> CanTrigger ---------------------------
+  - id: gcp-cloudscheduler-appengine-trigger-binding
+    emits: CanTrigger
+    description: "A Cloud Scheduler App Engine HTTP job triggers an App Engine service on schedule. App Engine targets are always same-project. OIDC/OAuth2 auth model applies identically to HTTP targets."
+    match_record:
+      resource_type: "google.cloud.scheduler.v1.Job"
+      field: "appEngineHttpTarget.relativeUri"
+    where:
+      - "appEngineHttpTarget.relativeUri is set (non-empty)"
+      - "job.state == ENABLED"
+    emit:
+      source_type: Scheduler
+      target_type: ApplicationPlatform
+      source: "<Cloud Scheduler job (Scheduler node)>"
+      target: "<App Engine service (ApplicationPlatform node)>"
+      permissions: []
+      derived_from: ["job.appEngineHttpTarget.relativeUri; job.state == ENABLED"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when job.state == ENABLED. CONDITIONAL(service_state) when PAUSED.
+        BLOCKED when DISABLED/UPDATE_FAILED. App Engine targets are always same-project and
+        reachable — no network_reachability condition.
+      false_positive_note: >-
+        App Engine HTTP targets always target the same project's App Engine application.
+        The appEngineRouting fields (service, version, instance) scope the delivery to a
+        specific App Engine service/version/instance; resolve these to the correct App Engine
+        node. The OIDC/OAuth2 SA model and actAs requirement are identical to HTTP targets.
+      narrative: >-
+        {job.name} fires a request to {appengine_service.name} App Engine service on its
+        cron schedule.
+
+  # ---------------------------------------------------------------------------
+  # DERIVED ATTACK-PATH RULES (combine existing edges)
+  # ---------------------------------------------------------------------------
+
+  # --- URI-retarget on existing authenticated job -> CanRetrieveToken ---------
+  - id: gcp-cloudscheduler-uri-retarget-token-theft
+    emits: CanRetrieveToken
+    description: "Retargeting an existing HTTP job's URI (via jobs.update) to an attacker-controlled endpoint causes the existing SA's OIDC/OAuth2 bearer token to be delivered on the next invocation — no actAs on the SA required since the SA is unchanged."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?job ]
+    where:
+      - "node_type(?job) == Scheduler"
+      - "?job has an HTTP target with oidcToken.serviceAccountEmail or oauthToken.serviceAccountEmail set (a SA-authenticated HTTP job)"
+      - "?principal does NOT need to hold iam.serviceAccounts.actAs on the existing SA — URI-only update does not require actAs"
+    emit:
+      source_type: Identity
+      target_type: Token
+      source: "<principal>"
+      target: "<OIDC/OAuth2 bearer token of the existing SA configured in the job>"
+      permissions: ["cloudscheduler.jobs.update"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the principal holds cloudscheduler.jobs.update on the job AND the job
+        is ENABLED (or PAUSED but can be run via jobs.run). The bearer token is delivered on
+        the next scheduled invocation (or on manual jobs.run trigger). If the principal also
+        holds cloudscheduler.jobs.run, immediate delivery is possible (ACTIVE). Without
+        jobs.run: ACTIVE but bounded by the schedule cadence (next firing time).
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from:
+        - "?principal CanModifyConfiguration ?job (gcp-cloudscheduler-update-config)"
+      false_positive_note: >-
+        This path requires the job to already have an SA-authenticated HTTP target (oidcToken
+        or oauthToken set). A job with no authentication configured (no oidcToken/oauthToken)
+        does not produce a bearer token — do not emit. The token received at the attacker's
+        endpoint is a short-lived OIDC JWT (1-hour TTL) or OAuth2 access token scoped to
+        https://www.googleapis.com/auth/cloud-platform; it can be used to call GCP APIs
+        as the SA. The attacker must intercept the HTTP request (the retargeted endpoint
+        must be under attacker control). This is a weaker path than CanExecuteAs (no ongoing
+        code execution), but each invocation delivers a fresh token.
+      narrative: >-
+        {principal.name} can update {job.name}'s HTTP URI to an attacker-controlled endpoint
+        (cloudscheduler.jobs.update) without needing actAs on the existing SA. On the next
+        invocation, the Cloud Scheduler service agent delivers the existing SA's OIDC/OAuth2
+        bearer token to the attacker's endpoint — yielding a short-lived token for that SA.
+
+  # --- CanExecuteAs via HTTP SA — CITED from messaging-chains rule 3 --------
+  # Cloud Scheduler HTTP jobs that combine CanSchedule + CanPassIdentity emit CanExecuteAs
+  # via messaging-chains rule 3 (messaging-schedule-persists-executes-as), which is the
+  # canonical derivation for schedule + identity attachment. This rule does NOT re-emit.
+  #
+  # Cloud Scheduler-specific narrative:
+  #   Creating a Cloud Scheduler HTTP job authenticated as a passable SA (jobs.create +
+  #   actAs) fires authenticated HTTP requests on schedule, yielding persistent execution
+  #   as that SA. The HTTP target endpoint must accept the SA's OIDC/OAuth2 token (i.e.,
+  #   the SA has roles/run.invoker, roles/cloudfunctions.invoker, or the target is a
+  #   googleapis.com REST API the SA has roles for). Without an accepting target, the token
+  #   is generated but rejected — escalation fails. Honor actAs scope: actAs on SA-A does
+  #   NOT grant execution as SA-B. The SA's roles determine blast radius; a SA with
+  #   roles/editor or roles/owner is maximum impact.
+
+  # --- CanExecuteAs via config update + SA swap — CITED from can-execute-as ---
+  # Cloud Scheduler jobs that combine CanModifyConfiguration + CanPassIdentity emit
+  # CanExecuteAs via can-execute-as/execute-as-via-config-identity-swap, which is the
+  # canonical derivation for config mutation + identity attachment. This rule does NOT re-emit.
+  #
+  # Cloud Scheduler-specific narrative:
+  #   Updating an existing job's OIDC/OAuth2 SA to a more-privileged actAs-able SA
+  #   (jobs.update + actAs) gives persistent execution as the new SA on the job's schedule.
+  #   Changing serviceAccountEmail requires actAs on the NEW SA — not the existing SA.
+  #   Changing only the URI without touching serviceAccountEmail yields CanRetrieveToken
+  #   of the EXISTING SA (gcp-cloudscheduler-uri-retarget-token-theft), not CanExecuteAs.
+  #   PAUSED jobs can be updated and manually triggered — execution is gated on a run path
+  #   (scheduled invocation or cloudscheduler.jobs.run).
+
+  # --- AttachIdentity: set/swap SA on existing job ----------------------------
+  - id: gcp-cloudscheduler-attach-sa-via-update
+    emits: CanAttachIdentity
+    description: "Update the serviceAccountEmail field of an HTTP job's oidcToken/oauthToken to swap the execution identity (jobs.update + actAs on new SA)."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?job ]
+      - [ ?principal, CanPassIdentity,        ?sa ]
+    where:
+      - "node_type(?job) == Scheduler"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<Cloud Scheduler job (Scheduler node)>"
+      permissions: ["cloudscheduler.jobs.update", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility, service_state]
+      state_logic: >-
+        ACTIVE when the principal holds cloudscheduler.jobs.update on the job AND actAs on
+        the new SA AND the job is ENABLED (or PAUSED and can be run via jobs.run).
+        CONDITIONAL(service_state) when the job is PAUSED. POTENTIAL(role_compatibility)
+        when actAs on the new SA is unknown/unresolved. BLOCKED by IAM deny or org policy
+        on either permission.
+      derived_from:
+        - "?principal CanModifyConfiguration ?job (gcp-cloudscheduler-update-config)"
+        - "?principal CanPassIdentity ?sa (gcp-cloudscheduler-passidentity-actas)"
+      false_positive_note: >-
+        Records the attach capability itself; downstream CanExecuteAs follows from
+        gcp-cloudscheduler-execute-as-via-sa-swap once the job fires. Requires actAs on
+        the NEW SA, not the existing SA. The attach is ACTIVE when actAs is confirmed;
+        downstream CanExecuteAs is still gated on a run path (scheduled invocation or
+        cloudscheduler.jobs.run).
+      narrative: >-
+        {principal.name} can change {job.name}'s OIDC/OAuth2 service account to {sa.name}
+        (cloudscheduler.jobs.update + iam.serviceAccounts.actAs) — attaching {sa.name} as
+        the execution identity for all future scheduled invocations.
+
+  # --- Create Pub/Sub job -> CanWriteData (principal -> topic via job creation)
+  # CanWriteData schema constraint: source must be [Identity, Compute], target [Storage, Data].
+  # Topic (Messaging class) is not an admissible target_type for CanWriteData; source_type is
+  # Identity (admissible) but target_type Topic is not. Omit target_type; the linter falls
+  # back to prose-mining for the target field. Source_type: Identity is correct and included.
+  - id: gcp-cloudscheduler-create-pubsub-job-write
+    emits: CanWriteData
+    description: "A principal with cloudscheduler.jobs.create can establish a Pub/Sub job that publishes attacker-controlled data to any topic in the project on schedule. No actAs required. Feeds messaging-chains rules 1+2 for CanTrigger -> CanExecuteAs chain."
+    match:
+      - [ ?principal, CanSchedule, ?job ]
+    where:
+      - "node_type(?job) == Scheduler"
+      - "?principal intends to / has created a Pub/Sub target job (pubsubTarget.topicName is set)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<target Pub/Sub topic (Topic node in Messaging class)>"
+      permissions: ["cloudscheduler.jobs.create"]
+      conditions: [iam_permission, api_enabled]
+      state_logic: >-
+        ACTIVE when the principal holds cloudscheduler.jobs.create AND the Cloud Scheduler
+        API is enabled. The Cloud Scheduler service agent automatically holds
+        roles/pubsub.publisher on project-local topics — no additional pubsub grant needed
+        for the creator. Cross-project topic targets require the service agent to hold
+        pubsub.topics.publish on the external topic (separate grant; downgrade to
+        CONDITIONAL(resource_policy) for cross-project targets).
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal CanSchedule ?job (gcp-cloudscheduler-can-schedule)"
+      false_positive_note: >-
+        This CanWriteData is from the PRINCIPAL (via job creation) to the TOPIC, not from
+        the job itself. The intermediate step is the job creation (gcp-cloudscheduler-can-schedule).
+        The actual publish is performed by the Cloud Scheduler service agent; the creator
+        controls the message payload (pubsubTarget.data and pubsubTarget.attributes).
+        If the topic has no consumer bound (no CanTrigger edge from topic to a Compute node),
+        this is CanWriteData with no CanExecuteAs consequence. Messaging-chains rule 1
+        (messaging-publish-triggers-consumer) handles the CanWriteData + CanTrigger =>
+        CanTrigger roll-up for the principal.
+      narrative: >-
+        {principal.name} can create a Cloud Scheduler Pub/Sub job
+        (cloudscheduler.jobs.create) that publishes attacker-controlled messages to
+        {topic.name} on schedule. If {topic.name} has a bound consumer, messaging-chains
+        rolls this up to CanTrigger -> CanExecuteAs(consumer runtime SA).
+
+  # --- Job definition read -> ContainsSecret (job body disclosure) -------------
+  - id: gcp-cloudscheduler-job-body-contains-secret
+    emits: ContainsSecret
+    description: "A Cloud Scheduler job's HTTP body (httpTarget.body) or Pub/Sub payload (pubsubTarget.data) may embed credentials. Any principal with cloudscheduler.jobs.get / fullView can read the job definition and recover the embedded credential."
+    match_record:
+      resource_type: "google.cloud.scheduler.v1.Job"
+      field: "httpTarget.body | pubsubTarget.data"
+    where:
+      - "base64-decoded body matches a credential pattern (API key, SA key JSON, password, OAuth2 token, connection string)"
+    emit:
+      source_type: Messaging
+      target_type: Secret
+      source: "<Cloud Scheduler job (Scheduler node)>"
+      target: "<secret / credential material in the job body>"
+      permissions: []
+      derived_from: ["job.httpTarget.body or job.pubsubTarget.data field classification"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the job body/data field is classified as containing a credential pattern
+        (confirmed by pattern matching on base64-decoded payload). CONDITIONAL(iam_permission)
+        when the principal's ability to read cloudscheduler.jobs.fullView is unconfirmed.
+        BLOCKED when no credential pattern is detected in the payload. The embedded secret
+        drives downstream ExposesCredential and CredentialsFor edges via credential-chains.
+      false_positive_note: >-
+        Only emit when classification of the body/data field yields a confirmed credential
+        pattern — not for every job. Many job bodies contain operational payloads (JSON data,
+        task identifiers) with no credential material. False-positive rate is high without
+        classifier confirmation. cloudscheduler.jobs.fullView permission is needed to read
+        the full body in the API response (it is included in roles/cloudscheduler.viewer,
+        roles/cloudscheduler.admin, roles/cloudscheduler.jobRunner).
+      narrative: >-
+        {job.name}'s request payload contains credential material (embedded in
+        httpTarget.body or pubsubTarget.data), recoverable by any principal with
+        cloudscheduler.jobs.get.
+
+  # --- Cross-project trust: Pub/Sub target in another project -----------------
+  - id: gcp-cloudscheduler-cross-project-pubsub
+    emits: CrossProjectTrust
+    description: "A Cloud Scheduler Pub/Sub job targeting a topic in a different project establishes cross-project trust — the Cloud Scheduler service agent must hold roles/pubsub.publisher in the external project."
+    match:
+      - [ ?job, CanWriteData, ?topic ]
+    where:
+      - "node_type(?job) == Scheduler"
+      - "node_type(?topic) == Topic"
+      - "?job.project != ?topic.project"
+      - "Cloud Scheduler service agent holds pubsub.topics.publish on ?topic (cross-project binding)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: "<Cloud Scheduler service agent's cross-project pubsub.topics.publish binding>"
+      target: "<target project ?topic.project>"
+      permissions: ["pubsub.topics.publish"]
+      derived_from:
+        - "?job CanWriteData ?topic (gcp-cloudscheduler-explicit-pubsub-trigger or gcp-cloudscheduler-create-pubsub-job-write)"
+        - "IAM binding: Cloud Scheduler service agent has pubsub.topics.publish on external topic"
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the Cloud Scheduler service agent unconditionally holds pubsub.topics.publish
+        on the external topic AND the job's pubsubTarget.topicName references the external topic.
+        CONDITIONAL(resource_policy) when the binding is conditional (IAM conditions restrict
+        the grant). BLOCKED by org policy or IAM deny overriding the cross-project binding.
+      false_positive_note: >-
+        Only emit when the job's target project differs from the job's project. The service
+        agent must have explicit pubsub.topics.publish on the external topic — it does NOT
+        inherit editor/owner roles. Confirm the binding is not conditionally scoped (e.g.,
+        time-bound or MFA-required) before emitting ACTIVE.
+      narrative: >-
+        {job.name} targets a Pub/Sub topic in {target_project.name} (a different project).
+        The Cloud Scheduler service agent holds pubsub.topics.publish on that topic,
+        establishing cross-project trust; can-control rolls this up to CanEnterProject.
+
+  # --- Cross-project trust: job's SA has bindings in another project ----------
+  - id: gcp-cloudscheduler-cross-project-sa-trust
+    emits: CrossProjectTrust
+    description: "A Cloud Scheduler HTTP job whose configured SA holds role bindings in a different project establishes cross-project trust — an attacker who can create/update the job (with actAs on the SA) can invoke APIs in the other project as that SA."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal can create or update a Cloud Scheduler HTTP job naming ?sa"
+      - "?sa has IAM role bindings in a project different from the Cloud Scheduler job's project"
+    emit:
+      source_type: ServiceAccount
+      target_type: Project
+      source: "<service account with cross-project bindings>"
+      target: "<project where the SA holds bindings>"
+      permissions: ["cloudscheduler.jobs.create | cloudscheduler.jobs.update", "iam.serviceAccounts.actAs"]
+      derived_from:
+        - "?principal CanPassIdentity ?sa (gcp-cloudscheduler-passidentity-actas)"
+        - "SA role bindings in external project (from IAM policy collection)"
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the SA unconditionally holds role bindings in the target project AND
+        the principal can bind the SA to a job (actAs confirmed). CONDITIONAL(resource_policy)
+        when the SA's bindings are conditional (IAM conditions on the binding). BLOCKED by
+        org policy or IAM deny overriding the cross-project binding.
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE can-control: this rule asserts ONLY the cross-project trust
+        fact via the SA. The CanEnterProject consequence (create job with SA -> SA calls APIs
+        in the other project -> foothold there) is produced by can-control consuming this
+        CrossProjectTrust. Only emit when the SA's bindings are confirmed in a different
+        project AND the principal can actAs that SA. A SA with only roles/viewer in another
+        project yields limited cross-project access — honor privilege_level gate.
+      narrative: >-
+        {sa.name} holds role bindings in {project.name} (a different project). An attacker
+        who can create a Cloud Scheduler job authenticated as {sa.name} (actAs confirmed) can
+        use that job to call GCP APIs in {project.name} on schedule, establishing cross-project
+        trust that can-control rolls up to CanEnterProject.
+
+  # --- Escalation roll-up — CITED from can-execute-as / can-control -----------
+  # Cloud Scheduler CanExecuteAs edges that reach a higher-privilege SA emit CanEscalateTo
+  # via can-execute-as/execute-as-* rules and can-control/escalate-via-* rules, which are
+  # the canonical derivations for privilege escalation. This rule does NOT re-emit.
+  #
+  # Cloud Scheduler-specific narrative:
+  #   A principal can escalate to a higher-privilege SA by creating or updating a Cloud
+  #   Scheduler HTTP job authenticated as that SA (jobs.create + actAs, or jobs.update +
+  #   actAs). The job fires on its cron schedule or on manual trigger (jobs.run),
+  #   executing HTTP requests with the SA's OIDC/OAuth2 token — persistent privilege
+  #   escalation requiring no ongoing attacker access.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An IAM deny or org policy denying cloudscheduler.jobs.create or .update ->
+#     gcp-cloudscheduler-can-schedule / -update-config BLOCKED; cascade to
+#     -execute-as-via-http-sa / -execute-as-via-sa-swap BLOCKED.
+#   - An IAM deny on iam.serviceAccounts.actAs at project/folder/org scope ->
+#     gcp-cloudscheduler-passidentity-actas BLOCKED; cascade to -execute-as-* BLOCKED.
+#   - Revoking roles/cloudscheduler.serviceAgent from the Cloud Scheduler service agent
+#     causes all authenticated HTTP requests to return 403 (token minting fails) ->
+#     CanExecuteAs via HTTP job BLOCKED at the delivery layer.
+#   - constraints/cloudscheduler.allowedTargetRegions (org policy) limits which regions
+#     jobs can be created in — honor when scoping job creation.
+#   - A job in DISABLED or UPDATE_FAILED state cannot be run (jobs.run BLOCKED) ->
+#     gcp-cloudscheduler-run-job BLOCKED for those jobs.
+#   - VPC Service Controls perimeter denying cloudscheduler.googleapis.com access ->
+#     CanSchedule / CanModifyConfiguration BLOCKED within the perimeter.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION (raw config -> explicit edges)
+# Inlined here for Phase-10 completion. Match raw API records, not edge combinations.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-cloudscheduler-explicit-http-trigger
+    emits: CanTrigger
+    applies_to: [gcp]
+    source_record:
+      api: "cloudscheduler.projects.locations.jobs.list"
+      field: "httpTarget.uri"
+    where:
+      - "httpTarget.uri resolves to a known compute node (Cloud Run URL, Cloud Functions endpoint, App Engine URL, Workflows executions.create endpoint)"
+      - "job.state == ENABLED"
+    emit:
+      source_type: Scheduler
+      target_type: Compute
+      source: "<Cloud Scheduler job node>"
+      target: "<HTTP target compute node>"
+      narrative: "{job.name} triggers {target.name} via HTTP on its schedule."
+
+  - id: gcp-cloudscheduler-explicit-pubsub-trigger
+    emits: CanWriteData
+    applies_to: [gcp]
+    source_record:
+      api: "cloudscheduler.projects.locations.jobs.list"
+      field: "pubsubTarget.topicName"
+    where:
+      - "pubsubTarget.topicName is set"
+      - "job.state == ENABLED"
+    emit:
+      source_type: Scheduler
+      target_type: Topic
+      source: "<Cloud Scheduler job node>"
+      target: "<Pub/Sub topic node>"
+      narrative: "{job.name} publishes attacker-controlled data to {topic.name} on its schedule. The CanTrigger(topic -> downstream consumer) binding is recorded by pubsub rules; messaging-chains rule 1 combines CanWriteData + CanTrigger."
+
+  - id: gcp-cloudscheduler-explicit-http-sa-attachment
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    source_record:
+      api: "cloudscheduler.projects.locations.jobs.list"
+      field: "httpTarget.oidcToken.serviceAccountEmail | httpTarget.oauthToken.serviceAccountEmail"
+    where:
+      - "serviceAccountEmail is set (non-empty)"
+    emit:
+      source_type: Messaging
+      target_type: ServiceAccount
+      source: "<Cloud Scheduler job node>"
+      target: "<OIDC/OAuth2 service account node>"
+      narrative: >-
+        {job.name} references {sa.name} as its OIDC/OAuth2 authentication identity. This
+        is a structural containment fact (job references SA). The creator's ability to bind
+        this SA (CanPassIdentity) is recorded separately by gcp-cloudscheduler-passidentity-actas.
+
+  - id: gcp-cloudscheduler-explicit-appengine-trigger
+    emits: CanTrigger
+    applies_to: [gcp]
+    source_record:
+      api: "cloudscheduler.projects.locations.jobs.list"
+      field: "appEngineHttpTarget.relativeUri"
+    where:
+      - "appEngineHttpTarget is set"
+      - "job.state == ENABLED"
+    emit:
+      source_type: Scheduler
+      target_type: ApplicationPlatform
+      source: "<Cloud Scheduler job node>"
+      target: "<App Engine service node>"
+      narrative: "{job.name} triggers App Engine service {appengine_service.name} on its schedule."

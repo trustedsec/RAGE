@@ -1,0 +1,284 @@
+# Azure AKS — explicit normalization rules (Microsoft.ContainerService/managedClusters)
+# ---------------------------------------------------------------------------
+# Translate raw collected AKS ARM config and in-cluster Kubernetes API data
+# into common explicit edges consumed by the derived rules in
+# /rules/derived/azure/aks.yaml.
+#
+# Three normalization areas:
+#   1. ExecutesAs — which cluster/nodepool/pod runs as which identity.
+#   2. Federation trust facts — MI federated credentials + KSA annotations
+#      normalize to TrustsExternalIdentity + ExternalIdentityMapsTo so
+#      federation-chains.yaml can collapse them into CanFederateAs.
+#   3. ContainsResourceReference — pod image pulls pointing at a ContainerRegistry,
+#      so container-chains image-push-poisons-consumers can fan out supply-chain
+#      code-control to each consuming workload.
+#
+# Collection APIs:
+#   ARM:
+#     az aks list / az aks show                            (cluster ARM resource)
+#     az aks nodepool list                                 (agentPool resources)
+#     az identity federated-credential list                (MI federated creds)
+#     az role assignment list                              (RBAC at cluster scope)
+#   In-cluster (requires kubeconfig):
+#     kubectl get serviceaccounts --all-namespaces -o yaml
+#     kubectl get pods,deployments,daemonsets,statefulsets,jobs \
+#         --all-namespaces -o yaml
+#
+# Permissions required (read-only collector):
+#   Microsoft.ContainerService/managedClusters/read
+#   Microsoft.ContainerService/managedClusters/agentPools/read
+#   Microsoft.ContainerService/managedClusters/listClusterUserCredential/action
+#   Microsoft.ManagedIdentity/userAssignedIdentities/read
+#   Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials/read
+#   Microsoft.Authorization/*/read
+# ---------------------------------------------------------------------------
+
+rules:
+
+  # ===========================================================================
+  # 1. ExecutesAs — Cluster / NodePool / Pod identity bindings
+  # ===========================================================================
+
+  # --- Cluster control-plane system-assigned / user-assigned MI ---------------
+  # The cluster's identity block identifies the control-plane MI (system-assigned
+  # SP or user-assigned identities).  This is the MI used for ARM operations
+  # (e.g. pulling from ACR via acrPull, managing LB/PIP/route-table).
+  - id: azure-aks-cluster-executes-as-control-plane-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ContainerService/managedClusters"
+      field: "identity"
+    where:
+      - "identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned']"
+    emit:
+      source_type: KubernetesCluster
+      target_type: ManagedIdentity
+      source: "<managedCluster>"
+      target: "<system-assigned SP (principalId) or each userAssignedIdentities key>"
+      api_source: "az aks show --name <name> --resource-group <rg>"
+      evidence_field: "identity.principalId | identity.userAssignedIdentities"
+      narrative: "AKS cluster {cluster.name} runs its control plane as managed identity {mi.name}."
+
+  # --- Node pool (VMSS) system-assigned node MI --------------------------------
+  # Each node pool's VMSS has a system-assigned MI (the node identity) identified
+  # in identityProfile.kubeletidentity.  This is the MI reachable from the node
+  # IMDS endpoint (169.254.169.254) for node-level code.
+  - id: azure-aks-nodepool-executes-as-kubelet-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ContainerService/managedClusters"
+      field: "properties.identityProfile.kubeletidentity"
+    where:
+      - "identityProfile.kubeletidentity is set (non-null)"
+    emit:
+      source_type: VirtualMachine
+      target_type: ManagedIdentity
+      source: "<VMSS instance (individual node) executing the kubelet>"
+      target: "<kubelet user-assigned MI (resourceId from identityProfile.kubeletidentity)>"
+      api_source: "az aks show --name <name> --resource-group <rg>"
+      evidence_field: "properties.identityProfile.kubeletidentity.resourceId"
+      narrative: "AKS node pool nodes in cluster {cluster.name} run as kubelet MI {mi.name}."
+
+  # --- Pod / Deployment / DaemonSet executes as its Kubernetes ServiceAccount ---
+  - id: azure-aks-pod-executes-as-ksa
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "k8s/Pod|k8s/Deployment|k8s/DaemonSet|k8s/StatefulSet|k8s/Job"
+      field: "spec.serviceAccountName"
+    where:
+      - "spec.serviceAccountName is set (non-empty)"
+    emit:
+      source_type: KubernetesWorkload
+      target_type: WorkloadIdentity
+      source: "<KubernetesWorkload (pod/deployment/daemonset/statefulset/job)>"
+      target: "<Kubernetes ServiceAccount (WorkloadIdentity) in the same namespace>"
+      api_source: "kubectl get <kind> -n <namespace> <name> -o yaml"
+      evidence_field: "spec.serviceAccountName"
+      narrative: "{workload.name} runs as Kubernetes ServiceAccount {ksa.name} (namespace {namespace.name})."
+
+  # ===========================================================================
+  # 2. Federation trust — AKS Workload Identity (KSA <-> MI)
+  # Normalized to TrustsExternalIdentity + ExternalIdentityMapsTo so that
+  # federation-chains.yaml federation-maps-to-identity collapses to CanFederateAs.
+  # ===========================================================================
+
+  # --- MI trusts the KSA via a federated credential ---------------------------
+  # A federated credential on a user-assigned MI that references a cluster's OIDC
+  # issuer URL + subject system:serviceaccount:<ns>:<sa> is the trust declaration.
+  - id: azure-aks-mi-trusts-ksa
+    emits: TrustsExternalIdentity
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ManagedIdentity/userAssignedIdentities"
+      field: "federatedIdentityCredentials"
+    where:
+      - "federatedIdentityCredential.issuer matches an AKS cluster oidcIssuerProfile.issuerURL"
+      - "federatedIdentityCredential.subject starts with system:serviceaccount:"
+    emit:
+      source_type: ManagedIdentity
+      target_type: WorkloadIdentity
+      source: "<managed identity (user-assigned MI holding the federated credential)>"
+      target: "<Kubernetes ServiceAccount (WorkloadIdentity) matching the subject>"
+      api_source: "az identity federated-credential list --identity-name <name> --resource-group <rg>"
+      evidence_field: "federatedIdentityCredentials[].issuer + subject"
+      note: >-
+        The trust condition (subject pin) is:
+          BROAD/UNPINNED if subject is a wildcard or if the attacker can schedule a pod
+          as the matching KSA (they control the namespace / hold pods/create RBAC there).
+          PINNED if subject is a specific system:serviceaccount:<ns>:<sa> the attacker
+          cannot run a pod as — federation-maps-to-identity stays CONDITIONAL(trust_condition).
+      narrative: >-
+        MI {mi.name} has a federated credential trusting KSA {ksa.name}
+        (issuer: {issuerURL}, subject: {subject}); pods running as {ksa.name} can exchange
+        their projected SA token for an MI access token.
+
+  # --- KSA maps to MI (realized workload-identity mapping) --------------------
+  # The KSA's azure.workload.identity/client-id annotation is the other side of
+  # the federation: it names the MI the token exchange produces.
+  - id: azure-aks-ksa-maps-to-mi
+    emits: ExternalIdentityMapsTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "k8s/ServiceAccount"
+      field: "metadata.annotations['azure.workload.identity/client-id']"
+    where:
+      - "annotation azure.workload.identity/client-id is set and non-empty"
+    emit:
+      source_type: WorkloadIdentity
+      target_type: ManagedIdentity
+      source: "<Kubernetes ServiceAccount (WorkloadIdentity)>"
+      target: "<Azure Managed Identity matching the client-id annotation>"
+      api_source: "kubectl get serviceaccount -n <namespace> <name> -o yaml"
+      evidence_field: "metadata.annotations['azure.workload.identity/client-id']"
+      narrative: >-
+        KSA {ksa.name} (namespace {namespace.name}) is annotated with
+        azure.workload.identity/client-id={clientId}; pods running as this KSA receive a
+        projected token they can exchange for MI {mi.name}'s access token.
+
+  # ===========================================================================
+  # 3. ContainsResourceReference — pod image pulls to ContainerRegistry
+  # Consumed by container-chains image-push-poisons-consumers for ACR push -> supply chain.
+  # ===========================================================================
+
+  - id: azure-aks-workload-pulls-image
+    emits: ContainsResourceReference
+    applies_to: [azure]
+    match_record:
+      resource_type: "k8s/Deployment|k8s/DaemonSet|k8s/StatefulSet|k8s/Job|k8s/Pod"
+      field: "spec.template.spec.containers[].image"
+    emit:
+      source_type: KubernetesWorkload
+      target_type: ContainerRegistry
+      source: "<KubernetesWorkload>"
+      target: "<ContainerRegistry (ACR) that hosts the image>"
+      reference_kind: "runs_image"
+      api_source: "kubectl get <kind> -n <namespace> <name> -o yaml"
+      evidence_field: "spec.template.spec.containers[].image"
+      note: >-
+        Tag/digest pinning is recorded as a property on this edge:
+          MUTABLE (moving tag like :latest, imagePullPolicy Always, no @sha256 digest pin)
+          => container-chains image-push-poisons-consumers fires ACTIVE for overwritten tag.
+          DIGEST-PINNED (@sha256:...) => the fan-out to this workload is BLOCKED for any
+          tag overwrite; an attacker must overwrite the exact digest (registry must not
+          enforce content-addressable immutability).
+      narrative: "{workload.name} pulls its container image from {registry.name} (tag/digest: {image_ref})."
+
+  # ===========================================================================
+  # 4. LocatedIn — cluster placement
+  # ===========================================================================
+
+  - id: azure-aks-cluster-located-in
+    emits: LocatedIn
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ContainerService/managedClusters"
+      field: "location"
+    emit:
+      source_type: KubernetesCluster
+      target_type: AdministrativeBoundary
+      source: "<managedCluster>"
+      target: "<Azure region (AdministrativeBoundary)>"
+      api_source: "az aks show"
+      evidence_field: "location"
+      narrative: "AKS cluster {cluster.name} is located in Azure region {region.name}."
+
+  - id: azure-aks-cluster-in-resource-group
+    emits: Contains
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ContainerService/managedClusters"
+      field: "resourceGroup"
+    emit:
+      source_type: ResourceGroup
+      target_type: KubernetesCluster
+      source: "<ResourceGroup>"
+      target: "<managedCluster>"
+      api_source: "az aks list --resource-group <rg>"
+      evidence_field: "resourceGroup"
+      narrative: "Resource group {rg.name} contains AKS cluster {cluster.name}."
+
+  # ===========================================================================
+  # 5. AttachedTo — user-assigned MI attached to the cluster
+  # ===========================================================================
+
+  - id: azure-aks-user-mi-attached
+    emits: AttachedTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ContainerService/managedClusters"
+      field: "identity.userAssignedIdentities"
+    emit:
+      source_type: ManagedIdentity
+      target_type: Compute
+      source: "<user-assigned managed identity>"
+      target: "<managedCluster>"
+      api_source: "az aks show"
+      evidence_field: "identity.userAssignedIdentities"
+      narrative: "User-assigned MI {mi.name} is attached to AKS cluster {cluster.name}."
+
+  # ===========================================================================
+  # 6. NETWORK EXPOSURE — public API server
+  # ===========================================================================
+
+  - id: azure-aks-public-api-server
+    emits: ExposedToInternet
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ContainerService/managedClusters"
+      field: "properties.apiServerAccessProfile"
+    where:
+      - "apiServerAccessProfile.authorizedIPRanges is empty, null, or absent"
+      - "cluster has no privateLinkResources (not a fully private cluster)"
+      - "publicFQDN is set and non-empty"
+    emit:
+      source_type: KubernetesCluster
+      target_type: AnonymousIdentity
+      source: "<AKS managedCluster (public API server endpoint)>"
+      target: "<AnonymousIdentity (any internet principal)>"
+      api_source: "az aks show --name <name> --resource-group <rg>"
+      evidence_field: "properties.apiServerAccessProfile + properties.publicFQDN"
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when the cluster has a public FQDN and authorizedIPRanges is empty/absent —
+        any internet host can reach the Kubernetes API server and attempt authentication
+        (no IP-level filtering). CONDITIONAL(network_reachability) when authorizedIPRanges
+        is set — only listed IP ranges can reach the API server. BLOCKED for a fully private
+        cluster (no public endpoint + privateLinkResources set + no public FQDN).
+        Note: runCommand bypasses this exposure gate — even a private cluster is reachable
+        via the ARM runCommand action regardless of this edge.
+      confidence: 0.90
+      false_positive_note: >-
+        A public FQDN with no authorized-IP restriction is internet-exposed at the TCP/TLS
+        layer; actual exploitation still requires valid Entra credentials or a static cert
+        (from listClusterAdminCredential).  Do NOT conflate network exposure with
+        authentication bypass — ExposedToInternet models the reachability fact, not the
+        auth bypass (which is azure-aks-list-admin-cred).  For a private cluster, the
+        API server is NOT internet-reachable, but runCommand still works from the ARM plane.
+      narrative: >-
+        AKS cluster {cluster.name} has a public API server endpoint with no authorized-IP
+        restrictions; any internet host can reach the Kubernetes API server and attempt
+        authentication (authentication still required — see azure-aks-list-admin-cred for
+        the cert bypass).

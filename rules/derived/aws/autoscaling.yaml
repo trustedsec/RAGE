@@ -1,0 +1,282 @@
+# AWS EC2 Auto Scaling — derived attack-path rules (Phase 4, compute)
+# ---------------------------------------------------------------------------
+# EC2 Auto Scaling (ASG) launches EC2 instances from a launch template
+# (AWS::EC2::LaunchTemplate) or launch configuration
+# (AWS::AutoScaling::LaunchConfiguration). Both may specify an IamInstanceProfile,
+# so launched instances run AS the contained IAM role. ASG is therefore a
+# CanPassIdentity / CanCreateWorkloadAs / CanExecuteAs primitive rather than a
+# resource that runs attacker code itself.
+#
+# Every rule emits a COMMON edge from schema/edges.yaml. Permissions listed are
+# the EFFECTIVE actions the evaluator must confirm at the given resource scope
+# BEFORE emitting. Honor iam:PassRole scoping (resource ARN + iam:PassedToService
+# = ec2.amazonaws.com); an out-of-scope PassRole does NOT yield execution.
+# state defaults ACTIVE unless a condition is unmet (CONDITIONAL/POTENTIAL) or an
+# SCP/permission-boundary denies (BLOCKED).
+#
+# Docs grounding (AWS):
+#  - Service Authorization Reference: Amazon EC2 Auto Scaling (autoscaling:*).
+#  - EC2 Auto Scaling User Guide: "IAM role for applications on EC2 instances"
+#    (iam:PassRole needed on the identity creating/updating an ASG whose launch
+#    template specifies an instance profile; scoped by iam:PassedToService=ec2).
+#  - EC2 Auto Scaling User Guide: "Control launch template usage" — on
+#    $Latest/$Default versions the ASG service-linked role
+#    (AWSServiceRoleForAutoScaling) performs RunInstances, which can pass a role
+#    even if the caller lacks iam:PassRole. autoscaling:LaunchTemplateVersionSpecified
+#    condition key restricts this.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 4-compute-serverless
+applies_to: [aws]
+service: "aws:autoscaling"
+
+rules:
+
+  # --- Pass an instance-profile role to EC2 via ASG launch template/config ----
+  - id: aws-asg-pass-instance-profile
+    emits: CanPassIdentity
+    description: "Caller can pass an instance-profile role to EC2 through an Auto Scaling launch template/config."
+    match_effective_permission: {action: "iam:PassRole", resource_type: "AWS::IAM::Role"}
+    where:
+      - "?role is (or can be) the role inside an instance profile referenced by a launch template/config"
+      - "iam:PassedToService (if present) includes ec2.amazonaws.com"
+      - "caller also holds autoscaling:CreateAutoScalingGroup OR autoscaling:UpdateAutoScalingGroup OR ec2:RunInstances"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<instance-profile role in scope>"
+      permissions: ["iam:PassRole"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: "iam:PassRole is normally scoped by role ARN AND iam:PassedToService. A role passable only to a non-ec2 service, or a role ARN the attacker cannot target, does NOT yield ASG execution — emit CONDITIONAL/POTENTIAL, not ACTIVE. Resolve the instance profile to its contained role before rating privilege."
+      narrative: "{principal.name} can pass instance-profile role {target.name} to EC2 via an Auto Scaling launch template/config (iam:PassRole, PassedToService=ec2)."
+
+  # --- Create an ASG that launches instances as a chosen role -----------------
+  # Modeling note: schema canonical_derivation for CanCreateWorkloadAs is
+  # 'CanDeploy(X, platform) + CanPassIdentity(X, I) + role_compatible'. This rule
+  # treats autoscaling:CreateAutoScalingGroup + ec2:RunInstances as the
+  # CanDeploy-equivalent for ASG (no separate CanDeploy edge is emitted for this
+  # service), so the derivation stays aligned with edges.yaml canonical_derivations.
+  - id: aws-asg-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create an Auto Scaling group whose launch template/config runs instances as a chosen instance-profile role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has autoscaling:CreateAutoScalingGroup AND ec2:RunInstances"
+      - "?role is the role of an instance profile the attacker can reference (existing template/config, or a brand-new one the attacker can create via ec2:CreateLaunchTemplate / autoscaling:CreateLaunchConfiguration)"
+      - "no SCP/boundary denies autoscaling:CreateAutoScalingGroup, ec2:RunInstances, or iam:PassRole"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<instance-profile role>"
+      permissions: ["autoscaling:CreateAutoScalingGroup", "ec2:RunInstances", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      escalation: "Create a new ASG bound to a privileged instance profile; launched instances run as that role."
+      false_positive_note: "CreateAutoScalingGroup performs an ec2:RunInstances DRY-RUN that checks the caller's iam:PassRole at call time, so this path requires the caller to genuinely hold in-scope PassRole. If PassRole is absent here, prefer aws-asg-launch-template-passrole-bypass instead."
+      narrative: "{principal.name} can create an Auto Scaling group that launches EC2 instances running as {role.name} (autoscaling:CreateAutoScalingGroup + ec2:RunInstances + iam:PassRole)."
+
+  # --- Update an existing ASG to attach a different instance-profile role ------
+  - id: aws-asg-update-attach-identity
+    emits: CanAttachIdentity
+    description: "Update an ASG / swap its launch template or config to launch instances as a more-privileged instance-profile role."
+    match_effective_permission: {action: "autoscaling:UpdateAutoScalingGroup", resource_type: "AWS::AutoScaling::AutoScalingGroup"}
+    where:
+      - "caller can reference a launch template/config whose IamInstanceProfile is a more-privileged role"
+      - "caller holds in-scope iam:PassRole (PassedToService=ec2) for that role (else use the SLR-bypass rule)"
+      - "caller holds ec2:RunInstances (checked via ASG dry-run)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Auto Scaling group / newly launched instances>"
+      permissions: ["autoscaling:UpdateAutoScalingGroup", "iam:PassRole", "ec2:RunInstances"]
+      conditions: [iam_permission, role_compatibility, trigger_exists]
+      note: "Chains to CanExecuteAs(instance-profile role) once the ASG launches fresh instances (see aws-asg-force-launch-trigger / aws-asg-execute-as)."
+      false_positive_note: "Only future launches use the new config; existing instances are unaffected until replaced. Without a scaling policy/scheduled action or SetDesiredCapacity/StartInstanceRefresh/terminate rights, emit CONDITIONAL(trigger_exists)."
+      narrative: "{principal.name} can update ASG {target.name} so its launched instances run as instance-profile role {role.name} (autoscaling:UpdateAutoScalingGroup). The role->CanExecuteAs handoff is carried by aws-asg-execute-as, not by this CanAttachIdentity edge (schema: Identity -> Compute)."
+
+  # --- Launch-config path: instance profile embedded at create time -----------
+  - id: aws-asg-create-launch-configuration
+    emits: CanPassIdentity
+    description: "Create a launch configuration that embeds a privileged instance profile, then point an ASG at it."
+    match_effective_permission: {action: "autoscaling:CreateLaunchConfiguration", resource_type: "AWS::AutoScaling::LaunchConfiguration"}
+    where:
+      - "caller holds in-scope iam:PassRole (PassedToService=ec2) for the instance-profile role named in the launch configuration"
+      - "caller can create or update an ASG to use this launch configuration"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<instance-profile role named in launch configuration>"
+      permissions: ["autoscaling:CreateLaunchConfiguration", "iam:PassRole"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: "Launch configurations are legacy; the instance profile is validated against the caller's iam:PassRole. A launch config with no IamInstanceProfile (or a low-priv one) is not escalation."
+      narrative: "{principal.name} can create a launch configuration embedding instance-profile role {target.name} for use by an Auto Scaling group (autoscaling:CreateLaunchConfiguration + iam:PassRole)."
+
+  # --- SLR PassRole bypass via $Latest/$Default launch-template version --------
+  - id: aws-asg-launch-template-passrole-bypass
+    emits: CanExecuteAs
+    description: "Modify the $Latest/$Default launch-template version an ASG uses; the ASG service-linked role launches with the chosen instance profile even without caller iam:PassRole."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?launch_template ]
+    where:
+      - "?launch_template is used by some ASG at version $Latest or $Default"
+      - "?principal has ec2:CreateLaunchTemplateVersion OR ec2:ModifyLaunchTemplate on ?launch_template"
+      - "?principal sets IamInstanceProfile in the new/default version to a privileged role ?role"
+      - "the ASG re-reads $Latest/$Default at next launch (health replacement, scaling, refresh)"
+    optional:
+      - [ ?principal, CanTrigger, ?asg ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<instance-profile role set in the template version>"
+      permissions: ["ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate"]
+      conditions: [service_state, trigger_exists, condition_expression]
+      state_logic: "if matched(optional[0]) or a scaling policy/scheduled action exists: ACTIVE else CONDITIONAL(trigger_exists). If autoscaling:LaunchTemplateVersionSpecified is enforced (requires a numbered version): BLOCKED/POTENTIAL (condition_expression)."
+      escalation: "Because launches from $Latest/$Default are executed by AWSServiceRoleForAutoScaling, the caller passes a role to instances WITHOUT holding iam:PassRole."
+      false_positive_note: "Applies ONLY when the ASG references $Latest/$Default (not a pinned numbered version) AND autoscaling:LaunchTemplateVersionSpecified is not enforced to require a numbered version. The create/update/refresh APIs run a RunInstances dry-run that checks the CALLER's PassRole, so the bypass is the 'ASG later re-reads the alias' case, not the caller's own create call. If the version is pinned or the condition key is enforced, emit BLOCKED/POTENTIAL."
+      narrative: "{principal.name} can modify the $Latest/$Default version of launch template {launch_template.name}; ASG {asg.name}'s service-linked role launches instances as {role.name}, executing code as {role.name} without iam:PassRole."
+
+  # --- UserData / image modification = code on launched instances -------------
+  - id: aws-asg-modify-userdata-exec
+    emits: CanModifyConfiguration
+    description: "Alter launch template/config UserData or ImageId so newly launched instances execute attacker-controlled boot code."
+    where:
+      - "?principal has ec2:CreateLaunchTemplateVersion OR ec2:ModifyLaunchTemplate on a launch template used by an ASG, OR ec2:CreateLaunchTemplate to supply an entirely new template, OR autoscaling:CreateLaunchConfiguration + point an ASG at it"
+      - "the modified/default/new version becomes the one the ASG launches from"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<launch template / Auto Scaling group>"
+      permissions: ["ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:CreateLaunchTemplate", "autoscaling:CreateLaunchConfiguration"]
+      conditions: [trigger_exists, service_state]
+      note: "Realized execution occurs on the launched VirtualMachine (aws:ec2); combine with aws-asg-force-launch-trigger for ACTIVE."
+      false_positive_note: "Only affects future launches. Pinned numbered launch-template versions are not auto-adopted; and if the caller lacks rights to force a launch, emit CONDITIONAL(trigger_exists)."
+      narrative: "{principal.name} can set attacker-controlled UserData/AMI in the launch config of ASG {target.name}, running arbitrary code on every newly launched instance."
+
+  # --- Force a fresh launch to apply attacker config --------------------------
+  - id: aws-asg-force-launch-trigger
+    emits: CanTrigger
+    description: "Force an ASG to launch fresh instances so attacker-modified config/identity takes effect."
+    where:
+      - "?principal has autoscaling:StartInstanceRefresh OR autoscaling:SetDesiredCapacity OR (ec2:TerminateInstances on ASG members, causing replacement)"
+      - "OR an existing scaling policy (CloudWatch alarm) / scheduled action / health-check-driven replacement will launch instances (service-driven via the service-linked role, no caller trigger needed) — this is the SLR PassRole-bypass case vs the caller-initiated case above"
+      - "an ASG exists with capacity > 0 or can be scaled up"
+    emit:
+      target_type: Compute
+      source: "<principal>"
+      target: "<newly launched EC2 instances of the ASG>"
+      permissions: ["autoscaling:StartInstanceRefresh", "autoscaling:SetDesiredCapacity", "ec2:TerminateInstances"]
+      conditions: [service_state]
+      note: "Upgrades aws-asg-update-attach-identity / aws-asg-modify-userdata-exec / aws-asg-launch-template-passrole-bypass from CONDITIONAL to ACTIVE."
+      false_positive_note: "StartInstanceRefresh/SetDesiredCapacity re-run a RunInstances dry-run against the CALLER for CreateAutoScalingGroup/UpdateAutoScalingGroup/StartInstanceRefresh; but ongoing health-check/scaling-driven launches use the service-linked role. Distinguish caller-initiated (PassRole checked) from service-initiated (bypass)."
+      narrative: "{principal.name} can force ASG {target.name} to launch fresh instances (StartInstanceRefresh / SetDesiredCapacity / terminate-and-replace), applying the attacker-controlled launch config."
+
+  # --- Roll-up: execute as the instance-profile role --------------------------
+  - id: aws-asg-execute-as
+    emits: CanExecuteAs
+    description: "Roll-up: create/update/point an ASG at an instance profile and get code running as its role."
+    match:
+      - [ ?principal, CanCreateWorkloadAs, ?role ]
+    optional:
+      - [ ?principal, CanTrigger, ?asg ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<instance-profile role>"
+      permissions: ["autoscaling:CreateAutoScalingGroup", "autoscaling:UpdateAutoScalingGroup", "iam:PassRole", "ec2:RunInstances"]
+      state_logic: "ACTIVE if launch is triggerable now (scaling policy/scheduled action present, or CanTrigger matched) else CONDITIONAL(trigger_exists)"
+      conditions: [iam_permission, role_compatibility, trigger_exists]
+      escalation: "Instances launched by the ASG run as the instance-profile role; the attacker inherits that role via IMDS (CanRetrieveToken)."
+      false_positive_note: "Resolve the instance profile to its role and confirm the role has privilege > the caller before flagging as escalation. Honor iam:PassRole scope and any autoscaling:LaunchTemplateVersionSpecified guardrail."
+      narrative: "{principal.name} can run code as {role.name} by launching EC2 instances through an Auto Scaling group bound to its instance profile."
+
+  # --- Credential retrieval on launched instances -----------------------------
+  - id: aws-asg-instance-imds-token
+    emits: CanRetrieveToken
+    description: "Instances launched by the ASG expose the instance-profile role's credentials via IMDS."
+    match:
+      - [ ?principal, CanExecuteAs, ?role ]
+    where:
+      - "?role is the instance-profile role of the launched instances"
+      - "IMDS is reachable (not fully disabled; IMDSv2 hop/token still yields creds to on-host code)"
+    emit:
+      source: "<principal>"
+      target: "<instance-profile role>"
+      permissions: []
+      conditions: [service_state]
+      false_positive_note: "If the launch template sets HttpEndpoint=disabled, on-host code cannot read IMDS creds; IMDSv2 required-mode still permits local code to fetch a token. Do not claim token retrieval when IMDS is disabled."
+      narrative: "{principal.name}, executing on ASG-launched instances, can read {role.name} credentials from the instance metadata service (IMDS)."
+
+  # --- Recon: launch-template/config UserData leaks hardcoded secrets ---------
+  - id: aws-asg-launchdata-exposes-credential
+    emits: ExposesCredential
+    description: "Reading a launch template/config exposes hardcoded secrets/credentials embedded in UserData or launch data."
+    match_effective_permission: {action: "ec2:DescribeLaunchTemplateVersions", resource_type: "AWS::EC2::LaunchTemplate"}
+    where:
+      - "?principal has ec2:DescribeLaunchTemplateVersions OR autoscaling:DescribeLaunchConfigurations at the effective scope"
+      - "the launch template/config UserData (or other launch data) contains plaintext credential material (API keys, passwords, tokens, bootstrap secrets)"
+    emit:
+      source: "<launch template / launch configuration>"
+      target: "<embedded credential>"
+      permissions: ["ec2:DescribeLaunchTemplateVersions", "autoscaling:DescribeLaunchConfigurations"]
+      conditions: [iam_permission]
+      false_positive_note: "Only escalation when the launch data actually contains a live credential; a template with no embedded secret is inert recon. UserData is returned base64-encoded and may need decoding before pattern-matching."
+      narrative: "Launch data of {source.name} exposes an embedded credential readable via ec2:DescribeLaunchTemplateVersions / autoscaling:DescribeLaunchConfigurations."
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw config -> explicit edges). These map ASG /
+# launch-template/config records to the base facts the derived rules consume.
+# They belong in rules/explicit/ (e.g. rules/explicit/aws-autoscaling.yaml);
+# duplicated here for co-location during research.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: aws-asg-executes-as-slr
+    emits: ExecutesAs
+    description: "The ASG control plane runs as its service-linked role."
+    match_record: {resource_type: "AWS::AutoScaling::AutoScalingGroup", field: "ServiceLinkedRoleARN"}
+    emit:
+      source: "<AutoScalingGroup>"
+      target: "<AWSServiceRoleForAutoScaling>"
+      permissions: []
+      narrative: "Auto Scaling group {source.name} operates as service-linked role {target.name} (launches/terminates instances)."
+
+  - id: aws-asg-instance-executes-as-profile
+    emits: ExecutesAs
+    description: "Instances launched by the ASG run as the launch template/config instance-profile role."
+    match_record: {resource_type: "AWS::EC2::LaunchTemplate", field: "LaunchTemplateData.IamInstanceProfile"}
+    where:
+      - "resolve IamInstanceProfile (Name or Arn) to the contained IAM role"
+      - "the launch template/config is referenced by an AutoScalingGroup"
+    emit:
+      source: "<launched EC2 instance / AutoScalingGroup workload>"
+      target: "<instance-profile role>"
+      permissions: []
+      note: "Also emit ContainsResourceReference(AutoScalingGroup -> launch template) for recon."
+      narrative: "Instances launched by the Auto Scaling group run as instance-profile role {target.name} (from the launch template IamInstanceProfile)."
+
+  - id: aws-asg-uses-launch-template
+    emits: ContainsResourceReference
+    description: "ASG references a launch template / launch configuration (recon; feeds config-modification derivations)."
+    match_record: {resource_type: "AWS::AutoScaling::AutoScalingGroup", field: "LaunchTemplate|LaunchConfigurationName|MixedInstancesPolicy"}
+    emit:
+      source: "<AutoScalingGroup>"
+      target: "<launch template or launch configuration>"
+      permissions: []
+      note: "Capture LaunchTemplate.Version ($Latest/$Default vs pinned) — decisive for the PassRole-bypass rule."
+      narrative: "Auto Scaling group {source.name} launches from {target.name}."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: if an SCP or permission boundary denies iam:PassRole,
+# ec2:RunInstances, ec2:CreateLaunchTemplateVersion/ModifyLaunchTemplate, or
+# autoscaling:CreateAutoScalingGroup/UpdateAutoScalingGroup/StartInstanceRefresh
+# at the effective scope, emit the edge with state: BLOCKED and
+# denied_by=<SCP arn/statement>. Likewise, an enforced
+# autoscaling:LaunchTemplateVersionSpecified=true (requiring a numbered version)
+# BLOCKS the $Latest/$Default service-linked-role PassRole-bypass path.
+# ---------------------------------------------------------------------------

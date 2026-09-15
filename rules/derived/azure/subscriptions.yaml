@@ -1,0 +1,380 @@
+# Azure Subscriptions & Resource Groups — boundary-control rules (Phase 3 — administrative hierarchy & guardrails)
+# ---------------------------------------------------------------------------
+# Subscription and ResourceGroup are AdministrativeBoundary nodes. RBAC scope
+# inheritance (learn.microsoft.com/azure/role-based-access-control/scope-overview):
+# "Access that you grant at parent scopes is inherited by child scopes." A role
+# assignment at subscription scope covers every RG and resource; at RG scope,
+# every resource in the RG.
+#
+# THIS FILE emits boundary-scoped grants/controls AT THEIR ASSIGNED SCOPE only.
+# The generic transitive descent to descendants (admin-inherits-down-contains),
+# the CanGrantPermission@boundary -> Controls(boundary) roll-up
+# (control-boundary-via-iam-admin), and the guardrail BLOCKED->ACTIVE upgrade
+# (guardrail-removal-upgrades-blocked) ALL live in the provider-agnostic files
+# and are cited via derived_from — NEVER duplicated here.
+#
+# The Global-Administrator elevateAccess bridge to the tenant root scope '/' is NOT
+# emitted here: it is fully modelled by azure/mgmtgroups.yaml azure-mg-elevate-access-root
+# (emits CanGrantPermission AND Controls at the root MG, feeds hierarchy-chains
+# admin-inherits-down-contains to every subscription). Root-MG modelling overlaps the
+# Phase-2 org layer — CITE azure-mg-elevate-access-root, do not re-derive.
+#
+# ROLE-CAPABILITY PRECISION (the crux of this service):
+#   Owner (8e3af657-a8ff-443c-a75c-2fe8c4bcb635): actions ["*"] incl.
+#       Microsoft.Authorization/* -> CAN assign RBAC -> Controls + CanGrantPermission.
+#   Contributor (b24988ac-6180-42a0-ab88-20f7382dd24c): actions ["*"] MINUS
+#       Microsoft.Authorization/*/write and .../elevateAccess/action -> broad control
+#       but CANNOT assign RBAC -> CanAdminister ONLY, never CanGrantPermission/Controls.
+#   User Access Administrator (18d7d88d-d35e-4fb5-a5c3-7773c20a72d9): actions
+#       ["*/read","Microsoft.Authorization/*"] -> CAN assign RBAC (self-grant Owner)
+#       but has NO resource data actions -> CanGrantPermission ONLY.
+#   RBAC Administrator (f58310d9-a9f6-439a-9e8d-f62e7b41a168): roleAssignments/*
+#       constrained by an assignment condition -> CanGrantPermission CONDITIONAL.
+# Key off EFFECTIVE actions, not role display names (custom roles).
+#
+# GUARDRAILS: deny assignments (Microsoft.Authorization/denyAssignments,
+# ConditionalPolicy nodes) and deny-effect Azure Policy assignments suppress the
+# inherited control edges to BLOCKED. A principal who can delete the owning
+# Blueprint/Managed-App, remove the policy assignment, or move the resource out of
+# scope upgrades them — via hierarchy-chains.yaml, not here.
+#
+# Quote any scalar containing ':'.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 3-administrative-hierarchy
+applies_to: [azure]
+
+rules:
+
+  # === Owner at a boundary -> Controls that boundary ========================
+  - id: azure-sub-owner-controls
+    emits: Controls
+    description: "Owner at a subscription or resource group controls that boundary (full actions incl. RBAC assignment)."
+    match:
+      - [ ?principal, HasPermission, ?scope ]
+    where:
+      - "node_class(?scope) == AdministrativeBoundary and node_type(?scope) in [Subscription, ResourceGroup]"
+      - "?principal has EFFECTIVE actions '*' at ?scope INCLUDING Microsoft.Authorization/roleAssignments/write (Owner 8e3af657-a8ff-443c-a75c-2fe8c4bcb635, or a custom role whose actions resolve to a superset with roleAssignments/write)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?scope
+      permissions: ["*", "Microsoft.Authorization/roleAssignments/write"]
+      conditions: [deny_assignment, condition_expression, pim_activation]
+      state_logic: >-
+        ACTIVE when the Owner assignment is unconditional and active. CONDITIONAL
+        when the assignment carries an ABAC condition (condition/conditionVersion)
+        or is a PIM ELIGIBLE (not activated) assignment -> CONDITIONAL(condition_expression)
+        / CONDITIONAL(pim_activation). BLOCKED when a deny assignment or deny Azure
+        Policy at/above ?scope covers the relevant actions (deny wins over role
+        assignment) UNLESS excludePrincipals lists ?principal or doNotApplyToChildScopes
+        exempts ?scope -> then not blocked. A BLOCKED Controls is upgraded only by
+        hierarchy-chains guardrail-removal-upgrades-blocked.
+      confidence: "0.95"
+      derived_from: [ "<HasPermission edge_id (Owner / '*' incl roleAssignments/write @scope)>" ]
+      false_positive_note: >-
+        Owner ONLY — do NOT fire on Contributor (it lacks Microsoft.Authorization/*/write).
+        Resolve custom roles by their effective actions, not display name: a role must
+        actually include Microsoft.Authorization/roleAssignments/write (or actions '*'
+        without an Authorization NotActions) to qualify. Respect ABAC conditions and PIM
+        eligibility (CONDITIONAL, not ACTIVE). This Controls(?scope) feeds
+        hierarchy-chains admin-inherits-down-contains for the subtree; do NOT enumerate
+        descendants here.
+      narrative: >-
+        {principal.name} holds Owner at {scope.name} and therefore controls it,
+        including the ability to assign roles — control inherits to every resource
+        group and resource beneath it.
+
+  # === Contributor -> CanAdminister (broad control, NO RBAC grant) ==========
+  - id: azure-sub-contributor-administers
+    emits: CanAdminister
+    description: "Contributor at a subscription/RG can create, modify, and delete resources under it, but cannot assign RBAC."
+    match:
+      - [ ?principal, HasPermission, ?scope ]
+    where:
+      - "node_class(?scope) == AdministrativeBoundary and node_type(?scope) in [Subscription, ResourceGroup]"
+      - "?principal has EFFECTIVE actions '*' at ?scope MINUS Microsoft.Authorization/*/write and .../elevateAccess/action (Contributor b24988ac-6180-42a0-ab88-20f7382dd24c)"
+      - "?principal does NOT hold Microsoft.Authorization/roleAssignments/write at ?scope"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?scope
+      permissions: ["*"]
+      conditions: [deny_assignment, condition_expression]
+      state_logic: >-
+        ACTIVE when the Contributor assignment is unconditional and active;
+        CONDITIONAL(condition_expression) with an ABAC condition or
+        CONDITIONAL(pim_activation) for an eligible PIM assignment; BLOCKED where a
+        deny assignment / deny Azure Policy covers the write actions at/above ?scope
+        (honoring excludePrincipals / doNotApplyToChildScopes). Upgrade of a BLOCKED
+        edge is deferred to hierarchy-chains guardrail-removal-upgrades-blocked.
+      confidence: "0.9"
+      derived_from: [ "<HasPermission edge_id (Contributor / '*' minus Authorization/*/write @scope)>" ]
+      false_positive_note: >-
+        CRITICAL: Contributor CANNOT assign RBAC — never emit CanGrantPermission or
+        Controls for it. It yields management-plane control over resources (create/
+        modify/delete/deploy) that inherits down the tree, but it cannot self-escalate
+        to Owner via role assignment. Its only escalation is Phase-4 deploy-with-MI
+        (see vm.yaml/functions.yaml), NOT modelled here. Do not fire if the principal
+        also holds roleAssignments/write (that is Owner/UAA -> the grant rules).
+      narrative: >-
+        {principal.name} holds Contributor at {scope.name} and can create, modify, and
+        delete resources under it (but cannot assign RBAC, so cannot self-grant Owner).
+
+  # === Foothold: control of a subscription => entry into it =================
+  - id: azure-sub-enter-subscription
+    emits: CanEnterSubscription
+    description: "A principal that controls or administers a subscription has a control-plane foothold inside it."
+    match:
+      - [ ?principal, ?cap, ?sub ]
+    where:
+      - "?cap in [Controls, CanAdminister]"
+      - "node_class(?sub) == AdministrativeBoundary and node_type(?sub) == Subscription"
+    emit:
+      source_type: Identity
+      target_type: Subscription
+      source: ?principal
+      target: ?sub
+      permissions: []
+      conditions: []
+      state_logic: >-
+        Inherit the state of the contributing Controls/CanAdminister edge exactly
+        (ACTIVE/CONDITIONAL/BLOCKED). Never stronger than its contributor.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?principal Controls|CanAdminister ?sub" ]
+      false_positive_note: >-
+        Emit ONLY for the Subscription boundary (Subscription has a dedicated
+        CanEnter* edge; ResourceGroup does NOT — an RG surfaces only as Controls/
+        CanAdminister and propagates via hierarchy-chains descent). Do not upgrade a
+        CONDITIONAL/BLOCKED contributor. This mirrors can-control enter-account-via-assume
+        for the Azure subscription case referenced in can-control.yaml.
+      narrative: >-
+        {principal.name} controls subscription {sub.name} and therefore has a
+        control-plane foothold inside it.
+
+  # === User Access Administrator / RBAC Admin -> self-grant =================
+  - id: azure-sub-uaa-self-grant
+    emits: CanGrantPermission
+    description: "User Access Administrator (or RBAC Administrator) at a scope can assign itself Owner — role-assignment privesc."
+    match:
+      - [ ?principal, HasPermission, ?scope ]
+    where:
+      - "node_class(?scope) == AdministrativeBoundary and node_type(?scope) in [Subscription, ResourceGroup]"
+      - "?principal holds EFFECTIVE Microsoft.Authorization/roleAssignments/write at ?scope via User Access Administrator (18d7d88d-d35e-4fb5-a5c3-7773c20a72d9), RBAC Administrator (f58310d9-a9f6-439a-9e8d-f62e7b41a168), or a custom role — WITHOUT already being Owner"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?principal
+      permissions: ["Microsoft.Authorization/roleAssignments/write"]
+      conditions: [condition_expression, deny_assignment, pim_activation]
+      state_logic: >-
+        ACTIVE when roleAssignments/write is held unconditionally at ?scope.
+        CONDITIONAL(condition_expression) when the assignment (e.g. RBAC Administrator)
+        carries a condition restricting which roles may be assigned — if that condition
+        does NOT exclude Owner/privileged roles the self-grant still succeeds but stays
+        CONDITIONAL until the condition is satisfied. CONDITIONAL(pim_activation) for an
+        eligible PIM assignment. BLOCKED when a deny assignment / deny Azure Policy
+        forbids roleAssignments/write at the scope.
+      confidence: "0.9"
+      derived_from: [ "<HasPermission edge_id (roleAssignments/write @scope via UAA/RBAC-Admin)>", "azure/identity-escalation.yaml#azure-role-assignment-write (Phase-2 canonical CanGrantPermission emitter for roleAssignments/write)" ]
+      note: >-
+        The self-grant targets ?principal itself (source==target). scope_of this
+        CanGrantPermission is the AdministrativeBoundary ?scope, so it feeds
+        can-control control-boundary-via-iam-admin -> Controls(?scope) and then
+        hierarchy-chains admin-inherits-down-contains for the subtree. The base
+        CanGrantPermission from roleAssignments/write is ALREADY emitted by Phase-2
+        azure/identity-escalation.yaml azure-role-assignment-write (at mg | subscription |
+        resourceGroup | resource scope) — this rule adds only the Phase-3 boundary framing
+        and the explicit UAA/RBAC-Admin/Contributor capability contrast. DEDUPE on
+        (CanGrantPermission, principal, principal, scope): if the Phase-2 edge is present,
+        keep it and let this rule contribute only the boundary-scoped narrative/state.
+      false_positive_note: >-
+        UAA and RBAC Administrator can assign roles but have NO resource data actions
+        of their own — their power comes ENTIRELY from the self-grant. Contributor is
+        excluded (no roleAssignments/write). RBAC Administrator is condition-constrained
+        by design; keep CONDITIONAL unless the condition provably permits assigning a
+        privileged role. Honor deny assignments on roleAssignments/write.
+      narrative: >-
+        {principal.name} holds User Access Administrator / RBAC Administrator at
+        {scope.name} and can assign itself Owner, thereby gaining full control of
+        {scope.name} and everything beneath it.
+
+  # === Global Admin elevateAccess -> root-scope grant =======================
+  # REMOVED (Phase-3 dedup): the Global-Administrator elevateAccess bridge is fully
+  # modelled by azure/mgmtgroups.yaml rule `azure-mg-elevate-access-root`, which emits
+  # BOTH CanGrantPermission AND Controls at the root MG scope '/' from the same
+  # Microsoft.Authorization/elevateAccess/action + roleAssignments/write and feeds
+  # hierarchy-chains admin-inherits-down-contains to reach every subscription
+  # (CanEnterSubscription each) and CanEnterTenant. This subscriptions file must NOT
+  # re-derive the identical identity-plane -> resource-plane bridge at root '/'.
+  # CITE azure-mg-elevate-access-root in derived_from; dedupe on
+  # (CanGrantPermission/Controls, principal, root-MG/tenant). See subscriptions.md §14.
+
+  # === Guardrail modification: deny assignment / deny Azure Policy ==========
+  - id: azure-sub-modify-deny-assignment
+    emits: CanModifyPolicy
+    description: "A principal who can delete the owning Blueprint/Managed-App or remove a deny-effect policy assignment can lift the guardrail suppressing inherited control edges."
+    match:
+      - [ ?principal, HasPermission, ?guardrail ]
+    where:
+      - "node_class(?guardrail) == Policy and node_type(?guardrail) in [ConditionalPolicy, GenericPolicy]"
+      - "?guardrail is a Microsoft.Authorization/denyAssignments node OR a deny/denyAction Microsoft.Authorization/policyAssignments node at a Subscription/ResourceGroup scope"
+      - "?principal holds ONE OF: Microsoft.Authorization/policyAssignments/write or .../delete at the scope (removes a deny Azure Policy); Microsoft.Blueprint/blueprintAssignments/write|delete or Microsoft.Solutions/applications/write|delete (deletes the owning assignment that CREATED a system-managed deny assignment)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?guardrail
+      permissions: ["Microsoft.Authorization/policyAssignments/write", "Microsoft.Authorization/policyAssignments/delete", "Microsoft.Blueprint/blueprintAssignments/delete", "Microsoft.Solutions/applications/delete"]
+      conditions: [guardrail_owner_write]
+      state_logic: >-
+        ACTIVE for a DENY AZURE POLICY when the principal holds policyAssignments/write
+        or delete at the scope (Owner or Resource Policy Contributor). CONDITIONAL
+        (guardrail_owner_write) for a system-managed DENY ASSIGNMENT: those are not
+        directly user-writable, so removal requires deleting the owning Blueprint
+        assignment / Managed Application — mark CONDITIONAL because it is an indirect,
+        multi-step route. BLOCKED if the principal lacks any removal capability.
+      confidence: "0.75"
+      derived_from: [ "<HasPermission edge_id (policyAssignments/delete OR blueprintAssignments/delete OR applications/delete @scope)>" ]
+      note: >-
+        This CanModifyPolicy over the guardrail node is CONSUMED by hierarchy-chains
+        guardrail-removal-upgrades-blocked, which re-emits every edge the guardrail was
+        suppressing (blocked_by == ?guardrail) at its underlying state,
+        CONDITIONAL(guardrail_removed). We DO NOT perform that upgrade here; we only
+        supply the modify capability and document the gated edges (see the service .md
+        GUARDRAIL section).
+      false_positive_note: >-
+        Azure deny assignments are overwhelmingly SYSTEM-MANAGED (created by Blueprints
+        and Managed Applications) and NOT writable via a general denyAssignments/write —
+        do NOT assume a direct-edit path. Prefer the delete-owning-assignment or move-out
+        route (azure-sub-move-out-of-guardrail) and keep CONDITIONAL. Deny-EFFECT AZURE
+        POLICY, by contrast, IS user-removable with policyAssignments/write|delete —
+        that path can be ACTIVE. Fire only when the guardrail actually gates a BLOCKED
+        edge (verified downstream by blocked_by).
+      narrative: >-
+        {principal.name} can remove the guardrail {guardrail.name} (delete its owning
+        Blueprint/Managed-App assignment, or remove the deny Azure Policy), lifting the
+        block on the control edges it was suppressing.
+
+  - id: azure-sub-move-out-of-guardrail
+    emits: CanModifyConfiguration
+    description: "A principal who can move a resource/RG/subscription out of a guardrail's scope escapes the deny assignment without editing it."
+    match:
+      - [ ?principal, HasPermission, ?scope_binding ]
+    where:
+      - "?principal holds ONE OF: Microsoft.Resources/subscriptions/resourceGroups/moveResources/action (move a resource to an RG the guardrail does not cover); Microsoft.Resources/subscriptions/resourceGroups/write (create/repoint an RG outside scope); Microsoft.Management/managementGroups/subscriptions/write (move the subscription to an MG without the deny assignment)"
+      - "the target guardrail's scope does NOT cover the destination (else the move does not escape it)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?scope_binding
+      permissions: ["Microsoft.Resources/subscriptions/resourceGroups/moveResources/action", "Microsoft.Management/managementGroups/subscriptions/write"]
+      conditions: [destination_outside_guardrail]
+      state_logic: >-
+        CONDITIONAL(destination_outside_guardrail): only escapes the guardrail if a
+        destination scope exists that the deny assignment/policy does not also cover
+        (a tenant-root deny assignment cannot be escaped by moving within the tenant).
+        ACTIVE only when such a destination is confirmed. BLOCKED if the move action
+        itself is denied.
+      confidence: "0.7"
+      derived_from: [ "<HasPermission edge_id (moveResources/action OR managementGroups/subscriptions/write @scope)>" ]
+      note: >-
+        Provides the OPTIONAL move-out branch of hierarchy-chains
+        guardrail-removal-upgrades-blocked (its optional CanModifyConfiguration
+        clause). Either this or azure-sub-modify-deny-assignment suffices to trigger the
+        BLOCKED->ACTIVE upgrade there.
+      false_positive_note: >-
+        Moving a resource does not escape a guardrail whose scope also covers the
+        destination — a subscription-wide or root-MG deny assignment is not escaped by
+        an in-subscription move. Verify the destination is genuinely outside scope;
+        otherwise do not treat as a removal path. moveResources also requires write on
+        both source and destination and may be blocked by resource-type move constraints.
+      narrative: >-
+        {principal.name} can move the affected resource/subscription out of the
+        guardrail {scope_binding.name}'s scope, escaping the deny assignment without
+        editing it.
+
+  # === Cross-tenant subscription transfer / association (conservative) ======
+  - id: azure-sub-cross-tenant-transfer
+    emits: CrossTenantTrust
+    description: "A subscription associated/transferred to a different Entra tenant is a boundary-crossing trust (rare, privileged)."
+    match:
+      - [ ?home_tenant, Contains, ?sub ]
+    where:
+      - "node_class(?sub) == AdministrativeBoundary and node_type(?sub) == Subscription"
+      - "node_class(?home_tenant) == AdministrativeBoundary and node_type(?home_tenant) == Tenant  # ?sub's home tenant"
+      - "?sub is associated to (or transferable to) a tenant different from ?home_tenant — evidenced by a Microsoft.Subscription alias / billing transfer to another tenantId, or a B2B principal from tenantId != sub home tenant holding RBAC"
+    emit:
+      source: ?home_tenant
+      target: "<external tenant (the destination/associated tenantId)>"
+      permissions: ["Microsoft.Subscription/aliases/write", "billing subscription transfer"]
+      conditions: [transfer_consent]
+      state_logic: >-
+        CONDITIONAL(transfer_consent): a directory change / billing transfer requires
+        billing-owner rights on the source AND admin acceptance in the destination
+        tenant — it is not a routine, one-sided action. Emit as a low-confidence
+        boundary-crossing fact, not an active path. For the B2B-guest-with-RBAC case,
+        the trust is ACTIVE (the guest already holds the assignment) but the
+        subscription-entry itself derives via azure-sub-enter-subscription from the
+        guest's Controls/CanAdminister.
+      confidence: "0.6"
+      derived_from: [ "<Contains(tenant->sub) + alias/roleAssignment edge_id evidencing cross-tenant association>" ]
+      note: >-
+        CrossTenantTrust source set (schema) is [Tenant, ApplicationIdentity] and target
+        [Tenant, ExternalIdentity] — so the edge is sourced from the subscription's HOME
+        TENANT node (not the Subscription node) to the external/destination tenant, per
+        edges.yaml. The subscription is the SUBJECT of the transfer, but the trust
+        relationship is tenant-to-tenant.
+      false_positive_note: >-
+        Subscription transfer to another tenant is rare and heavily gated (billing +
+        target-tenant consent); do NOT present it as a routine attack step. Distinguish
+        it from the common B2B-guest-with-RBAC case, which is an ordinary cross-tenant
+        assignment whose subscription foothold is already captured by
+        azure-sub-enter-subscription. Keep low confidence and CONDITIONAL.
+      narrative: >-
+        The tenant that owns subscription {sub.name} trusts external tenant
+        {target.name}; a principal in that tenant may gain control-plane reach into
+        {sub.name} (transfer/association requires billing rights and destination-tenant
+        consent).
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A deny assignment (ConditionalPolicy) or deny-effect Azure Policy covering an
+#    action at/above a scope makes the inherited Controls/CanAdminister/
+#    CanGrantPermission BLOCKED for the denied actions, blocked_by=<guardrail node>,
+#    UNLESS excludePrincipals lists the principal or doNotApplyToChildScopes exempts
+#    the scope. Upgrade only via hierarchy-chains guardrail-removal-upgrades-blocked
+#    once azure-sub-modify-deny-assignment or azure-sub-move-out-of-guardrail proves
+#    the principal can remove/escape THAT guardrail.
+#  - An ABAC condition on a role assignment -> CONDITIONAL(condition_expression), not
+#    BLOCKED. A PIM eligible-not-active assignment -> CONDITIONAL(pim_activation).
+#
+# DEFERRED TO PROVIDER-AGNOSTIC FILES (cited, not duplicated):
+#  - admin-inherits-down-contains  (hierarchy-chains.yaml): descent of Controls/
+#    CanAdminister down Contains(Subscription->RG->resource) to every descendant.
+#  - control-boundary-via-iam-admin (can-control.yaml): CanGrantPermission@boundary
+#    -> Controls(boundary), consumed by azure-sub-uaa-self-grant.
+#  - azure-mg-elevate-access-root (azure/mgmtgroups.yaml): the Global-Administrator
+#    elevateAccess bridge at root '/' (CanGrantPermission + Controls at root MG). The
+#    former azure-sub-elevate-access rule was a duplicate of this and has been REMOVED;
+#    cite azure-mg-elevate-access-root instead.
+#  - guardrail-removal-upgrades-blocked (hierarchy-chains.yaml): the BLOCKED->ACTIVE
+#    upgrade fed by azure-sub-modify-deny-assignment / azure-sub-move-out-of-guardrail.
+#  - escalate-via-execute-as (can-control.yaml): CanEscalateTo roll-up.
+#
+# ANTI-DUPLICATION: Phase-2 azure/identity-escalation.yaml already emits
+# CanGrantPermission from roleAssignments/write (azure-role-assignment-write) and
+# CanModifyPolicy from roleDefinitions/write (azure-role-definition-write). Phase-3
+# azure/mgmtgroups.yaml azure-mg-elevate-access-root already emits the Global-Admin
+# elevateAccess root-scope grant (CanGrantPermission + Controls at root '/') — we do
+# NOT re-derive it (the former azure-sub-elevate-access was removed as a duplicate).
+# We add the boundary-control roll-ups (Owner->Controls, Contributor->CanAdminister-only),
+# the CanEnterSubscription foothold, the guardrail modify/move-out capabilities, and
+# the conservative cross-tenant transfer edge. Dedupe CanGrantPermission emits on
+# (type, principal, target, scope).
+# ---------------------------------------------------------------------------

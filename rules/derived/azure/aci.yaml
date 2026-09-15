@@ -1,0 +1,324 @@
+# Azure — Container Instances (Microsoft.ContainerInstance) execution rules (Phase 4)
+# ---------------------------------------------------------------------------
+# Core Azure ACI escalation primitive:
+#   an attacker who runs code in a container group inherits every managed
+#   identity (MI) bound to it, because that code can mint MI tokens
+#   (Linux: IMDS 169.254.169.254/metadata/identity/oauth2/token, header
+#   "Metadata: true"; Windows: IDENTITY_ENDPOINT + IDENTITY_HEADER env vars).
+#
+# Unlike a VM, ACI needs NO OS credential for either path:
+#   - Microsoft.ContainerInstance/containerGroups/containers/exec/action
+#       -> interactive shell in a running container (control-plane action).
+#   - Microsoft.ContainerInstance/containerGroups/write
+#       -> deploy/recreate a group with an attacker image + entrypoint + MI.
+#
+# All operation strings verified against the Azure RBAC permissions reference
+# (Microsoft.ContainerInstance) and the ACI managed-identity / IMDS docs. Every
+# rule records the effective operation the evaluator must confirm at the group
+# (or MI) scope. Deny assignments override -> BLOCKED. Escalation edges require
+# the MI to out-privilege the caller.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 4-compute-serverless
+applies_to: [azure]
+
+rules:
+
+  # === Administrative control over the container group ======================
+  - id: azure-aci-contributor
+    emits: CanAdminister
+    match_effective_permission: {action: "Microsoft.ContainerInstance/containerGroups/write", scope_type: "resource|resourceGroup|subscription"}
+    where: ["principal effectively holds Azure Container Instances Contributor (Microsoft.ContainerInstance/containerGroups/*) / Contributor / Owner at the scope"]
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<containerGroup in scope>"
+      permissions: ["Microsoft.ContainerInstance/containerGroups/write"]
+      false_positive_note: "containerGroups/* grants full control of the group (write/exec/start/logs) but NOT Microsoft.Authorization/*/write, and attaching a user-assigned MI still needs the separate userAssignedIdentities/assign/action. Still sufficient for code execution via exec or redeploy."
+      narrative: "{principal.name} has full control of container group {target.name} (Microsoft.ContainerInstance/containerGroups/*)."
+
+  # === Command / code execution in a running container ======================
+  - id: azure-aci-exec
+    emits: CanExecuteCommand
+    match_effective_permission: {action: "Microsoft.ContainerInstance/containerGroups/containers/exec/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<container within the container group>"
+      permissions: ["Microsoft.ContainerInstance/containerGroups/containers/exec/action"]
+      conditions: [service_state]
+      state_logic: "ACTIVE if the container group is running; else CONDITIONAL(service_state) and pair with azure-aci-start"
+      false_positive_note: "exec only attaches to a running container; on a stopped/terminated group emit CONDITIONAL(service_state). No OS credential is required — this is a control-plane action. Target is the Container node (generic_type Container, an allowed CanExecuteCommand target), NOT the ContainerService group; the group→MI ExecutesAs fact is carried on the group and joined via Contains in azure-aci-execute-as-via-exec."
+      narrative: "{principal.name} can open an interactive shell in a container of {target.name} (containers/exec/action) with no OS credential."
+
+  - id: azure-aci-write-redeploy
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.ContainerInstance/containerGroups/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<containerGroup>"
+      permissions: ["Microsoft.ContainerInstance/containerGroups/write"]
+      escalation: "Recreate the group with an attacker-chosen image, command, or environmentVariables — arbitrary code runs as the group's MI."
+      false_positive_note: "Container groups are largely immutable; write recreates the group. Effective code execution regardless — the new container runs whatever the attacker specifies."
+      narrative: "{principal.name} can (re)deploy container group {target.name} with an arbitrary image/entrypoint (containerGroups/write), running attacker code."
+
+  - id: azure-aci-write-config
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "Microsoft.ContainerInstance/containerGroups/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<containerGroup>"
+      permissions: ["Microsoft.ContainerInstance/containerGroups/write"]
+      note: "Can change the identity block (attach/enable MI), image, startup command, and env vars — altering what runs and as which identity."
+      narrative: "{principal.name} can rewrite the configuration of {target.name} (containerGroups/write) including the image and the identity binding."
+
+  - id: azure-aci-deploy
+    emits: CanDeploy
+    match_effective_permission: {action: "Microsoft.ContainerInstance/containerGroups/write", scope_type: "resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<containerGroup (new) in scope>"
+      permissions: ["Microsoft.ContainerInstance/containerGroups/write"]
+      note: "Create a brand-new container group running an attacker image; combine with assign/action to attach a privileged MI (azure-aci-attach-user-mi)."
+      narrative: "{principal.name} can deploy a new container group in {scope} (containerGroups/write)."
+
+  - id: azure-aci-start
+    emits: CanStart
+    match_effective_permission: {action: "Microsoft.ContainerInstance/containerGroups/start/action", scope_type: "resource|resourceGroup|subscription"}
+    optional_permission: "Microsoft.ContainerInstance/containerGroups/restart/action"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<containerGroup>"
+      permissions: ["Microsoft.ContainerInstance/containerGroups/start/action"]
+      permissions_note: "When the capability is realized via restart instead of start, record Microsoft.ContainerInstance/containerGroups/restart/action in permissions[] (in place of or in addition to start/action) so the edge evidence reflects the action actually held."
+      note: "Realizes CONDITIONAL(service_state) execution edges on stopped groups. restart/action is equivalent for re-running the entrypoint; whichever action the principal actually holds MUST be the one recorded in permissions[]."
+      narrative: "{principal.name} can start stopped container group {target.name} (start/action or restart/action) to enable execution."
+
+  # === Identity attachment (Azure PassRole analog) ==========================
+  - id: azure-aci-attach-user-mi
+    emits: CanAttachIdentity
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?userMI"
+      - "?principal has EFFECTIVE Microsoft.ContainerInstance/containerGroups/write on the target group (existing or new)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<containerGroup (existing or new)>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.ContainerInstance/containerGroups/write"]
+      conditions: [role_compatibility]
+      passable_identity: "<?userMI - the user-assigned MI this principal can attach to the group>"
+      evidence:
+        passable_identity: "?userMI"
+        note: "Records which MI the CanAttachIdentity edge can attach so downstream derived rules (azure-aci-create-workload-as) can recover ?userMI and evaluate its privilege_level."
+      false_positive_note: "BOTH permissions are required: assign/action on the MI AND containerGroups/write on the group. Neither alone attaches the MI. Honor the assign/action resource scope. The CanAttachIdentity edge targets the Compute group (schema target = Compute); the specific attachable MI is carried in evidence.passable_identity so the create-workload-as escalation guard can bind it."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to container group {target.name} (assign/action + containerGroups/write)."
+
+  # === IMDS / env-var credential exposure / token retrieval =================
+  - id: azure-aci-imds-token
+    emits: CanRetrieveToken
+    description: "Any code in a container group can mint a bearer token for each bound managed identity (Linux IMDS, Windows IDENTITY_ENDPOINT)."
+    match:
+      - [ ?group, ExecutesAs, ?mi ]
+    emit:
+      source: "<containerGroup>"
+      target: "<managed identity bound to the group>"
+      permissions: []
+      note: "Linux: GET http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=<aud> with header 'Metadata: true' (add client_id= for user-assigned). Windows: fetch from IDENTITY_ENDPOINT with header X-IDENTITY-HEADER=IDENTITY_HEADER (env vars injected by Azure). The paired credential-leak fact ExposesCredential(group -> mi) is produced by azure-aci-imds-exposescred."
+      false_positive_note: "Only fires when the group actually has a managed identity (identity.type != None). No MI => no token; do NOT emit. Windows containers have no 169.254.169.254 endpoint — capability is identical but the mechanism is the injected env vars."
+      narrative: "Any code running in {group.name} can request a bearer token for {mi.name} (Linux IMDS / Windows IDENTITY_ENDPOINT) with no OS credential."
+
+  - id: azure-aci-imds-exposescred
+    emits: ExposesCredential
+    description: "A container group with a bound managed identity leaks that MI's credential to any in-container code via the local IMDS/IDENTITY_ENDPOINT — the credential-leak fact paired with azure-aci-imds-token."
+    match:
+      - [ ?group, ExecutesAs, ?mi ]
+    emit:
+      source: "<containerGroup>"
+      target: "<managed identity bound to the group>"
+      permissions: []
+      note: "Companion to azure-aci-imds-token: same match [?group, ExecutesAs, ?mi]. CanRetrieveToken models the token-mint capability; ExposesCredential models the leak fact (source Compute -> target Identity, both schema-valid)."
+      false_positive_note: "Only fires when the group actually has a managed identity (identity.type != None). No MI => no exposure; do NOT emit."
+      narrative: "Container group {group.name} exposes the credential of its managed identity {mi.name} to any code running inside it (IMDS / IDENTITY_ENDPOINT)."
+
+  - id: azure-aci-logs-secret
+    emits: ExposesCredential
+    match_effective_permission: {action: "Microsoft.ContainerInstance/containerGroups/containers/logs/read", scope_type: "resource|resourceGroup|subscription"}
+    optional_permission: "Microsoft.ContainerInstance/containerGroups/containers/attach/action"
+    emit:
+      target_type: Credential
+      source: "<containerGroup>"
+      target: "<Credential>"
+      permissions: ["Microsoft.ContainerInstance/containerGroups/containers/logs/read"]
+      note: "Secrets printed to stdout/stderr by the workload are readable via logs/read or the attach output stream."
+      false_positive_note: "Only a real exposure if the workload actually emits credentials to stdout; mark POTENTIAL when unverified. Not an execution primitive on its own."
+      narrative: "{principal.name} can read container logs of {group.name} (logs/read), which may leak secrets printed by the workload."
+
+  - id: azure-aci-env-secret
+    emits: ExposesCredential
+    match_effective_permission: {action: "Microsoft.ContainerInstance/containerGroups/read", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      target_type: Credential
+      source: "<containerGroup>"
+      target: "<Credential>"
+      permissions: ["Microsoft.ContainerInstance/containerGroups/read"]
+      note: "Plain environmentVariables[].value and imageRegistryCredentials are returned by GET; often embed registry passwords / connection strings."
+      false_positive_note: "environmentVariables marked secureValue are NOT returned by read — do not claim exposure for those. Only plaintext env values and imageRegistryCredentials are readable."
+      narrative: "{principal.name} can read the definition of {group.name} (containerGroups/read), exposing plaintext env vars and image-registry credentials."
+
+  # === Derived: attacker code -> execute as the group's managed identity =====
+  - id: azure-aci-execute-as-via-exec
+    emits: CanExecuteAs
+    description: "exec in a container + its group runs as an MI => execute as that MI (via IMDS/env token)."
+    match:
+      - [ ?principal, CanExecuteCommand, ?container ]
+      - [ ?group, ContainsResourceReference, ?container ]
+      - [ ?group, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?container) == Container"
+      - "node_type(?group) == ContainerService"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    optional:
+      - [ ?principal, CanStart, ?group ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      state_logic: "if ?group running then ACTIVE; elif matched(optional[0]) then ACTIVE (attacker can start it); else CONDITIONAL(service_state)"
+      conditions: [service_state]
+      conditions_from: [ ?group, ?mi ]
+      permissions: ["Microsoft.ContainerInstance/containerGroups/containers/exec/action"]
+      derived_from: [ "<CanExecuteCommand edge_id>", "<ContainsResourceReference edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Emit only when the group has a managed identity and that MI out-privileges the caller. On a stopped group without CanStart -> CONDITIONAL(service_state). CanExecuteCommand targets the Container node (schema-valid target); the containing group carries the ExecutesAs(group -> mi) fact, joined here via the structural ContainsResourceReference(group -> container) materialized by azure-aci-group-contains-container."
+      narrative: "{principal.name} can exec into a container of {group.name} and mint the token of its identity {mi.name} (IMDS / IDENTITY_ENDPOINT), executing as {mi.name}."
+
+  - id: azure-aci-execute-as-via-redeploy
+    emits: CanExecuteAs
+    description: "write (recreate) a container group that already runs as an MI => execute as that MI."
+    match:
+      - [ ?principal, CanModifyCode, ?group ]
+      - [ ?group, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?group) == ContainerService"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      permissions: ["Microsoft.ContainerInstance/containerGroups/write"]
+      derived_from: [ "<CanModifyCode edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Recreating the group preserves its identity binding by default; emit only when the group has an MI that out-privileges the caller."
+      narrative: "{principal.name} can recreate {group.name} with an attacker image (containerGroups/write), running code as its identity {mi.name}."
+
+  - id: azure-aci-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Deploy a NEW container group with a privileged user-assigned MI attached, run it, and execute as the MI."
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+      - [ ?principal, CanAttachIdentity, ?group ]
+      - [ ?principal, CanDeploy, ?group ]
+    where:
+      - "?userMI is the identity carried on the CanAttachIdentity edge (evidence.passable_identity == ?userMI), i.e. the MI attachable to ?group"
+      - "?userMI.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.ContainerInstance/containerGroups/write"]
+      conditions: [role_compatibility]
+      derived_from: [ "<CanPassIdentity edge_id>", "<CanAttachIdentity edge_id>", "<CanDeploy edge_id>" ]
+      false_positive_note: "Requires the attach chain (assign/action + containerGroups/write). ?userMI is bound via CanPassIdentity and cross-checked against the CanAttachIdentity edge's evidence.passable_identity for ?group so the privilege_level guard has a real binding. The new group runs the attacker image immediately (restartPolicy Always/OnFailure), so no separate exec is needed. Escalation only if the attached MI out-privileges the caller."
+      narrative: "{principal.name} can deploy a new container group with user-assigned MI {userMI.name} attached (assign/action + containerGroups/write), executing attacker code as {userMI.name}."
+
+  # === Network exposure =====================================================
+  - id: azure-aci-exposed-internet
+    emits: ExposedToInternet
+    description: "Container group with a public IP and exposed ports."
+    where:
+      - "containerGroup ipAddress.type == Public"
+      - "ipAddress.ports lists a reachable port (e.g. app/80/443)"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<containerGroup>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      false_positive_note: "Do not emit for VNet-injected groups (ipAddress.type Private / subnetIds set) or when no ports are exposed. A public IP with no listening/exposed port is not exposure."
+      narrative: "{group.name} is reachable from the internet on an exposed port (public IP)."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: any action above covered by an applicable DENY
+# ASSIGNMENT (Azure Blueprint / Managed Application) or an explicit deny in a
+# custom role is emitted with state: BLOCKED and denied_by=<deny assignment>,
+# so the UI can explain why an otherwise-present execution path does not work.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# COVERAGE NOTE — containerGroupProfiles / nGroups (container scale sets):
+# The provider .md (§1, §19) lists Microsoft.ContainerInstance/containerGroupProfiles
+# (a config template) and .../nGroups (container scale set) as ContainerService-family
+# resources, and the RBAC reference includes containerGroups/refreshDelegatedResourceIdentity/action.
+# These rules currently model only containerGroups. If nGroups supports its own
+# write/exec plus identity binding it is an equivalent "code-exec-as-MI" surface and
+# would need analogous CanDeploy / CanModifyCode / CanAttachIdentity / CanExecuteAs
+# rules (mirroring the containerGroups rules above, swapping the operation prefix to
+# .../nGroups/...). containerGroupProfiles is a template consumed by nGroups rather
+# than a directly-runnable workload. This is called out as a plausible missed
+# escalation surface pending confirmation of the nGroups write/exec + assign/action
+# semantics; it is intentionally deferred here rather than modeled speculatively.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization (raw config -> explicit edges). These belong in
+# /rules/explicit/azure/ but are noted here for completeness; they emit the
+# ExecutesAs / AttachedTo facts the derived rules above consume.
+# ---------------------------------------------------------------------------
+explicit_rules:
+  - id: azure-aci-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Microsoft.ContainerInstance/containerGroups", field: "identity"}
+    where: ["identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned']"]
+    emit:
+      source: "<containerGroup>"
+      target: "<each MI: system-assigned SP (principalId) and every userAssignedIdentities key>"
+      note: "System-assigned principalId is the group's Entra SP; user-assigned keys are Microsoft.ManagedIdentity/userAssignedIdentities resource ids."
+      narrative: "{group.name} runs as managed identity {mi.name}."
+
+  - id: azure-aci-group-contains-container
+    emits: ContainsResourceReference
+    source_config: {resource_type: "Microsoft.ContainerInstance/containerGroups", field: "properties.containers[]"}
+    emit:
+      source: "<containerGroup (ContainerService)>"
+      target: "<each Container within the group>"
+      note: "Structural link tying each Container node (the CanExecuteCommand target) to its ContainerService group (which carries the ExecutesAs -> MI fact). Consumed by azure-aci-execute-as-via-exec to join the exec capability on the container to the group's identity. ContainsResourceReference source=Compute, target=* is schema-valid for group -> container."
+      narrative: "Container group {group.name} contains container {container.name}."
+
+  - id: azure-aci-mi-attached
+    emits: AttachedTo
+    source_config: {resource_type: "Microsoft.ContainerInstance/containerGroups", field: "identity.userAssignedIdentities"}
+    emit:
+      source: "<user-assigned managed identity>"
+      target: "<containerGroup>"
+      narrative: "User-assigned MI {mi.name} is attached to container group {group.name}."
+
+  - id: azure-aci-env-contains-credential
+    emits: ContainsCredential
+    source_config: {resource_type: "Microsoft.ContainerInstance/containerGroups", field: "properties.containers[].properties.environmentVariables / imageRegistryCredentials"}
+    where: ["a plaintext environmentVariables[].value or imageRegistryCredentials.password is present"]
+    emit:
+      source: "<containerGroup>"
+      target: "<Credential>"
+      note: "Feeds ExposesCredential (azure-aci-env-secret). secureValue env vars are excluded (not returned by read)."
+      narrative: "Container group {group.name} embeds a plaintext credential in its env vars / registry credentials."

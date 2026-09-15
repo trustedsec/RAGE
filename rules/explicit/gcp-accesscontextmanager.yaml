@@ -1,0 +1,260 @@
+# Normalizing GCP Access Context Manager / VPC Service Controls into explicit edges.
+# ===========================================================================
+# The collector ingests ACM resources via the Access Context Manager API
+# (accesscontextmanager.servicePerimeters.list / .get, accesscontextmanager.accessLevels.list)
+# and the IAM Policy Analyzer. These rules translate one observed configuration
+# fact into one explicit edge.
+#
+# NODE MODELING:
+#   * AccessPolicy  -> ConditionalPolicy node (org-scoped container)
+#   * ServicePerimeter -> ConditionalPolicy node (the guardrail itself)
+#     annotate: perimeterType, restrictedServices[], status.resources[]
+#     enforced = has status (not dry-run-only)
+#   * AccessLevel  -> ConditionalPolicy node (condition on ingress path)
+#     annotate: basicLevel.conditions (IP ranges, device policy, identity requirement)
+#
+# BLOCKED-edge semantics:
+#   A ServicePerimeter SUPPRESSES cross-perimeter API calls from projects outside it
+#   to the restricted GCP services inside. The explicit normalizer sets state=BLOCKED
+#   and blocked_by=<perimeter_node_id> on CanReadData / CanExfiltrate edges when:
+#     (a) source resource/project is outside the perimeter, AND
+#     (b) target resource/project is inside the perimeter (status.resources[]), AND
+#     (c) the GCP service being called is in status.restrictedServices[], AND
+#     (d) no ingress rule whitelists this specific (source_project, source_identity,
+#         operation) combination.
+#
+# Permission names verbatim from
+#   https://cloud.google.com/access-context-manager/docs/access-control
+# ===========================================================================
+
+rules:
+
+  # --- AccessPolicy node + IAM -----------------------------------------------
+  - id: gcp-acm-access-policy-node
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.identity.accesscontextmanager.v1.AccessPolicy"
+      field: "name"
+    emit:
+      source_type: Organization
+      target_type: ConditionalPolicy
+      source: "<organization node (parent of the access policy)>"
+      target: "<AccessPolicy ConditionalPolicy node>"
+      api_source: "accesscontextmanager.accessPolicies.list / .get"
+      evidence_field: "name, parent (organizations/<org_id>), title, scopes[]"
+      annotate:
+        provider_type: "google.identity.accesscontextmanager.v1.AccessPolicy"
+        org: "<organizations/<org_id>>"
+      state_logic: "ACTIVE"
+      conditions: []
+      confidence: 1.0
+      derived_from: ["accesscontextmanager.accessPolicies.get — name, parent"]
+      false_positive_note: "Only one AccessPolicy exists per GCP organization; the parent field on the resource names the org. This is a structural inventory fact."
+      narrative: "Organization {org.name} owns the VPC-SC access policy {accesspolicy.name}."
+
+  # --- ServicePerimeter node -> HasPolicy + BLOCKED suppressor ----------------
+  - id: gcp-acm-perimeter-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.identity.accesscontextmanager.v1.ServicePerimeter"
+      field: "status"
+    where:
+      - "perimeter is ENFORCED: status field is present (not only spec) AND status.resources[] is non-empty"
+      - "perimeterType == 'PERIMETER_TYPE_REGULAR'  # bridge perimeters are permitted paths, not guardrails"
+    emit:
+      source_type: ConditionalPolicy
+      target_type: ConditionalPolicy
+      source: "<AccessPolicy ConditionalPolicy node>"
+      target: "<ServicePerimeter ConditionalPolicy node>"
+      api_source: "accesscontextmanager.servicePerimeters.list / .get"
+      evidence_field: "name, status.resources[], status.restrictedServices[], status.ingressPolicies[], status.egressPolicies[], perimeterType"
+      annotate:
+        provider_type: "google.identity.accesscontextmanager.v1.ServicePerimeter"
+        perimeter_type: "PERIMETER_TYPE_REGULAR"
+        enforced: true
+        restricted_services: "<status.restrictedServices[]>"
+        protected_projects: "<status.resources[] — list of projects/<number>>"
+      state_logic: "ACTIVE when perimeter is enforced (status non-empty, perimeterType REGULAR); skip when DRY_RUN-only or PERIMETER_TYPE_BRIDGE."
+      conditions: []
+      confidence: 0.95
+      derived_from: ["accesscontextmanager.servicePerimeters.get — status, perimeterType"]
+      false_positive_note: "Do not emit for dry-run-only perimeters (status absent or empty resources) or PERIMETER_TYPE_BRIDGE."
+      narrative: "Access policy {accesspolicy.name} contains enforced ServicePerimeter {perimeter.name}, protecting projects {protected_projects} for services {restricted_services}."
+
+  - id: gcp-acm-perimeter-blocks-project
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.identity.accesscontextmanager.v1.ServicePerimeter"
+      field: "status.resources"
+    where:
+      - "perimeter is ENFORCED (status.resources[] non-empty)"
+      - "perimeterType == 'PERIMETER_TYPE_REGULAR'"
+    emit:
+      source_type: Project
+      target_type: ConditionalPolicy
+      source: "<Project node for each projects/<number> in status.resources[]>"
+      target: "<ServicePerimeter ConditionalPolicy node>"
+      api_source: "accesscontextmanager.servicePerimeters.get — status.resources[]"
+      evidence_field: "status.resources[N]"
+      annotate:
+        inside_perimeter: true
+      state_logic: "ACTIVE when the perimeter is enforced (status.resources[] non-empty, perimeterType REGULAR)."
+      conditions: []
+      confidence: 0.95
+      derived_from: ["accesscontextmanager.servicePerimeters.get — status.resources[]"]
+      false_positive_note: "Do not emit for dry-run-only or bridge perimeters. This edge carries guardrail semantics — the ServicePerimeter blocks cross-perimeter data access; downstream CanReadData/CanExfiltrate edges crossing this perimeter should be marked BLOCKED."
+      narrative: "Project {project.name} is inside ServicePerimeter {perimeter.name} — cross-perimeter API calls to restricted services from outside are blocked."
+
+  # --- AccessLevel node -> HasPolicy (condition on ingress rules) --------------
+  - id: gcp-acm-access-level-node
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.identity.accesscontextmanager.v1.AccessLevel"
+      field: "name"
+    emit:
+      source_type: ConditionalPolicy
+      target_type: ConditionalPolicy
+      source: "<AccessPolicy ConditionalPolicy node>"
+      target: "<AccessLevel ConditionalPolicy node>"
+      api_source: "accesscontextmanager.accessLevels.list / .get"
+      evidence_field: "name, title, basic.conditions[] (ipSubnetworks, devicePolicy, members), custom.expr"
+      annotate:
+        provider_type: "google.identity.accesscontextmanager.v1.AccessLevel"
+        has_device_policy: "<true/false from basic.conditions[].devicePolicy>"
+        has_ip_restriction: "<true/false from basic.conditions[].ipSubnetworks>"
+        has_identity_restriction: "<true/false from basic.conditions[].members>"
+      state_logic: "ACTIVE (unconditional structural fact — access level exists within the access policy)."
+      conditions: []
+      confidence: 1.0
+      derived_from: ["accesscontextmanager.accessLevels.get — name, basic.conditions"]
+      false_positive_note: "Access levels without any ingressPolicies[] reference in an enforced perimeter have no security effect on path traversal; emit the structural node regardless but do not model them as guardrail conditions."
+      narrative: "Access policy {accesspolicy.name} defines Access Level {level.name} (device/IP/identity condition for ingress)."
+
+  - id: gcp-acm-ingress-rule-references-access-level
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.identity.accesscontextmanager.v1.ServicePerimeter"
+      field: "status.ingressPolicies"
+    where:
+      - "perimeter is ENFORCED: status.resources[] non-empty AND perimeterType REGULAR"
+      - "ingressPolicies[].ingressFrom.sources[].accessLevel is non-empty"
+    emit:
+      source_type: ConditionalPolicy
+      target_type: ConditionalPolicy
+      source: "<ServicePerimeter ConditionalPolicy node>"
+      target: "<AccessLevel ConditionalPolicy node referenced by the ingress rule>"
+      api_source: "accesscontextmanager.servicePerimeters.get — status.ingressPolicies[].ingressFrom.sources[].accessLevel"
+      evidence_field: "status.ingressPolicies[N].ingressFrom.sources[M].accessLevel"
+      state_logic: "ACTIVE when referenced perimeter is enforced (status non-empty, perimeterType REGULAR)."
+      conditions: []
+      confidence: 0.9
+      derived_from: ["accesscontextmanager.servicePerimeters.get — status.ingressPolicies[].ingressFrom.sources[].accessLevel"]
+      false_positive_note: "Do not emit for dry-run-only perimeters (status absent or empty) or PERIMETER_TYPE_BRIDGE. The access level is only a guardrail condition when the perimeter is ENFORCED."
+      narrative: "ServicePerimeter {perimeter.name} ingress rule requires Access Level {level.name} — this access level is a condition on the perimeter's ingress path."
+
+  # --- CanModifyPolicy: servicePerimeters.update / delete ---------------------
+  - id: gcp-acm-can-modify-perimeter
+    emits: CanModifyPolicy
+    applies_to: [gcp]
+    match_effective_permission:
+      any_of:
+        - {action: "accesscontextmanager.servicePerimeters.update", resource_type: "google.identity.accesscontextmanager.v1.AccessPolicy"}
+        - {action: "accesscontextmanager.servicePerimeters.delete", resource_type: "google.identity.accesscontextmanager.v1.AccessPolicy"}
+        - {action: "accesscontextmanager.servicePerimeters.create", resource_type: "google.identity.accesscontextmanager.v1.AccessPolicy"}
+    where:
+      - "the target ServicePerimeter is ENFORCED (status non-empty, perimeterType REGULAR)"
+    emit:
+      source_type: Identity
+      target_type: ConditionalPolicy
+      source: "<principal>"
+      target: "<ServicePerimeter ConditionalPolicy node>"
+      api_source: "IAM Policy Analyzer — effective accesscontextmanager.servicePerimeters.update / .delete / .create at the access policy"
+      permissions:
+        - "accesscontextmanager.servicePerimeters.update"
+        - "accesscontextmanager.servicePerimeters.delete"
+        - "accesscontextmanager.servicePerimeters.create"
+      state_logic: "ACTIVE when effective permission is unconditionally held; CONDITIONAL(iam_permission) when gated by an IAM condition expression; BLOCKED when an IAM deny policy denies accesscontextmanager.servicePerimeters.update / .delete — no guardrail-removal fires until the deny is lifted."
+      conditions: [iam_permission, condition_expression]
+      confidence: 0.9
+      derived_from: ["IAM Policy Analyzer — effective accesscontextmanager.servicePerimeters.update or .delete or .create at access policy"]
+      false_positive_note: "Verify the perimeter is ENFORCED and REGULAR before emitting; do not emit for dry-run or bridge perimeters. An IAM deny policy that denies .update / .delete / .create keeps this edge BLOCKED. The .create case is more nuanced: a created permissive perimeter may not immediately block anything, but a bridge perimeter that routes egress to an attacker project is a direct exfil enablement."
+      narrative: "{principal.name} can update, delete, or create a ServicePerimeter (servicePerimeters.update / .delete / .create) — guardrail-removal capability over VPC-SC. Cite hierarchy-chains.yaml guardrail-removal-upgrades-blocked for the BLOCKED -> CONDITIONAL upgrade of CanReadData / CanExfiltrate edges."
+
+  # --- CanModifyPolicy: accessLevels.update / delete / create -------------------------
+  - id: gcp-acm-can-modify-access-level
+    emits: CanModifyPolicy
+    applies_to: [gcp]
+    match_effective_permission:
+      any_of:
+        - {action: "accesscontextmanager.accessLevels.update", resource_type: "google.identity.accesscontextmanager.v1.AccessPolicy"}
+        - {action: "accesscontextmanager.accessLevels.delete", resource_type: "google.identity.accesscontextmanager.v1.AccessPolicy"}
+        - {action: "accesscontextmanager.accessLevels.create", resource_type: "google.identity.accesscontextmanager.v1.AccessPolicy"}
+    where:
+      - "the access level is referenced by >=1 ingress rule in an enforced PERIMETER_TYPE_REGULAR perimeter (for update/delete); or the principal can modify ingress rules to reference the new level (for create)"
+    emit:
+      source_type: Identity
+      target_type: ConditionalPolicy
+      source: "<principal>"
+      target: "<AccessLevel ConditionalPolicy node>"
+      api_source: "IAM Policy Analyzer — effective accesscontextmanager.accessLevels.update / .delete / .create at the access policy"
+      permissions:
+        - "accesscontextmanager.accessLevels.update"
+        - "accesscontextmanager.accessLevels.delete"
+        - "accesscontextmanager.accessLevels.create"
+      state_logic: "ACTIVE for accessLevels.update (broadening conditions clearly weakens the access level); CONDITIONAL(collector_verification) for accessLevels.delete — deleting a referenced access level may break the ingress rule rather than open it; state is CONDITIONAL until the collector confirms the perimeter's behavior. Create: CONDITIONAL(servicePerimeters.update) — creating a permissive access level only opens the perimeter if an ingress rule can be modified to reference it."
+      conditions: [iam_permission]
+      confidence: 0.75
+      derived_from: ["IAM Policy Analyzer — effective accesscontextmanager.accessLevels.update / .delete / .create at access policy"]
+      false_positive_note: "Deletion nuance (from providers/gcp/accesscontextmanager.md §22.7): deleting a referenced access level may break the ingress rule (rule is unsatisfied) rather than open it. Prefer modeling .update (broadening) as the cleaner guardrail-weakening path. For .delete, emit CONDITIONAL pending collector verification. For .create, emit only if the principal can also modify ingress rules (servicePerimeters.update) to reference the new level."
+      narrative: "{principal.name} can update, delete, or create Access Levels (accessLevels.update / .delete / .create), indirectly weakening or removing guardrail conditions on perimeter ingress rules. Weakening (.update) clearly opens the ingress path; deletion behavior is implementation-specific."
+
+  # --- CanGrantPermission: policies.setIamPolicy ----------------------------
+  - id: gcp-acm-can-set-iam-policy
+    emits: CanGrantPermission
+    applies_to: [gcp]
+    match_effective_permission:
+      any_of:
+        - {action: "accesscontextmanager.policies.setIamPolicy", resource_type: "google.identity.accesscontextmanager.v1.AccessPolicy"}
+        - {action: "accesscontextmanager.accessPolicies.setIamPolicy", resource_type: "google.identity.accesscontextmanager.v1.AccessPolicy"}
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<any Identity at access policy scope — self-grant target>"
+      api_source: "IAM Policy Analyzer — effective accesscontextmanager.policies.setIamPolicy or accessPolicies.setIamPolicy at the access policy"
+      permissions:
+        - "accesscontextmanager.policies.setIamPolicy"
+        - "accesscontextmanager.accessPolicies.setIamPolicy"
+      state_logic: "ACTIVE when effective setIamPolicy is unconditionally held; CONDITIONAL(iam_permission) when gated by an IAM condition."
+      conditions: [iam_permission]
+      confidence: 0.95
+      derived_from: ["IAM Policy Analyzer — effective accesscontextmanager.policies.setIamPolicy or accessPolicies.setIamPolicy at the access policy"]
+      false_positive_note: "The downstream CanGrantPermission -> CanEscalateTo roll-up is handled by can-control.yaml and gcp/identity-escalation.yaml; do not re-derive the escalation chain here. Verify the permission is on the policies resource (access policy), not a per-perimeter resource. Both accesscontextmanager.policies.setIamPolicy (v1 standard form) and accesscontextmanager.accessPolicies.setIamPolicy (alternative v1 form) are functionally identical."
+      narrative: "{principal.name} can set the IAM policy on the VPC-SC access policy (policies.setIamPolicy or accessPolicies.setIamPolicy) — can grant roles/accesscontextmanager.policyAdmin to itself or others, yielding full perimeter control."
+
+  # --- CanRead: policies.getIamPolicy (recon) ---------------------------------
+  - id: gcp-acm-can-get-iam-policy
+    emits: CanRead
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "accesscontextmanager.policies.getIamPolicy"
+      resource_type: "google.identity.accesscontextmanager.v1.AccessPolicy"
+    emit:
+      source_type: Identity
+      target_type: ConditionalPolicy
+      source: "<principal>"
+      target: "<AccessPolicy ConditionalPolicy node>"
+      api_source: "IAM Policy Analyzer — effective accesscontextmanager.policies.getIamPolicy"
+      permissions:
+        - "accesscontextmanager.policies.getIamPolicy"
+      state_logic: "ACTIVE when effective getIamPolicy is held; low attack value (reconnaissance only — reveals who holds policyAdmin/policyEditor)."
+      conditions: [iam_permission]
+      confidence: 0.7
+      derived_from: ["IAM Policy Analyzer — effective accesscontextmanager.policies.getIamPolicy"]
+      false_positive_note: "This is a read-only reconnaissance edge; it does not enable guardrail removal on its own. The value is in identifying who else has policyAdmin/policyEditor roles on the access policy."
+      narrative: "{principal.name} can read the IAM policy of the VPC-SC access policy (reconnaissance — who has policyAdmin / policyEditor)."

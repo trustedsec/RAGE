@@ -1,0 +1,197 @@
+# AWS CodeCommit — Explicit (normalization) rules
+# ---------------------------------------------------------------------------
+# These rules translate raw collected API output into explicit graph edges.
+# They do NOT combine edges; each translates ONE observed config fact into ONE
+# (or a small set of) explicit edge(s) with evidence.
+#
+# CodeCommit has no ExecutesAs edge (it runs no user code). The normalization
+# focus is:
+#   (a) the source-binding link: CodeBuild / CodePipeline -> CodeCommit repo
+#       (enables the derived rules in codecommit.yaml to fire)
+#   (b) cross-account trust: resource policy grants to external principals
+#   (c) repository triggers: SNS/Lambda invocation on push events
+#   (d) approval rule template associations: branch-protection metadata
+#
+# All CanModifyCode / CanReadData edges are produced by the DERIVED rules in
+# /rules/derived/aws/codecommit.yaml (they require IAM effective-permission
+# evaluation, not just raw config). These explicit rules supply the STRUCTURAL
+# binding facts and TRUST facts that the derived rules consume.
+# ---------------------------------------------------------------------------
+
+rules:
+
+  # --- CodeBuild project sourcing from CodeCommit (binding fact) ---------------
+  # Records that a CodeBuild project pulls its source from a specific CodeCommit
+  # repository on a specific branch. This binding is the prerequisite the derived
+  # CanModifyCode rules consume: without it, a GitPush grant has no known downstream
+  # runner and no CanModifyCode edge can be emitted.
+  #
+  # ContainsResourceReference is the correct structural edge for "resource X
+  # references resource Y" (a non-walkable inventory fact). The derived rules
+  # in codecommit.yaml consume the binding metadata (tracked_branch, buildspec_in_source)
+  # to determine whether a principal's push scope overlaps the runner's source.
+  - id: aws-cc-codebuild-source-binding
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    note: >-
+      Structural binding fact: CodeBuild project references CodeCommit repository as its
+      source. ContainsResourceReference is non-walkable (structural, not attack-traversal).
+      The attack capability (CanModifyCode) is derived in codecommit.yaml rules 1-3 by
+      combining this binding with an effective push permission check. The tracked_branch
+      property recorded here is the gating parameter for that derivation.
+    match_record:
+      resource_type: "AWS::CodeBuild::Project"
+      field: "source.type"
+      value: "CODECOMMIT"
+    emit:
+      target_type: "*"
+      source_type: Compute
+      source: "<CodeBuild BuildWorker node>"
+      target: "<CodeCommit Repository (ArtifactRepository) node resolved from source.location ARN>"
+      api_source: "codebuild:BatchGetProjects"
+      evidence_field: "source.type, source.location"
+      properties:
+        tracked_branch: "source.branchName (or webhook.filterGroups[].filters[].pattern where type==HEAD_REF)"
+        buildspec_in_source: "true if source.buildspec is absent or empty (buildspec lives in the repo)"
+      narrative: >-
+        {project.name} (BuildWorker) references CodeCommit repository {repo.name} as its
+        source; tracked branch: {tracked_branch}. When buildspec is in-source, a push to
+        the tracked branch changes the executed buildspec (feeds CanModifyCode derivation).
+
+  # --- CodePipeline stage sourcing from CodeCommit (binding fact) --------------
+  - id: aws-cc-codepipeline-source-binding
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    note: >-
+      Analogous to aws-cc-codebuild-source-binding but for CodePipeline source stages.
+      Records that a CodePipeline pipeline stage references a CodeCommit repository as its
+      source. The tracked_branch property enables the derived codecommit.yaml rules to
+      emit CanModifyCode(Identity -> pipeline BuildWorker) when the identity can push to
+      the tracked branch. ContainsResourceReference is non-walkable structural metadata.
+    match_record:
+      resource_type: "AWS::CodePipeline::Pipeline"
+      field: "stages[].actions[].actionTypeId.provider"
+      value: "CodeCommit"
+    where:
+      - "actionTypeId.category == 'Source'"
+      - "actionTypeId.owner == 'AWS'"
+      - "configuration.RepositoryName is present"
+    emit:
+      source_type: BuildWorker
+      target_type: "*"
+      source: "<CodePipeline (BuildWorker) node>"
+      target: "<CodeCommit Repository (ArtifactRepository) node resolved from configuration.RepositoryName + account/region>"
+      api_source: "codepipeline:GetPipeline"
+      evidence_field: "stages[].actions[].configuration.RepositoryName, configuration.BranchName"
+      properties:
+        tracked_branch: "configuration.BranchName"
+        output_artifact: "outputArtifacts[0].name (fed to downstream build/deploy stages)"
+      narrative: >-
+        CodePipeline {pipeline.name} references CodeCommit repository {repo.name} as its
+        source on branch {tracked_branch}; a push to that branch starts a new pipeline
+        execution (feeds CanModifyCode derivation for the pipeline's BuildWorker).
+
+  # --- Repository resource policy -> CrossAccountTrust -------------------------
+  # This rule captures cross-account trust grants in the repository's resource policy.
+  # The trust can be for GitPush (write/code-injection) or GitPull (read-only). These
+  # have different attack implications:
+  #   - GitPush: cross-account code injection (rules 1/2 in derived apply) -> CanModifyCode
+  #   - GitPull: cross-account read access (rule 6 in derived applies) -> CanReadData
+  # A principal in account B with an IAM policy granting codecommit:GitPush can use
+  # the resource policy grant (in repo's account A) to inject code into A's pipelines.
+  - id: aws-cc-cross-account-policy
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodeCommit::Repository"
+      field: "repositoryPolicy"
+    where:
+      - "repositoryPolicy is non-empty"
+      - "exists a Statement where Effect==Allow AND Principal specifies an account or role NOT in this repository's account"
+      - "Statement Action includes at least one of [codecommit:GitPush, codecommit:PutFile, codecommit:GitPull, codecommit:GetFile, codecommit:GetFolder, codecommit:*]"
+    emit:
+      source_type: ResourcePolicy
+      target_type: ExternalIdentity
+      source: "<ResourcePolicy node for this repository>"
+      target: "<external principal (IAM ARN) or Account named in the Statement Principal>"
+      api_source: "codecommit:GetRepositoryPolicy"
+      evidence_field: "repositoryPolicy.Statement[].Principal"
+      properties:
+        granted_actions: "Statement.Action (the specific codecommit:* actions granted)"
+        effect: "Allow"
+      narrative: >-
+        {repo.name}'s resource policy grants {granted_actions} to external principal
+        {external.name} in account {external_account}; this is a cross-account trust
+        that may enable cross-account source reads or pushes. The derived rule
+        aws-cc-cross-account-push-code-inject consumes this to emit CanModifyCode
+        when the external principal also holds an IAM policy granting the same actions.
+
+  # --- Repository triggers -> CanTrigger (outbound: repo notifies Lambda) --------
+  # A CodeCommit repository trigger fires asynchronously when a push or create-branch
+  # event occurs. The trigger invokes an AWS Lambda function (the primary use case
+  # in attack paths; SNS topics are secondary). This edge models the OUTBOUND trigger
+  # from the repository to the Lambda compute node. It is NOT an inbound trigger to
+  # CodeCommit itself. Note: SNS topic triggers exist but do not map to CanTrigger
+  # (per edges.yaml target set [Compute]; SNS Topic is a Messaging node, not Compute).
+  # For SNS topics, model as ContainsResourceReference instead.
+  - id: aws-cc-repo-trigger
+    emits: CanTrigger
+    applies_to: [aws]
+    note: >-
+      Repository trigger to Lambda function (compute target). SNS topic triggers
+      are structural inventory (ContainsResourceReference) because CanTrigger's
+      target set is [Compute] and SNS Topic is Messaging, not Compute.
+    match_record:
+      resource_type: "AWS::CodeCommit::Repository"
+      field: "triggers[].destinationArn"
+    where:
+      - "triggers is non-empty"
+      - "triggers[].events includes 'all' or 'updateReference' or 'createReference'"
+      - "destinationArn points to a Lambda function (arn:aws:lambda:...)"
+    emit:
+      source_type: ArtifactRepository
+      target_type: Compute
+      source: "<ArtifactRepository node>"
+      target: "<Lambda function (ServerlessFunction) at destinationArn>"
+      api_source: "codecommit:GetRepositoryTriggers"
+      evidence_field: "triggers[].destinationArn, triggers[].events, triggers[].branches"
+      properties:
+        trigger_events: "triggers[].events"
+        trigger_branches: "triggers[].branches (empty = all branches)"
+      narrative: >-
+        {repo.name} is configured to trigger Lambda function {target.name} on push events
+        (events: {trigger_events}; branches: {trigger_branches or 'all'}); any push
+        to the repository fires this Lambda trigger, enabling the cicd-chains
+        CanModifyCode + ExecutesAs => CanExecuteAs roll-up.
+
+  # --- Approval rule template association (branch-protection metadata) ----------
+  - id: aws-cc-approval-rule-template-assoc
+    emits: HasPolicy
+    applies_to: [aws]
+    note: >-
+      An approval rule template auto-applies an approval rule to PRs targeting
+      matched branches. This is CodeCommit's "branch protection" equivalent. The
+      HasPolicy edge records that the repository has an approval gate (a GenericPolicy
+      node) on specified branches; derived rules use this to downgrade CanModifyCode
+      edges for the PR-merge path (rule 3 in codecommit.yaml) to CONDITIONAL when
+      the template requires N approvals that the attacker cannot satisfy.
+    match_record:
+      resource_type: "AWS::CodeCommit::Repository"
+      field: "associatedApprovalRuleTemplates[]"
+    where:
+      - "associatedApprovalRuleTemplates is non-empty"
+    emit:
+      source_type: ArtifactRepository
+      target_type: GenericPolicy
+      source: "<ArtifactRepository node>"
+      target: "<GenericPolicy node for the approval rule template>"
+      api_source: "codecommit:ListAssociatedApprovalRuleTemplatesForRepository + codecommit:GetApprovalRuleTemplate"
+      evidence_field: "associatedApprovalRuleTemplates[].approvalRuleTemplateName, approvalRuleTemplateContent"
+      properties:
+        required_approvals: "approvalRuleTemplateContent.NumberOfApprovalsNeeded"
+        destination_refs: "approvalRuleTemplateContent.DestinationReferences (branch patterns the rule applies to)"
+      narrative: >-
+        {repo.name} has approval rule template {template.name} applied, requiring
+        {required_approvals} approval(s) on PRs targeting {destination_refs};
+        merging a PR without the required approvals requires
+        codecommit:OverridePullRequestApprovalRules.

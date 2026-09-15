@@ -1,0 +1,294 @@
+# AWS EKS — Explicit normalization rules: raw config -> explicit edges
+# ---------------------------------------------------------------------------
+# These rules translate raw collected EKS/IAM/k8s config records into the
+# explicit edges (ExecutesAs, TrustsExternalIdentity, ExternalIdentityMapsTo,
+# ContainsResourceReference, CanModifyCode) that the derived rules in
+# /rules/derived/aws/eks.yaml and the container-chains / federation-chains
+# linchpins consume.
+#
+# All rules here use match_record (raw config field) or match_effective_permission
+# (IAM permission evaluator output). They never derive escalation edges.
+#
+# Fact-emission discipline:
+#  - ExecutesAs: zero-cost structural fact linking Compute -> Identity.
+#  - TrustsExternalIdentity: trust anchor declares it accepts an external principal.
+#  - ExternalIdentityMapsTo: the realized mapping external -> internal identity.
+#  - ContainsResourceReference: a workload references (pulls/runs) an image.
+#  - CanModifyCode: principal can push/overwrite an image (ecr:PutImage).
+#
+# APIs required to collect these facts are listed in providers/aws/eks.md §19.
+# ---------------------------------------------------------------------------
+
+applies_to: [aws]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # ExecutesAs: EC2 node -> node group IAM role
+  # ---------------------------------------------------------------------------
+  - id: aws-eks-node-executes-as-role
+    emits: ExecutesAs
+    description: "Each EC2 instance in an EKS managed node group runs as the node group IAM role (nodeRole)."
+    match_record:
+      resource_type: "AWS::EKS::Nodegroup"
+      field: "nodeRole"
+    emit:
+      source_type: Compute
+      source: "<EC2 instance (VirtualMachine) in the node group>"
+      target: "<nodeRole ARN (MachineIdentity/Role)>"
+      api_source: "eks:DescribeNodegroup"
+      evidence_field: "nodeRole"
+      narrative: >-
+        EC2 node in EKS node group {nodegroup.name} executes as node IAM role
+        {role.name} (nodeRole). All pods on this node can potentially reach the
+        node role's credentials via IMDS (hop-limit dependent).
+
+  # ---------------------------------------------------------------------------
+  # ExecutesAs: Pod -> IAM role (IRSA annotation)
+  # ---------------------------------------------------------------------------
+  - id: aws-eks-pod-executes-as-irsa-role
+    emits: ExecutesAs
+    description: "A pod whose ServiceAccount has an IRSA annotation executes as the annotated IAM role (credentials delivered by token projection + STS)."
+    match_record:
+      resource_type: "k8s:ServiceAccount"
+      field: "annotations.eks.amazonaws.com/role-arn"
+    emit:
+      source_type: KubernetesWorkload
+      source: "<KubernetesWorkload (any pod running as this ServiceAccount)>"
+      target: "<IAM Role from eks.amazonaws.com/role-arn annotation (MachineIdentity/Role)>"
+      api_source: "kubectl get serviceaccount -n <namespace> -o json"
+      evidence_field: "metadata.annotations.eks.amazonaws.com/role-arn"
+      narrative: >-
+        Pods running as ServiceAccount {sa.name} (namespace {sa.namespace}) execute
+        as IAM role {role.name} via IRSA. The pod receives a projected token volume
+        which it exchanges for STS credentials (sts:AssumeRoleWithWebIdentity).
+
+  # ---------------------------------------------------------------------------
+  # ExecutesAs: Pod -> IAM role (EKS Pod Identity Association)
+  # ---------------------------------------------------------------------------
+  - id: aws-eks-pod-executes-as-pod-identity-role
+    emits: ExecutesAs
+    description: "A pod whose SA is linked via an EKS Pod Identity Association executes as the associated IAM role (credentials delivered by the pod-identity-agent DaemonSet at 169.254.170.23)."
+    match_record:
+      resource_type: "AWS::EKS::PodIdentityAssociation"
+      field: "roleArn"
+    where:
+      - "eks-pod-identity-agent DaemonSet is installed on the cluster (service_state)"
+    emit:
+      source_type: KubernetesWorkload
+      source: "<KubernetesWorkload (any pod running as the namespace:SA specified in the association)>"
+      target: "<IAM Role from roleArn (MachineIdentity/Role)>"
+      api_source: "eks:DescribePodIdentityAssociation"
+      evidence_field: "roleArn"
+      conditions: [service_state]
+      state_logic: "ACTIVE if eks-pod-identity-agent DaemonSet is confirmed installed; CONDITIONAL(service_state) if install is unknown; BLOCKED on Fargate profiles without Pod Identity agent (note: Pod Identity IS supported on Fargate as of 2024, via the agent-less Fargate path — check cluster addon status)."
+      narrative: >-
+        Pods running as ServiceAccount {sa.name} (namespace {namespace}) execute as
+        IAM role {role.name} via EKS Pod Identity Association. Credentials are
+        delivered by the eks-pod-identity-agent at http://169.254.170.23/v1/credentials.
+
+  # ---------------------------------------------------------------------------
+  # TrustsExternalIdentity: IAM role trust -> IRSA OIDC issuer
+  # ---------------------------------------------------------------------------
+  - id: aws-eks-irsa-role-trusts-oidc-issuer
+    emits: TrustsExternalIdentity
+    description: "An IAM role whose trust policy Federated principal matches an EKS cluster OIDC issuer URL trusts that cluster's projected SA tokens."
+    match_record:
+      resource_type: "AWS::IAM::Role"
+      field: "AssumeRolePolicyDocument"
+    where:
+      - "Statement[].Action includes sts:AssumeRoleWithWebIdentity"
+      - "Statement[].Principal.Federated matches oidc.eks.<region>.amazonaws.com/id/<cluster-id> (an AWS::IAM::OIDCProvider ARN registered for an EKS cluster)"
+    emit:
+      source_type: Role
+      source: "<IAM Role>"
+      target: "<ExternalIdentity / FederatedIdentity representing the cluster OIDC issuer>"
+      api_source: "iam:GetRole"
+      evidence_field: "AssumeRolePolicyDocument.Statement[].Principal.Federated"
+      properties:
+        trust_condition_sub: "<value of StringEquals/StringLike condition on token.sub>"
+        trust_condition_aud: "<value of StringEquals/StringLike condition on token.aud>"
+        pinned: "<true if sub is pinned to a specific system:serviceaccount:ns:sa; false if wildcard>"
+      narrative: >-
+        IAM role {role.name} trusts EKS cluster OIDC issuer {issuer.name}
+        (Federated principal in trust policy) with Action sts:AssumeRoleWithWebIdentity.
+        Sub condition: {trust_condition_sub}. Pinned: {pinned}.
+
+  # ---------------------------------------------------------------------------
+  # TrustsExternalIdentity: IAM role trust -> pods.eks.amazonaws.com (Pod Identity)
+  # ---------------------------------------------------------------------------
+  - id: aws-eks-pod-identity-role-trusts-pods
+    emits: TrustsExternalIdentity
+    description: "An IAM role whose trust policy Service principal includes pods.eks.amazonaws.com is eligible for EKS Pod Identity associations."
+    match_record:
+      resource_type: "AWS::IAM::Role"
+      field: "AssumeRolePolicyDocument"
+    where:
+      - "Statement[].Action includes sts:AssumeRoleWithWebIdentity"
+      - "Statement[].Principal.Service includes pods.eks.amazonaws.com"
+    emit:
+      source_type: Role
+      source: "<IAM Role>"
+      target: "<FederatedIdentity representing pods.eks.amazonaws.com>"
+      api_source: "iam:GetRole"
+      evidence_field: "AssumeRolePolicyDocument.Statement[].Principal.Service"
+      narrative: >-
+        IAM role {role.name} trusts pods.eks.amazonaws.com for EKS Pod Identity.
+        The role can be associated with a namespace:SA pair via
+        eks:CreatePodIdentityAssociation.
+
+  # ---------------------------------------------------------------------------
+  # ExternalIdentityMapsTo: KSA -> IAM role (IRSA)
+  # ---------------------------------------------------------------------------
+  - id: aws-eks-irsa-ksa-maps-to-iam-role
+    emits: ExternalIdentityMapsTo
+    description: "A Kubernetes ServiceAccount annotated with eks.amazonaws.com/role-arn maps to that IAM role; the mapping is realized when the role trust allows the cluster OIDC issuer + sub for this SA."
+    match_record:
+      resource_type: "k8s:ServiceAccount"
+      field: "annotations.eks.amazonaws.com/role-arn"
+    where:
+      - "a matching TrustsExternalIdentity exists: ?iam_role TrustsExternalIdentity cluster_oidc, with sub condition matching system:serviceaccount:{namespace}:{sa-name}"
+    emit:
+      source_type: WorkloadIdentity
+      source: "<k8s ServiceAccount (WorkloadIdentity)>"
+      target: "<IAM Role from annotation (MachineIdentity/Role)>"
+      api_source: "kubectl get serviceaccount -o json"
+      evidence_field: "metadata.annotations.eks.amazonaws.com/role-arn"
+      properties:
+        trust_satisfied: "<true if the role trust sub condition matches this SA; false if mismatch>"
+      narrative: >-
+        Kubernetes ServiceAccount {sa.name} (namespace {sa.namespace}) maps to IAM
+        role {role.name} via IRSA annotation. Mapping realized when the role trust
+        sub condition is satisfied (system:serviceaccount:{sa.namespace}:{sa.name}).
+
+  # ---------------------------------------------------------------------------
+  # ExternalIdentityMapsTo: KSA -> IAM role (EKS Pod Identity)
+  # ---------------------------------------------------------------------------
+  - id: aws-eks-pod-identity-ksa-maps-to-iam-role
+    emits: ExternalIdentityMapsTo
+    description: "An EKS Pod Identity Association explicitly maps a namespace:SA pair to an IAM role; the mapping is backed by the role trust trusting pods.eks.amazonaws.com."
+    match_record:
+      resource_type: "AWS::EKS::PodIdentityAssociation"
+      field: "roleArn"
+    emit:
+      source_type: WorkloadIdentity
+      source: "<k8s ServiceAccount (WorkloadIdentity) in namespace from association>"
+      target: "<IAM Role (roleArn)>"
+      api_source: "eks:DescribePodIdentityAssociation"
+      evidence_field: "roleArn"
+      properties:
+        namespace: "<association.namespace>"
+        service_account: "<association.serviceAccount>"
+      narrative: >-
+        EKS Pod Identity Association maps {namespace}:{serviceAccount} to IAM role
+        {role.name}. Backed by role trust trusting pods.eks.amazonaws.com.
+
+  # ---------------------------------------------------------------------------
+  # ContainsResourceReference: Pod/Deployment -> ECR repository (runs image)
+  # ---------------------------------------------------------------------------
+  - id: aws-eks-workload-pulls-ecr-image
+    emits: ContainsResourceReference
+    description: "A Kubernetes pod/deployment references (pulls and runs) a container image from an ECR repository. Records the tag/digest for mutability assessment."
+    match_record:
+      resource_type: "k8s:Pod"
+      field: "spec.containers[].image"
+    where:
+      - "image URI matches an ECR registry (*.dkr.ecr.*.amazonaws.com/<repo>:<tag-or-digest>)"
+    emit:
+      target_type: "*"
+      source_type: KubernetesWorkload
+      source: "<KubernetesWorkload (pod/deployment)>"
+      target: "<ContainerRegistry (ECR repository)>"
+      api_source: "kubectl get pod -o json"
+      evidence_field: "spec.containers[].image"
+      properties:
+        reference_kind: "runs_image"
+        image_tag: "<tag portion of the image URI, e.g. latest>"
+        image_digest: "<sha256:... digest if pinned, else null>"
+        mutable: "<true if referenced by mutable tag (no digest pin); false if @sha256 digest-pinned>"
+        image_pull_policy: "<Always | IfNotPresent | Never>"
+      narrative: >-
+        Pod {pod.name} references ECR image {image_uri} (reference_kind=runs_image).
+        Mutable: {mutable} (digest-pinned: {image_digest != null}). imagePullPolicy:
+        {image_pull_policy}. Container-chains image-push-poisons-consumers will fan
+        out CanModifyCode from a registry push to this workload only when mutable=true
+        and a re-pull occurs.
+
+  # ---------------------------------------------------------------------------
+  # CanModifyCode: principal can push images to an ECR repository
+  # ---------------------------------------------------------------------------
+  - id: aws-eks-ecr-put-image
+    emits: CanModifyCode
+    description: "A principal with ecr:PutImage on an ECR repository can overwrite any mutable tag, poisoning every workload that pulls it."
+    match_effective_permission:
+      action: "ecr:PutImage"
+      resource_type: "AWS::ECR::Repository"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<ECR repository (ContainerRegistry)>"
+      permissions: ["ecr:PutImage"]
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      narrative: >-
+        {principal.name} can push (overwrite) images in ECR repository {registry.name}
+        (ecr:PutImage). Container-chains image-push-poisons-consumers fans this out to
+        every KubernetesWorkload that pulls a mutable tag from this repository,
+        propagating CanModifyCode to each consumer and enabling CanExecuteAs the pod's
+        IAM role.
+
+  # ---------------------------------------------------------------------------
+  # CanModifyCode: principal can initiate ECR image upload (BatchCheckLayerAvailability
+  # + InitiateLayerUpload + UploadLayerPart + CompleteLayerUpload + PutImage)
+  # ---------------------------------------------------------------------------
+  - id: aws-eks-ecr-full-push-workflow
+    emits: CanModifyCode
+    description: "A principal holding the full ECR push permission set (BatchCheck + InitiateLayerUpload + UploadLayerPart + CompleteLayerUpload + PutImage) can push a complete new image."
+    match_effective_permission:
+      action: "ecr:InitiateLayerUpload"
+      resource_type: "AWS::ECR::Repository"
+    where:
+      - "?principal also has ecr:BatchCheckLayerAvailability, ecr:UploadLayerPart, ecr:CompleteLayerUpload, ecr:PutImage on ?repo"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<ECR repository (ContainerRegistry)>"
+      permissions:
+        - "ecr:BatchCheckLayerAvailability"
+        - "ecr:InitiateLayerUpload"
+        - "ecr:UploadLayerPart"
+        - "ecr:CompleteLayerUpload"
+        - "ecr:PutImage"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      narrative: >-
+        {principal.name} holds the full ECR push permission set for {registry.name}
+        (InitiateLayerUpload + UploadLayerPart + CompleteLayerUpload + PutImage),
+        equivalent to CanModifyCode on the registry. Note: dedupes with aws-eks-ecr-put-image
+        when PutImage is also present — emit once per (principal, repository).
+
+  # ---------------------------------------------------------------------------
+  # CanExecuteCommand: principal has k8s pods/exec RBAC on a namespace/pod
+  # (Collected from k8s RBAC; recorded here for explicit normalization)
+  # ---------------------------------------------------------------------------
+  - id: aws-eks-rbac-pods-exec
+    emits: CanExecuteCommand
+    description: "A Kubernetes RBAC subject (user/group/SA) holding pods/exec create verb on a namespace can exec into any pod in that namespace."
+    match_record:
+      resource_type: "k8s:ClusterRoleBinding | k8s:RoleBinding"
+      field: "subjects + roleRef (pods/exec create verb)"
+    where:
+      - "roleRef resolves to a ClusterRole or Role with rules including verbs=[create] resources=[pods/exec]"
+      - "subject maps to an IAM principal via access entry or aws-auth ConfigMap"
+    emit:
+      source_type: Identity
+      source: "<IAM principal (mapped from k8s subject via access entry or aws-auth)>"
+      target: "<KubernetesWorkload (pod in the namespace scope of the binding)>"
+      permissions: []
+      api_source: "kubectl get clusterrolebindings,rolebindings -o json"
+      evidence_field: "rules[].verbs / resources"
+      conditions: [service_state]
+      state_logic: "ACTIVE when the cluster API endpoint is reachable and the binding is in effect. CONDITIONAL(service_state) for private-only endpoints without confirmed VPC foothold."
+      narrative: >-
+        IAM principal {principal.name} (mapped to k8s subject {subject.name}) holds
+        the pods/exec create verb in {scope} via ClusterRoleBinding/RoleBinding to
+        {role.name}. It can kubectl exec into any pod in {scope} and run OS commands
+        in the container.

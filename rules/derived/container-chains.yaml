@@ -1,0 +1,423 @@
+# Provider-agnostic container / Kubernetes chain rules (Phase 7 — containers & k8s)
+# ===========================================================================
+# THE PHASE-7 LINCHPIN. Written as the provider-agnostic roll-up that the
+# per-service container/k8s adapters (aws:ecr/ecs/eks, gcp:artifact-registry/
+# gke/cloud-run, azure:acr/aks/aci, plus raw Kubernetes RBAC + workload-identity
+# bindings) target. Each adapter only has to emit a handful of NORMALIZED facts
+# and inherits full path-finding here — exactly as cicd-chains does for
+# pipelines and federation-chains does for OIDC/WIF.
+#
+# THE PHASE-7 IDEA (containers as three attack surfaces):
+#   (a) SUPPLY CHAIN — a registry PUSH is code control over every consumer.
+#       An image is not a passive artifact: every Compute/KubernetesWorkload that
+#       PULLS it will EXECUTE its layers. So whoever can push/overwrite the image
+#       (or the tag/manifest a workload resolves) can run code in EVERY consumer
+#       that pulls it. A single registry write fans out to N workloads, each of
+#       which ExecutesAs an identity -> the pusher CanExecuteAs each of those
+#       identities. This is the container analogue of cicd's "modify what the
+#       runner executes".
+#   (b) CLUSTER EXEC — a cluster credential / RBAC verb that can exec into a pod
+#       runs commands INSIDE that pod, which has the pod's mounted ServiceAccount
+#       token / IRSA / Workload-Identity credential on its filesystem and metadata
+#       endpoint. Exec = hold the pod's workload identity. This is the container
+#       framing of can-execute-as execute-as-via-command.
+#   (c) WORKLOAD IDENTITY FEDERATION — a k8s workload identity binding
+#       (KSA<->GSA on GKE, IRSA on EKS, Azure AKS Workload Identity) is an OIDC
+#       federation: the projected SA token is exchanged for a cloud Role/SA with
+#       NO static key. That is a federation trust, OWNED by federation-chains;
+#       this file only asserts the bridge fact (the pod identity IS a
+#       WorkloadIdentity that federates in) and lets federation-chains roll it up.
+#
+# NORMALIZED FACTS THIS FILE CONSUMES (what the adapters emit):
+#   [?p, CanModifyCode, ?image_store]  principal can push/overwrite an image in a
+#                                       ContainerRegistry (or a specific image/tag).
+#                                       Adapter targets the ContainerRegistry (or,
+#                                       where it models per-image nodes, the repo).
+#   [?consumer, ContainsResourceReference, ?image_store]  a Compute/Kubernetes-
+#                                       Workload references (pulls / runs) that image
+#                                       — the run-image relation. The adapter records
+#                                       tag/digest pinning as a property on this edge.
+#   [?consumer, ExecutesAs, ?identity]  the pulling workload runs as an identity
+#                                       (task role / pod ServiceAccount / WI).
+#   [?p, CanExecuteCommand, ?pod]       a cluster credential / RBAC verb
+#                                       (pods/exec, kubectl exec, run-command) lets
+#                                       the principal run commands inside the pod.
+#   [?pod, ExecutesAs, ?workload_identity]  the pod runs as its mounted SA/IRSA/WI.
+#   k8s workload-identity bindings are normalized by the federation adapters to
+#     TrustsExternalIdentity + ExternalIdentityMapsTo — see federation-chains;
+#     rule 3 only bridges the pod's WorkloadIdentity to that federation.
+#
+# WHAT THIS FILE PRODUCES (the collapse):
+#   CanModifyCode(registry) + consumer pulls image + ExecutesAs
+#        => CanModifyCode(?p -> ?consumer)        (rule 1a, supply-chain fan-out)
+#        => CanExecuteAs(?p -> ?identity)          (rule 1b, via each consumer)
+#   CanExecuteCommand(pod) + ExecutesAs
+#        => CanExecuteAs(?p -> ?workload_identity) (rule 2, exec inherits the token)
+#   k8s workload-identity binding
+#        => CanFederateAs(pod identity -> cloud Role/SA)  (rule 3 bridges;
+#           federation-chains rolls up to CanImpersonate / CanEnter*)
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE:
+#   * can-execute-as.yaml — the CanExecuteAs PRIMITIVE.
+#       - execute-as-via-code-modify already collapses CanModifyCode(?compute) +
+#         ExecutesAs into CanExecuteAs for ANY Compute. Rule 1b here is the
+#         container-SPECIFIC framing (the CanModifyCode arrived via a registry push
+#         that rule 1a fanned out to the consumer) so the supply-chain narrative is
+#         explicit; it dedupes with execute-as-via-code-modify on
+#         (CanExecuteAs, ?p, ?identity) — same collapse, do not double-count weight.
+#       - execute-as-via-command already collapses CanExecuteCommand(?compute) +
+#         ExecutesAs into CanExecuteAs. Rule 2 is the pod/exec framing of that same
+#         collapse (mounted SA/IRSA/WI token) and dedupes with it likewise.
+#       - The escalation roll-up (CanExecuteAs -> CanEscalateTo) is NOT re-derived
+#         here — it is can-execute-as / can-control's job.
+#   * cicd-chains.yaml — a CI runner that PULLS an image the attacker can push gets
+#       its CanModifyCode(runner) from rule 1a here; cicd-chains then consumes that
+#       CanModifyCode. We produce the registry->workload propagation; cicd-chains
+#       does the pipeline framing. Do not re-derive the buildspec execute-as here.
+#   * federation-chains.yaml — the k8s workload-identity OIDC trust => CanFederateAs
+#       and its CanEnter*/CanImpersonate roll-ups are OWNED by federation-chains.
+#       Rule 3 only asserts the bridge fact (the pod SA IS a WorkloadIdentity whose
+#       projected token federates in); we do NOT re-derive federation-maps-to-identity,
+#       federate-then-enter-*, or federate-inherits-capabilities.
+#   * credential-chains.yaml — a pod that ExposesCredential of its SA token to
+#       container code is the credential-chains discipline; consumed downstream, not
+#       re-derived. The "exec == read the mounted token" step is the container
+#       instance of execute-then-read-secret.
+#
+# STATE PROPAGATION (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. The container-specific gates:
+#   * SUPPLY CHAIN (rule 1): CONDITIONAL(image_pulled) — the push only reaches a
+#     consumer that ACTUALLY pulls the pushed content. DIGEST-PINNED consumers
+#     (image referenced by @sha256 immutable digest, or an IMMUTABLE-tag registry)
+#     do NOT pull an overwritten tag => the fan-out to those consumers is BLOCKED/
+#     does not fire. A mutable tag (`:latest`, a moving tag) the consumer re-pulls
+#     on next deploy/restart => ACTIVE once a pull/redeploy occurs.
+#   * CLUSTER EXEC (rule 2): ACTIVE — exec into a running pod immediately yields
+#     the mounted token; CONDITIONAL only when the SA token is NOT mounted
+#     (automountServiceAccountToken: false) or the exec verb is namespace/pod
+#     scoped away from the target.
+#   * WORKLOAD-IDENTITY (rule 3): DELEGATED to federation-chains — inherits its
+#     trust_condition state (an unpinned/broad binding is ACTIVE; a correctly
+#     scoped one CONDITIONAL).
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml) — honored by every emit;
+# typed source_type/target_type declared per RULE-FORMAT.md, within these sets:
+#   CanModifyCode:          source [Identity]
+#                           target [Compute, ContainerRegistry, ArtifactRepository, KubernetesWorkload]
+#   CanExecuteAs:           source [Identity]  target [Identity]
+#   CanExecuteCommand:      source [Identity]
+#                           target [VirtualMachine, Container, ContainerService, KubernetesWorkload, RemoteManagementService]
+#   ExecutesAs:             source [Compute]
+#                           target [Identity, ServiceIdentity, MachineIdentity, ServiceAccount, ManagedIdentity, Role]
+#   CanFederateAs:          source [Identity, FederatedIdentity, WorkloadIdentity]
+#                           target [Role, ServiceAccount, MachineIdentity]
+#   ContainsResourceReference: source [Data, Storage, Compute]  target ["*"]  (walkable:false — recon link)
+# ===========================================================================
+
+applies_to: ["*"]
+phase: 7-containers-k8s
+
+rules:
+
+  # --- 1a) Registry push fans out to every consumer that pulls the image -------
+  # THE supply-chain primitive. A ContainerRegistry write is not a single-resource
+  # action: every Compute/KubernetesWorkload that PULLS the pushed image/tag will
+  # execute its layers. So CanModifyCode over the registry image propagates to
+  # CanModifyCode over each consuming workload. This is the fan-out; rule 1b then
+  # turns each consumer's CanModifyCode + ExecutesAs into CanExecuteAs (via
+  # can-execute-as execute-as-via-code-modify — cited, deduped).
+  #
+  # The run-image relation is normalized as ContainsResourceReference(consumer ->
+  # image_store): the workload references/pulls that image. The adapter records
+  # tag/digest PINNING on that edge — the whole judgment of this rule.
+  - id: image-push-poisons-consumers
+    emits: CanModifyCode
+    description: "Pushing/overwriting an image in a registry poisons every workload that pulls it — code control propagates from the registry to each consuming Compute/KubernetesWorkload."
+    applies_to: ["*"]
+    match:
+      - [ ?principal, CanModifyCode,              ?image_store ]
+      - [ ?consumer,  ContainsResourceReference,  ?image_store ]
+    where:
+      # ?image_store is the pushable image supply-chain node: a ContainerRegistry
+      # (or an ArtifactRepository serving OCI images). CanModifyCode's target set
+      # admits both; a per-image/per-tag node the adapter models resolves to its
+      # registry here.
+      - "node_type(?image_store) in [ContainerRegistry, ArtifactRepository]"
+      # ?consumer is a workload that PULLS and runs the image (its layers execute).
+      - "node_type(?consumer) in [Compute, ContainerService, ContainerTask, KubernetesWorkload, Container, VirtualMachine, ServerlessFunction, BuildWorker]"
+      # The reference is a run-image relation (the consumer resolves this image at
+      # deploy/pull time), not an unrelated recon mention.
+      - "reference_kind(?consumer -> ?image_store) == runs_image"
+    optional:
+      # Presence of a MUTABLE, re-pullable reference (a moving tag like :latest the
+      # consumer re-resolves on next deploy/restart, with no digest pin and no
+      # registry image-immutability) is what makes the poison reach the consumer.
+      # Absent (digest-pinned / immutable tag) => the overwrite is not pulled.
+      - [ ?consumer, ContainsResourceReference, ?image_store ]   # placeholder for "reference is a mutable, re-pullable tag (image_mutable(?consumer -> ?image_store) == true)"
+    emit:
+      source_type: Identity
+      target_type: KubernetesWorkload
+      source: ?principal
+      target: ?consumer
+      permissions: ["<registry push, e.g. ecr:PutImage | AcrPush | artifactregistry.repositories.uploadArtifacts>"]
+      conditions: [image_pulled]
+      state_logic: >-
+        ACTIVE only when the consumer will ACTUALLY pull the pushed content: the
+        reference is a MUTABLE, re-pullable tag (matched(optional[0]) — a moving tag
+        like :latest, no @sha256 digest pin, registry tags not immutable) AND a
+        pull/redeploy/restart occurs (imagePullPolicy Always, or the workload is
+        (re)scheduled). CONDITIONAL(image_pulled) when no re-pull is established (the
+        pod already runs the old image and won't restart). BLOCKED / does-not-fire
+        for a DIGEST-PINNED consumer (image referenced by immutable @sha256 digest)
+        or an IMMUTABLE-tag registry — overwriting a tag cannot change what a
+        digest-pinned consumer runs. Inherit weakest with the contributing
+        CanModifyCode over the registry: a CONDITIONAL/BLOCKED push (registry policy
+        deny on PutImage / AcrPush, immutable repo) caps or blocks this fan-out.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "?principal CanModifyCode ?image_store", "?consumer ContainsResourceReference ?image_store (runs_image)" ]
+      false_positive_note: >-
+        The judgment is (a) the reference is a genuine run-image relation, not a
+        recon mention, and (b) the consumer will actually PULL the overwritten
+        content. DIGEST PINNING is the primary weakener: a workload that pulls
+        `repo@sha256:...` (or a registry that enforces immutable tags / content
+        digest) is NOT poisoned by overwriting a tag — do NOT emit ACTIVE, treat the
+        fan-out to that consumer as blocked. A tag pushed but never re-pulled (no
+        redeploy, imagePullPolicy IfNotPresent with the image already cached) stays
+        CONDITIONAL(image_pulled). Scope the push to the exact repository/tag the
+        consumer resolves — a write to a DIFFERENT repo/tag does not reach it. This
+        edge feeds rule 1b (and can-execute-as execute-as-via-code-modify) on each
+        consumer's ExecutesAs; the escalation consequence is produced there, not here.
+        Where the consumer is a CI runner, cicd-chains consumes this CanModifyCode —
+        do not re-derive the buildspec execute-as here.
+      narrative: >-
+        {principal.name} can push/overwrite an image in {image_store.name}
+        ({perm:CanModifyCode}); {consumer.name} pulls that image and executes its
+        layers, so the push injects attacker code into {consumer.name} — one
+        registry write fans out to every workload that pulls the poisoned image.
+
+  # --- 1b) A poisoned consumer executes as its identity ------------------------
+  # Once rule 1a (or a direct CanModifyCode) gives the attacker code control over a
+  # consuming workload, that workload runs as an identity — so the attacker executes
+  # as it. This is the container framing of can-execute-as execute-as-via-code-modify
+  # (the CanModifyCode arrived via the registry supply chain); cited, deduped, and
+  # NOT re-derived for escalation. It exists so the supply-chain narrative is
+  # first-class and the state gate (image_pulled) is carried through explicitly.
+  - id: poisoned-image-executes-as
+    emits: CanExecuteAs
+    description: "A workload poisoned via a registry image push runs as its identity, so the pusher executes as that identity."
+    applies_to: ["*"]
+    match:
+      - [ ?principal, CanModifyCode, ?consumer ]
+      - [ ?consumer,  ExecutesAs,    ?identity ]
+    where:
+      # The CanModifyCode over ?consumer is the supply-chain edge rule 1a emits (or a
+      # direct code-write). ?consumer is a running container workload.
+      - "node_type(?consumer) in [Compute, ContainerService, ContainerTask, KubernetesWorkload, Container, VirtualMachine, ServerlessFunction, BuildWorker]"
+      - "node_class(?identity) == Identity"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: []
+      conditions: [image_pulled]
+      state_logic: >-
+        inherit weakest from the contributing CanModifyCode (rule 1a) and ExecutesAs:
+        ACTIVE only when the poison actually reaches the running workload (rule 1a
+        ACTIVE — mutable tag re-pulled); CONDITIONAL(image_pulled) when the pull/
+        redeploy is not yet established; BLOCKED when the consumer is digest-pinned so
+        rule 1a did not fire ACTIVE. Never stronger than the CanModifyCode input.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?principal CanModifyCode ?consumer", "?consumer ExecutesAs ?identity" ]
+      false_positive_note: >-
+        This dedupes with can-execute-as execute-as-via-code-modify on
+        (CanExecuteAs, ?principal, ?identity) — SAME collapse, container/supply-chain
+        framing; emit once, do not double-count weight where both fire. The escalation
+        consequence (identity more privileged than the principal) is produced by
+        can-execute-as / can-control off this CanExecuteAs — cite, do not duplicate.
+        Carries rule 1a's image_pulled gate: a digest-pinned or never-re-pulled
+        consumer does not yield an ACTIVE execute-as. Only emit for ?consumer whose
+        ExecutesAs is a real, mounted execution identity (task role / pod SA / WI),
+        not a placeholder.
+      narrative: >-
+        {principal.name} controls the code {consumer.name} runs (via a poisoned
+        registry image), and {consumer.name} executes as {identity.name}; running the
+        poisoned image therefore executes attacker code as {identity.name}.
+
+  # --- 2) Exec into a pod inherits its mounted workload-identity token ----------
+  # A cluster credential / RBAC verb that can exec into a pod (pods/exec create,
+  # kubectl exec, a cluster-admin kubeconfig, a run-command into the container) runs
+  # commands INSIDE the pod. The pod's ServiceAccount token / IRSA / Workload-Identity
+  # credential is mounted on the container filesystem (/var/run/secrets/...) and the
+  # cloud credential is reachable via the metadata/relay endpoint — so exec == hold
+  # the pod's workload identity. This is the container framing of can-execute-as
+  # execute-as-via-command (mounted-token variant); cited, deduped, not re-derived
+  # for escalation.
+  - id: cluster-rbac-exec
+    emits: CanExecuteAs
+    description: "Exec into a pod (cluster RBAC / credential / run-command) inherits the pod's mounted ServiceAccount/IRSA/Workload-Identity token, executing as that identity."
+    applies_to: ["*"]
+    match:
+      - [ ?principal, CanExecuteCommand, ?pod ]
+      - [ ?pod,       ExecutesAs,        ?workload_identity ]
+    where:
+      # The exec target is a container workload (pod/deployment/task/service), not a
+      # bare VM — a VM run-command is the generic execute-as-via-command case.
+      - "node_type(?pod) in [KubernetesWorkload, Container, ContainerService, ContainerTask]"
+      - "node_class(?workload_identity) == Identity"
+      - "node_type(?workload_identity) in [ServiceAccount, WorkloadIdentity, MachineIdentity, ManagedIdentity, ServiceIdentity, Identity, Role]"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?workload_identity
+      permissions: ["<pods/exec create | kubectl exec | run-command into container>"]
+      conditions: [token_mounted]
+      state_logic: >-
+        ACTIVE — exec into a running pod immediately exposes the mounted SA token and
+        the cloud credential relay to the attacker's shell, so the attacker holds
+        ?workload_identity. CONDITIONAL(token_mounted) when the SA token is NOT
+        projected into the pod (automountServiceAccountToken: false AND no IRSA/WI
+        projected volume) — then exec yields OS access but not the token. Inherit
+        weakest with the contributing CanExecuteCommand: a CONDITIONAL/BLOCKED exec
+        (RBAC verb scoped to a different namespace/pod, pods/exec denied,
+        PodSecurity/OPA gate) caps or blocks this edge.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?principal CanExecuteCommand ?pod", "?pod ExecutesAs ?workload_identity" ]
+      false_positive_note: >-
+        This dedupes with can-execute-as execute-as-via-command on
+        (CanExecuteAs, ?principal, ?workload_identity) — SAME collapse, k8s/pod-exec
+        framing; emit once, do not double-count weight. The escalation consequence is
+        produced by can-execute-as / can-control off this CanExecuteAs — cite, do not
+        duplicate. The token-mount gate matters: a pod with
+        automountServiceAccountToken:false and no IRSA/WI projected volume gives OS
+        access but not the identity => CONDITIONAL(token_mounted). Scope the exec verb
+        to the ACTUAL pod/namespace: a `pods/exec` grant in namespace A does not exec a
+        pod in namespace B. Cluster-admin kubeconfig / a broad pods/exec on all
+        namespaces reaches every pod's identity — the fan-out is real but each edge is
+        per (pod, workload_identity). Distinct from rule 1: exec is runtime access to
+        an already-running pod, not a supply-chain code push.
+      narrative: >-
+        {principal.name} can exec into {pod.name} ({perm:CanExecuteCommand}), which
+        runs as {workload_identity.name}; the pod's mounted ServiceAccount/IRSA/
+        Workload-Identity token is readable from inside, so {principal.name} executes
+        as {workload_identity.name}.
+
+  # --- 3) A k8s workload-identity binding federates the pod into a cloud role ---
+  # KSA<->GSA (GKE Workload Identity), IRSA (EKS), and Azure AKS Workload Identity
+  # are all OIDC federations: the cluster's projected ServiceAccount token is
+  # exchanged (via the cluster OIDC issuer the cloud trusts) for a cloud Role/SA
+  # with NO static key. That trust is a FEDERATION and is OWNED by federation-chains.
+  # This rule ONLY asserts the bridge fact — the pod's WorkloadIdentity is the
+  # external side of a federation whose token the cloud Role/SA trusts — so the
+  # CanFederateAs roll-up and its CanEnter*/CanImpersonate consequences are produced
+  # by federation-chains, NOT re-derived here.
+  - id: workload-identity-federates
+    emits: CanFederateAs
+    description: "A Kubernetes workload-identity binding (KSA<->GSA / IRSA / AKS Workload Identity) lets the pod's projected SA token federate into a cloud Role/ServiceAccount; escalation roll-ups are federation-chains'."
+    applies_to: ["*"]
+    match:
+      # The normalized federation trust the federation adapters emit for the cluster
+      # OIDC issuer -> cloud identity. ?pod_identity is the projected KSA / pod
+      # WorkloadIdentity; ?cloud_identity is the Role/SA it maps to.
+      - [ ?pod_identity, ExternalIdentityMapsTo, ?cloud_identity ]
+    where:
+      - "node_type(?pod_identity) in [WorkloadIdentity, FederatedIdentity, ExternalIdentity, ServiceAccount]  # the pod's projected ServiceAccount identity"
+      - "?pod_identity is a Kubernetes workload identity (GKE WI KSA / EKS IRSA SA / AKS WI SA)"
+      - "node_type(?cloud_identity) in [Role, ServiceAccount, MachineIdentity]  # the cloud identity the pod assumes"
+      - "exists TrustsExternalIdentity(?anchor -> ?pod_identity) backing this mapping (the cloud Role/SA OIDC trust on the cluster issuer)"
+    emit:
+      source_type: WorkloadIdentity
+      target_type: Role
+      source: ?pod_identity
+      target: ?cloud_identity
+      permissions: []
+      conditions: [trust_condition]
+      state_logic: >-
+        DELEGATED to federation-chains federation-maps-to-identity: ACTIVE when the
+        cluster-OIDC trust condition is BROAD/UNPINNED (the cloud Role/SA accepts any
+        namespace/KSA `sub`, a wildcard/shared aud, or the binding maps any pod in a
+        namespace an attacker can schedule into), CONDITIONAL(trust_condition) when
+        pinned to a specific namespace:serviceaccount the attacker cannot run a pod
+        as, BLOCKED if the cluster OIDC provider is disabled/deleted. This rule
+        inherits that exact state — it is the same collapse keyed to a k8s pod
+        ?pod_identity; do not compute a stronger state here.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?pod_identity ExternalIdentityMapsTo ?cloud_identity", "?anchor TrustsExternalIdentity ?pod_identity (cluster OIDC trust)" ]
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE federation-chains: this rule exists only to name the
+        k8s workload-identity case explicitly and dedupes with federation-chains
+        federation-maps-to-identity on (CanFederateAs, ?pod_identity, ?cloud_identity)
+        — emit once. The CanEnter*/CanImpersonate/escalation roll-ups off this
+        CanFederateAs are federation-chains' (federate-then-enter-*,
+        federate-inherits-capabilities) — never re-derive them here. The whole
+        judgment is the OIDC trust pin: an IRSA trust whose `sub` is
+        `system:serviceaccount:NS:SA` bound to a namespace/SA the attacker cannot run
+        a pod as is a legitimate control => CONDITIONAL(trust_condition), not ACTIVE.
+        An UNPINNED binding (the Role trusts `system:serviceaccount:*:*`, or the
+        attacker can create/schedule a pod as the trusted KSA — e.g. via rule 2 exec
+        or pod-create RBAC in that namespace) is ACTIVE. Do NOT treat mere existence
+        of workload identity as compromise. If ?cloud_identity is a plain User the
+        CanFederateAs target set excludes it — keep it FederatesTo (see
+        federation-chains). A disabled cluster OIDC issuer => adapter emits no trust =>
+        this rule does not fire.
+      narrative: >-
+        The pod workload identity {pod_identity.name} is bound to the cloud identity
+        {cloud_identity.name} via the cluster's OIDC issuer (KSA<->GSA / IRSA / AKS
+        Workload Identity); a pod running as {pod_identity.name} presents a token
+        {cloud_identity.name}'s trust accepts, federating in as {cloud_identity.name}
+        with no static credential (federation-chains rolls up the foothold and
+        impersonation).
+
+# ===========================================================================
+# WORKED EXAMPLES
+#
+# REGISTRY PUSH -> SUPPLY-CHAIN FAN-OUT (rule 1a -> 1b -> can-execute-as escalation):
+#   [dev CanModifyCode app-ecr(ContainerRegistry)]   (ecr:PutImage on app-ecr)
+#   + [payments-pod(KubernetesWorkload) ContainsResourceReference app-ecr] (runs_image,
+#     tag :latest, imagePullPolicy Always — MUTABLE)
+#     => image-push-poisons-consumers: [dev CanModifyCode payments-pod] ACTIVE
+#   + [payments-pod ExecutesAs payments-sa(ServiceAccount)]
+#     => poisoned-image-executes-as: [dev CanExecuteAs payments-sa] ACTIVE
+#     => can-execute-as / can-control: [dev CanEscalateTo payments-sa]
+#        (CITED, not re-derived) when payments-sa outranks dev.
+#   A SECOND consumer [batch-job ContainsResourceReference app-ecr] pinned to
+#     `app-ecr@sha256:abc...` (DIGEST) => the fan-out to batch-job is BLOCKED
+#     (overwriting :latest cannot change what the digest-pinned job runs).
+#
+# CLUSTER EXEC -> POD IDENTITY (rule 2 -> can-execute-as escalation):
+#   [operator CanExecuteCommand api-pod(KubernetesWorkload)]  (pods/exec create RBAC)
+#   + [api-pod ExecutesAs api-irsa(WorkloadIdentity)]  (token mounted)
+#     => cluster-rbac-exec: [operator CanExecuteAs api-irsa] ACTIVE
+#        (exec reads /var/run/secrets/... and the IRSA relay endpoint).
+#   A pod with automountServiceAccountToken:false and no IRSA volume =>
+#     CONDITIONAL(token_mounted) — OS access without the identity.
+#
+# WORKLOAD IDENTITY FEDERATION (rule 3 -> federation-chains):
+#   adapter normalizes an EKS IRSA trust with an unpinned sub (Role trusts
+#   `system:serviceaccount:*:*` on the cluster OIDC issuer):
+#     [app-ksa(WorkloadIdentity) ExternalIdentityMapsTo app-role(Role)]
+#     backed by [app-role TrustsExternalIdentity app-ksa]
+#     => workload-identity-federates: [app-ksa CanFederateAs app-role] ACTIVE
+#     => federation-chains federate-then-enter-account + federate-inherits-capabilities
+#        produce the account foothold and impersonation (CITED, not re-derived).
+#   sub pinned to `system:serviceaccount:prod:app-sa` the attacker cannot schedule a
+#     pod as => CONDITIONAL(trust_condition). If the attacker CAN create/exec a pod as
+#     that KSA (pod-create RBAC or rule 2), the pin is satisfiable => ACTIVE.
+#
+# BLOCKED-edge guidance:
+#  - A DIGEST-PINNED consumer (@sha256) or an IMMUTABLE-tag registry => rule 1a does
+#    not fire ACTIVE for that consumer; overwriting a tag cannot change what it runs.
+#  - A registry policy / SCP / RBAC deny on the push action (ecr:PutImage / AcrPush /
+#    artifactregistry.repositories.uploadArtifacts) => the contributing CanModifyCode
+#    is BLOCKED => the whole supply-chain fan-out is BLOCKED.
+#  - A pods/exec deny (RBAC / PodSecurity / OPA-Gatekeeper) or exec scoped to a
+#    different namespace/pod => rule 2's CanExecuteCommand is BLOCKED/CONDITIONAL and
+#    cluster-rbac-exec inherits it.
+#  - automountServiceAccountToken:false with no IRSA/WI projected volume =>
+#    cluster-rbac-exec CONDITIONAL(token_mounted), never ACTIVE.
+#  - A correctly pinned IRSA/WI sub (namespace:serviceaccount) the attacker cannot
+#    run a pod as, or a disabled cluster OIDC issuer => federation-chains does not fire
+#    ACTIVE; rule 3 inherits CONDITIONAL/BLOCKED.
+#  - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ===========================================================================

@@ -1,0 +1,787 @@
+# GCP Pub/Sub — Derived attack-path rules (Phase 10 — messaging)
+# ---------------------------------------------------------------------------
+# Pub/Sub is a Phase-10 event-source. Its attack surface is the signature
+# messaging primitive:
+#   * A topic is the event source; subscriptions bind topics to consumers.
+#   * PUSH subscriptions POST messages to an HTTPS endpoint (Cloud Run,
+#     Cloud Functions) authenticated with a configured SA OIDC token.
+#   * PULL subscriptions feed any consumer that polls via gRPC streaming pull.
+#   * Whoever can pubsub.topics.publish delivers to bound push subscriptions
+#     -> triggers the consumer with an attacker-influenced payload.
+#   * messaging-chains then collapses CanWriteData + CanTrigger(subscription →
+#     consumer) + ExecutesAs(consumer → SA) into CanExecuteAs.
+#
+# WHAT THIS FILE EMITS (normalized messaging FACTS the linchpins consume):
+#   CanWriteData(principal → topic)           pubsub.topics.publish granted
+#   CanReadData(principal → subscription)     pubsub.subscriptions.consume granted
+#   CanTrigger(subscription → consumer)       push subscription binding fact
+#   CrossProjectTrust(ResourcePolicy → Project) cross-project member in topic IAM
+#   ExposedToInternet(topic → AnonymousIdentity) allUsers/allAuthenticatedUsers publish
+#   CanModifyPolicy(principal → topic)        pubsub.topics.setIamPolicy
+#   ExposesCredential(subscription → push SA) push subscription oidcToken SA
+#   CanModifyConfiguration(principal → sub)  pubsub.subscriptions.update (endpoint/SA swap)
+#
+# LINCHPINS CITED (do not duplicate):
+#   messaging-chains messaging-publish-triggers-consumer
+#       (CanWriteData(p→topic) + CanTrigger(topic→sub→consumer) → CanTrigger(p→consumer))
+#   messaging-chains messaging-trigger-executes-as
+#       (CanTrigger(p→consumer) + ExecutesAs(consumer→SA) → CanExecuteAs(p,SA))
+#   messaging-chains messaging-resource-policy-cross-boundary-trust
+#       (CrossProjectTrust from resource policy → CanEnterProject via can-control)
+#   messaging-chains messaging-schedule-persists-executes-as
+#       (CanSchedule + CanPassIdentity → CanExecuteAs for schedulers, cited not
+#        re-derived; Cloud Scheduler creates a Pub/Sub topic as a delivery mechanism —
+#        that vector is owned by the Cloud Scheduler rule)
+#   credential-chains read-secret-yields-identity
+#       (CanReadData + ContainsSecret + CredentialsFor → CanImpersonate)
+#   can-control enter-account-via-assume / enter-project-via-*
+#       (CrossProjectTrust → CanEnterProject)
+#   can-execute-as execute-as-via-code-modify
+#       (CanModifyCode + ExecutesAs → CanExecuteAs; consumer-side code change is
+#        owned by the consumer's rule file — gcp/cloudrun.yaml, gcp/gcf.yaml)
+#
+# Permissions are from the official GCP IAM permissions reference for Pub/Sub:
+#   https://cloud.google.com/pubsub/docs/access-control
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 10-messaging
+service: pubsub
+applies_to: [gcp]
+
+rules:
+
+  # --- 1) Push subscription binding: topic → consumer (the event-source fact) --
+  # A push subscription with a non-empty pushConfig.pushEndpoint that resolves
+  # to a Cloud Run service or Cloud Function URL creates the binding
+  # CanTrigger(subscription → consumer). This is the structural event-source FACT
+  # that messaging-chains messaging-publish-triggers-consumer consumes (together
+  # with CanWriteData(principal → topic) via the topic-to-subscription chain) to
+  # derive CanTrigger(principal → consumer). State is ACTIVE when the subscription
+  # is ACTIVE and the push endpoint resolves to a modeled consumer; CONDITIONAL
+  # when the subscription is disabled, paused, or has an unresolvable endpoint.
+  - id: gcp-pubsub-push-triggers-consumer
+    emits: CanTrigger
+    description: >-
+      An active push subscription binding its topic's messages to an HTTP endpoint
+      (Cloud Run service / Cloud Function URL) makes the subscription an event-source
+      bridge: messages published to the topic are delivered to the consumer.
+      Consumed by messaging-chains to derive CanTrigger(publisher → consumer).
+    match:
+      - match_record:
+          resource_type: "google.pubsub.Subscription"
+          field: "pushConfig.pushEndpoint"
+        where:
+          - "pushConfig.pushEndpoint is non-empty and resolves to a Cloud Run service or Cloud Functions URL"
+          - "?subscription.state is ACTIVE (not PAUSED, DELETED)"
+          - "?subscription is attached to ?topic (subscription.topic field)"
+    where:
+      - "node_type(?subscription) == Queue"
+      - "node_class(?consumer) == Compute"
+    emit:
+      source_type: Queue
+      target_type: Compute
+      source: "<Pub/Sub subscription node>"
+      target: "<Cloud Run service / Cloud Function consumer at the push endpoint URL>"
+      permissions: []
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        ACTIVE when the subscription state is ACTIVE and the push endpoint URL
+        resolves to a modeled Cloud Run service or Cloud Function that is enabled/
+        running. CONDITIONAL(trigger_exists) when the subscription is PAUSED or the
+        endpoint does not resolve to a modeled compute node (external URL or not yet
+        inventoried). CONDITIONAL(condition_expression) when the subscription has a
+        non-trivial message filter (filter field non-empty): the attacker's payload
+        must match the filter expression to be delivered. BLOCKED when the subscription
+        state is DELETED or the push SA is missing actAs (delivery fails silently).
+        Inherit weakest with the contributing CanWriteData edge in messaging-chains.
+      confidence: 0.95
+      derived_from:
+        - "pubsub.subscriptions.get[pushConfig.pushEndpoint, state, topic, filter]"
+      false_positive_note: >-
+        Only emit for PUSH subscriptions (pushConfig.pushEndpoint non-empty).
+        Pull subscriptions do NOT automatically trigger a consumer — they require the
+        consumer to actively poll (model the consumer's pull action as CanReadData,
+        not CanTrigger). A subscription filter (filter field) is a real delivery gate:
+        if the attacker's payload cannot satisfy the filter expression, delivery is
+        silently dropped — downgrade to CONDITIONAL(condition_expression). BigQuery
+        and Cloud Storage subscriptions deliver to data sinks, not compute; do not
+        emit CanTrigger → CanExecuteAs for those delivery types. Dead-letter topic
+        forwarding is a separate hop; model it as a new CanTrigger chain off the
+        dead-letter topic if that topic also has a consumer.
+      narrative: >-
+        Pub/Sub subscription {subscription.name} is a push subscription delivering to
+        {consumer.name} ({pushEndpoint}); messages published to the topic are POSTed to
+        {consumer.name}, feeding messaging-chains to derive CanTrigger(publisher →
+        {consumer.name}).
+
+  # --- 2) pubsub.topics.publish → CanWriteData (the publish fact) ---------------
+  # pubsub.topics.publish is the data-plane SEND action for a topic: the principal
+  # writes a message (with attacker-controlled body + attributes) to the topic.
+  # messaging-chains messaging-publish-triggers-consumer then consumes
+  # CanWriteData(principal → topic) + CanTrigger(subscription → consumer) to
+  # derive CanTrigger(principal → consumer). The publish permission is checked
+  # against the topic's IAM allow policy (topic-level) + project/folder/org IAM.
+  - id: gcp-pubsub-publish-can-write-data
+    emits: CanWriteData
+    description: >-
+      pubsub.topics.publish on a topic is the data-plane publish action; the principal
+      can send attacker-influenced messages that drive push-subscription consumers.
+      Consumed by messaging-chains as CanWriteData(principal → topic).
+    match:
+      - match_effective_permission:
+          action: "pubsub.topics.publish"
+          resource_type: "google.pubsub.Topic"
+    emit:
+      source_type: Identity
+      target_type: Topic
+      source: "<principal>"
+      target: "<Pub/Sub topic node>"
+      permissions: ["pubsub.topics.publish"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the effective pubsub.topics.publish is granted (topic IAM + project/
+        folder/org IAM all allow; no IAM deny policy denies). CONDITIONAL(resource_policy)
+        when a topic IAM condition (e.g. request.time, resource.name) scopes the grant
+        and the condition is not unconditionally satisfied. BLOCKED by an IAM deny policy
+        or org policy that denies the action at effective scope.
+      confidence: 0.97
+      derived_from:
+        - "effective-permission: pubsub.topics.publish on topic"
+      false_positive_note: >-
+        GCP Pub/Sub uses a unified IAM model: effective publish permission is the
+        union of grants at topic / project / folder / org minus any IAM deny policies.
+        Honor IAM deny policies (they win over allow). pubsub.topics.publish does NOT
+        require the publisher to also hold pubsub.subscriptions.create — the publisher
+        only writes messages; consumers independently subscribe. A publisher cannot
+        suppress or read messages on a subscription it did not create.
+      narrative: >-
+        {principal.name} can publish messages to Pub/Sub topic {topic.name}
+        (pubsub.topics.publish), enabling the Phase-10 trigger chain when {topic.name}
+        has an active push subscription bound to a compute consumer.
+
+  # --- 3) pubsub.subscriptions.consume → CanReadData (the pull-read fact) -------
+  # pubsub.subscriptions.consume is the data-plane PULL action: the principal
+  # receives messages from a subscription (via streaming pull or REST pull). If
+  # the subscription carries secrets (ContainsSecret / ContainsCredential),
+  # credential-chains read-secret-yields-identity rolls this into CanImpersonate.
+  # Also enables the CanExfiltrate path: an attacker-owned process that subscribes
+  # to a subscription in a target project can drain confidential data out of that
+  # project via pull.
+  - id: gcp-pubsub-subscribe-can-read-data
+    emits: CanReadData
+    description: >-
+      pubsub.subscriptions.consume on a subscription is the data-plane pull action;
+      if the subscription carries credential material, credential-chains derives
+      CanImpersonate. Also an exfiltration path when cross-project.
+    match:
+      - match_effective_permission:
+          action: "pubsub.subscriptions.consume"
+          resource_type: "google.pubsub.Subscription"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<Pub/Sub subscription node>"
+      permissions: ["pubsub.subscriptions.consume"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when effective pubsub.subscriptions.consume is granted (subscription IAM +
+        project IAM; no deny policy blocks). CONDITIONAL(resource_policy) when a
+        subscription IAM condition scopes the grant. BLOCKED by IAM deny policy.
+        Pub/Sub does not support native encryption with customer-managed keys at the
+        subscription delivery level (CMEK is at the topic storage level via
+        pubsub.topics.create with a kmsKeyName); if the topic has a CMEK binding the
+        Pub/Sub service decrypts transparently — no additional kms:Decrypt-like gate on
+        the subscriber. Downgrade to CONDITIONAL(key_permission) only if explicit
+        application-level encryption (separate from Pub/Sub service-level CMEK) is
+        confirmed in the message payloads.
+      confidence: 0.95
+      derived_from:
+        - "effective-permission: pubsub.subscriptions.consume on subscription"
+      false_positive_note: >-
+        pubsub.subscriptions.consume grants pull delivery; it does NOT grant read of
+        a push subscription's messages (push delivery is unidirectional to the endpoint).
+        Credential-chain value only materializes when the subscription is confirmed to
+        carry sensitive data (ContainsSecret / ContainsCredential must be separately
+        emitted by pipeline metadata analysis or analyst labeling — do not assume every
+        subscription carries secrets). CanExfiltrate is rolled up by the data-plane
+        linchpin when CanReadData on a cross-project subscription is confirmed.
+      narrative: >-
+        {principal.name} can pull messages from Pub/Sub subscription {subscription.name}
+        (pubsub.subscriptions.consume); if {subscription.name} carries credential
+        material, credential-chains derives the ability to authenticate as the embedded
+        identity.
+
+  # --- 4) Cross-project publish grant in topic IAM → CrossProjectTrust ----------
+  # A topic IAM binding that grants pubsub.topics.publish (or roles/pubsub.publisher)
+  # to a principal whose project ≠ the topic's project is cross-project publish
+  # trust. messaging-chains rule 4 handles the generic cross-boundary messaging
+  # policy case; this rule is the GCP-specific materialization that emits
+  # CrossProjectTrust from the raw IAM binding, making it explicit in the graph.
+  # can-control's enter-project-via-* then collapses CrossProjectTrust →
+  # CanEnterProject when a push-subscription binding routes to compute in the
+  # target project (via messaging-chains rules 1-2). CITE, do not re-derive.
+  - id: gcp-pubsub-cross-project-publish-trust
+    emits: CrossProjectTrust
+    description: >-
+      A Pub/Sub topic IAM binding granting pubsub.topics.publish to a principal from
+      another GCP project is cross-project publish trust; feeds can-control's
+      CanEnterProject derivation via messaging-chains.
+    match:
+      - match_record:
+          resource_type: "google.pubsub.Topic"
+          field: "iamPolicy.bindings"
+        where:
+          - "a binding grants pubsub.topics.publish or roles/pubsub.publisher or roles/pubsub.admin"
+          - "the member's project (extracted from SA email or user domain) != the topic's project"
+          - "the member is NOT allUsers or allAuthenticatedUsers (those are ExposedToInternet, see rule 5)"
+    where:
+      - "node_type(?policy) == ResourcePolicy"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: "<topic ResourcePolicy node>"
+      target: "<GCP project of the foreign member>"
+      permissions: []
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the topic IAM binding unconditionally grants pubsub.topics.publish
+        to a named external SA or user (no IAM condition on the binding). CONDITIONAL
+        (condition_expression) when the binding has an IAM condition expression that the
+        external principal must satisfy (e.g. request.time, resource.name prefix) —
+        the cross-project trust is gated. BLOCKED by an org policy
+        (constraints/iam.allowedPolicyMemberDomains or constraints/gcp.restrictCrossProjectCommunication)
+        that prevents the cross-project grant from being effective.
+      confidence: 0.95
+      derived_from:
+        - "pubsub.topics.getIamPolicy[bindings, member, condition]"
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE messaging-chains rule 4 and can-control: this rule
+        asserts only the CrossProjectTrust FACT; the CanEnterProject consequence is
+        produced by can-control consuming CrossProjectTrust together with
+        CanTrigger/CanExecuteAs from messaging-chains rules 1-2. Honor IAM condition
+        expressions on the binding — a condition-scoped binding is CONDITIONAL, not
+        an unconditional cross-project trust. A foreign SA binding that is also
+        denied by an IAM deny policy at project/folder/org level is BLOCKED. A user
+        SA whose project is the SAME as the topic's project is not cross-project
+        (compare the project number in the SA email, not just the project ID string).
+        pubsub.subscriptions.consume granted cross-project is a separate
+        CrossProjectTrust edge on the subscription ResourcePolicy — not covered by
+        this rule (emit separately from pubsub.subscriptions.getIamPolicy).
+      narrative: >-
+        The IAM policy on Pub/Sub topic {topic.name} grants pubsub.topics.publish to
+        a principal in project {foreign_project}; this cross-project trust lets that
+        external principal publish to {topic.name} and thereby (via messaging-chains)
+        trigger any push-subscription consumer in {topic.project}.
+
+  # --- 5) allUsers/allAuthenticatedUsers publish → ExposedToInternet ---------------
+  # A topic IAM binding that grants pubsub.topics.publish to allUsers or
+  # allAuthenticatedUsers makes the topic publicly writable: any internet caller
+  # (unauthenticated or authenticated with any Google account respectively) can
+  # publish messages. This directly enables the trigger chain for any push-
+  # subscription consumer without any project-specific identity requirement.
+  - id: gcp-pubsub-topic-public-publish
+    emits: ExposedToInternet
+    description: >-
+      allUsers or allAuthenticatedUsers granted pubsub.topics.publish on a topic
+      makes it publicly writable; any internet caller can trigger bound push-subscription
+      consumers via messaging-chains without project credentials.
+    match:
+      - match_record:
+          resource_type: "google.pubsub.Topic"
+          field: "iamPolicy.bindings"
+        where:
+          - "a binding grants pubsub.topics.publish or roles/pubsub.publisher to allUsers OR allAuthenticatedUsers"
+    where:
+      - "node_type(?topic) == Topic"
+    emit:
+      source_type: Topic
+      target_type: AnonymousIdentity
+      source: "<Pub/Sub topic node>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the topic IAM binding unconditionally grants pubsub.topics.publish
+        to allUsers (fully unauthenticated) or allAuthenticatedUsers (any Google
+        account — treat as effectively internet-accessible). No IAM condition can
+        restrict allUsers at the topic level (it is the wildcard principal). CONDITIONAL
+        (resource_policy) when a condition expression on the binding would further scope
+        it (unusual for allUsers but theoretically possible). BLOCKED by an org policy
+        (constraints/iam.allowedPolicyMemberDomains) that prevents allUsers/
+        allAuthenticatedUsers grants at this project/folder/org.
+      confidence: 0.97
+      derived_from:
+        - "pubsub.topics.getIamPolicy[bindings — allUsers/allAuthenticatedUsers member]"
+      false_positive_note: >-
+        allUsers is genuinely anonymous (no Google sign-in required); allAuthenticatedUsers
+        requires any valid Google account — an internet attacker with a free Google account
+        qualifies. Both are modeled as ExposedToInternet for path scoring. An org policy
+        (constraints/iam.allowedPolicyMemberDomains) that excludes these members makes
+        the grant ineffective -> BLOCKED. Only pubsub.topics.publish (or a role that
+        includes it) creates the ExposedToInternet fact; a subscribe-only wildcard grant
+        is a data-exfil exposure but does not produce ExposedToInternet for the trigger
+        chain (emit separately as CanReadData with anonymous source).
+      narrative: >-
+        Pub/Sub topic {topic.name} grants pubsub.topics.publish to {member} (public);
+        any internet caller can publish messages to {topic.name}, enabling the Phase-10
+        trigger chain for any push-subscription consumer without project credentials
+        via messaging-chains.
+
+  # --- 6) pubsub.topics.setIamPolicy → CanModifyPolicy -------------------------
+  # pubsub.topics.setIamPolicy allows rewriting the topic IAM allow policy. An
+  # attacker with this permission can self-grant pubsub.topics.publish, then
+  # proceed along the trigger chain (CanModifyPolicy → self-grant CanWriteData →
+  # CanTrigger). The downstream consequence (publish → trigger) is handled by
+  # messaging-chains; this rule emits the CanModifyPolicy fact only.
+  - id: gcp-pubsub-set-iam-policy-topic
+    emits: CanModifyPolicy
+    description: >-
+      pubsub.topics.setIamPolicy allows rewriting the topic IAM policy, enabling
+      self-grant of pubsub.topics.publish and the downstream trigger chain.
+    match:
+      - match_effective_permission:
+          action: "pubsub.topics.setIamPolicy"
+          resource_type: "google.pubsub.Topic"
+    emit:
+      source_type: Identity
+      target_type: Topic
+      source: "<principal>"
+      target: "<Pub/Sub topic node>"
+      permissions: ["pubsub.topics.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when effective pubsub.topics.setIamPolicy is granted and no IAM deny
+        policy or org policy constraint blocks the action. BLOCKED by IAM deny or by
+        an org policy that restricts IAM policy mutation at this scope.
+      confidence: 0.90
+      derived_from:
+        - "effective-permission: pubsub.topics.setIamPolicy on topic"
+      false_positive_note: >-
+        pubsub.topics.setIamPolicy modifies only the topic's own IAM policy, not the
+        subscription's. The attacker can self-grant pubsub.topics.publish but cannot
+        self-grant consume access to existing subscriptions via this permission alone.
+        The downstream CanModifyPolicy → CanWriteData → CanTrigger escalation requires
+        a push subscription already to exist and be active (unless the attacker also
+        has pubsub.subscriptions.create). Org policy
+        (constraints/iam.allowedPolicyMemberDomains) may prevent adding external
+        members via setIamPolicy.
+      narrative: >-
+        {principal.name} can rewrite the IAM policy of Pub/Sub topic {topic.name}
+        (pubsub.topics.setIamPolicy); an attacker can self-grant pubsub.topics.publish
+        and then trigger any push-subscription consumer via the Phase-10 trigger chain.
+
+  # --- 7) Push subscription oidcToken SA → ExposesCredential --------------------
+  # A push subscription that specifies pushConfig.oidcToken.serviceAccountEmail
+  # attaches a Google-signed OIDC token for that SA to every HTTP POST to the
+  # push endpoint. The push endpoint receives the token as an Authorization bearer
+  # header. Any code running at the push endpoint can extract and replay the OIDC
+  # token for the push SA — which may grant access to GCP APIs that accept OIDC
+  # tokens (metadata-based short-lived access). This is an ExposesCredential
+  # fact: the subscription exposes the push SA's token at the endpoint. Credential-
+  # chains read-secret-yields-identity rolls this into CanImpersonate when combined
+  # with CredentialsFor(token → push SA). CONDITIONAL: the push SA's OIDC token is
+  # only present when push delivery is active; if the subscription is paused or the
+  # push SA's actAs is revoked, no token is delivered.
+  - id: gcp-pubsub-push-sa-exposes-credential
+    emits: ExposesCredential
+    description: >-
+      A Pub/Sub push subscription delivers a Google-signed OIDC token for its
+      pushConfig.oidcToken.serviceAccountEmail to the push endpoint on every delivery;
+      code at the endpoint can extract and replay the token, exposing the push SA's
+      identity.
+    match:
+      - match_record:
+          resource_type: "google.pubsub.Subscription"
+          field: "pushConfig.oidcToken.serviceAccountEmail"
+        where:
+          - "pushConfig.oidcToken.serviceAccountEmail is non-empty (push OIDC auth configured)"
+          - "?subscription.state is ACTIVE"
+    where:
+      - "node_type(?subscription) == Queue"
+    emit:
+      source_type: Messaging
+      target_type: ServiceAccount
+      source: "<Pub/Sub subscription node>"
+      target: "<push SA (ServiceAccount node for oidcToken.serviceAccountEmail)>"
+      permissions: []
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        CONDITIONAL(trigger_exists): the OIDC token is only delivered when messages
+        are being actively pushed (subscription ACTIVE + messages in the topic +
+        push endpoint reachable). ACTIVE when the subscription is confirmed ACTIVE
+        and push delivery is ongoing (subscription has recent delivery metrics).
+        BLOCKED when the subscription is PAUSED or the push SA's actAs is revoked
+        (Pub/Sub Service Agent no longer holds actAs on the push SA).
+      confidence: 0.85
+      derived_from:
+        - "pubsub.subscriptions.get[pushConfig.oidcToken.serviceAccountEmail, state]"
+      false_positive_note: >-
+        The OIDC token is a SHORT-LIVED bearer token (1-hour expiry by default).
+        The push endpoint receives it as an Authorization header and may or may not
+        log/store it — the ExposesCredential fact is about the delivery mechanism,
+        not a confirmed theft. Actual exploitation requires code at the push endpoint
+        to extract the token from the request header and use it to call GCP APIs as
+        the push SA. The push SA is a DIFFERENT identity from the consumer's runtime SA
+        (Cloud Run / GCF runtime SA) — do NOT conflate them. A push SA with minimal
+        roles (e.g. only run.invoker on the target service) is a low-value exposure;
+        a push SA with broad project roles is high-value. The ExposesCredential edge
+        feeds credential-chains only if CredentialsFor(token → push SA) is also emitted.
+      narrative: >-
+        Pub/Sub push subscription {subscription.name} delivers a Google-signed OIDC
+        token for {push_sa.name} to {push_endpoint} on every message POST; code
+        running at the push endpoint can extract the token from the Authorization
+        header and authenticate to GCP APIs as {push_sa.name}.
+
+  # --- 8) pubsub.subscriptions.update (push endpoint/SA swap) → CanModifyConfiguration
+  # pubsub.subscriptions.update lets a principal change the push endpoint URL and
+  # oidcToken.serviceAccountEmail. Redirecting the push endpoint to an attacker-
+  # controlled URL reroutes all message delivery there — data exfiltration. Swapping
+  # the push SA (requires iam.serviceAccounts.actAs on the new SA) changes which
+  # identity's OIDC token is delivered. This is a CanModifyConfiguration fact.
+  # The downstream escalation (subscription now points to attacker URL → drain
+  # secrets from messages) is CanExfiltrate, rolled up by data-plane linchpin.
+  - id: gcp-pubsub-update-subscription-can-modify-configuration
+    emits: CanModifyConfiguration
+    description: >-
+      pubsub.subscriptions.update allows changing the push endpoint URL and push SA
+      (oidcToken.serviceAccountEmail) on a subscription, enabling push-endpoint
+      redirect for data exfiltration or push SA swap for credential exposure.
+    match:
+      - match_effective_permission:
+          action: "pubsub.subscriptions.update"
+          resource_type: "google.pubsub.Subscription"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<Pub/Sub subscription node>"
+      permissions: ["pubsub.subscriptions.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when effective pubsub.subscriptions.update is granted. Swapping the push
+        SA field additionally requires iam.serviceAccounts.actAs on the new SA — if the
+        principal lacks actAs on the desired SA, the push-SA-swap path is POTENTIAL
+        (role_compatibility gate); the push-endpoint-redirect path remains ACTIVE.
+        BLOCKED by IAM deny policy.
+      confidence: 0.90
+      derived_from:
+        - "effective-permission: pubsub.subscriptions.update on subscription"
+      false_positive_note: >-
+        The push endpoint redirect (changing pushConfig.pushEndpoint) requires only
+        pubsub.subscriptions.update — no actAs needed to change the URL. However,
+        changing the oidcToken.serviceAccountEmail to an ARBITRARY SA requires
+        iam.serviceAccounts.actAs on that SA; without it, GCP rejects the update.
+        Do not conflate the two sub-capabilities: endpoint redirect is ACTIVE with
+        only pubsub.subscriptions.update; SA swap is POTENTIAL without actAs.
+        A pull subscription (no pushConfig) offers less interesting modification targets
+        — changing deadLetterPolicy or filter is operationally impactful but does not
+        directly yield an attack path; still emit CanModifyConfiguration for analyst
+        awareness.
+      narrative: >-
+        {principal.name} can update Pub/Sub subscription {subscription.name}
+        (pubsub.subscriptions.update), redirecting its push endpoint to an attacker-
+        controlled URL (data exfiltration of all messages) or swapping the push SA to
+        deliver a different identity's OIDC token to the endpoint (requires actAs on
+        the new SA).
+
+  # --- 9) pubsub.subscriptions.setIamPolicy → CanModifyPolicy on subscription ------
+  # pubsub.subscriptions.setIamPolicy allows rewriting the subscription's IAM allow
+  # policy. An attacker with this permission can self-grant pubsub.subscriptions.consume
+  # on a subscription carrying secrets (ContainsSecret), then read/drain the credential-
+  # carrying messages via the credential-chains read-secret-yields-identity path.
+  - id: gcp-pubsub-set-iam-policy-subscription
+    emits: CanModifyPolicy
+    description: >-
+      pubsub.subscriptions.setIamPolicy allows rewriting the subscription IAM policy,
+      enabling self-grant of pubsub.subscriptions.consume for credential/secret
+      extraction via credential-chains.
+    match:
+      - match_effective_permission:
+          action: "pubsub.subscriptions.setIamPolicy"
+          resource_type: "google.pubsub.Subscription"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<Pub/Sub subscription node>"
+      permissions: ["pubsub.subscriptions.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when effective pubsub.subscriptions.setIamPolicy is granted and no IAM
+        deny policy or org policy constraint blocks the action. BLOCKED by IAM deny or
+        by an org policy that restricts IAM policy mutation at this scope.
+      confidence: 0.90
+      derived_from:
+        - "effective-permission: pubsub.subscriptions.setIamPolicy on subscription"
+      false_positive_note: >-
+        pubsub.subscriptions.setIamPolicy modifies only the subscription's own IAM
+        policy. The attacker can self-grant pubsub.subscriptions.consume on the
+        subscription to read messages. Credential value only materializes if the
+        subscription carries secret/credential material (ContainsSecret /
+        ContainsCredential must be separately emitted). Org policy
+        (constraints/iam.allowedPolicyMemberDomains) may prevent adding members
+        via setIamPolicy.
+      narrative: >-
+        {principal.name} can rewrite the IAM policy of Pub/Sub subscription
+        {subscription.name} (pubsub.subscriptions.setIamPolicy); an attacker can
+        self-grant pubsub.subscriptions.consume and then read credential-carrying
+        messages via credential-chains.
+
+  # --- 10) pubsub.subscriptions.create/update + iam.serviceAccounts.actAs →
+  # CanPassIdentity (push SA attachment for OIDC token delivery) ---------------
+  # A principal with pubsub.subscriptions.create (or pubsub.subscriptions.update)
+  # AND iam.serviceAccounts.actAs on a target SA can create a push subscription
+  # specifying pushConfig.oidcToken.serviceAccountEmail = the target SA. This
+  # attaches the SA's identity to the subscription as an event-source delivery
+  # mechanism: the push SA's OIDC token is forwarded to the push endpoint, and
+  # code there can extract and replay it. This is a CanPassIdentity fact: the
+  # principal can attach the push SA's identity to the subscription (a workload
+  # event source) for token delivery.
+  - id: gcp-pubsub-create-push-subscription-can-pass-identity
+    emits: CanPassIdentity
+    description: >-
+      pubsub.subscriptions.create (or pubsub.subscriptions.update) +
+      iam.serviceAccounts.actAs on a push SA allows creating a push subscription
+      that delivers the SA's OIDC token to a push endpoint, attaching the SA's
+      identity to the event source.
+    match:
+      - match_effective_permission:
+          action: "pubsub.subscriptions.create"
+          resource_type: "google.pubsub.Topic"
+      - match_effective_permission:
+          action: "iam.serviceAccounts.actAs"
+          resource_type: "google.iam.ServiceAccount"
+    where:
+      - "both permissions held by ?principal"
+      - "?sa is the target of iam.serviceAccounts.actAs"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "<principal>"
+      target: "<push service account>"
+      permissions: ["pubsub.subscriptions.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when both pubsub.subscriptions.create (or pubsub.subscriptions.update)
+        and iam.serviceAccounts.actAs on the target SA are effectively granted and
+        no deny policy blocks. CONDITIONAL(role_compatibility) when the actAs scope
+        or role compatibility to the push SA is not confirmed. BLOCKED by IAM deny
+        on either permission or an org policy that restricts actAs usage.
+      confidence: 0.85
+      derived_from:
+        - "effective-permission: pubsub.subscriptions.create (or .update) on Topic"
+        - "effective-permission: iam.serviceAccounts.actAs on ServiceAccount"
+      false_positive_note: >-
+        The Pub/Sub Service Agent (service-<project-number>@gcp-sa-pubsub.iam.gserviceaccount.com)
+        must also hold iam.serviceAccounts.actAs on the push SA at delivery time — if the
+        Service Agent binding is absent or revoked, push delivery fails even if the
+        creator has actAs. Do not emit unless both permissions are confirmed on the same
+        principal. The CanPassIdentity edge feeds credential-chains when combined with
+        ExposesCredential(subscription → push SA) and CredentialsFor(token → push SA).
+      narrative: >-
+        {principal.name} can create a Pub/Sub push subscription (pubsub.subscriptions.create)
+        with pushConfig.oidcToken.serviceAccountEmail set to {sa.name} and holds
+        iam.serviceAccounts.actAs on {sa.name}, enabling delivery of {sa.name}'s OIDC
+        token to an attacker-controlled push endpoint for extraction and replay.
+
+  # --- 11) Cross-project subscription IAM → CrossProjectTrust (read/consume) ------
+  # A subscription IAM binding that grants pubsub.subscriptions.consume (or
+  # roles/pubsub.subscriber) to a principal whose project ≠ the subscription's
+  # project is cross-project subscribe trust. An external-project principal with
+  # consume access can drain messages from a subscription in the target project
+  # (CanReadData exfiltration path) and trigger attached consumers if the messages
+  # carry secrets (credential-chains read-secret-yields-identity path). Separate
+  # from rule 4 (cross-project publish trust on topics).
+  - id: gcp-pubsub-cross-project-consume-trust
+    emits: CrossProjectTrust
+    description: >-
+      A Pub/Sub subscription IAM binding granting pubsub.subscriptions.consume to a
+      principal from another GCP project enables the external principal to read/drain
+      the subscription (data exfiltration via messaging-chains).
+    match:
+      - match_record:
+          resource_type: "google.pubsub.Subscription"
+          field: "iamPolicy.bindings"
+        where:
+          - "a binding grants pubsub.subscriptions.consume or roles/pubsub.subscriber or roles/pubsub.admin"
+          - "the member's project (extracted from SA email or user domain) != the subscription's project"
+          - "the member is NOT allUsers or allAuthenticatedUsers"
+    where:
+      - "node_type(?policy) == ResourcePolicy"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: "<subscription ResourcePolicy node>"
+      target: "<GCP project of the external member>"
+      permissions: []
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the subscription IAM binding unconditionally grants
+        pubsub.subscriptions.consume to a named external SA or user (no IAM condition).
+        CONDITIONAL(condition_expression) when the binding has an IAM condition
+        expression that the external principal must satisfy — the cross-project
+        consume trust is gated. BLOCKED by an org policy
+        (constraints/iam.allowedPolicyMemberDomains or
+        constraints/gcp.restrictCrossProjectCommunication) that prevents the
+        cross-project grant from being effective.
+      confidence: 0.95
+      derived_from:
+        - "pubsub.subscriptions.getIamPolicy[bindings, member, condition]"
+      false_positive_note: >-
+        This rule covers CONSUMPTION (pull/read) from a subscription, distinct from
+        rule 4 (cross-project publish to a topic). A cross-project consume grant
+        enables CanReadData(external principal → subscription) for the external
+        project's principal. The CanEnterProject consequence is produced by
+        can-control consuming this CrossProjectTrust together with
+        CanReadData/CanExfiltrate on the subscription. Honor IAM condition
+        expressions — a condition-scoped binding is CONDITIONAL, not ACTIVE.
+        A foreign SA binding that is also denied by an IAM deny policy at project/
+        folder/org level is BLOCKED.
+      narrative: >-
+        The IAM policy on Pub/Sub subscription {subscription.name} grants
+        pubsub.subscriptions.consume to a principal in project {foreign_project};
+        this cross-project trust lets that external principal read/drain messages
+        from {subscription.name}.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An IAM deny policy denying pubsub.topics.publish or pubsub.subscriptions.consume
+#    at effective scope -> emit the edge with state: BLOCKED and
+#    denied_by=<deny policy resource name>.
+#  - An org policy (constraints/iam.allowedPolicyMemberDomains) blocking allUsers or
+#    allAuthenticatedUsers grants -> gcp-pubsub-topic-public-publish BLOCKED.
+#  - A subscription in PAUSED state -> gcp-pubsub-push-triggers-consumer CONDITIONAL
+#    (trigger_exists), not ACTIVE; gcp-pubsub-push-sa-exposes-credential BLOCKED.
+#  - A message filter (filter field non-empty) on a subscription -> CanTrigger
+#    CONDITIONAL(condition_expression): the attacker payload must match the filter.
+#  - pubsub.subscriptions.update without iam.serviceAccounts.actAs on the target SA
+#    -> push-SA-swap path POTENTIAL(role_compatibility); push-endpoint-redirect
+#    path remains ACTIVE.
+#  - Org policy constraints/gcp.restrictCrossProjectCommunication or
+#    constraints/iam.allowedPolicyMemberDomains -> gcp-pubsub-cross-project-publish-trust
+#    CONDITIONAL or BLOCKED.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service. These drive the derived rules
+# above and should also live in /rules/explicit/gcp-pubsub.yaml, but are
+# summarized here for the service bundle.
+explicit_rules:
+
+  - id: gcp-pubsub-executes-as-push-consumer
+    emits: ExecutesAs
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.cloud.run.Service"
+      field: "spec.template.spec.serviceAccountName"
+    where:
+      - "service URL matches a push subscription pushConfig.pushEndpoint"
+    emit:
+      source_type: Compute
+      target_type: ServiceAccount
+      source: "<Cloud Run service / GCF consumer node>"
+      target: "<runtime service account of the consumer>"
+      api_source: "run.services.get / cloudfunctions.functions.get"
+      evidence_field: "spec.serviceAccountName / serviceAccountEmail"
+      narrative: >-
+        Consumer {consumer.name} at the push endpoint executes as runtime SA
+        {sa.name} (owned by cloudrun.yaml / gcf.yaml rules; cited here for clarity).
+      note: >-
+        This rule re-emits ExecutesAs(consumer → runtime SA) that is owned by
+        cloudrun.yaml / gcf.yaml rules and emitted for every Cloud Run service /
+        Cloud Function. Including it here for clarity but may produce duplicate
+        edges on (ExecutesAs, consumer, SA) — deduplicate at graph ingestion.
+        The material Phase-10 value is the upstream CanTrigger/CanWriteData edges
+        (from this service's rules 1-8) that feed into messaging-chains to derive
+        CanExecuteAs(publisher → runtime SA) without requiring re-derivation of
+        the ExecutesAs edge.
+
+  - id: gcp-pubsub-can-write-data
+    emits: CanWriteData
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "pubsub.topics.publish"
+      resource_type: "google.pubsub.Topic"
+    emit:
+      source_type: Identity
+      target_type: Topic
+      source: "<principal>"
+      target: "<Pub/Sub topic node>"
+      permissions: ["pubsub.topics.publish"]
+      api_source: "pubsub.topics.getIamPolicy + effective-permission evaluator"
+      narrative: "{principal.name} can publish messages to {topic.name} (pubsub.topics.publish)."
+
+  - id: gcp-pubsub-can-read-data
+    emits: CanReadData
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "pubsub.subscriptions.consume"
+      resource_type: "google.pubsub.Subscription"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<Pub/Sub subscription node>"
+      permissions: ["pubsub.subscriptions.consume"]
+      api_source: "pubsub.subscriptions.getIamPolicy + effective-permission evaluator"
+      narrative: "{principal.name} can pull messages from {subscription.name} (pubsub.subscriptions.consume)."
+
+  - id: gcp-pubsub-push-subscription-binding
+    emits: CanTrigger
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.pubsub.Subscription"
+      field: "pushConfig.pushEndpoint"
+    where:
+      - "pushConfig.pushEndpoint resolves to a Cloud Run service or Cloud Function URL"
+      - "subscription.state == ACTIVE"
+    emit:
+      source_type: Queue
+      target_type: Compute
+      source: "<Pub/Sub subscription node>"
+      target: "<Cloud Run service / Cloud Function node>"
+      api_source: "pubsub.subscriptions.get[pushConfig.pushEndpoint, state]"
+      evidence_field: "pushConfig.pushEndpoint + state"
+      narrative: >-
+        Pub/Sub subscription {subscription.name} delivers messages to
+        {consumer.name} via push (OIDC auth with push SA {push_sa.name}).
+
+  - id: gcp-pubsub-topic-iam-cross-project
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.pubsub.Topic"
+      field: "iamPolicy.bindings"
+    where:
+      - "member's project != topic's project"
+      - "role includes pubsub.topics.publish"
+      - "member is not allUsers or allAuthenticatedUsers"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: "<topic ResourcePolicy node>"
+      target: "<foreign project>"
+      api_source: "pubsub.topics.getIamPolicy"
+      narrative: >-
+        Pub/Sub topic {topic.name} IAM binding grants pubsub.topics.publish to
+        {member.name} in project {foreign_project} (cross-project trust).
+
+  - id: gcp-pubsub-topic-public-send
+    emits: ExposedToInternet
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.pubsub.Topic"
+      field: "iamPolicy.bindings"
+    where:
+      - "member is allUsers or allAuthenticatedUsers"
+      - "role includes pubsub.topics.publish"
+    emit:
+      source_type: Topic
+      target_type: AnonymousIdentity
+      source: "<Pub/Sub topic node>"
+      target: "<AnonymousIdentity>"
+      api_source: "pubsub.topics.getIamPolicy"
+      narrative: >-
+        Pub/Sub topic {topic.name} is publicly writable ({member} granted
+        pubsub.topics.publish); any internet caller can publish messages.

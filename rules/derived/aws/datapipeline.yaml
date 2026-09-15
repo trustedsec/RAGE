@@ -1,0 +1,692 @@
+# AWS Data Pipeline — Derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# AWS Data Pipeline is a LEGACY, fully-deprecated managed ETL orchestration
+# service (no longer available to new customers as of 2024). Existing-estate
+# coverage is warranted because the PassRole escalation pattern it embodies is
+# the CANONICAL precursor to every modern data-analytics PassRole chain (Glue,
+# SageMaker, Dataproc, etc.) and remains present in accounts created before
+# the deprecation.
+#
+# THE DOMINANT PRIMITIVE (Phase 11 theme):
+#   A pipeline's activities (ShellCommandActivity, EmrActivity, HadoopActivity)
+#   run on an EC2 or EMR RESOURCE NODE that EXECUTES AS a chosen IAM role (the
+#   `resourceRole` field). Whoever can:
+#     (a) write the pipeline definition (datapipeline:PutPipelineDefinition), and
+#     (b) trigger execution (datapipeline:ActivatePipeline or an active schedule)
+#   runs ARBITRARY SHELL CODE as that role — the Phase 11 execute-as pattern.
+#   Whoever can also CHOOSE the resourceRole (iam:PassRole) can promote any role
+#   they can pass into the execution identity — the CLASSIC PassRole RCE.
+#
+# WHAT THIS FILE EMITS (facts):
+#   Rule 1  (aws-datapipeline-executes-as-resource-role): ExecutesAs
+#   Rule 2  (aws-datapipeline-executes-as-pipeline-role): ExecutesAs
+#   Rule 3  (aws-datapipeline-put-definition-code):      CanModifyCode
+#   Rule 4  (aws-datapipeline-put-definition-config):    CanModifyConfiguration
+#   Rule 5  (aws-datapipeline-activate-pipeline):        CanTrigger
+#   Rule 5a (aws-datapipeline-set-status-trigger):       CanTrigger
+#   Rule 6  (aws-datapipeline-pass-resource-role):       CanPassIdentity
+#   Rule 6a (aws-datapipeline-add-tags-bypass):          CanModifyConfiguration
+#   Rule 7  (aws-datapipeline-pass-pipeline-role):       CanPassIdentity
+#   Rule 8  (aws-datapipeline-execute-as-passrole-rce):  CanExecuteAs  (PassRole create-and-run)
+#   Rule 9  (aws-datapipeline-execute-as-existing-def):  CanExecuteAs  (modify existing)
+#   Rule 10 (aws-datapipeline-create-workload-as):       CanCreateWorkloadAs
+#   Rule 11 (aws-datapipeline-exposes-resource-role-cred): ExposesCredential
+#   Rule 12 (aws-datapipeline-escalate-to-role):         CanEscalateTo
+#
+# WHAT THIS FILE DOES NOT EMIT (cite and defer):
+#   * CanExecuteAs from CanModifyCode + ExecutesAs — already handled by
+#     can-execute-as:execute-as-via-code-modify (cited in rules 8-9).
+#   * CanCreateWorkloadAs from CanPassIdentity + create capability — already
+#     handled by can-execute-as:execute-as-via-new-workload (cited in rule 10).
+#   * CanEscalateTo — rolled up by can-control:escalate-via-execute-as.
+#   * ExposesCredential → CredentialsFor → CanImpersonate chain — owned by
+#     credential-chains (credential-chains:execute-then-read-secret +
+#     read-secret-yields-identity).
+#   * CanEnterAccount from cross-account role assumption off the resource role —
+#     can-control:enter-account-via-assume.
+#
+# PERMISSIONS used below are the EXACT names from the AWS Data Pipeline Service
+# Authorization Reference (datapipeline:*) and IAM reference (iam:PassRole).
+# All datapipeline:* actions scope to Resource: "*" (no ARN-level scoping).
+# Access is narrowed via condition keys:
+#   datapipeline:Tag        — pipeline tag matching
+#   datapipeline:PipelineCreator — owner matching
+#   datapipeline:workerGroup — task-runner isolation
+#
+# LINCHPINS CITED (do not duplicate logic, only emit facts):
+#   /rules/derived/can-execute-as.yaml
+#   /rules/derived/cicd-chains.yaml
+#   /rules/derived/credential-chains.yaml
+#   /rules/derived/can-control.yaml
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 11-data-analytics-ml
+applies_to: [aws]
+
+rules:
+
+  # --- 1) EC2 / EMR resource node executes as the pipeline's resourceRole ------
+  # FACT: the Ec2Resource / EmrCluster resource node that runs pipeline activities
+  # (ShellCommandActivity, EmrActivity, HadoopActivity) runs AS the role specified
+  # in the `resourceRole` field of the pipeline definition. Code on the EC2/EMR
+  # node retrieves credentials via IMDS (instance-profile endpoint). This is the
+  # structural ExecutesAs fact that feeds rules 8-9 and can-execute-as.
+  - id: aws-datapipeline-executes-as-resource-role
+    emits: ExecutesAs
+    description: "A pipeline's EC2 or EMR resource node executes as the IAM role in the pipeline's resourceRole field, making that role reachable via IMDS by any code the pipeline runs."
+    match_record:
+      resource_type: "AWS::DataPipeline::Pipeline"
+      field: "pipelineObjects[type=Ec2Resource or type=EmrCluster].resourceRole"
+    where:
+      - "pipeline has a defined resourceRole (non-empty string)"
+    emit:
+      source_type: Compute
+      target_type: Role
+      source: "<EC2Resource or EmrCluster compute node spawned by the pipeline>"
+      target: "<IAM role ARN resolved from resourceRole field>"
+      state: ACTIVE
+      conditions: [service_state]
+      permissions: []
+      false_positive_note: >-
+        Emit only when the pipeline has at least one Ec2Resource or EmrCluster
+        resource object with a non-empty resourceRole. A pipeline that runs only
+        via a Task Runner (workerGroup, no runsOn EC2 resource) does NOT expose
+        IMDS credentials — it uses the Task Runner's own instance credentials on
+        a self-managed host; model that as a separate ExecutesAs on the Task
+        Runner EC2 node itself, not the pipeline. Do not emit for pipelines in
+        INACTIVE/FINISHED state with no pending schedule runs.
+      narrative: >-
+        The {resource.type} resource node in pipeline {pipeline.name} runs as
+        {role.name} (the pipeline's resourceRole). Any code executing in a
+        ShellCommandActivity / EmrActivity on this resource can retrieve
+        {role.name}'s temporary credentials from the IMDS endpoint
+        (http://169.254.169.254/latest/meta-data/iam/security-credentials/).
+
+  # --- 2) Pipeline service itself executes as the pipeline role ----------------
+  # FACT: AWS Data Pipeline service assumes the `role` field on the pipeline
+  # definition to provision EC2 instances, EMR clusters, and access S3/SNS/SQS
+  # on the customer's behalf. This role must trust datapipeline.amazonaws.com.
+  # It is a structural fact for completeness; the higher-value escalation target
+  # is usually the resourceRole (rule 1), but the pipeline role itself may carry
+  # broad permissions (the deprecated AWSDataPipelineRole managed policy grants
+  # extensive EC2, S3, EMR, SNS, SQS, and RDS permissions).
+  - id: aws-datapipeline-executes-as-pipeline-role
+    emits: ExecutesAs
+    description: "The Data Pipeline service assumes the pipeline's `role` field to provision compute resources and access downstream AWS services on the pipeline's behalf."
+    match_record:
+      resource_type: "AWS::DataPipeline::Pipeline"
+      field: "pipelineObjects[type=Default].role"
+    where:
+      - "pipeline has a defined role field (non-empty string)"
+    emit:
+      source_type: Messaging
+      target_type: Role
+      source: "<AWS::DataPipeline::Pipeline Workflow node>"
+      target: "<IAM role ARN resolved from role field>"
+      state: ACTIVE
+      conditions: [service_state]
+      permissions: []
+      false_positive_note: >-
+        The pipeline role is held by the DATA PIPELINE SERVICE, not by code that
+        runs inside activities. It is used for control-plane operations (EC2
+        RunInstances, EMR CreateCluster, S3 writes for logs). An attacker who can
+        modify the pipeline definition and activate it does NOT directly receive
+        this role's credentials; they receive the resourceRole (rule 1) via IMDS.
+        However, an attacker who CanPassIdentity to a privileged pipeline role and
+        can activate the pipeline gains indirect leverage via the service's use of
+        that role. Model the resourceRole (rule 1) as the primary execution-as target.
+      narrative: >-
+        The Data Pipeline service assumes {role.name} (the pipeline role on
+        {pipeline.name}) to provision EC2/EMR resources and access downstream
+        services. The role must trust datapipeline.amazonaws.com in its trust policy.
+
+  # --- 3) PutPipelineDefinition rewrites executable shell commands (CanModifyCode) -
+  # FACT: datapipeline:PutPipelineDefinition replaces the entire pipeline object
+  # graph, including ShellCommandActivity.command, ShellCommandActivity.scriptUri,
+  # and EmrActivity step / bootstrap action definitions. This is equivalent to
+  # replacing a buildspec: the attacker controls what runs on the EC2/EMR resource.
+  # Combined with an existing or creatable run path (ActivatePipeline or active
+  # schedule), this yields arbitrary code execution as the resourceRole.
+  #
+  # LINCHPIN: can-execute-as:execute-as-via-code-modify collapses
+  #   CanModifyCode(?principal, ?pipeline) + ExecutesAs(?resource, ?role)
+  # into CanExecuteAs(?principal, ?role). This rule emits the FACT; the linchpin
+  # produces the CanExecuteAs consequence.
+  - id: aws-datapipeline-put-definition-code
+    emits: CanModifyCode
+    description: "datapipeline:PutPipelineDefinition replaces the pipeline object graph including shell commands and scriptUri, giving the principal arbitrary code control over the pipeline's activities."
+    match_effective_permission:
+      action: "datapipeline:PutPipelineDefinition"
+      resource_type: "AWS::DataPipeline::Pipeline"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<AWS::DataPipeline::Pipeline Workflow node>"
+      permissions: ["datapipeline:PutPipelineDefinition"]
+      conditions: [iam_permission, condition_expression]
+      false_positive_note: >-
+        datapipeline:PutPipelineDefinition scopes to Resource: "*" (no ARN-level
+        restriction). Access is narrowed by tag-based conditions
+        (datapipeline:Tag), pipeline-creator conditions (datapipeline:PipelineCreator),
+        or workerGroup conditions. Honor these: if the effective policy has a
+        datapipeline:Tag condition that blocks the target pipeline's tags, do not
+        emit. PutPipelineDefinition alone does NOT run anything — a run path
+        (ActivatePipeline or an active schedule) is required; without one this edge
+        feeds a CONDITIONAL CanExecuteAs via can-execute-as (trigger_exists unmet).
+      narrative: >-
+        {principal.name} can replace the definition of pipeline {pipeline.name}
+        (datapipeline:PutPipelineDefinition), including the shell commands and
+        script URIs that pipeline activities execute on EC2/EMR resource nodes.
+
+  # --- 4) PutPipelineDefinition rewrites role/config (CanModifyConfiguration) ---
+  # FACT: PutPipelineDefinition also controls the `role` and `resourceRole` fields
+  # (changing the execution identity requires iam:PassRole on the new role — that
+  # is the CanPassIdentity + CanModifyConfiguration combination), as well as
+  # schedule timing, EMR cluster parameters, and bootstrap actions.
+  - id: aws-datapipeline-put-definition-config
+    emits: CanModifyConfiguration
+    description: "datapipeline:PutPipelineDefinition rewrites the pipeline's role, resourceRole, schedule, and cluster configuration — changing execution identity or trigger requires iam:PassRole for the new role."
+    match_effective_permission:
+      action: "datapipeline:PutPipelineDefinition"
+      resource_type: "AWS::DataPipeline::Pipeline"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<AWS::DataPipeline::Pipeline Workflow node>"
+      permissions: ["datapipeline:PutPipelineDefinition"]
+      conditions: [iam_permission, condition_expression]
+      false_positive_note: >-
+        Changing the `role` or `resourceRole` fields additionally requires
+        iam:PassRole for the new target role; without it, the API rejects the
+        update. Dedupes with rule 3 (CanModifyCode) on the same permission; both
+        edges are emitted because they feed different linchpin derivations:
+        CanModifyCode feeds execute-as-via-code-modify; CanModifyConfiguration
+        feeds execute-as-via-config-identity-swap (when combined with CanPassIdentity).
+      narrative: >-
+        {principal.name} can rewrite the configuration of pipeline {pipeline.name}
+        (datapipeline:PutPipelineDefinition), including its execution roles,
+        schedule, and cluster settings.
+
+  # --- 5) ActivatePipeline triggers execution (CanTrigger) ----------------------
+  # FACT: datapipeline:ActivatePipeline causes the pipeline to start a run. When
+  # combined with CanModifyCode (rule 3), this completes the execute-as chain —
+  # can-execute-as upgrades the CONDITIONAL(trigger_exists) to ACTIVE.
+  - id: aws-datapipeline-activate-pipeline
+    emits: CanTrigger
+    description: "datapipeline:ActivatePipeline starts a pipeline run, completing the execution path when combined with CanModifyCode on the pipeline's definition."
+    match_effective_permission:
+      action: "datapipeline:ActivatePipeline"
+      resource_type: "AWS::DataPipeline::Pipeline"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<AWS::DataPipeline::Pipeline Workflow node>"
+      permissions: ["datapipeline:ActivatePipeline"]
+      conditions: [iam_permission, condition_expression, service_state]
+      false_positive_note: >-
+        ActivatePipeline on an already-running pipeline with no pending schedule
+        interval may not immediately trigger a new run (the pipeline might be
+        waiting for its next scheduled window). For pipelines with scheduleType=
+        ondemand, ActivatePipeline always triggers an immediate run. For cron/
+        timeseries pipelines, it starts the pipeline and runs at the next scheduled
+        interval. An active schedule (scheduleType=cron/timeseries) also constitutes
+        a trigger_exists condition even without explicit ActivatePipeline permission
+        — the pipeline runs autonomously. Honor datapipeline:Tag conditions.
+      narrative: >-
+        {principal.name} can activate pipeline {pipeline.name}
+        (datapipeline:ActivatePipeline), starting a run that executes its activities
+        on the configured EC2 or EMR resource nodes.
+
+  # --- 5a) SetStatus triggers / re-triggers execution (CanTrigger) --------
+  # FACT: datapipeline:SetStatus can force-resume stalled objects, effectively
+  # re-triggering pipeline activities. This is a documented trigger primitive
+  # (datapipeline.md §12) that completes the execute-as chain on stalled pipelines.
+  # An attacker with PutPipelineDefinition + SetStatus but without ActivatePipeline
+  # can still complete execution on a stalled pipeline — a missing high-value path.
+  - id: aws-datapipeline-set-status-trigger
+    emits: CanTrigger
+    description: "datapipeline:SetStatus can force-resume stalled pipeline objects, effectively re-triggering activities — an alternative to ActivatePipeline."
+    match_effective_permission:
+      action: "datapipeline:SetStatus"
+      resource_type: "AWS::DataPipeline::Pipeline"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<AWS::DataPipeline::Pipeline Workflow node>"
+      permissions: ["datapipeline:SetStatus"]
+      conditions: [iam_permission, condition_expression, service_state]
+      false_positive_note: >-
+        datapipeline:SetStatus is commonly used to resume failed pipeline objects
+        by forcing status RUNNING. This constitutes a trigger primitive when the
+        pipeline is in a stalled/incomplete state. On an already-completed pipeline
+        with no pending objects, SetStatus does not trigger a new run. Honor
+        datapipeline:Tag and datapipeline:PipelineCreator conditions.
+      narrative: >-
+        {principal.name} can force-resume stalled pipeline objects in {pipeline.name}
+        (datapipeline:SetStatus), triggering activity execution as an alternative to
+        ActivatePipeline. This completes the code-injection execute-as chain when
+        ActivatePipeline permission is absent but SetStatus is available.
+
+  # --- 6) PassRole for resource role (CanPassIdentity) -------------------------
+  # FACT: iam:PassRole on a role that trusts ec2.amazonaws.com (instance profile)
+  # allows the principal to bind that role as the `resourceRole` in a new or
+  # updated pipeline definition. This is the key privilege gate for the classic
+  # PassRole RCE chain: without PassRole, an attacker is limited to the existing
+  # resourceRole already bound to a pipeline.
+  - id: aws-datapipeline-pass-resource-role
+    emits: CanPassIdentity
+    description: "iam:PassRole on a role that trusts ec2.amazonaws.com lets the principal bind it as the resourceRole in a Data Pipeline definition, enabling code running on the EC2/EMR node to execute as that role."
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "principal has datapipeline:CreatePipeline OR datapipeline:PutPipelineDefinition"
+      - "target role trust policy allows ec2.amazonaws.com (for instance profile as resourceRole)"
+      - "iam:PassedToService condition (if any) includes ec2.amazonaws.com or datapipeline.amazonaws.com or is unconditioned"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: "<principal>"
+      target: "<IAM role passable as resourceRole>"
+      permissions: ["iam:PassRole", "datapipeline:CreatePipeline or datapipeline:PutPipelineDefinition"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: >-
+        CRITICAL: honor iam:PassedToService. A role passable only to
+        lambda.amazonaws.com or ecs-tasks.amazonaws.com does NOT become a
+        Data Pipeline resource role. The role must trust ec2.amazonaws.com
+        (for Ec2Resource instance profile) or datapipeline.amazonaws.com (for
+        the pipeline role). When the PassedToService condition is absent and the
+        role trust is unconstrained, the pass is ACTIVE. When the trust policy
+        does NOT include ec2.amazonaws.com, downgrade to POTENTIAL(role_compatibility).
+        An attacker who can pass a role but has no datapipeline:PutPipelineDefinition
+        or datapipeline:CreatePipeline cannot use it — emit POTENTIAL in that case.
+      narrative: >-
+        {principal.name} can pass {role.name} (iam:PassRole) as the resourceRole
+        of a Data Pipeline EC2 or EMR resource node. EC2 nodes with that role
+        expose its credentials via IMDS to any code the pipeline runs.
+
+  # --- 6a) AddTags to bypass tag-based IAM conditions (CanModifyConfiguration) --
+  # FACT: datapipeline:AddTags allows an attacker to alter pipeline tags that
+  # IAM tag-based conditions (datapipeline:Tag) depend on, potentially defeating
+  # tag-based access restrictions and unblocking otherwise-BLOCKED operations.
+  # Documented in datapipeline.md §14 escalation path #4 and §22 false-positive #4.
+  # This can upgrade BLOCKED/CONDITIONAL tag-gated edges to ACTIVE by removing
+  # restrictive tags or adding permissive ones.
+  - id: aws-datapipeline-add-tags-bypass
+    emits: CanModifyConfiguration
+    description: "datapipeline:AddTags allows altering pipeline tags used in IAM conditions, potentially defeating tag-based access restrictions."
+    match_effective_permission:
+      action: "datapipeline:AddTags"
+      resource_type: "AWS::DataPipeline::Pipeline"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<AWS::DataPipeline::Pipeline Workflow node>"
+      permissions: ["datapipeline:AddTags"]
+      conditions: [iam_permission, condition_expression]
+      false_positive_note: >-
+        datapipeline:AddTags alone cannot remove tags used in deny conditions
+        (only AddTags permission, no RemoveTags). However, this can add tags that
+        match permissive IAM conditions (datapipeline:Tag), unlocking otherwise
+        tag-gated operations on rules 3-5 and 8-9. Over-claim guard: if a deny
+        condition on datapipeline:Tag blocks an action, and the attacker has only
+        AddTags without RemoveTags, the deny cannot be removed — downgrade such
+        paths to CONDITIONAL(condition_expression). If the attacker has both AddTags
+        and RemoveTags, full tag mutation is possible — model as ACTIVE CanModifyConfiguration
+        on the tags themselves.
+      narrative: >-
+        {principal.name} can add tags to pipeline {pipeline.name} (datapipeline:AddTags),
+        potentially matching IAM conditions that gate other operations. This can defeat
+        tag-based access restrictions (datapipeline:Tag conditions) that otherwise block
+        PutPipelineDefinition, ActivatePipeline, or SetStatus on that pipeline.
+
+  # --- 7) PassRole for pipeline role (CanPassIdentity) -------------------------
+  # FACT: iam:PassRole on a role that trusts datapipeline.amazonaws.com lets
+  # the principal set that role as the pipeline's `role` field. The pipeline
+  # service uses this role for provisioning. Secondary to rule 6 (resource role),
+  # but the pipeline role may itself carry broad permissions.
+  - id: aws-datapipeline-pass-pipeline-role
+    emits: CanPassIdentity
+    description: "iam:PassRole on a role that trusts datapipeline.amazonaws.com lets the principal bind it as the pipeline role, used by the Data Pipeline service to provision EC2/EMR resources and access downstream AWS services."
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "principal has datapipeline:CreatePipeline OR datapipeline:PutPipelineDefinition"
+      - "target role trust policy allows datapipeline.amazonaws.com"
+      - "iam:PassedToService condition (if any) includes datapipeline.amazonaws.com or is unconditioned"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: "<principal>"
+      target: "<IAM role passable as pipeline role>"
+      permissions: ["iam:PassRole", "datapipeline:CreatePipeline or datapipeline:PutPipelineDefinition"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to ec2.amazonaws.com does
+        NOT become a pipeline role. The pipeline role is used by the DATA PIPELINE
+        SERVICE for control-plane operations (RunInstances, CreateCluster), not for
+        code running in activities. An attacker who passes a privileged pipeline role
+        gains indirect escalation through the service's provisioning actions, not
+        direct credential access. The resourceRole (rule 6) is typically the
+        higher-value target for code execution.
+      narrative: >-
+        {principal.name} can pass {role.name} as the Data Pipeline service role
+        (datapipeline.amazonaws.com trust). The pipeline service will use {role.name}
+        to provision resources and access AWS services on behalf of the pipeline.
+
+  # --- 8) Classic PassRole RCE: create+define+pass+activate -> CanExecuteAs ----
+  # DERIVED: the canonical Data Pipeline escalation path.
+  # create a pipeline → inject ShellCommandActivity with attacker command →
+  # pass a privileged role as resourceRole → activate → EC2 node runs command
+  # as the passed role → CanExecuteAs.
+  #
+  # LINCHPIN: This is the Data Pipeline instantiation of can-execute-as
+  # execute-as-via-code-modify:
+  #   CanModifyCode(principal, pipeline) + ExecutesAs(EC2-resource, role)
+  #   => CanExecuteAs(principal, role)
+  # and cicd-chains cicd-modify-buildspec-executes-as (the pipeline definition
+  # IS the "buildspec" — the attacker controls what runs on the resource).
+  # This rule provides Data Pipeline-specific framing and permission names;
+  # the roll-up logic is CITED from those linchpins, not re-derived.
+  - id: aws-datapipeline-execute-as-passrole-rce
+    emits: CanExecuteAs
+    description: "Create a pipeline with a ShellCommandActivity injecting attacker commands, pass a privileged role as resourceRole, and activate: the EC2 resource runs attacker code as that role. The classic Data Pipeline PassRole RCE."
+    match:
+      - [ ?principal, CanModifyCode,    ?pipeline ]
+      - [ ?principal, CanPassIdentity,  ?role ]
+    where:
+      - "node_type(?pipeline) == Workflow"
+      - "?pipeline.provider_type == 'AWS::DataPipeline::Pipeline'"
+      - "?principal has EFFECTIVE datapipeline:CreatePipeline OR datapipeline:PutPipelineDefinition"
+      - "?role trust policy allows ec2.amazonaws.com (resourceRole passable as instance profile)"
+      - "iam:PassedToService condition (if any) includes ec2.amazonaws.com or is unconditioned"
+    optional:
+      - [ ?principal, CanTrigger, ?pipeline ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions:
+        - "datapipeline:CreatePipeline"
+        - "datapipeline:PutPipelineDefinition"
+        - "datapipeline:ActivatePipeline"
+        - "iam:PassRole"
+      conditions: [iam_permission, condition_expression, role_compatibility, trigger_exists]
+      state_logic: >-
+        ACTIVE when: (a) principal has EFFECTIVE datapipeline:PutPipelineDefinition
+        (or datapipeline:CreatePipeline for a new pipeline) — confirmed CanModifyCode;
+        (b) principal has EFFECTIVE iam:PassRole on ?role admitting ec2.amazonaws.com —
+        confirmed CanPassIdentity; AND (c) a run path exists: either the principal
+        has CanTrigger(principal, pipeline) via datapipeline:ActivatePipeline or
+        datapipeline:SetStatus (matched optional[0]) OR the pipeline already has an
+        active cron/timeseries schedule that will run the next interval.
+        CONDITIONAL(trigger_exists) when neither CanTrigger is confirmed nor an active
+        schedule exists (code is planted but has no established run path). CONDITIONAL
+        (role_compatibility) when the role trust or PassedToService condition is
+        unknown/unresolved (downgrade to POTENTIAL when trust demonstrably excludes
+        ec2.amazonaws.com). BLOCKED by SCP/boundary deny on datapipeline:PutPipelineDefinition,
+        CanTrigger, or iam:PassRole at the effective scope.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanModifyCode ?pipeline (aws-datapipeline-put-definition-code)"
+        - "?principal CanPassIdentity ?role (aws-datapipeline-pass-resource-role)"
+        - "can-execute-as:execute-as-via-code-modify (linchpin — cited not re-derived)"
+        - "cicd-chains:cicd-modify-buildspec-executes-as (linchpin — cited; pipeline def == buildspec)"
+      false_positive_note: >-
+        ALL of the following must hold for ACTIVE: (1) datapipeline:PutPipelineDefinition
+        is EFFECTIVE on the target pipeline — honor tag-based conditions
+        (datapipeline:Tag), pipeline-creator conditions (datapipeline:PipelineCreator),
+        and workerGroup conditions. (2) iam:PassRole is EFFECTIVE and scoped to admit
+        the target role for ec2.amazonaws.com: a role passable only to
+        lambda.amazonaws.com, ecs-tasks.amazonaws.com, or another service is NOT
+        passable as a Data Pipeline resourceRole — downgrade to POTENTIAL(role_compatibility).
+        (3) A run path (ActivatePipeline or active schedule) is established. Without
+        (3), the definition is modified but never executes: CONDITIONAL(trigger_exists).
+        Do not emit ACTIVE if only datapipeline:ValidatePipelineDefinition is present
+        (validation does not write or activate). Cite can-execute-as and cicd-chains for
+        the CanExecuteAs roll-up logic; do not re-derive it.
+      narrative: >-
+        {principal.name} can define a Data Pipeline with a ShellCommandActivity that
+        runs attacker-chosen commands (datapipeline:PutPipelineDefinition /
+        datapipeline:CreatePipeline), pass {role.name} as the resourceRole
+        (iam:PassRole → ec2.amazonaws.com), and activate the pipeline
+        (datapipeline:ActivatePipeline). The EC2 resource node runs the injected
+        command and {role.name}'s credentials are accessible via IMDS — executing
+        arbitrary code as {role.name}. This is the canonical AWS Data Pipeline
+        PassRole RCE (see can-execute-as:execute-as-via-code-modify and
+        cicd-chains:cicd-modify-buildspec-executes-as for the roll-up derivation).
+
+  # --- 9) Modify EXISTING pipeline definition -> execute as existing resourceRole -
+  # DERIVED: an attacker who only has datapipeline:PutPipelineDefinition and
+  # datapipeline:ActivatePipeline (no iam:PassRole) can inject commands into an
+  # EXISTING pipeline that already has a privileged resourceRole bound. No PassRole
+  # is needed because the role is already in the definition — the attacker exploits
+  # the existing binding. This is a CanModifyCode + ExecutesAs -> CanExecuteAs
+  # derivation, same linchpin as rule 8 but with the role already in place.
+  - id: aws-datapipeline-execute-as-existing-def
+    emits: CanExecuteAs
+    description: "Inject shell commands into an existing pipeline definition and activate it to execute as the resourceRole already bound to that pipeline — no iam:PassRole needed."
+    match:
+      - [ ?principal, CanModifyCode,  ?pipeline ]
+      - [ ?ec2resource, ExecutesAs,   ?role ]
+    where:
+      - "node_type(?pipeline) == Workflow"
+      - "?pipeline.provider_type == 'AWS::DataPipeline::Pipeline'"
+      - "?ec2resource is the EC2/EMR resource node of ?pipeline (ContainsResourceReference or structural link)"
+      - "?role.privilege_level >= ?principal.privilege_level  # only emit when escalation is possible"
+    optional:
+      - [ ?principal, CanTrigger, ?pipeline ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions:
+        - "datapipeline:PutPipelineDefinition"
+        - "datapipeline:ActivatePipeline"
+      conditions: [iam_permission, condition_expression, trigger_exists]
+      state_logic: >-
+        ACTIVE when principal has EFFECTIVE datapipeline:PutPipelineDefinition on
+        the pipeline AND a run path exists (datapipeline:ActivatePipeline matched
+        via optional[0], or an active schedule runs the pipeline). CONDITIONAL
+        (trigger_exists) when no run path is confirmed. BLOCKED by a deny on
+        datapipeline:PutPipelineDefinition or datapipeline:ActivatePipeline.
+        Inherits weakest state from CanModifyCode and ExecutesAs contributors.
+        Only emit when ?role is more privileged than ?principal (escalation); a
+        lateral same-privilege existing resourceRole is still code execution but
+        not escalation — emit CanExecuteAs without CanEscalateTo in that case.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanModifyCode ?pipeline (aws-datapipeline-put-definition-code)"
+        - "?ec2resource ExecutesAs ?role (aws-datapipeline-executes-as-resource-role)"
+        - "can-execute-as:execute-as-via-code-modify (linchpin — cited not re-derived)"
+      false_positive_note: >-
+        No iam:PassRole is required because the role is already bound to the pipeline
+        definition — the attacker exploits the EXISTING resourceRole binding. The key
+        gating conditions are: (1) datapipeline:PutPipelineDefinition is EFFECTIVE on
+        the specific pipeline (honor tag/creator/workerGroup conditions); (2) a run path
+        (ActivatePipeline or active schedule) is established. A pipeline in a permanently
+        INACTIVE state with no active schedule and where ActivatePipeline is denied yields
+        CONDITIONAL(trigger_exists), never ACTIVE. Dedupes with rule 8 on (CanExecuteAs,
+        ?principal, ?role) for the case where the attacker both has PassRole and is
+        targeting the same existing role — rule 8 is ACTIVE (has both PassRole and
+        PutPipelineDefinition); rule 9 is ACTIVE too (existing binding); deduplicate,
+        emit once with higher-confidence evidence from rule 8.
+      narrative: >-
+        {principal.name} can rewrite the activity commands in existing pipeline
+        {pipeline.name} (datapipeline:PutPipelineDefinition) and activate it
+        (datapipeline:ActivatePipeline). The EC2 resource node in the pipeline already
+        runs as {role.name}; injecting a credential-exfiltrating command and running
+        it yields {role.name}'s credentials via IMDS — without needing iam:PassRole.
+
+  # --- 10) Create pipeline + pass role -> CanCreateWorkloadAs ------------------
+  # DERIVED: the schema canonical_derivation for CanCreateWorkloadAs is
+  #   CanDeploy(principal, platform) + CanPassIdentity(principal, role) + role_compatible
+  # => CanCreateWorkloadAs(principal, role).
+  # For Data Pipeline, CanDeploy is expressed as datapipeline:CreatePipeline
+  # (creating a NEW pipeline, not modifying an existing one) + CanPassIdentity.
+  # This rule captures the "create a new workload bound to a chosen identity" fact.
+  # can-execute-as:execute-as-via-new-workload then produces CanExecuteAs from it.
+  - id: aws-datapipeline-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "datapipeline:CreatePipeline + iam:PassRole for a role (resourceRole passable to ec2.amazonaws.com) lets the principal spawn a new pipeline workload running as that role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE datapipeline:CreatePipeline AND datapipeline:PutPipelineDefinition"
+      - "?role trust policy allows ec2.amazonaws.com (passable as resourceRole instance profile)"
+      - "iam:PassedToService condition (if any) includes ec2.amazonaws.com or is unconditioned"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions:
+        - "datapipeline:CreatePipeline"
+        - "datapipeline:PutPipelineDefinition"
+        - "datapipeline:ActivatePipeline (optional for full exploitation)"
+        - "iam:PassRole"
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      state_logic: >-
+        ACTIVE when CreatePipeline, PutPipelineDefinition, and iam:PassRole are confirmed
+        EFFECTIVE and the role trust admits ec2.amazonaws.com (or PassedToService is
+        unconditioned). ActivatePipeline is optional for full exploitation but not required
+        for CanCreateWorkloadAs (the workload can run on built-in schedules without explicit
+        trigger permission). POTENTIAL (role_compatibility) when the role trust or
+        iam:PassedToService is unknown/unresolved. CONDITIONAL(iam_permission) when any of the
+        three required actions (CreatePipeline, PutPipelineDefinition, PassRole) is missing.
+        Inherits from CanPassIdentity contributor (weakest state rule).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanPassIdentity ?role (aws-datapipeline-pass-resource-role)"
+        - "can-execute-as:execute-as-via-new-workload (linchpin — cited; CanCreateWorkloadAs -> CanExecuteAs)"
+      false_positive_note: >-
+        Modeling consistency: datapipeline:CreatePipeline is the CanDeploy-equivalent
+        for Data Pipeline. No separate CanDeploy(principal -> DataPipeline platform)
+        edge is emitted; this rule folds CreatePipeline directly as the deploy step.
+        Graph consumers keying strictly off CanDeploy will not see this path —
+        this is intentional (CreatePipeline~CanDeploy fold, per lambda.yaml note).
+        Honor iam:PassedToService: a role passable only to lambda.amazonaws.com
+        does NOT become a Data Pipeline resourceRole; downgrade to POTENTIAL.
+      narrative: >-
+        {principal.name} can create a new Data Pipeline (datapipeline:CreatePipeline +
+        datapipeline:PutPipelineDefinition), pass {role.name} as the resourceRole
+        (iam:PassRole to ec2.amazonaws.com), and activate it, spawning an EC2 workload
+        that runs as {role.name}. can-execute-as:execute-as-via-new-workload produces
+        CanExecuteAs(?principal, ?role) from this CanCreateWorkloadAs edge.
+
+  # --- 11) EC2 resource exposes resourceRole credentials via IMDS --------------
+  # DERIVED: any code executing inside a pipeline's ShellCommandActivity (or a
+  # bootstrap action on an EmrCluster) can query IMDS for the EC2 instance
+  # profile credentials — the resourceRole. This ExposesCredential edge makes
+  # the credential-chains linchpin (execute-then-read-secret / read-secret-
+  # yields-identity) applicable: if the code runs as the resource role and the
+  # resource role can CanReadSecret on a secret, the executing principal
+  # inherits that reach. By itself this edge is only a fact, not an escalation.
+  - id: aws-datapipeline-exposes-resource-role-cred
+    emits: ExposesCredential
+    description: "A pipeline's EC2 or EMR resource node exposes the resourceRole's temporary credentials to any code running in its activities via the IMDS endpoint."
+    match:
+      - [ ?ec2resource, ExecutesAs, ?role ]
+    where:
+      - "node_type(?ec2resource) in [VirtualMachine, AnalyticsService]"
+      - "?ec2resource is a Data Pipeline Ec2Resource or EmrCluster node (provider_type check)"
+    emit:
+      source_type: Compute
+      target_type: Role
+      source: ?ec2resource
+      target: ?role
+      permissions: []
+      conditions: [service_state]
+      derived_from:
+        - "?ec2resource ExecutesAs ?role (aws-datapipeline-executes-as-resource-role)"
+        - "credential-chains:execute-then-read-secret (downstream — cited not re-derived)"
+      false_positive_note: >-
+        Not an escalation by itself — it asserts that code-execution on the EC2/EMR
+        resource equals holding the resourceRole's credentials (standard IMDS exposure).
+        Path value comes from a contributing CanModifyCode + CanTrigger chain
+        (rules 8-9). IMDSv2 does NOT block this: IMDSv2 requires only a PUT to get a
+        token (no credential required), and code running on the instance can perform
+        the PUT. IMDSv2 with hop-limit 1 blocks requests from nested containers but
+        not from code running directly on the host (ShellCommandActivity on Ec2Resource
+        runs on the host). Model as BLOCKED only if IMDSv2 with hop-limit 1 AND
+        the activity runs inside a container that cannot reach IMDS (unlikely default).
+      narrative: >-
+        The EC2/EMR resource node {resource.name} in the Data Pipeline runs as
+        {role.name}. Any code executing in a ShellCommandActivity or bootstrap
+        action on this resource can query IMDS (http://169.254.169.254/latest/meta-data/
+        iam/security-credentials/{role.name}) and obtain {role.name}'s temporary
+        AWS credentials — standard instance-profile credential exposure.
+
+  # --- 12) CanExecuteAs a more-privileged role is escalation (CanEscalateTo) --
+  # DERIVED: when the resourceRole (or pipeline role) is strictly more privileged
+  # than the attacker, executing as it is privilege escalation. This rule is the
+  # Data Pipeline instantiation of can-control:escalate-via-execute-as.
+  # CITED — the roll-up is can-control's; this rule is emitted explicitly to
+  # provide a Data Pipeline-specific narrative for the UI.
+  - id: aws-datapipeline-escalate-to-role
+    emits: CanEscalateTo
+    description: "Executing as a more-privileged Data Pipeline resourceRole or pipeline role is privilege escalation — an ACTIVE CanExecuteAs where the target role outranks the attacker."
+    match:
+      - [ ?principal, CanExecuteAs, ?role ]
+    where:
+      - "?role is reached via a Data Pipeline CanExecuteAs rule (rule 8 or rule 9 above)"
+      - "?role.privilege_level > ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: []
+      derived_from:
+        - "?principal CanExecuteAs ?role (aws-datapipeline-execute-as-passrole-rce or aws-datapipeline-execute-as-existing-def)"
+        - "can-control:escalate-via-execute-as (linchpin — cited not re-derived)"
+      false_positive_note: >-
+        Only emit when the target role is STRICTLY more privileged than the principal;
+        a lateral same-privilege role is code execution but not escalation. Inherits
+        state from the contributing CanExecuteAs — never stronger than ACTIVE.
+        NOTE: This rule CITES the linchpin can-control:escalate-via-execute-as rather
+        than re-deriving CanEscalateTo. Both the linchpin and this service-level rule
+        may fire on the same (principal, role) pair. The runtime dedup logic should
+        merge by (edge type, source, target) to avoid duplication in the output graph.
+        Preferentially emit the higher-evidence Data Pipeline narrative if both fire.
+      narrative: >-
+        {principal.name} can escalate to {role.name} by executing code in a Data
+        Pipeline ShellCommandActivity that runs as {role.name} — the pipeline
+        PassRole RCE or definition-injection chain yields arbitrary code execution
+        as the more-privileged {role.name}.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP or permission boundary denying datapipeline:PutPipelineDefinition ->
+#     CanModifyCode BLOCKED; rules 8-9 inherit BLOCKED.
+#   - SCP or permission boundary denying datapipeline:ActivatePipeline ->
+#     CanTrigger BLOCKED; rules 8-9 degrade to CONDITIONAL(trigger_exists)
+#     unless an active schedule exists.
+#   - SCP or permission boundary denying iam:PassRole (or iam:PassedToService
+#     condition excluding ec2.amazonaws.com) -> CanPassIdentity BLOCKED;
+#     rules 6, 8, 10 inherit BLOCKED (rule 9 is unaffected — no PassRole needed).
+#   - datapipeline:Tag condition that does not match the target pipeline's tags
+#     -> per-pipeline BLOCKED on rules 3-5, 8-9.
+#   - datapipeline:PipelineCreator condition excluding the attacker -> BLOCKED.
+#   - An SCP requiring ec2:MetadataHttpTokens=required (IMDSv2) alone does NOT
+#     block rule 11 — code on the EC2 host can issue the IMDSv2 PUT/GET; only
+#     block if hop-limit 1 AND containerized execution (not ShellCommandActivity
+#     default).
+#   - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw config -> explicit edges) are located in:
+#   /rules/explicit/aws-datapipeline.yaml
+# This file contains ONLY derived rules to maintain schema conformance
+# (derived rules files emit only derived/both edges, explicit rules files emit
+# only explicit/both edges).
+# ---------------------------------------------------------------------------

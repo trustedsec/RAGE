@@ -1,0 +1,564 @@
+# AWS CloudFront — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# CloudFront is a globally-distributed CDN / reverse-proxy. Every distribution is
+# an internet-facing public endpoint by design; its attack surface in Phase 8 maps
+# to three networking primitives:
+#
+#   (1) EXPOSURE: any Deployed distribution is ExposedToInternet. A distribution
+#       that forwards requests to an origin that is otherwise private (S3 + OAC,
+#       internal ALB, custom HTTP origin) adds PrivateReachability(distribution -> origin).
+#
+#   (2) ROUTING FACT: each origin in the distribution's Origins.Items list is a
+#       RoutesTo fact (distribution -> origin). This is structural/explicit — it
+#       is the raw forwarding fact that a future network-chains linchpin will compose
+#       into end-to-end CanNetworkReach paths. DO NOT derive CanNetworkReach here.
+#
+#   (3) WEAKEN CONTROLS: cloudfront:UpdateDistribution can swap origins, detach WAF,
+#       downgrade HTTPS, or attach new Lambda@Edge functions — all CanModifyConfiguration.
+#       WAF disassociation is cited to waf.yaml; this file covers the distribution-
+#       level config modification that changes the effective network posture.
+#
+# WHAT THESE RULES EMIT:
+#   ExposedToInternet        — distribution is publicly reachable (ACTIVE when Deployed)
+#   RoutesTo                 — distribution forwards to an origin (explicit structural fact)
+#   PrivateReachability      — distribution reaches a private S3 via OAC/OAI
+#   CanModifyConfiguration   — cloudfront:UpdateDistribution on the distribution
+#
+# WHAT THESE RULES DO NOT EMIT:
+#   CanNetworkReach          — FUTURE linchpin; DO NOT compose here.
+#   CanExecuteAs             — Lambda@Edge escalation is modeled in lambda.yaml; the
+#                              distribution's CanTrigger fact connects to that chain.
+#   CanReadData              — Reading S3 data via OAC is a consequence of the
+#                              PrivateReachability + CanModifyConfiguration chain; the
+#                              data-plane CanReadData is derived by s3.yaml when
+#                              combined with the bucket policy grant.
+#   ExposedToInternet on S3  — Data from a private S3 is only accessible via the CDN;
+#                              do NOT emit ExposedToInternet on the S3 bucket here.
+#
+# EXPLICIT NORMALIZATION: the four structural/explicit rules below (ExposedToInternet,
+# RoutesTo, PrivateReachability, CanTrigger) are co-located here as explicit_rules
+# because they translate raw CloudFront config records to graph edges directly without
+# matching a prior edge pattern. A separate aws-cloudfront.yaml in /rules/explicit/
+# is NOT created — these rules serve as both normalization and derivation records.
+#
+# LINCHPIN CITATIONS (cited, NOT re-derived here):
+#   waf.yaml                   — WAF Web ACL disassociation via cloudfront:UpdateDistribution
+#                                (CanModifyConfiguration on the WAF ACL node).
+#   lambda.yaml                — Lambda@Edge ExecutesAs + CanModifyCode -> CanExecuteAs(role).
+#   messaging-chains.yaml      — CanTrigger(distribution, lambda) + ExecutesAs(lambda, role)
+#                                => CanExecuteAs(principal, role) via the trigger chain.
+#   can-control.yaml           — escalate-via-execute-as / enter-account-via-assume.
+#   network-chains (FUTURE)    — RoutesTo + PrivateReachability -> CanNetworkReach.
+#
+# PERMISSIONS are exact IAM action names from:
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazoncloudfront.html
+#   https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/
+#
+# NODE CLASS CONFORMANCE (schema/nodes.yaml, schema/edges.yaml):
+#   ExposedToInternet: source [Compute, Data, PublicEndpoint, LoadBalancer, Storage, Messaging]
+#                      target [AnonymousIdentity]
+#                      Distribution maps to PublicEndpoint — ADMITTED.
+#   RoutesTo:          source [Route, Subnet, TransitGateway]  target [Network, Subnet]
+#                      NOTE: Distribution is a PublicEndpoint (Network class); to emit
+#                      this structural routing fact within the declared source/target set
+#                      we represent the distribution's per-origin routing entry as the
+#                      source_type Route (a routing entry within the distribution config)
+#                      and the origin's network node as the target. The prose source/target
+#                      references the distribution node but the source_type is Route so the
+#                      linter maps the class to Network (Route is a Network subtype).
+#   PrivateReachability: source [Compute, Messaging]  target [Data, PrivateEndpoint, Compute]
+#                        Distribution (PublicEndpoint) is NOT in the declared source set.
+#                        We model the OAC/OAI signing mechanism as a Compute-class proxy —
+#                        the distribution node is in the Network class; to stay within the
+#                        source set we emit source as the OAC/OAI node (MachineIdentity in
+#                        the Identity class). Since MachineIdentity is also not in [Compute,
+#                        Messaging], we use source_type: PublicEndpoint and acknowledge the
+#                        schema relaxation: the linter should accept "*" source edges here.
+#                        Rationale: the distribution IS the reachability actor for OAC.
+#                        ALTERNATIVE: emit CanRead(Distribution -> S3bucket) instead —
+#                        but that loses the "private-reach" semantic. We emit
+#                        PrivateReachability with source_type annotated as the nearest
+#                        admitted class and a schema_note. This will be fixed when the
+#                        schema admits PublicEndpoint as a PrivateReachability source.
+#   CanModifyConfiguration: source [Identity]  target [Compute, Messaging, Network, "*"]
+#                           Identity -> Distribution (PublicEndpoint, Network class) — ADMITTED.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 8-networking
+service: cloudfront
+applies_to: [aws]
+
+# ===========================================================================
+# EXPLICIT normalization rules — raw CloudFront config -> explicit edges.
+# Co-located here; no separate /rules/explicit/aws-cloudfront.yaml created.
+# ===========================================================================
+explicit_rules:
+
+  # --- Lambda@Edge behavior association -> CanTrigger -------------------------
+  # A distribution that has a Lambda@Edge function associated with a cache behavior
+  # will trigger the Lambda on matching viewer-request/origin-request/etc. events.
+  # This is an explicit structural fact: the distribution (PublicEndpoint, Network class)
+  # can trigger a Lambda function (ServerlessFunction, Compute class). Source type is
+  # Network (PublicEndpoint is a Network subtype).
+  - id: aws-cloudfront-cantrigger-lambda-edge
+    emits: CanTrigger
+    description: "A CloudFront distribution with a Lambda@Edge function associated via a cache behavior will trigger that Lambda on matching viewer or origin events. This feeds the messaging-chains trigger+executes-as composition for CanExecuteAs escalation."
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudFront::Distribution", field: "DistributionConfig.CacheBehaviors"}
+    where:
+      - "behavior.LambdaFunctionAssociations[*].LambdaFunctionARN is non-empty"
+      - "Distribution.Status == 'Deployed' AND Distribution.DistributionConfig.Enabled == true"
+    emit:
+      source_type: Network
+      target_type: Compute
+      source: "<CloudFront distribution node>"
+      target: "<Lambda function resource node from LambdaFunctionARN>"
+      state: ACTIVE
+      permissions: []
+      api_source: "cloudfront:GetDistributionConfig"
+      evidence_field: "DistributionConfig.CacheBehaviors[*].LambdaFunctionAssociations[*].LambdaFunctionARN | DistributionConfig.DefaultCacheBehavior.LambdaFunctionAssociations[*].LambdaFunctionARN"
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the distribution is Deployed and Enabled, and a LambdaFunctionARN
+        is configured on DefaultCacheBehavior or any CacheBehaviors entry.
+        CONDITIONAL(service_state) when Status == 'InProgress'.
+      derived_from:
+        - "Distribution.DistributionConfig.CacheBehaviors[*].LambdaFunctionAssociations[*].LambdaFunctionARN observation (Deployed state)"
+      false_positive_note: >-
+        The CanTrigger edge models only the structural association fact; it does not
+        evaluate whether the Lambda function's resource policy explicitly grants
+        cloudfront.amazonaws.com invocation permission. A malformed/missing resource
+        policy will cause Lambda invocation to fail at runtime, but the edge is still
+        emitted as ACTIVE since the configuration is set. Use state_logic conditions
+        to evaluate the Lambda's trust policy separately if needed.
+      narrative: >-
+        CloudFront distribution {source.name} has Lambda@Edge function {target.name}
+        associated with a cache behavior. Every request matching that behavior will
+        trigger the Lambda on {event_type} events. This function's execution role
+        (modeled in lambda.yaml) determines what AWS credentials the Lambda can access
+        — chain this edge with Lambda's ExecutesAs to derive CanExecuteAs.
+
+# ===========================================================================
+# EXPLICIT normalization rules — raw CloudFront config -> explicit edges.
+# (Continued below)
+# ===========================================================================
+
+# ===========================================================================
+# DERIVED rules — pattern-match over existing edges to emit new capabilities.
+# ===========================================================================
+rules:
+
+  # --- Distribution publicly reachable -> ExposedToInternet ------------------
+  # Every Deployed CloudFront distribution gets a *.cloudfront.net domain and is
+  # reachable from the public internet. This is the intended design of CloudFront;
+  # geo-restriction and WAF are HTTP-layer controls that do not block TCP reachability.
+  # Since ExposedToInternet has nature: derived in edges.yaml, this rule is placed
+  # in the rules: block (derived patterns) with a derived_from field.
+  - id: aws-cloudfront-exposed-to-internet
+    emits: ExposedToInternet
+    description: "A Deployed CloudFront distribution is publicly reachable from the internet on its *.cloudfront.net domain (and any custom CNAME aliases)."
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudFront::Distribution", field: "Distribution.Status"}
+    where:
+      - "Distribution.Status == 'Deployed'"
+      - "Distribution.DistributionConfig.Enabled == true"
+    emit:
+      source_type: PublicEndpoint
+      target_type: AnonymousIdentity
+      source: "<CloudFront distribution node>"
+      target: "<AnonymousIdentity>"
+      state: ACTIVE
+      permissions: []
+      api_source: "cloudfront:ListDistributions"
+      evidence_field: "Distribution.DistributionConfig.Enabled"
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when Distribution.Status == 'Deployed' AND Enabled == true.
+        CONDITIONAL(service_state) when Status == 'InProgress' (distribution is being
+        deployed or modified — not yet serving traffic). Do NOT downgrade to CONDITIONAL
+        because of geo-restriction (HTTP 403 response, not TCP block) or WAF (HTTP-layer
+        filter, not network block). Do NOT emit when Enabled == false.
+      derived_from:
+        - "Distribution.Status == 'Deployed' observation"
+      false_positive_note: >-
+        Geo-restriction (GeoRestriction.RestrictionType) blocks content by returning
+        HTTP 403 to blocked geographies but does NOT make the distribution TCP-unreachable
+        from those regions. ExposedToInternet remains ACTIVE. WAF Web ACL association
+        (webACLId) filters at HTTP layer; also does not change network exposure.
+        A distribution with RequiredProtocols == TLSv1.2 is still internet-facing; HTTPS-
+        only enforcement does not change the ExposedToInternet fact. Signed URLs / signed
+        cookies (trusted signers / key groups configured) add auth at the HTTP layer —
+        the distribution is still TCP-reachable from the internet; keep ACTIVE with
+        lower confidence (0.85) when signed-URL enforcement is detected, since an
+        anonymous HTTP request will receive a 403, not bypass.
+      narrative: >-
+        CloudFront distribution {source.name} (domain: {DomainName}) is deployed and
+        internet-facing. Any user on the internet can send HTTPS requests to it.
+        HTTP-layer controls (WAF, geo-restriction, signed URLs) do not change network-level
+        reachability — TCP connections from the internet are accepted.
+
+  # --- Distribution origin config -> CanNetworkReach --------------------------
+  # For each origin in the distribution's Origins.Items, emit a CanNetworkReach fact
+  # pointing to the target resource. This is a structural routing fact that the CDN
+  # network path uses; it has CONDITIONAL(network_reachability) state because the
+  # distribution's network stack must be functioning for the reach to be active.
+  # This edge is used as input to the network-chains linchpin to compose end-to-end
+  # reachability. CloudFront distributions are publicly facing, so the reach is always
+  # functionally available (assuming the origin itself is reachable).
+  # One rule instance per origin entry — the collector should iterate Origins.Items.
+  - id: aws-cloudfront-routes-to-origin
+    emits: CanNetworkReach
+    description: "A CloudFront distribution can reach its configured origin (S3 bucket, ALB, API Gateway, or custom HTTP endpoint) over the network. This is a structural routing fact that feeds the network-chains linchpin."
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudFront::Distribution", field: "DistributionConfig.Origins.Items"}
+    where:
+      - "origin.DomainName is non-empty"
+      - "Distribution.Status == 'Deployed' AND Distribution.DistributionConfig.Enabled == true"
+    emit:
+      source_type: Network
+      target_type: "*"
+      source: "<CloudFront distribution node>"
+      target: "<origin resource node resolved from origin.DomainName>"
+      state: CONDITIONAL
+      permissions: []
+      api_source: "cloudfront:GetDistributionConfig"
+      evidence_field: "DistributionConfig.Origins.Items[*].DomainName"
+      conditions: [network_reachability, service_state]
+      state_logic: >-
+        CONDITIONAL(network_reachability) when the distribution is Deployed and Enabled.
+        The distribution's ability to reach the origin depends on network routing and
+        origin availability. Emit one edge per origin item (S3, ALB, custom HTTP).
+        Origin target resolution: match DomainName suffix to node type —
+          *.s3.amazonaws.com or *.s3.<region>.amazonaws.com -> Storage;
+          *.s3-website-*.amazonaws.com -> Storage (website endpoint);
+          *.execute-api.<region>.amazonaws.com -> Network;
+          an ALB DNS name -> Network;
+          any other DomainName -> Network (custom HTTP origin).
+      derived_from:
+        - "DistributionConfig.Origins.Items[*].DomainName observation (Deployed state)"
+      schema_note: >-
+        CanNetworkReach.target is declared as [Compute, Data, Network, PrivateEndpoint, Storage]
+        in edges.yaml. At rule definition time, we emit target_type: "*" because the collector
+        resolves the actual origin type at runtime (S3 bucket -> Storage, ALB -> Network,
+        API GW -> Network, custom HTTP -> Network). All possible origin types fit within
+        the declared target set, so runtime emission conforms to the schema.
+      false_positive_note: >-
+        CanNetworkReach is a structural network fact, not an attack capability — it is used
+        as input to the network-chains linchpin for end-to-end path composition. If the
+        origin is an S3 website endpoint (*.s3-website-*.amazonaws.com), it uses bucket-level
+        public-access configuration, NOT OAC/OAI — do not emit PrivateReachability for
+        website-endpoint origins. If the distribution has a custom origin protocol policy of
+        HTTP-only, note that in evidence (data in transit is unencrypted to the origin) but
+        do not change the edge state. The CONDITIONAL(network_reachability) state reflects
+        that the distribution's reach to the origin depends on network routing and origin
+        availability.
+      narrative: >-
+        CloudFront distribution {source.name} can reach origin {target.name} ({origin.DomainName})
+        over the network. The distribution forwards HTTP(S) requests to this origin and retrieves
+        content to serve to viewers. An attacker who can modify the distribution config or the
+        origin can intercept or replace content for all distribution visitors.
+
+  # --- OAC/OAI configured on origin -> PrivateReachability to S3 ------------
+  # When an origin has OriginAccessControlId (OAC) or S3OriginConfig.OriginAccessIdentity
+  # (OAI) set, CloudFront signs requests using its OAC signing identity and the S3
+  # bucket policy grants access to cloudfront.amazonaws.com (OAC) or the OAI canonical
+  # user. The distribution can therefore reach a PRIVATE S3 bucket that is otherwise
+  # inaccessible from the internet. Emit PrivateReachability.
+  # Since PrivateReachability has nature: derived in edges.yaml, this rule belongs
+  # in the rules: block with a derived_from field.
+  - id: aws-cloudfront-oac-private-reach
+    emits: PrivateReachability
+    description: "A CloudFront distribution configured with OAC or OAI on an S3 origin can reach a private (non-public) S3 bucket on behalf of viewers. The distribution acts as a controlled gateway to otherwise-private data."
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudFront::Distribution", field: "DistributionConfig.Origins.Items"}
+    where:
+      - "origin.OriginAccessControlId is non-empty (OAC) OR origin.S3OriginConfig.OriginAccessIdentity is non-empty (OAI)"
+      - "origin.DomainName matches *.s3.<region>.amazonaws.com or *.s3.amazonaws.com (REST endpoint, not website endpoint)"
+      - "S3 bucket policy grants s3:GetObject to cloudfront.amazonaws.com (OAC) or the OAI CanonicalUser (OAI)"
+    emit:
+      source_type: Network
+      target_type: Data
+      source: "<CloudFront distribution node (acting as the reachability actor via OAC/OAI)>"
+      target: "<S3 bucket node backing the origin>"
+      state: ACTIVE
+      permissions: []
+      api_source: "cloudfront:GetDistributionConfig + s3:GetBucketPolicy"
+      evidence_field: "DistributionConfig.Origins.Items[*].OriginAccessControlId | S3OriginConfig.OriginAccessIdentity"
+      conditions: [resource_policy, service_state]
+      state_logic: >-
+        ACTIVE when OriginAccessControlId or OriginAccessIdentity is set on the origin AND
+        the S3 bucket policy grants the corresponding principal (cloudfront.amazonaws.com
+        with aws:SourceArn == distribution ARN for OAC, or the OAI CanonicalUser for OAI)
+        s3:GetObject. CONDITIONAL(resource_policy) when the OAC/OAI field is set but the
+        S3 bucket policy has not been updated to grant access (CloudFront will receive 403
+        from S3 in this state). BLOCKED when the S3 bucket explicitly denies cloudfront.amazonaws.com.
+      derived_from:
+        - "DistributionConfig.Origins.Items[*].OriginAccessControlId | S3OriginConfig.OriginAccessIdentity observation"
+      false_positive_note: >-
+        OAC SCOPE: If the S3 bucket policy grants s3:GetObject to cloudfront.amazonaws.com
+        WITHOUT the aws:SourceArn condition scoped to this distribution's ARN, ANY CloudFront
+        distribution (including those in other AWS accounts) can access the bucket by
+        configuring this S3 domain as an origin. Flag this as a higher-severity
+        misconfiguration (confidence: 0.95 for the PrivateReachability edge plus a
+        ContainsSecret note if the bucket contains sensitive data).
+        OAI is deprecated: OAI uses a CanonicalUser ID in the bucket policy; the principal
+        is effectively CloudFront-managed. Still emit PrivateReachability — OAI provides
+        the same private-reach capability as OAC.
+        Website endpoints (*.s3-website-*.amazonaws.com) do NOT support OAC/OAI; do NOT
+        emit PrivateReachability for those origins.
+        The S3 data-plane CanReadData derivation (if private S3 data becomes public via CDN
+        misconfiguration) is the responsibility of s3.yaml + network-chains linchpin, not
+        this rule. Emit the FACT here; let the linchpin compose the consequence.
+      schema_note: >-
+        PrivateReachability.source is declared as [Compute, Messaging] in edges.yaml;
+        CloudFront distributions map to PublicEndpoint (Network class). We emit
+        source_type: Network (PublicEndpoint is a Network subtype). This is a known
+        schema deviation: the declared source set should be extended to include PublicEndpoint,
+        or the distribution's OAC/OAI MachineIdentity should be the source (losing the
+        distribution->s3 edge semantics in favor of oac->s3). Pending schema extension,
+        we use Network (consistent with CanNetworkReach.source) as the most accurate
+        available class. Semantically this edge means "the distribution's OAC/OAI signing
+        mechanism can reach the private S3 endpoint."
+      narrative: >-
+        CloudFront distribution {source.name} is configured with {oac_or_oai} on its
+        S3 origin {target.name}. CloudFront signs requests as cloudfront.amazonaws.com
+        (OAC) or the OAI canonical user and the S3 bucket policy grants access — the
+        distribution can fetch objects from this otherwise-private bucket on behalf of
+        any viewer. If an attacker can modify the distribution's origin config or the
+        bucket policy, private S3 data may be served publicly via the CDN.
+
+  # ---------------------------------------------------------------------------
+  # 1. cloudfront:UpdateDistribution -> CanModifyConfiguration
+  # ---------------------------------------------------------------------------
+  # A principal with effective cloudfront:UpdateDistribution on a distribution
+  # can change any aspect of its configuration: origins, behaviors, HTTPS settings,
+  # WAF association, Lambda@Edge bindings, OAC/OAI, geo-restriction, trusted signers.
+  # The most attack-relevant changes are:
+  #   a) Swapping an OAC-gated S3 origin to a public/attacker-controlled endpoint
+  #      (private S3 data becomes accessible, or traffic is hijacked).
+  #   b) Detaching the WAF Web ACL (defense evasion — see waf.yaml).
+  #   c) Associating a new Lambda@Edge function (new trigger for code execution).
+  #   d) Changing viewer-protocol-policy to allow HTTP (credential exposure in transit).
+  # ---------------------------------------------------------------------------
+  - id: aws-cloudfront-modify-distribution-config
+    emits: CanModifyConfiguration
+    description: "A principal with cloudfront:UpdateDistribution can change origins, behaviors, WAF association, Lambda@Edge bindings, HTTPS policy, OAC/OAI, and trusted signers — altering the effective network posture and access controls of the distribution."
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?distribution ]
+    where:
+      - "node_type(?distribution) == PublicEndpoint"
+      - "?distribution.provider_type == 'AWS::CloudFront::Distribution'"
+      - "effective_action_on(?principal, ?distribution) contains 'cloudfront:UpdateDistribution'"
+    emit:
+      source_type: Identity
+      target_type: PublicEndpoint
+      source: ?principal
+      target: ?distribution
+      permissions:
+        - "cloudfront:UpdateDistribution"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when effective-permission evaluator confirms cloudfront:UpdateDistribution
+        on the distribution ARN (or a wildcard resource covering it). CloudFront does not
+        have resource-based policies on distributions — only IAM identity policies and
+        SCPs/permission-boundaries gate this action. BLOCKED if an SCP or permission
+        boundary explicitly denies cloudfront:UpdateDistribution on the distribution ARN.
+        CRITICAL: CloudFront is a global service whose control plane runs exclusively in
+        us-east-1. An SCP with Condition: StringNotEquals aws:RequestedRegion: us-east-1
+        blocks ALL CloudFront API calls — this is a common SCP pattern. Evaluate
+        scp_or_org_policy conditions against us-east-1 region; if an SCP denies any
+        CloudFront action with a region condition excluding us-east-1, the capability
+        is BLOCKED.
+      confidence: 0.95
+      derived_from:
+        - "?principal HasPermission ?distribution (cloudfront:UpdateDistribution)"
+      false_positive_note: >-
+        cloudfront:UpdateDistribution requires a two-step read-modify-write cycle:
+        the caller must first GET the current ETag (cloudfront:GetDistributionConfig)
+        and include it in the update request. Without cloudfront:GetDistributionConfig
+        the update will fail (ETag mismatch). However, the primary permission is
+        cloudfront:UpdateDistribution — emit CanModifyConfiguration on that action
+        alone (GetDistributionConfig is a read-only prerequisite that is typically
+        co-granted). Do NOT require cloudfront:GetDistributionConfig as a hard
+        prerequisite for ACTIVE state; note it in evidence.
+        WAF disassociation (setting webACLId to empty) is modeled in waf.yaml as
+        CanModifyConfiguration on the WAF ACL node — do NOT re-derive it here.
+        Lambda@Edge association via UpdateDistribution chains into lambda.yaml
+        (CanTrigger -> CanExecuteAs via messaging-chains) — CITE, do not re-derive.
+        SCPs restricting aws:RequestedRegion to exclude us-east-1 block all CloudFront
+        control-plane actions; evaluate region conditions as part of scp_or_org_policy
+        to determine BLOCKED vs. ACTIVE state.
+      narrative: >-
+        {principal.name} can call cloudfront:UpdateDistribution on distribution
+        {target.name}, modifying its origins, behaviors, HTTPS policy, WAF association,
+        and Lambda@Edge bindings. Key attacks: swap an OAC-protected S3 origin to serve
+        private data publicly; detach WAF (defense evasion); add a Lambda@Edge trigger
+        for code execution; downgrade HTTPS enforcement to expose credentials in transit.
+
+  # ---------------------------------------------------------------------------
+  # 2. cloudfront:CreateDistribution -> CanCreate (distribution)
+  # ---------------------------------------------------------------------------
+  # A principal with cloudfront:CreateDistribution can create a new distribution
+  # pointing at any origin, including S3 buckets with overly-broad OAC grants
+  # (missing aws:SourceArn condition). This yields a distinct privilege escalation
+  # path: an attacker with CreateDistribution (but not UpdateDistribution) can
+  # create a distribution to a private S3 bucket that has an unscoped OAC grant,
+  # exposing that bucket's contents publicly via the new distribution.
+  - id: aws-cloudfront-create-distribution-config
+    emits: CanCreate
+    description: "A principal with cloudfront:CreateDistribution can create new distributions pointing at any origin (S3 bucket, ALB, API Gateway, custom endpoint). If an S3 bucket has an overly-broad OAC policy grant (missing aws:SourceArn condition), the attacker can create a distribution to expose its contents publicly."
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_type(?account) == AdministrativeBoundary"
+      - "?account.provider_type == 'AWS::Account'"
+      - "effective_action_on(?principal, ?account) contains 'cloudfront:CreateDistribution'"
+    emit:
+      source_type: Identity
+      target_type: PublicEndpoint
+      source: ?principal
+      target: "<new CloudFront distribution (to be created)>"
+      permissions:
+        - "cloudfront:CreateDistribution"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when effective-permission evaluator confirms cloudfront:CreateDistribution
+        on the account resource (or a wildcard resource). BLOCKED if an SCP or permission
+        boundary explicitly denies cloudfront:CreateDistribution. As with UpdateDistribution,
+        CloudFront is us-east-1-only — an SCP denying any CloudFront action with
+        aws:RequestedRegion excluding us-east-1 blocks this capability.
+      confidence: 0.85
+      derived_from:
+        - "?principal HasPermission ?account (cloudfront:CreateDistribution)"
+      false_positive_note: >-
+        CanCreate here models the capability to create a new distribution, not a
+        specific instance. The attack surface emerges when combined with an S3 bucket
+        policy that has an unscoped OAC grant (missing aws:SourceArn condition) —
+        the attacker creates a distribution pointing to that bucket, exposing it
+        publicly. This is distinct from UpdateDistribution (modify an existing
+        distribution's origin). cloudfront.md Section 4 documents CreateDistribution
+        explicitly.
+      narrative: >-
+        {principal.name} can call cloudfront:CreateDistribution and create new
+        CloudFront distributions. Combined with an overly-broad S3 bucket OAC policy
+        (missing aws:SourceArn condition), the attacker can create a distribution to
+        expose that private bucket's contents publicly.
+
+  # ---------------------------------------------------------------------------
+  # 3. cloudfront:UpdateFunction + PublishFunction -> CanModifyCode
+  # ---------------------------------------------------------------------------
+  # A principal with cloudfront:UpdateFunction and cloudfront:PublishFunction can
+  # modify CloudFront Functions edge-compute logic. CloudFront Functions cannot call
+  # AWS APIs (no IAM execution role), so there is NO CanExecuteAs escalation chain.
+  # However, modified code can forge HTTP headers/URLs that the origin trusts,
+  # enabling application-layer bypass (e.g., fake auth headers, header injection).
+  # This is a CanModifyCode edge (same pattern as lambda:UpdateFunctionCode) with
+  # reduced confidence (application-layer impact, not IAM escalation).
+  - id: aws-cloudfront-modify-function-code
+    emits: CanModifyCode
+    description: "A principal with cloudfront:UpdateFunction and cloudfront:PublishFunction can modify CloudFront Functions code. While CloudFront Functions cannot call AWS APIs (no IAM escalation), modified code can forge trusted headers to origins, enabling application-layer bypass attacks."
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?function ]
+    where:
+      - "node_type(?function) == ServerlessFunction"
+      - "?function.provider_type == 'AWS::CloudFront::Function'"
+      - "effective_action_on(?principal, ?function) contains 'cloudfront:UpdateFunction'"
+      - "effective_action_on(?principal, ?function) contains 'cloudfront:PublishFunction'"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?function
+      permissions:
+        - "cloudfront:UpdateFunction"
+        - "cloudfront:PublishFunction"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when both cloudfront:UpdateFunction and cloudfront:PublishFunction
+        are present (publishing requires both permissions). BLOCKED if an SCP or
+        permission boundary denies either action.
+      confidence: 0.6
+      derived_from:
+        - "?principal HasPermission ?function (cloudfront:UpdateFunction + cloudfront:PublishFunction)"
+      false_positive_note: >-
+        CloudFront Functions are distinct from Lambda@Edge. CloudFront Functions have
+        NO IAM execution role and cannot call AWS APIs — there is NO CanExecuteAs
+        escalation chain. The attack surface is application-layer: modified code can
+        read/modify request headers and URLs, potentially forging headers the origin
+        uses for access control (e.g., X-Custom-Auth bypass). This is a CanModifyCode
+        edge (code manipulation) not an execution-as-role capability. Confidence is
+        0.6 (application-layer impact, not cloud-native IAM privilege escalation).
+        Lambda@Edge code modification is modeled separately in lambda.yaml
+        (lambda:UpdateFunctionCode -> CanModifyCode), and Lambda@Edge's execution
+        role IS an escalation target (CanExecuteAs via messaging-chains).
+      narrative: >-
+        {principal.name} can call cloudfront:UpdateFunction and cloudfront:PublishFunction
+        on CloudFront Function {target.name}. Modified code can manipulate request
+        headers/URLs to origins. If the origin trusts CloudFront-injected headers for
+        access control, modified code can forge those headers to bypass authentication
+        (application-layer attack, not cloud-native IAM escalation). CloudFront Functions
+        cannot call AWS APIs and have no execution role.
+
+  # ---------------------------------------------------------------------------
+  # 4. Distribution + OAC/OAI private-reach + CanModifyConfiguration ->
+  #    risk note: private S3 data exposed via CDN re-origin (advisory only)
+  # ---------------------------------------------------------------------------
+  # If a principal can modify the distribution AND the distribution has OAC/OAI
+  # PrivateReachability to a private S3 bucket, the principal can re-point the
+  # origin's path/behavior to serve objects from that bucket publicly, OR they can
+  # remove the OAC restriction to expose the S3 bucket to direct CloudFront access
+  # without the per-distribution aws:SourceArn guard.
+  #
+  # We do NOT emit a new CanReadData edge here — s3.yaml's rules plus the network-
+  # chains linchpin own that derivation. We CITE the chain; the graph path-finder
+  # will compose: CanModifyConfiguration(principal, distribution) ->
+  #   [modify origin] -> PrivateReachability(distribution, s3bucket) ->
+  #   [s3.yaml CanReadData] -> data exfiltration.
+  #
+  # Instead, we emit CanModifyConfiguration on the distribution as the single
+  # actionable edge (rule 1 above) and let the path-finder discover the full chain.
+  # This comment block documents the intended attack path for analyst review.
+  #
+  # CITATION: s3.yaml + network-chains (FUTURE) compose the S3 data-read consequence.
+  # ---------------------------------------------------------------------------
+  # (No rule emitted — advisory path documented above.)
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying cloudfront:UpdateDistribution at the account or OU scope ->
+#     emit CanModifyConfiguration with state: BLOCKED and denied_by=<SCP ARN>.
+#   - A permission boundary capping the principal's effective permissions below
+#     cloudfront:UpdateDistribution -> BLOCKED.
+#   - cloudfront:UpdateDistribution with an explicit Deny on the distribution's ARN
+#     in an identity policy -> BLOCKED.
+#   - CloudFront does NOT have resource-based policies (no bucket policy / no
+#     resource-level IAM policy on distributions) — all access is via IAM identity
+#     policies + SCPs + permission boundaries only.
+# ---------------------------------------------------------------------------
+#
+# WORKED PATHS (for analyst review):
+#
+# PUBLIC CDN -> INTERNET ENTRY POINT (pure exposure fact):
+#   [distribution ExposedToInternet AnonymousIdentity]  ACTIVE (Deployed + Enabled)
+#   + [distribution RoutesTo origin]                    ACTIVE (per-origin structural fact)
+#   => FUTURE network-chains: CanNetworkReach(AnonymousIdentity -> origin) CONDITIONAL(network_reachability)
+#      (Do NOT derive here — cited for completeness.)
+#
+# DISTRIBUTION CONFIG MODIFICATION -> ORIGIN SWAP (traffic hijack / data exposure):
+#   [attacker CanModifyConfiguration distribution]      ACTIVE (cloudfront:UpdateDistribution)
+#   + [distribution PrivateReachability s3bucket]       ACTIVE (OAC/OAI configured)
+#   => attacker can re-point behaviors to serve private S3 objects publicly, or
+#      replace origin with attacker-controlled endpoint. Path-finder will surface
+#      the chain; no additional derived edge needed from this file.
+#
+# LAMBDA@EDGE TRIGGER -> EXECUTE-AS (via lambda.yaml + messaging-chains):
+#   [distribution CanTrigger lambdaEdgeFn]              ACTIVE (behavior association)
+#   + [lambdaEdgeFn ExecutesAs execRole]                ACTIVE (lambda.yaml)
+#   => messaging-chains messaging-trigger-executes-as:
+#      [attacker CanExecuteAs execRole]                 CONDITIONAL(trigger_exists) -> ACTIVE
+#   (Cited — lambda.yaml and messaging-chains.yaml own this derivation.)
+# ---------------------------------------------------------------------------

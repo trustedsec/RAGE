@@ -1,0 +1,677 @@
+# Azure Cache for Redis — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Covers: Microsoft.Cache/redis (Standard and Premium tiers)
+#
+# Phase-6 dominant attack surfaces:
+#   (1) CREDENTIAL GRAB (headline):
+#         Microsoft.Cache/redis/listKeys/action → primary/secondary access key →
+#         full data-plane read/write/delete bypassing all RBAC and firewall rules.
+#         This ARM control-plane call is NOT gated by the Redis IP firewall or
+#         publicNetworkAccess — it always succeeds from any network with the RBAC grant.
+#   (2) DATA READ + EXFIL:
+#         Possession of an access key + network reachability to the Redis endpoint
+#         → CanReadData (all Redis commands: KEYS, GET, SCAN, DUMP, etc.).
+#         Cache frequently stores session tokens, OAuth tokens, connection strings
+#         → ContainsSecret → credential-chains.yaml handles the roll-up.
+#   (3) PUBLIC EXPOSURE:
+#         publicNetworkAccess=Enabled + no restrictive firewallRules → the Redis
+#         data-plane port 6380 (SSL) is reachable from the public internet.
+#         A firewall rule with startIpAddress=0.0.0.0 endIpAddress=255.255.255.255
+#         explicitly opens all IPv4 addresses.
+#   (4) ARM CONTRIBUTOR → CONFIG TAMPERING:
+#         Microsoft.Cache/redis/write allows opening the firewall, disabling auth
+#         (authnotrequired=true), enabling the non-SSL port, or changing the MI
+#         used for CMK — CanAdminister yields Controls via can-control.yaml.
+#
+# KEY FALSE-POSITIVE GUARDS:
+#   - listKeys succeeds over ARM regardless of firewallRules/publicNetworkAccess.
+#     However USING the key against the data-plane IS gated by network access.
+#     ExposesCredential is always ACTIVE when listKeys RBAC is confirmed;
+#     CanReadData derived from key use is CONDITIONAL(network_reachability) when
+#     publicNetworkAccess=Disabled or restrictive firewallRules block the endpoint.
+#   - publicNetworkAccess=Disabled overrides all firewallRules — no ExposedToInternet.
+#   - VNet-injected Premium instances have publicNetworkAccess forced to Disabled;
+#     do NOT emit ExposedToInternet for them.
+#   - Empty firewallRules with publicNetworkAccess=Disabled ≠ internet exposure.
+#   - Standard/Premium do NOT support Entra ID data-plane RBAC; Enterprise tier does.
+#     Do NOT model Entra data-plane paths for Standard/Premium instances.
+#
+# Permissions verified against:
+#   https://learn.microsoft.com/azure/role-based-access-control/permissions/databases#microsoftcache
+#   (2026 snapshot). All action strings are exact.
+#
+# LINCHPIN CITATIONS (CITE, DO NOT DUPLICATE):
+#   credential-chains.yaml —
+#     read-secret-yields-identity: ExposesCredential(AccessKey) + CredentialsFor(AccessKey → Cache)
+#       → CanImpersonate (if cache credential is stored as a secret for another identity).
+#     execute-then-read-secret: a workload with CanExecuteAs on a compute resource that has
+#       listKeys permission inherits the ability to retrieve the Redis key.
+#     decrypt-gates-secret-read: Premium CMK-encrypted data read is CONDITIONAL(key_permission);
+#       resolved when the principal also holds CanDecrypt on the Key Vault key.
+#   can-control.yaml —
+#     control-via-admin: CanAdminister(principal, cache) → Controls(principal, cache).
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 6-storage-databases
+applies_to: [azure]
+
+rules:
+
+  # ==========================================================================
+  # (1) CREDENTIAL GRAB — listKeys → ExposesCredential (primary attack vector)
+  # ==========================================================================
+  # Microsoft.Cache/redis/listKeys/action is an ARM control-plane call that returns
+  # the primaryKey and secondaryKey for the cache instance. These 64-character
+  # base64 keys serve as the Redis password (requirepass) and grant full data-plane
+  # access — all Redis commands — to any caller who possesses them and can reach
+  # the Redis endpoint.
+  #
+  # CRITICAL: listKeys is NOT gated by firewallRules or publicNetworkAccess.
+  # The ARM call succeeds from any network that can reach management.azure.com,
+  # regardless of the cache's own network configuration.
+  #
+  # Verified action: Microsoft.Cache/redis/listKeys/action
+  # Roles that include this action: Owner, Contributor, Redis Cache Contributor,
+  # and any custom role explicitly listing Microsoft.Cache/redis/listKeys/action.
+  # Note: DocumentDB Account Contributor does NOT include Microsoft.Cache/redis permissions.
+  - id: azure-rediscache-listkeys-exposes-credential
+    emits: ExposesCredential
+    description: "The Redis access keys are exposed via the cache resource whenever a principal with listKeys/action can retrieve them. This is a structural credential-exposure edge: the cache itself exposes the keys as a resource-level property, coupled with a principal's CanReadCredential permission."
+    match:
+      - [ ?cache, ContainsCredential, ?accessKey ]
+    where:
+      - "node_type(?cache) == Cache"
+      - "?cache.provider_type == 'Microsoft.Cache/redis'"
+      - "node_type(?accessKey) == AccessKey"
+    emit:
+      source_type: Cache
+      target_type: AccessKey
+      source: ?cache
+      target: ?accessKey
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE (structural): {cache.name} holds and exposes primary and secondary
+        access keys that authenticate to the Redis data-plane. This is an always-present
+        structural property of the cache resource itself. A principal's ability to
+        *retrieve* the key value is governed by a separate CanReadCredential edge
+        conditioned on HasPermission(listKeys/action).
+      confidence: "1.0"
+      derived_from: [ "<ContainsCredential edge (cache → accessKey)>" ]
+      false_positive_note: >-
+        This edge models resource-level exposure only: the keys exist on the cache.
+        A principal *using* the key requires the principal to hold CanReadCredential
+        on the AccessKey (derived from listKeys/action permission), plus network
+        reachability to the Redis data-plane endpoint. See azure-rediscache-listkeys-principal-read-credential
+        and azure-rediscache-listkeys-can-read-data for principal paths.
+      narrative: >-
+        {cache.name} exposes primary and secondary Redis access keys that grant full
+        data-plane access (read, write, delete, commands). These keys are always present
+        on the resource and retrievable by any identity holding Microsoft.Cache/redis/listKeys/action
+        via the ARM control-plane API.
+
+  # ==========================================================================
+  # (1/1b) CREDENTIAL GRAB — principal reads the exposed key
+  # ==========================================================================
+  # Once ExposesCredential(cache → accessKey) is established, any principal
+  # with listKeys/action permission can read (retrieve) the key value via ARM.
+  # This yields CanReadCredential(principal → accessKey).
+  - id: azure-rediscache-listkeys-principal-read-credential
+    emits: CanReadCredential
+    description: "A principal with listKeys/action permission can retrieve the Redis access key via ARM, gaining read access to the credential."
+    match:
+      - [ ?principal, HasPermission, ?cache ]
+      - [ ?cache, ExposesCredential, ?accessKey ]
+    where:
+      - "node_type(?cache) == Cache"
+      - "?cache.provider_type == 'Microsoft.Cache/redis'"
+      - "node_type(?accessKey) == AccessKey"
+      - "?principal has EFFECTIVE Microsoft.Cache/redis/listKeys/action at ?cache scope (Owner, Contributor, Redis Cache Contributor, or custom role)"
+    emit:
+      source_type: Identity
+      target_type: AccessKey
+      source: ?principal
+      target: ?accessKey
+      permissions:
+        - "Microsoft.Cache/redis/listKeys/action"
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers listKeys/action at the
+        effective scope: BLOCKED;
+        else ACTIVE: the principal can call the ARM listKeys REST API
+        (POST .../redis/{name}/listKeys) from any network and retrieve both the
+        primaryKey and secondaryKey. This is an ARM control-plane action not gated
+        by the Redis IP firewall (firewallRules) or publicNetworkAccess setting.
+      confidence: "0.97"
+      derived_from: [ "<HasPermission edge_id (listKeys/action)>", "<ExposesCredential edge_id (cache → accessKey)>" ]
+      false_positive_note: >-
+        Verify the EFFECTIVE permission at the ?cache scope — do not infer from the
+        role name alone. Redis Cache Contributor includes listKeys/action. The "Cosmos DB
+        Operator" and "SQL Server Contributor" roles do NOT cover Microsoft.Cache resources.
+        The ARM listKeys call succeeds regardless of firewallRules or publicNetworkAccess;
+        this CanReadCredential edge is always ACTIVE when the RBAC grant is confirmed.
+        Using the retrieved key against the Redis data-plane is separately gated by
+        network_reachability (see azure-rediscache-listkeys-can-read-data).
+      narrative: >-
+        {principal.name} holds Microsoft.Cache/redis/listKeys/action on {cache.name},
+        allowing retrieval of the primary and secondary access keys via ARM.
+
+  # ==========================================================================
+  # (1/2) CREDENTIAL GRAB → DATA READ — key possession yields full data-plane read
+  # ==========================================================================
+  # Once the access key is retrieved (via listKeys/action), the caller can authenticate
+  # to the Redis data-plane and read all cached data. This is a two-step chain:
+  #   ExposesCredential(principal → AccessKey) [above rule]
+  #   + network reachability to the Redis endpoint
+  #   → CanReadData(principal → Cache)
+  #
+  # The network gate: the Redis data endpoint (port 6380 SSL, or 6379 non-SSL if enabled)
+  # IS gated by firewallRules and publicNetworkAccess, unlike the ARM listKeys call.
+  # When publicNetworkAccess=Disabled or restrictive firewallRules block the caller's IP,
+  # CanReadData is CONDITIONAL(network_reachability) rather than ACTIVE.
+  - id: azure-rediscache-listkeys-can-read-data
+    emits: CanReadData
+    description: "Retrieving the cache access key via listKeys/action yields full data-plane read of all cached data, subject to network reachability of the Redis endpoint."
+    match:
+      - [ ?principal, CanReadCredential, ?accessKey ]
+      - [ ?accessKey, CredentialsFor, ?cache ]
+    where:
+      - "node_type(?cache) == Cache"
+      - "?cache.provider_type == 'Microsoft.Cache/redis'"
+      - "node_type(?accessKey) == AccessKey"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cache
+      permissions:
+        - "Microsoft.Cache/redis/listKeys/action"
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers listKeys/action: BLOCKED;
+        elif ?cache.properties.publicNetworkAccess == 'Disabled' AND no private endpoint
+        reachable from caller: CONDITIONAL(network_reachability) — key is obtainable via ARM
+        but the data-plane is not reachable; the path is possible if the caller gains
+        a foothold in the VNet (e.g., via a private endpoint or VNet peering);
+        elif ?cache.properties.publicNetworkAccess == 'Enabled' AND firewallRules restrict
+        the caller's network: CONDITIONAL(network_reachability);
+        elif ?cache.properties.publicNetworkAccess == 'Enabled' AND (firewallRules is empty
+        OR contains a rule allowing the caller's IP): ACTIVE — the caller can retrieve the
+        key via ARM and immediately connect to the Redis data endpoint.
+        Note: Premium VNet-injected instances have publicNetworkAccess forced Disabled;
+        treat as CONDITIONAL(network_reachability) unless the caller has VNet access.
+      confidence: "0.95"
+      derived_from: [ "<CanReadCredential edge_id (principal → accessKey)>", "<CredentialsFor edge_id (accessKey → cache)>" ]
+      false_positive_note: >-
+        The key retrieval (ARM listKeys via CanReadCredential) is always ACTIVE when the RBAC grant is
+        confirmed; this CanReadData edge additionally requires network reachability
+        to the Redis data-plane endpoint (port 6380/SSL or 6379/non-SSL). When
+        publicNetworkAccess=Disabled, the data-plane is only reachable via private
+        endpoint or (for Premium) the injected VNet — downgrade to
+        CONDITIONAL(network_reachability). For Standard/Premium tier, the Redis
+        endpoint only accepts key-based authentication (no Entra ID data-plane
+        token auth); this rule correctly models the key-based path. Do NOT emit ACTIVE
+        for VNet-injected Premium instances without confirming VNet reachability.
+      narrative: >-
+        {principal.name} can retrieve the access key for {cache.name} via
+        listKeys/action (ARM, network-unrestricted), then authenticate to the Redis
+        data endpoint and read all cached data. Full data-plane access includes KEYS,
+        GET, SCAN, DUMP, and CONFIG commands. Network reachability to the Redis
+        endpoint is required for the data-plane step; the ARM key retrieval is
+        unconditional.
+
+  # ==========================================================================
+  # (1/2) CREDENTIAL GRAB → DATA WRITE — key possession yields full data-plane write
+  # ==========================================================================
+  # Symmetric to CanReadData: the same key grants full write access (SET, HSET,
+  # LPUSH, EXPIRE, DEL, FLUSHDB, CONFIG SET, etc.) allowing data poisoning, session
+  # hijacking, or cache-invalidation attacks.
+  - id: azure-rediscache-listkeys-can-write-data
+    emits: CanWriteData
+    description: "Retrieving the cache access key via listKeys/action yields full data-plane write of all cached data (SET, DEL, FLUSHDB, CONFIG SET), subject to network reachability of the Redis endpoint."
+    match:
+      - [ ?principal, CanReadCredential, ?accessKey ]
+      - [ ?accessKey, CredentialsFor, ?cache ]
+    where:
+      - "node_type(?cache) == Cache"
+      - "?cache.provider_type == 'Microsoft.Cache/redis'"
+      - "node_type(?accessKey) == AccessKey"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cache
+      permissions:
+        - "Microsoft.Cache/redis/listKeys/action"
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        Same network-reachability gate as azure-rediscache-listkeys-can-read-data:
+        if publicNetworkAccess=Disabled and no private reachability: CONDITIONAL(network_reachability);
+        if firewall restricts caller: CONDITIONAL(network_reachability);
+        else ACTIVE. Inherit weakest state from the CanReadCredential contributing edge.
+      confidence: "0.95"
+      derived_from: [ "<CanReadCredential edge_id (principal → accessKey)>", "<CredentialsFor edge_id (accessKey → cache)>" ]
+      false_positive_note: >-
+        Same guards as azure-rediscache-listkeys-can-read-data. Write access includes
+        FLUSHDB (wipe entire cache), CONFIG SET (modify Redis runtime config), and
+        arbitrary key writes — data poisoning, session hijacking, and queue corruption
+        are all in scope. CanWriteData is separately emitted from CanReadData to allow
+        queries to distinguish read-only reconnaissance from destructive/injection paths.
+      narrative: >-
+        {principal.name} can retrieve the access key for {cache.name} and write to
+        all data in the cache. Write-access primitives include SET (value injection),
+        DEL (key removal), FLUSHDB (complete wipe), CONFIG SET (runtime Redis config
+        changes), and LPUSH/RPUSH (queue injection). Session hijacking and cache
+        poisoning are direct impacts.
+
+  # ==========================================================================
+  # (3) PUBLIC EXPOSURE — publicNetworkAccess=Enabled with no firewall rules
+  # ==========================================================================
+  # When publicNetworkAccess=Enabled (the default) and no firewallRules are
+  # configured, the Redis data-plane endpoint (port 6380 SSL) is reachable from
+  # any IP on the internet. Authentication (Redis password/key) is still required
+  # by default, but the TCP endpoint is fully open to the internet.
+  #
+  # This is the most common Azure Cache for Redis misconfiguration: cache created
+  # without a private endpoint and without configuring any firewall rules.
+  #
+  # Guard: publicNetworkAccess=Disabled → DO NOT EMIT.
+  # Guard: VNet-injected Premium instances → publicNetworkAccess forced Disabled → DO NOT EMIT.
+  - id: azure-rediscache-public-no-firewall
+    emits: ExposedToInternet
+    description: "Cache for Redis with publicNetworkAccess=Enabled and no IP firewall rules exposes the Redis data-plane port 6380 (SSL) to the public internet."
+    match:
+      - [ ?cache ]
+    where:
+      - "node_type(?cache) == Cache"
+      - "?cache.provider_type == 'Microsoft.Cache/redis'"
+      - "?cache.properties.publicNetworkAccess != 'Disabled'  # absent/null defaults to Enabled for instances without explicit private-endpoint-only config"
+      - "count(firewallRules for ?cache) == 0  # no IP firewall rules whatsoever"
+    emit:
+      source_type: Cache
+      target_type: AnonymousIdentity
+      source: ?cache
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if ?cache.properties.publicNetworkAccess == 'Disabled': DO NOT EMIT;
+        elif ?cache is VNet-injected Premium (subnetId is set, publicNetworkAccess
+        is absent or Disabled): DO NOT EMIT;
+        elif firewallRules count == 0 AND publicNetworkAccess is Enabled (or absent/null):
+        ACTIVE — the Redis endpoint port 6380 (SSL) is reachable from any internet IPv4
+        host. Authentication (key or requirepass) is still required unless authnotrequired=yes,
+        but the network attack surface is fully public. Unauthenticated TCP connections can
+        probe the endpoint regardless.
+        Note: port 6379 (non-SSL) is disabled by default (enableNonSslPort=false); if
+        enableNonSslPort=true, the non-SSL port is also exposed — no separate rule needed
+        (same ExposedToInternet applies, lower confidentiality on the transport).
+      confidence: "0.93"
+      derived_from: [ "<cache.properties.publicNetworkAccess property>", "<firewallRules absence>" ]
+      false_positive_note: >-
+        The absence of firewallRules does NOT mean anonymous access — Redis still
+        requires the access key (requirepass) unless authnotrequired=yes. This edge
+        models network-layer exposure (the TCP endpoint is publicly reachable), not
+        data-layer access (which also requires the key). The combination of this edge
+        and azure-rediscache-listkeys-exposes-credential in a path means an attacker
+        can reach the endpoint AND has the key → full data access.
+        VNet-injected Premium instances: when subnetId is set, Azure forces
+        publicNetworkAccess=Disabled — do NOT emit regardless of other properties.
+        If publicNetworkAccess is absent/null and subnetId is also absent, treat as
+        Enabled (Standard and Basic tier default before the property was added).
+      narrative: >-
+        {cache.name} has publicNetworkAccess=Enabled (or defaults to it) with no IP
+        firewall rules. The Redis data-plane port 6380 (SSL) is reachable from any
+        internet host. Any caller with the Redis access key can connect directly;
+        without additional network controls, brute-force and credential-spray attacks
+        against the Redis password are feasible.
+
+  # ==========================================================================
+  # (3) PUBLIC EXPOSURE — explicit firewall rule opening 0.0.0.0–255.255.255.255
+  # ==========================================================================
+  # A firewall rule with startIpAddress=0.0.0.0 and endIpAddress=255.255.255.255
+  # explicitly permits all IPv4 internet addresses. This is the most permissive
+  # firewall configuration and is distinct from an empty rule list (which also
+  # allows all IPs, but may be an omission rather than an intentional decision).
+  #
+  # Azure portal "Allow access from all networks" creates this exact rule pattern.
+  #
+  # Guard: publicNetworkAccess=Disabled overrides all firewall rules → DO NOT EMIT.
+  - id: azure-rediscache-public-open-firewall-rule
+    emits: ExposedToInternet
+    description: "A firewall rule allowing 0.0.0.0–255.255.255.255 explicitly exposes the Redis data-plane endpoint to the entire public internet."
+    match:
+      - [ ?cache, Contains, ?firewallRule ]
+    where:
+      - "node_type(?cache) == Cache"
+      - "?cache.provider_type == 'Microsoft.Cache/redis'"
+      - "?cache.properties.publicNetworkAccess != 'Disabled'"
+      - "node_type(?firewallRule) == Firewall"
+      - "?firewallRule.provider_type == 'Microsoft.Cache/redis/firewallRules'"
+      - "?firewallRule.properties.startIP == '0.0.0.0'"
+      - "?firewallRule.properties.endIP == '255.255.255.255'"
+    emit:
+      source_type: Cache
+      target_type: AnonymousIdentity
+      source: ?cache
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if ?cache.properties.publicNetworkAccess == 'Disabled': DO NOT EMIT
+        (the service-level flag overrides all firewallRules);
+        elif ?firewallRule.properties.endIP != '255.255.255.255': DO NOT EMIT
+        for this rule pattern (other rules patterns are handled separately);
+        else ACTIVE: the explicit 0.0.0.0–255.255.255.255 rule allows all internet
+        IPv4 addresses to reach the Redis endpoint on port 6380 (SSL).
+        This rule pattern is created by the Azure portal "Allow access from all networks"
+        checkbox and is deliberately permissive. Key-based authentication is still
+        required unless authnotrequired=yes.
+        NOTE: Azure Cache for Redis ARM API property names are 'startIP' and 'endIP'
+        (not 'startIpAddress'/'endIpAddress' as in Azure SQL Server firewall rules).
+      confidence: "0.95"
+      derived_from: [ "<Contains edge_id (cache → firewallRule)>", "<firewallRule.properties.startIpAddress/endIpAddress>", "<cache.properties.publicNetworkAccess>" ]
+      false_positive_note: >-
+        publicNetworkAccess=Disabled is a service-level guard that overrides all
+        firewallRules — check it first. The rule must have BOTH startIP=0.0.0.0
+        AND endIP=255.255.255.255 to qualify; partial ranges (e.g. 10.0.0.0 range)
+        are not internet exposure. Property names are 'startIP' and 'endIP' per the
+        Azure Cache for Redis ARM API (not 'startIpAddress'/'endIpAddress' as in SQL Server).
+        Unlike azure-rediscache-public-no-firewall (empty rules),
+        this rule is an intentional portal action — higher confidence (0.95 vs 0.93).
+        The network exposure is TCP reachability only; data access requires the Redis key.
+      narrative: >-
+        {cache.name} has an explicit firewall rule allowing all IPv4 addresses
+        (0.0.0.0–255.255.255.255). The Redis data-plane port 6380 is reachable from
+        the entire public internet. Combined with key possession (via listKeys/action),
+        an attacker has both the network path and credentials to access all cached data.
+
+  # ==========================================================================
+  # (4) ARM CONTRIBUTOR → full ARM control of the cache (via CanControl)
+  # ==========================================================================
+  # An identity with ARM Contributor or Owner on the Redis cache (or its parent
+  # resource group/subscription) holds Microsoft.Cache/redis/write, enabling:
+  #   - Opening the firewall (firewallRules/write → ExposedToInternet)
+  #   - Retrieving keys (listKeys/action — included in Contributor/Owner)
+  #   - Disabling auth (redisConfiguration.authnotrequired=yes)
+  #   - Enabling non-SSL port (enableNonSslPort=true)
+  #   - Rotating keys (regenerateKey/action — persistent key control)
+  #   - Modifying the managed identity for CMK access
+  #
+  # This rule emits CanAdminister (explicit CONTROL edge) representing full ARM write.
+  # The can-control.yaml linchpin rule matches on CanAdminister and derives Controls.
+  # Downstream capability edges (ExposedToInternet via firewall write, ExposesCredential via listKeys)
+  # are derived by separate rules that match on more specific HasPermission facts.
+  - id: azure-rediscache-arm-write-can-control
+    emits: CanAdminister
+    description: "ARM write (redis/write) permission grants full control-plane administration: firewall rules, authentication settings, port configuration, managed identity, and deletion."
+    match:
+      - [ ?principal, HasPermission, ?cache ]
+    where:
+      - "node_type(?cache) == Cache"
+      - "?cache.provider_type == 'Microsoft.Cache/redis'"
+      - "?principal has EFFECTIVE Microsoft.Cache/redis/write at ?cache scope (Owner, Contributor, Redis Cache Contributor, or custom role with redis/write)"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cache
+      permissions:
+        - "Microsoft.Cache/redis/write"
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers redis/write at the effective
+        scope: BLOCKED;
+        else ACTIVE. This is an ARM control-plane action; the Redis IP firewall and
+        publicNetworkAccess settings do NOT gate it. The write permission covers all
+        cache properties including redisConfiguration (authnotrequired, enableNonSslPort),
+        firewallRules (via Microsoft.Cache/redis/firewallRules/write included in
+        Contributor), and managed identity assignment. This CanControl edge is the
+        canonical derived summary of master ARM control over the resource.
+        Note: Contributor at the cache scope also includes listKeys/action — the separate
+        azure-rediscache-listkeys-principal-read-credential rule captures that path directly.
+      confidence: "0.95"
+      derived_from: [ "<HasPermission edge_id (redis/write)>" ]
+      false_positive_note: >-
+        The Redis Cache Contributor built-in role includes redis/write AND listKeys/action.
+        Redis Cache Contributor does NOT include Microsoft.Authorization/* (cannot grant
+        permissions) — it is not an RBAC escalation path on its own. ARM Contributor
+        and Owner at the subscription/RG/cache scope DO include both redis/write and
+        listKeys/action. Custom roles must explicitly list redis/write.
+        Do NOT emit CanControl for redis/read-only roles (e.g., Reader) —
+        read access does NOT include write or listKeys.
+      narrative: >-
+        {principal.name} holds Microsoft.Cache/redis/write on {cache.name}, granting
+        full control-plane administration: opening the firewall to the internet,
+        disabling Redis authentication (authnotrequired), enabling the non-SSL port,
+        retrieving access keys (listKeys), rotating keys, modifying the managed identity
+        for CMK, or deleting the cache. This is the ARM master control over the resource.
+
+  # ==========================================================================
+  # (4a) CONFIG MODIFICATION — redis/write allows tampering with auth/firewall
+  # ==========================================================================
+  # Microsoft.Cache/redis/write permission enables tampering with the Redis
+  # configuration via PATCH operations on the cache resource:
+  #   - Setting authnotrequired=true (disables Redis password authentication)
+  #   - Enabling enableNonSslPort (opens port 6379 unencrypted)
+  #   - Lowering minimumTlsVersion (weakens transport security)
+  #   - Changing redisConfiguration (various server-side settings)
+  #   - Modifying the managed identity for CMK (redirects Key Vault access)
+  # This is direct resource configuration tampering (CanModifyConfiguration),
+  # which feeds the can-control linchpin and also affects data-plane exposure.
+  - id: azure-rediscache-write-can-modify-config
+    emits: CanModifyConfiguration
+    description: "redis/write permission allows modifying cache configuration including authentication settings, port exposure, TLS version, and managed identity for CMK."
+    match:
+      - [ ?principal, HasPermission, ?cache ]
+    where:
+      - "node_type(?cache) == Cache"
+      - "?cache.provider_type == 'Microsoft.Cache/redis'"
+      - "?principal has EFFECTIVE Microsoft.Cache/redis/write at ?cache scope (Owner, Contributor, Redis Cache Contributor, or custom role with redis/write)"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cache
+      permissions:
+        - "Microsoft.Cache/redis/write"
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers redis/write at the effective
+        scope: BLOCKED;
+        else ACTIVE. The redis/write permission covers all cache properties including
+        redisConfiguration (authnotrequired, enableNonSslPort, minimumTlsVersion),
+        networkAcls / firewallRules, and managed identity assignment. Modifying these
+        properties alters the attack surface and can enable unauthenticated access or
+        redirect Key Vault access. This is the ARM-level configuration tampering capability.
+      confidence: "0.95"
+      derived_from: [ "<HasPermission edge_id (redis/write)>" ]
+      false_positive_note: >-
+        The Redis Cache Contributor and Contributor/Owner roles include redis/write.
+        Configuration changes via PATCH are immediate and observable in the cache
+        properties. CanModifyConfiguration gates the can-control linchpin rule which
+        derives Controls. Do NOT confuse with CanModifyCode (which is not applicable
+        to Redis, a passive data store).
+      narrative: >-
+        {principal.name} holds Microsoft.Cache/redis/write on {cache.name}, enabling
+        modification of all cache configuration properties: disabling Redis authentication
+        (authnotrequired), enabling unencrypted port 6379 (enableNonSslPort), lowering
+        TLS version (minimumTlsVersion), and changing the managed identity for CMK
+        (CanAttachIdentity). These changes directly expand the attack surface.
+
+  # ==========================================================================
+  # (4a-attach) MANAGED IDENTITY ATTACHMENT — CMK redirection
+  # ==========================================================================
+  # Modifying the managed identity assigned to the cache requires:
+  #   - Microsoft.Cache/redis/write (permission to change cache properties)
+  # Premium tier caches with customer-managed keys (CMK) are encrypted using a
+  # Key Vault key. The cache accesses the key via a user-assigned or system-assigned
+  # managed identity. An attacker with redis/write can replace the user-assigned MI
+  # to an attacker-controlled identity, breaking data-at-rest access for existing
+  # clients or redirecting Key Vault access to attacker infrastructure.
+  # This is CanAttachIdentity at the ARM level.
+  - id: azure-rediscache-write-can-attach-identity
+    emits: CanAttachIdentity
+    description: "redis/write permission allows attaching/replacing the managed identity used for CMK (data-at-rest encryption)."
+    match:
+      - [ ?principal, HasPermission, ?cache ]
+    where:
+      - "node_type(?cache) == Cache"
+      - "?cache.provider_type == 'Microsoft.Cache/redis'"
+      - "?principal has EFFECTIVE Microsoft.Cache/redis/write at ?cache scope (Owner, Contributor, Redis Cache Contributor, or custom role with redis/write)"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: ?cache
+      permissions:
+        - "Microsoft.Cache/redis/write"
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers redis/write at the effective
+        scope: BLOCKED;
+        else ACTIVE if the cache is Premium tier with CMK enabled; CONDITIONAL if
+        the cache does not have user-assigned MI or CMK is not configured (the
+        CanAttachIdentity capability exists but has no impact until CMK + MI are
+        present). The principal can modify the cache resource's managed identity
+        property, swapping the user-assigned MI used for CMK (Premium tier with
+        customer-managed keys). Replacing it with an attacker-controlled MI breaks
+        existing data-at-rest access or redirects Key Vault decrypt calls to
+        attacker infrastructure.
+      confidence: "0.90"
+      derived_from: [ "<HasPermission edge_id (redis/write)>" ]
+      false_positive_note: >-
+        CanAttachIdentity (for CMK) requires redis/write permission. This capability
+        only applies to Premium tier caches with CMK and a user-assigned MI configured;
+        Standard tier does not support customer-managed keys. Verify the cache has
+        'sku.tier == Premium' and the identity property is set before modeling this
+        path. If CMK is not enabled, the AttachIdentity capability is present but
+        has no functional impact.
+      narrative: >-
+        {principal.name} holds Microsoft.Cache/redis/write on {cache.name}, enabling
+        replacement of the managed identity assigned to the cache for CMK access
+        (Premium tier). An attacker can swap the CMK MI to an attacker-controlled
+        identity, breaking data access for existing clients or redirecting Key Vault
+        decrypt operations.
+
+  # ==========================================================================
+  # (4b) KEY ROTATION → persistence & session revocation
+  # ==========================================================================
+  # Microsoft.Cache/redis/regenerateKey/action allows an attacker to rotate
+  # the primary and secondary access keys. This enables:
+  #   - Revoking all existing client sessions (availability impact)
+  #   - Reading the new key via listKeys and establishing persistence
+  #   - Locking out legitimate users while maintaining attacker access
+  - id: azure-rediscache-regeneratekey-can-control
+    emits: CanAdminister
+    description: "regenerateKey/action allows rotating the Redis access keys, enabling session revocation and credential rotation for persistence. Treated as control capability."
+    match:
+      - [ ?principal, HasPermission, ?cache ]
+    where:
+      - "node_type(?cache) == Cache"
+      - "?cache.provider_type == 'Microsoft.Cache/redis'"
+      - "?principal has EFFECTIVE Microsoft.Cache/redis/regenerateKey/action at ?cache scope"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?cache
+      permissions:
+        - "Microsoft.Cache/redis/regenerateKey/action"
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers regenerateKey/action: BLOCKED;
+        else ACTIVE. The principal can call the ARM regenerateKey REST API to rotate
+        the primary and secondary access keys. Once rotated, old keys no longer authenticate
+        to the Redis data-plane (revoking all existing sessions), and the new key can be
+        retrieved via listKeys/action to establish persistence with attacker-controlled
+        credentials.
+      confidence: "0.93"
+      derived_from: [ "<HasPermission edge_id (regenerateKey/action)>" ]
+      false_positive_note: >-
+        regenerateKey is a distinct action from listKeys. A principal with regenerateKey
+        can rotate keys but may not have listKeys permission — however, Contributor and
+        Owner roles typically include both. If regenerateKey is present without listKeys,
+        the impact is session revocation only (availability); if both are present, the
+        attacker can establish persistence (confidentiality + integrity).
+      narrative: >-
+        {principal.name} holds Microsoft.Cache/redis/regenerateKey/action on {cache.name},
+        allowing key rotation to revoke all existing client sessions and (if combined
+        with listKeys permission) establish persistence with new attacker-controlled keys.
+
+  # ==========================================================================
+  # (5) UNAUTHENTICATED ACCESS — authnotrequired=true + publicNetworkAccess=Enabled
+  # ==========================================================================
+  # Setting authnotrequired=true (via redis/write permission) disables Redis
+  # password authentication entirely. Combined with publicNetworkAccess=Enabled,
+  # any internet host can connect and issue full Redis commands without credentials.
+  # This is the most severe configuration and is very rare but documented.
+  - id: azure-rediscache-authnotrequired-exposed-internet
+    emits: ExposedToInternet
+    description: "Cache with authnotrequired=true and publicNetworkAccess=Enabled allows anonymous internet access to the Redis data-plane with full commands."
+    match:
+      - [ ?cache ]
+    where:
+      - "node_type(?cache) == Cache"
+      - "?cache.provider_type == 'Microsoft.Cache/redis'"
+      - "?cache.properties.redisConfiguration.authnotrequired == 'yes'"
+      - "?cache.properties.publicNetworkAccess != 'Disabled'"
+    emit:
+      source_type: Cache
+      target_type: AnonymousIdentity
+      source: ?cache
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if ?cache.properties.publicNetworkAccess == 'Disabled': DO NOT EMIT
+        (service-level flag blocks the endpoint);
+        elif ?cache.properties.redisConfiguration.authnotrequired != 'yes': DO NOT EMIT
+        (authentication is required);
+        else ACTIVE: any internet host can connect to the Redis data-plane endpoint
+        on port 6380 (or 6379 if enableNonSslPort=true) without providing credentials
+        and issue any Redis command. This grants full read, write, delete, and CONFIG
+        access to an unauthenticated attacker. This is an extremely rare but catastrophic
+        misconfiguration.
+      confidence: "0.99"
+      derived_from: [ "<cache.properties.redisConfiguration.authnotrequired property>", "<cache.properties.publicNetworkAccess property>" ]
+      false_positive_note: >-
+        This is a very rare configuration and requires explicit action to enable
+        (authnotrequired defaults to 'no'). If both properties are set as detected,
+        the exposure is real. High confidence. Cross-check with documentation or
+        compliance policies to confirm this is not an intentional shared/testing cache.
+      narrative: >-
+        {cache.name} has authentication disabled (authnotrequired=yes) and is exposed
+        to the public internet (publicNetworkAccess=Enabled). Any internet attacker can
+        connect and issue full Redis commands: reading all cached data, injecting malicious
+        data, flushing the cache, or modifying Redis runtime config — all without credentials.
+        This is a critical misconfiguration.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - Azure deny assignment covering listKeys/action → azure-rediscache-listkeys-principal-read-credential BLOCKED.
+#   - Azure deny assignment covering redis/write → azure-rediscache-arm-write-can-modify-config BLOCKED.
+#   - Azure deny assignment covering regenerateKey/action → azure-rediscache-regeneratekey-can-rotate-credentials BLOCKED.
+#   - Azure Policy denying redis/write → azure-rediscache-arm-write-can-modify-config BLOCKED.
+#   - properties.publicNetworkAccess=Disabled → azure-rediscache-public-no-firewall,
+#     azure-rediscache-public-open-firewall-rule, and azure-rediscache-authnotrequired-exposed-internet: DO NOT EMIT.
+#   - VNet-injected Premium instances (subnetId set) → treat publicNetworkAccess as Disabled →
+#     azure-rediscache-public-no-firewall: DO NOT EMIT.
+#
+# Linchpin cross-references (DO NOT RE-DERIVE here):
+#   credential-chains.yaml:
+#     - read-secret-yields-identity: if the Redis access key (AccessKey node)
+#       is stored in a Key Vault secret or App Config value that also has a CredentialsFor
+#       edge to another identity, the credential-chains rule collapses it to CanImpersonate.
+#     - execute-then-read-secret: a workload identity (e.g., an App Service MI) that has
+#       CanExecuteAs capability and whose effective permissions include listKeys/action
+#       inherits the CanReadCredential path via the execute-then-read-secret collapse.
+#     - decrypt-gates-secret-read: Premium tier CMK — CanReadData on a CMK-encrypted
+#       cache is CONDITIONAL(key_permission); the upgrade to ACTIVE fires when the principal
+#       also holds CanDecrypt on the Key Vault key wrapping the CMK. Not re-derived here.
+#   can-control.yaml:
+#     - control-via-control: CanControl(principal, cache) yields Controls(principal, cache).
+#     - escalate-via-execute-as: if the cache MI has elevated ARM permissions and a principal
+#       CanExecuteAs that MI, the escalation chain is in can-execute-as.yaml; not re-derived.
+# ---------------------------------------------------------------------------

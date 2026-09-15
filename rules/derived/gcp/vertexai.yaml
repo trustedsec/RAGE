@@ -1,0 +1,256 @@
+# GCP Vertex AI / Workbench — Derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:vertexai. Emits ONLY derived edge types from schema/edges.yaml
+# (nature=derived or nature=both), building upon explicit normalization rules from
+# /rules/explicit/gcp-vertexai.yaml.
+# Permissions are the EFFECTIVE actions the permission evaluator must confirm.
+# Permission identifiers are verbatim from the Vertex AI IAM reference:
+#   cloud.google.com/vertex-ai/docs/general/access-control
+# and the Notebooks IAM reference:
+#   cloud.google.com/iam/docs/roles-permissions/notebooks
+#
+# CENTRAL PIVOT (Phase 11 theme):
+#   Every Vertex AI compute surface (custom training job, Vertex Pipelines step,
+#   Workbench notebook instance, notebook execution job) runs AS a service account
+#   on GCE VMs. The job SA token is available to any running code via the GCE
+#   metadata server (http://metadata.google.internal/computeMetadata/v1/instance/
+#   service-accounts/default/token; header Metadata-Flavor: Google).
+#
+#   There are two execution entry points:
+#     1. JOB CREATION (aiplatform.customJobs.create, pipelineJobs.create,
+#        notebookExecutionJobs.create): create == deploy == run immediately.
+#        The caller fully controls the container image and command; no separate
+#        invoke step is needed. Requires iam.serviceAccounts.actAs on the target SA.
+#     2. NOTEBOOK INSTANCE ACCESS (notebooks.instances.use): an always-on GCE VM.
+#        Whoever can open JupyterLab can run arbitrary code as the instance SA.
+#
+#   The linchpins can-execute-as.yaml and cicd-chains.yaml roll up CanExecuteAs
+#   from the normalized facts (ExecutesAs + CanModifyCode/CanCreateWorkloadAs/
+#   CanExecuteCommand). This file EMITS the facts; those linchpins produce the
+#   CanEscalateTo roll-up — CITED, NOT re-derived here.
+#
+# State discipline:
+#   - Job creation is ACTIVE (create == run, no trigger_exists gate). Contrast
+#     with GCF where invoke is a separate step.
+#   - Notebook instance use is ACTIVE if the instance is confirmed RUNNING;
+#     CONDITIONAL(service_state) if stopped; add CanStart if principal also
+#     holds notebooks.instances.start.
+#   - actAs is per-SA: without it on the target SA -> POTENTIAL(iam_permission).
+#   - VPC Service Controls perimeter restricting aiplatform.googleapis.com or
+#     notebooks.googleapis.com -> emit as BLOCKED(scp_or_org_policy) from
+#     perimeter-exterior principals.
+#   - Org policy iam.disableCrossProjectServiceAccountUsage active AND the target SA
+#     is cross-project -> BLOCKED on the CanPassIdentity / CanCreateWorkloadAs edges.
+#
+# LINCHPIN CITATIONS (do not re-derive):
+#   can-execute-as.yaml — execute-as-via-new-workload: CanCreateWorkloadAs -> CanExecuteAs
+#   can-execute-as.yaml — execute-as-via-command: CanExecuteCommand + ExecutesAs -> CanExecuteAs
+#   can-execute-as.yaml — execute-as-via-config-identity-swap:
+#                         CanModifyConfiguration + CanPassIdentity -> CanExecuteAs
+#   can-execute-as.yaml — execute-as-via-code-modify:
+#                         CanModifyCode + ExecutesAs -> CanExecuteAs
+#   can-control.yaml   — escalate-via-execute-as: CanExecuteAs (higher priv) -> CanEscalateTo
+#   credential-chains.yaml — execute-then-read-secret: CanExecuteAs -> CanReadSecret inheritance
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 11-data-analytics-ml
+service: vertexai
+applies_to: [gcp]
+
+rules:
+
+  # ===========================================================================
+  # EXPLICIT STRUCTURAL FACTS (from /rules/explicit/gcp-vertexai.yaml)
+  # ===========================================================================
+  # ExecutesAs edges are emitted ONLY by the explicit file:
+  #   - gcp-vertexai-explicit-executes-as-training
+  #   - gcp-vertexai-explicit-executes-as-notebook
+  # These are foundational facts that derived rules depend on.
+
+  # ===========================================================================
+  # IDENTITY PASS / WORKLOAD CREATION
+  # ===========================================================================
+  # CanPassIdentity is emitted by /rules/explicit/gcp-vertexai.yaml (gcp-vertexai-explicit-passidentity-actas).
+  # These derived rules depend on it.
+
+  # --- Create training job bound to a passable SA (CanCreateWorkloadAs) --------
+  - id: gcp-vertexai-create-workload-as-training
+    emits: CanCreateWorkloadAs
+    description: "Create a Vertex AI custom training job / pipeline job / notebook execution job whose workers run as a passable SA (create + actAs). Job runs immediately on creation — no invoke step."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has EFFECTIVE aiplatform.customJobs.create OR aiplatform.pipelineJobs.create OR aiplatform.notebookExecutionJobs.create in the target project/location"
+      - "?principal has iam.serviceAccounts.actAs on ?sa (confirmed present)"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["aiplatform.customJobs.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: "ACTIVE if iam.serviceAccounts.actAs on ?sa is confirmed AND the job-create permission is present (the job runs immediately — no trigger_exists gate; contrast with GCF). POTENTIAL(iam_permission) if actAs is not confirmed on ?sa. BLOCKED if org policy iam.disableCrossProjectServiceAccountUsage is active AND ?sa is in a different project."
+      derived_from: [ "<CanPassIdentity edge_id>" ]
+      false_positive_note: >-
+        No invoke/trigger gating — Vertex AI custom training creates and runs in a single API
+        call. The attacker's container runs immediately with ?sa's credentials. actAs is
+        required on the exact SA; without it -> POTENTIAL. If the SA is cross-project AND
+        iam.disableCrossProjectServiceAccountUsage is active -> BLOCKED.
+      narrative: "{principal.name} can create a Vertex AI training job (aiplatform.customJobs.create) whose worker VMs run attacker-controlled code as {sa.name} (iam.serviceAccounts.actAs); the job runs on creation, no separate invocation needed."
+
+  # --- Create Workbench instance bound to a passable SA (CanCreateWorkloadAs) --
+  - id: gcp-vertexai-create-workload-as-notebook
+    emits: CanCreateWorkloadAs
+    description: "Create a Workbench notebook instance whose underlying GCE VM runs as a passable SA. The instance persists; accessing JupyterLab (notebooks.instances.use) executes code as the SA."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has EFFECTIVE notebooks.instances.create in the target project/location"
+      - "?principal has iam.serviceAccounts.actAs on ?sa (confirmed present)"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["notebooks.instances.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: "ACTIVE if iam.serviceAccounts.actAs on ?sa is confirmed AND notebooks.instances.create are present. The instance creation capability is ACTIVE regardless of whether the principal holds notebooks.instances.use — the use permission gates the downstream CanExecuteCommand (via gcp-vertexai-notebook-use-execute-command), not the creation capability itself. CONDITIONAL(service_state) if the newly created instance is not yet RUNNING. POTENTIAL(iam_permission) if actAs is not confirmed. BLOCKED if org policy iam.disableCrossProjectServiceAccountUsage is active AND ?sa is cross-project."
+      derived_from: [ "<CanPassIdentity edge_id>" ]
+      false_positive_note: >-
+        The Workbench instance is a persistent GCE VM (not ephemeral like a training job).
+        Creating it alone gives a running VM. CanCreateWorkloadAs models the create capability,
+        not the subsequent execution (use) step. The downstream CanExecuteCommand via
+        gcp-vertexai-notebook-use-execute-command requires notebooks.instances.use, not this rule.
+        actAs is required on the exact SA.
+      narrative: "{principal.name} can create a Workbench notebook instance running as {sa.name} (notebooks.instances.create + iam.serviceAccounts.actAs); code execution requires separate notebooks.instances.use permission."
+
+  # ===========================================================================
+  # EXECUTION ON EXISTING RESOURCES
+  # ===========================================================================
+  # CanExecuteCommand on notebooks is emitted by /rules/explicit/gcp-vertexai.yaml
+  # (gcp-vertexai-explicit-notebook-use-execute-command). It feeds into the
+  # can-execute-as execute-as-via-command linchpin for CanExecuteAs derivation.
+
+  # ===========================================================================
+  # CONFIGURATION / IDENTITY SWAP ON EXISTING WORKBENCH INSTANCE
+  # ===========================================================================
+
+  # --- Swap Workbench instance SA (CanAttachIdentity) -----------------------
+  - id: gcp-vertexai-notebook-update-attach-sa
+    emits: CanAttachIdentity
+    description: "Update a Workbench instance's service account (notebooks.instances.update + actAs on new SA) so future code runs as the new SA."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?instance ]
+      - [ ?principal, CanPassIdentity,        ?newsa ]
+    where:
+      - "node_type(?instance) == Notebook"
+      - "?principal has EFFECTIVE notebooks.instances.update on ?instance (confirmed via CanModifyConfiguration edge)"
+      - "?principal has iam.serviceAccounts.actAs on ?newsa"
+      - "?newsa is compatible with the Workbench instance (GCE SA)"
+    emit:
+      source_type: Identity
+      target_type: Notebook
+      source: "<principal>"
+      target: "<Workbench notebook instance>"
+      permissions: ["notebooks.instances.update", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility, service_state]
+      state_logic: "ACTIVE for the attach capability itself when CanModifyConfiguration (notebooks.instances.update) and CanPassIdentity (actAs on ?newsa) are confirmed. The instance must be restarted for the new SA to take effect (CONDITIONAL(service_state) for the downstream CanExecuteAs until the instance restarts and the attacker regains notebooks.instances.use). POTENTIAL(iam_permission) if actAs on ?newsa is not confirmed."
+      derived_from: [ "<CanModifyConfiguration edge_id>", "<CanPassIdentity edge_id>" ]
+      false_positive_note: >-
+        The SA swap takes effect on the NEXT start of the instance; a currently running instance
+        still uses the old SA until restarted. The downstream CanExecuteAs via can-execute-as
+        execute-as-via-config-identity-swap fires off this edge — cited, not re-derived here.
+        Requires actAs on the NEW SA; actAs on the old SA is irrelevant. If the instance is
+        managed by a GKE-style enforcement that prevents SA changes, emit as BLOCKED.
+      narrative: "{principal.name} can change the service account of Workbench instance {instance.name} to {newsa.name} (notebooks.instances.update + iam.serviceAccounts.actAs); the next instance start runs code as {newsa.name}."
+
+  # ===========================================================================
+  # CREDENTIAL EXPOSURE
+  # ===========================================================================
+
+  # --- Runtime SA credentials exposed to job code via GCE metadata server ----
+  - id: gcp-vertexai-exposes-runtime-sa-cred
+    emits: ExposesCredential
+    description: "A training job or Workbench notebook exposes its runtime SA credentials to any code it runs via the GCE metadata server."
+    match:
+      - [ ?compute, ExecutesAs, ?sa ]
+    where:
+      - "node_type(?compute) in [Notebook, BatchJob, Workflow]"
+    emit:
+      source_type: Compute
+      target_type: ServiceAccount
+      source: "<training job / notebook instance>"
+      target: "<runtime service account>"
+      permissions: []
+      derived_from: [ "<ExecutesAs edge_id>" ]
+      note: >-
+        GCE metadata endpoint: http://metadata.google.internal/computeMetadata/v1/instance/
+        service-accounts/default/token (header Metadata-Flavor: Google). Returns a short-lived
+        OAuth 2.0 access token for the runtime SA. Not a standalone escalation — value comes
+        from a contributing CanModifyCode/CanCreateWorkloadAs/CanExecuteCommand edge.
+      false_positive_note: >-
+        Not an escalation by itself; expresses the fact that code execution in the job equals
+        holding the SA's token. Path value comes from a contributing execution edge.
+      narrative: "{compute.name} exposes credentials of its runtime service account {sa.name} to any code it runs (GCE metadata server token endpoint)."
+
+
+  # ===========================================================================
+  # POLICY MODIFICATION
+  # ===========================================================================
+
+  # --- notebooks.instances.setIamPolicy -> CanModifyPolicy (from derived rules) ----
+  # NOTE: This rule is now in /rules/explicit/gcp-vertexai.yaml as an explicit normalization.
+  # It is included here for reference only. The derived CanModifyPolicy from setIamPolicy
+  # is emitted by the explicit rule and used by downstream derived rules.
+
+  # ===========================================================================
+  # CROSS-BOUNDARY ENTRY
+  # ===========================================================================
+
+  # --- Cross-project entry via training job with a cross-project SA -----------
+  - id: gcp-vertexai-cross-project-entry
+    emits: CanEnterProject
+    description: "A principal in project A can execute code as a SA that holds privilege in project B by submitting a training job or creating a notebook bound to that cross-project SA."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    where:
+      - "?sa.project != ?principal.project"
+      - "?sa has IAM bindings granting meaningful roles in ?sa.project (or other projects)"
+    emit:
+      source_type: Identity
+      target_type: Project
+      source: "<principal>"
+      target: "<project of the cross-project SA>"
+      permissions: ["aiplatform.customJobs.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: "ACTIVE if CanExecuteAs on the cross-project SA is ACTIVE AND org policy iam.disableCrossProjectServiceAccountUsage is NOT active. BLOCKED if the org policy is active (cross-project SA usage blocked). CONDITIONAL(iam_permission) if actAs on the SA is not fully confirmed."
+      derived_from: [ "<CanExecuteAs edge_id>" ]
+      false_positive_note: >-
+        Only emit when the SA is confirmed to be in a different project AND has meaningful IAM
+        roles in that project. Org policy iam.disableCrossProjectServiceAccountUsage -> BLOCKED.
+        Inherits state from CanExecuteAs; never stronger than the contributing edge.
+      narrative: "{principal.name} can execute code as {sa.name} (from project {sa.project}) by submitting a Vertex AI job, entering project {sa.project} via the SA's cross-project IAM roles."
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - VPC-SC perimeter restricting aiplatform.googleapis.com or
+#    notebooks.googleapis.com for the caller's network -> BLOCKED on all
+#    create/use edges from outside the perimeter.
+#  - Org policy iam.disableCrossProjectServiceAccountUsage -> BLOCKED on
+#    CanPassIdentity / CanCreateWorkloadAs where ?sa is cross-project.
+#  - An IAM deny policy explicitly denying aiplatform.customJobs.create or
+#    notebooks.instances.create at the effective scope -> BLOCKED.
+#  - Org policy constraints/ai.disableServiceAccountActAs (if enforced by the
+#    org) further gates the actAs path.
+#  - A stopped Workbench instance (state != ACTIVE) gates CanExecuteCommand ->
+#    CONDITIONAL(service_state); ACTIVE only when the instance is RUNNING.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules for this service live in /rules/explicit/gcp-vertexai.yaml.
+# All ExecutesAs, CanModifyConfiguration, CanModifyCode, CanModifyPolicy, and CrossProjectTrust
+# edges are emitted from the explicit file to maintain schema conformance (nature=explicit,
+# nature=derived, or nature=both only; no mismatched nature in derived files).
+# ---------------------------------------------------------------------------

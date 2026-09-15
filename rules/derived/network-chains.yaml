@@ -1,0 +1,619 @@
+# Provider-agnostic network reachability chain rules (Phase 8 — networking)
+# ===========================================================================
+# THE PHASE-8 LINCHPIN. Written as the provider-agnostic roll-up that the
+# per-service networking adapters target (aws:vpc / elb / route53 / cloudfront /
+# directconnect / tgw / globalaccelerator / networkfirewall / vpclattice /
+# appmesh; azure:vnet / nsg / loadbalancer / frontdoor / firewall / dns / vwan /
+# privatelink; gcp:vpc / firewall / loadbalancing / clouddns / psc / ncc /
+# cloudarmor / iap). Each adapter emits a handful of NORMALIZED, ATOMIC network
+# FACTS and inherits end-to-end reachability composition here — exactly as
+# messaging-chains does for event sources and cicd-chains does for pipelines.
+#
+# THE PHASE-8 IDEA (reachability is a conjunction, not any single fact):
+#   The adapters emit atomic facts that are each TRUE IN ISOLATION but that,
+#   alone, do NOT establish that host A can actually reach host B:
+#     * a security-group / NSG / firewall ALLOW rule  => CanReachPort (ingress
+#       is permitted to a port) — says nothing about whether a PATH exists.
+#     * a route-table entry / gateway attachment       => RoutesTo (a forwarding
+#       hop exists) — says nothing about whether ingress is permitted.
+#     * a VPC / VNet peering                           => PeeredWith (two
+#       segments are bridged) — NON-TRANSITIVE.
+#     * a PrivateLink / PSC / private endpoint          => PrivateReachability (a
+#       private path to a PaaS/data service, often cross-boundary).
+#     * a public-facing resource                        => ExposedToInternet (any
+#       internet principal is a valid source).
+#   REAL end-to-end reachability is the CONJUNCTION: the source can egress AND a
+#   route/adjacency exists to the destination's segment AND the destination's
+#   SG/NSG/firewall admits the source on the port AND no NACL/firewall DENY
+#   overrides it. This file composes the atomic facts into a single
+#   CanNetworkReach edge (the "post SG/firewall/route evaluation" verdict), so
+#   path queries can gate every downstream exploit on genuine reachability
+#   instead of on an isolated allow-rule or an isolated route.
+#
+# NORMALIZED FACTS THIS FILE CONSUMES (what the networking adapters emit):
+#   [?sg, CanReachPort, ?dst]         the INGRESS-ALLOW fact: a SG/NSG/firewall
+#                                     node (?sg, class Network) admits inbound
+#                                     traffic to ?dst on a port. Adapters emit
+#                                     source_type=Network (the SG/NSG/Firewall
+#                                     node), target_type=Compute. Ingress only —
+#                                     NOT yet path-gated. Rules below join from
+#                                     ?src's SG via [?src, AttachedSG, ?sg] or
+#                                     equivalently via [?sg, CanReachPort, ?dst]
+#                                     where ?sg governs the ?src segment.
+#   [?x, LocatedIn, ?net]             placement: a resource sits in a subnet /
+#                                     VNet / VPC (Network) segment.
+#   [?subnet, RoutesTo, ?dstnet]      a direct forwarding hop: adapters emit
+#                                     RoutesTo with source_type=Route (RouteTable)
+#                                     or source_type=Subnet depending on provider.
+#                                     Rules below bridge via [?rt, RoutesTo, ?dstnet]
+#                                     AND [?rt, AttachedTo, ?srcnet] (or equivalent)
+#                                     to connect compute placement to route facts.
+#   [?srcnet, RoutesTo, ?hub] +       a TRANSIT hub (Transit Gateway / VWAN hub /
+#   [?hub, RoutesTo, ?dstnet]         NCC hub / Direct Connect gateway / VPN gateway)
+#                                     that forwards between ALL its attachments.
+#   [?vnetA, PeeredWith, ?vnetB]      a peering that bridges two VNets/VPCs.
+#   [?src, PrivateReachability, ?dst] a private (PrivateLink/PSC/PE) path to a
+#                                     PaaS/data endpoint, often cross-boundary.
+#   [?dst, ExposedToInternet, ?anon]  the destination is reachable from the public
+#                                     internet (?anon is the AnonymousIdentity).
+#
+# ADAPTER CANONICAL FACT SHAPES (required for correct rule joins):
+#   CanReachPort  : source=[Network (SG/NSG/Firewall node)], target=[Compute, Data]
+#                   Rules 1–4 join [?sg, CanReachPort, ?dst] AND separately establish
+#                   that ?src resides in the segment admitted by ?sg.
+#   RoutesTo      : source=[Route (RouteTable), Subnet, TransitGateway],
+#                   target=[Network, Subnet]  (per edges.yaml)
+#                   AWS adapter emits source=Route (RouteTable node); Azure emits source=Subnet
+#                   or Route depending on the UDR shape. Rules bridge via AttachedTo/LocatedIn.
+#
+# WHAT THIS FILE PRODUCES (the composition => CanNetworkReach):
+#   CanReachPort + co-location (same Subnet) + segment co-location  => CanNetworkReach  (rule 1)
+#   CanReachPort + one routed hop via RouteTable (intra-boundary)   => CanNetworkReach  (rule 2)
+#   CanReachPort + ONE peering hop (non-transitive)                 => CanNetworkReach  (rule 3)
+#   CanReachPort + transit hub (TRANSITIVE across attach)           => CanNetworkReach  (rule 4)
+#   ExposedToInternet                                               => CanNetworkReach  (rule 5)
+#   PrivateReachability (cross-boundary private path)               => CanNetworkReach  (rule 6)
+#   CanNetworkReach(?anon,?lb) + CanNetworkReach(?lb,?backend)      => CanNetworkReach  (rule 7)
+#
+# THE TWO CORRECTNESS INVARIANTS (why this linchpin is subtle):
+#   1. PEERING IS NON-TRANSITIVE. A route learned across VNet-A<->VNet-B does NOT
+#      propagate to a third VNet-C peered with B. Rule 3 matches EXACTLY ONE
+#      PeeredWith hop (a single direct-edge assertion) and must never chain
+#      peering-of-peering. A transit HUB (rule 4) is the opposite: it forwards
+#      between all attachments, so rule 4 DOES compose two RoutesTo hops through
+#      the hub node. The engine MUST treat PeeredWith as non-transitive (no
+#      transitive-closure pass on this edge type).
+#   2. REACHABILITY IS A CONJUNCTION. Ingress-allow (CanReachPort) without a route
+#      is not reach; a route without ingress-allow is not reach. Every rule below
+#      requires BOTH, and an explicit NACL/firewall DENY on the path caps the edge
+#      to BLOCKED regardless of the allow rules.
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE:
+#   * The per-service networking adapters OWN the atomic facts (CanReachPort,
+#     RoutesTo, PeeredWith, PrivateReachability, ExposedToInternet). This file
+#     NEVER re-derives an atomic fact; it only composes the ones the adapters emit.
+#   * can-control.yaml OWNS the terminal roll-ups. A CanNetworkReach to a listening
+#     service is a PRECONDITION that GATES an exploit (CanExecuteCommand / CanReadData
+#     / CanEnter*), never the exploit itself. This file emits ONLY the reachability
+#     verdict; the service adapters + can-control compose reachability + a vulnerable
+#     surface into the actual capability. Emit reach here; let them compose the
+#     consequence — exactly as messaging-chains emits CanTrigger and lets
+#     can-execute-as roll it up.
+#   * ExposedToInternet -> CanEnterAccount/tenant/project is NOT a network fact and
+#     is NOT derived here; rule 5 only asserts that the internet is a valid SOURCE.
+#   * credential-chains / data-plane rules own CanExfiltrate and secret reads over a
+#     reachable service; not re-derived here.
+#
+# STATE PROPAGATION (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. The network-specific gates:
+#   * A path is CONDITIONAL(network_reachability) unless every hop is confirmed
+#     from collected routing + ingress data; a collection gap on any hop (an
+#     unenumerated route table, a remote-account segment) downgrades to
+#     CONDITIONAL, never silently ACTIVE.
+#   * An explicit NACL / stateless-firewall / Cloud Armor / NSG DENY that covers
+#     the source range on the port is a real control => BLOCKED.
+#   * Transit-hub route-table SEGMENTATION (a TGW route table / VWAN hub routing
+#     intent / NCC spoke isolation) that does not associate both attachments caps
+#     rule 4 to CONDITIONAL(network_reachability) or BLOCKED.
+#
+# MODELING LIMITATIONS (explicit, for the Job-B engine that will EXECUTE these):
+#   * EGRESS is assumed permissive. The rules gate on the DESTINATION ingress
+#     (CanReachPort) plus adjacency/route, but do not currently check the SOURCE's
+#     outbound SG/NACL/egress-firewall, because the adapters do not yet emit a
+#     distinct egress-allow/deny fact (SGs are stateful+default-allow-out and NSGs
+#     similar, so this is usually right, but a locked-down egress policy or an egress
+#     firewall can make an emitted edge over-claim). When an egress-deny fact exists,
+#     the engine must cap the edge to BLOCKED.
+#   * DENY facts are referenced but not yet emitted. Rules cite NACL / stateless-
+#     firewall / Cloud Armor / WAF DENY as a BLOCKED trigger, but the per-service
+#     adapters do not yet emit an explicit network-DENY fact. Until they do, the
+#     engine cannot subtract denies and these edges represent ALLOW-path reachability
+#     only. Emitting a normalized NetworkDeny fact is a prerequisite Job-B follow-up.
+#   * TRANSITIVE CLOSURE is the engine's job, not the matcher's. Rules 3/4 encode the
+#     per-hop invariants (peering = one hop; hub = transitive across its route table),
+#     but composing multi-segment paths is a constrained graph traversal the engine
+#     performs — it must honor these invariants and never blindly transitively-close
+#     PeeredWith.
+#   * CANREACHPORT SOURCE SHAPE. Adapters emit CanReachPort with source_type=Network
+#     (the SG/NSG/Firewall node that holds the allow rule), NOT source_type=Compute
+#     (the attacking workload). Rules 1–4 join [?sg, CanReachPort, ?dst] where ?sg
+#     is the SG covering ?dst; the engine must additionally confirm that ?src resides
+#     in a segment whose traffic is admitted by ?sg (e.g. via CIDR or SG reference).
+#     Until a full SG-to-source-compute join is implemented in the engine, these edges
+#     are emitted as CONDITIONAL(network_reachability) conservatively.
+#   * ROUTESTO SOURCE SHAPE. AWS adapters emit RoutesTo with source_type=Route
+#     (RouteTable node), not Subnet. Rules 2 and 4 bridge this via
+#     [?rt, RoutesTo, ?dstnet] AND [?rt, AttachedTo, ?srcnet] (route table associated
+#     with the source subnet). Azure adapters may emit RoutesTo with source_type=Subnet.
+#     Both shapes are valid per edges.yaml (source: [Route, Subnet, TransitGateway]).
+#     The engine must handle both shapes; the match clause below uses the RouteTable
+#     (Route) shape as canonical and documents the Subnet shape as an alternative.
+#   * PRIVATE-LINK CONJUNCTION. Rule 6 relies on PrivateReachability, which the
+#     adapter notes embeds both the private adjacency check AND a provisional
+#     endpoint-SG admission check (emitted CONDITIONAL when endpoint SG is unverified).
+#     Rule 6 does NOT add a separate CanReachPort clause because PrivateReachability
+#     is designed to carry the combined adjacency+admission signal from the adapter.
+#     If PrivateReachability is ACTIVE, the adapter has confirmed both the private path
+#     and the endpoint SG. If CONDITIONAL, neither has been fully confirmed. Callers
+#     must treat rule-6-derived CanNetworkReach edges as CONDITIONAL unless the
+#     adapter-emitted PrivateReachability is explicitly ACTIVE.
+#   * ON-PREM SOURCES via Direct Connect / VPN. Rule 4 fires when the on-prem segment
+#     is represented as a VirtualNetwork node (LocatedIn) with RoutesTo the DXGW/TGW
+#     hub AND when a CanReachPort fact exists for the on-prem segment against the cloud
+#     destination. If the on-prem segment is unmodeled (no VirtualNetwork node for the
+#     on-prem CIDR range), these paths are absent — the directconnect/vpn adapters must
+#     emit an on-prem VirtualNetwork node and the corresponding RoutesTo + CanReachPort
+#     facts for rule 4 to compose the path.
+#   * STORAGE TARGET COVERAGE. Rules 1–4 and rule 6 include Storage as a valid
+#     target_type, covering gateway VPC endpoint paths (S3/GCS/Blob via route injection)
+#     and private endpoint paths to object/blob storage. CanNetworkReach declares
+#     target: [Compute, Data, Network, PrivateEndpoint, Storage] in edges.yaml.
+#   * MESSAGING TARGET COVERAGE. Rule 5 includes Messaging as a valid target_type
+#     (internet-exposed queues/topics/event buses with public wildcard resource policies,
+#     per ExposedToInternet's declared source set in edges.yaml). Rules 1–4 do not
+#     currently include Messaging targets — CanReachPort.target is [Compute, Data];
+#     adding Messaging would require extending CanReachPort in edges.yaml first.
+#   * LB-FRONTED INTERNET PATHS. Rule 7 composes internet-to-LB reach with LB-to-backend
+#     reach to produce internet-to-backend CanNetworkReach. This covers ALB/NLB/App
+#     Gateway/GCP LB as the dominant public entry point pattern. The LB's own listener
+#     admission and WAF actions are a separate authorization gate; rule 7 emits
+#     CONDITIONAL(network_reachability) pending confirmation.
+#   * IPV6 PATHS. Rules treat IPv4 and IPv6 paths equivalently. The adapters' open-
+#     ingress checks include ::/0 (IPv6 any-source) alongside 0.0.0.0/0, and
+#     ExposedToInternet is emitted for IPv6-only resources that have open ::/0 SG rules
+#     and a route to an Internet Gateway. IPv6-only deployments (no NAT gateway needed)
+#     are in scope for rule 5 — the direct IGW route makes them internet-reachable
+#     without NAT, and the adapter already checks ::/0 in the SG rule.
+# ===========================================================================
+
+applies_to: ["*"]
+phase: 8-networking
+
+rules:
+
+  # --- 1) Co-located reach: same Subnet + ingress-allow -----------------------
+  # The base case. Two workloads in the SAME L3 Subnet need no routing — if the
+  # destination's SG/NSG/firewall admits the source segment (CanReachPort on the
+  # SG covering the dst), the source reaches it. ?net is constrained to Subnet
+  # (node_type == Subnet) so co-location means same L3 broadcast domain, NOT
+  # merely the same parent VPC/VNet. A VPC-level LocatedIn edge would be matched
+  # by rule 2 (routed hop), not here.
+  - id: network-local-segment-reach
+    emits: CanNetworkReach
+    description: "A source co-located with the destination in the same Subnet reaches it when the destination's SG/NSG/firewall admits the source segment on a listening port."
+    applies_to: ["*"]
+    match:
+      - [ ?sg,  CanReachPort, ?dst ]
+      - [ ?src, LocatedIn,    ?net ]
+      - [ ?dst, LocatedIn,    ?net ]
+    where:
+      - "node_class(?src) in [Compute, Network]"
+      - "node_class(?dst) in [Compute, Data, Storage]"
+      # ?net MUST be a Subnet (Layer-3 segment), not a parent VPC/VNet.
+      # VPC-level co-location (two nodes LocatedIn the same VPC but different subnets)
+      # does NOT satisfy this rule — that is rule 2 (routed hop).
+      - "node_type(?net) == Subnet"
+      # ?sg is the security group / NSG / firewall that governs ?dst's ingress.
+      # The engine must confirm that ?sg's allow rule covers the ?src segment
+      # (source CIDR, source SG reference, or subnet reference includes ?net).
+      - "node_type(?sg) in [SecurityGroup, Firewall]"
+    emit:
+      source_type: [Compute, Network]
+      target_type: [Compute, Data, Storage]
+      source: ?src
+      target: ?dst
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when both endpoints are confirmed in the same Subnet and the
+        destination's ingress rule (SG/NSG/firewall) admits the source segment on the
+        port. CONDITIONAL(network_reachability) if placement or the ingress rule is
+        unconfirmed from collection, or if the SG-to-source-segment join is not fully
+        evaluated (see MODELING LIMITATIONS: CANREACHPORT SOURCE SHAPE).
+        BLOCKED if a subnet NACL / stateless firewall DENY covers the source range on
+        the port. Inherit the weakest state of the contributing CanReachPort.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?sg CanReachPort ?dst", "?src LocatedIn ?net", "?dst LocatedIn ?net" ]
+      false_positive_note: >-
+        The judgment is (a) the destination ingress rule genuinely admits THIS source
+        segment (a 0.0.0.0/0 SG is internet exposure — rule 5 — not intra-segment; a
+        source-SG reference or the source's own CIDR/subnet must match) and (b) both
+        endpoints are truly in the same L3 Subnet (node_type == Subnet). Do NOT emit
+        for endpoints in different subnets that lack a route (that is rule 2). A NACL
+        or stateless firewall DENY is a real control: emit BLOCKED, not ACTIVE. This
+        edge is the reachability PRECONDITION only — the exploit of the listening
+        service is the service adapter's / can-control's job.
+      narrative: >-
+        {src.name} is co-located with {dst.name} in subnet {net.name} and the destination's
+        security group/NSG admits it on the service port, so {src.name} can reach
+        {dst.name} over the network without traversing any gateway.
+
+  # --- 2) Routed reach: one intra-boundary route hop + ingress-allow -----------
+  # The source's subnet has a route to the destination's subnet (via a route-table
+  # entry) WITHIN the same VPC/VNet routing domain, and the destination admits the
+  # source. One routed hop — not a transit hub (rule 4), not a peering (rule 3).
+  #
+  # ADAPTER SHAPE NOTE: AWS adapters emit RoutesTo with source=RouteTable (Route
+  # type); the join [?rt, RoutesTo, ?dstnet] AND [?rt, AttachedTo, ?srcnet] bridges
+  # the RouteTable to the source subnet. Azure adapters may emit source=Subnet
+  # directly. Both shapes are valid (edges.yaml source: [Route, Subnet, TransitGateway]).
+  # ?srcnet and ?dstnet must not be TransitGateway or VPN nodes — those belong to
+  # rule 4. ?srcnet must be in [Subnet, Route] to exclude hub-mediated paths.
+  - id: network-routed-reach
+    emits: CanNetworkReach
+    description: "A source whose subnet routes to the destination's subnet (intra-VPC/VNet routing) reaches the destination when its ingress rule admits the source."
+    applies_to: ["*"]
+    match:
+      - [ ?sg,  CanReachPort, ?dst ]
+      - [ ?src, LocatedIn,    ?srcnet ]
+      - [ ?dst, LocatedIn,    ?dstnet ]
+      - [ ?rt,  RoutesTo,     ?dstnet ]
+      - [ ?rt,  AttachedTo,   ?srcnet ]
+    where:
+      - "node_class(?src) in [Compute, Network]"
+      - "node_class(?dst) in [Compute, Data, Storage]"
+      - "node_type(?sg) in [SecurityGroup, Firewall]"
+      - "?srcnet != ?dstnet"
+      # Exclude hub-mediated paths from this single-hop rule: ?dstnet must not be a
+      # transit device. This makes the mutual exclusion with rule 4 machine-enforceable.
+      - "node_type(?dstnet) not in [TransitGateway, VPN]"
+      # ?srcnet must be a direct routing source (Subnet or Route), not a hub.
+      - "node_type(?srcnet) in [Subnet, Route]"
+      # ?rt is the RouteTable (Route type) associated with ?srcnet, or ?srcnet is
+      # the Subnet when the adapter emits RoutesTo directly from the Subnet.
+      - "node_type(?rt) in [Route, Subnet]"
+    emit:
+      source_type: [Compute, Network]
+      target_type: [Compute, Data, Storage]
+      source: ?src
+      target: ?dst
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when the route from ?srcnet to ?dstnet is confirmed AND the destination
+        ingress admits the source segment. CONDITIONAL(network_reachability) if the route
+        table or ingress is unconfirmed, or if the SG-to-source-segment join is not fully
+        evaluated (see MODELING LIMITATIONS). BLOCKED on a NACL/stateless-firewall DENY
+        covering the path. Inherit the weakest of the contributing CanReachPort and RoutesTo.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?sg CanReachPort ?dst", "?rt RoutesTo ?dstnet", "?rt AttachedTo ?srcnet" ]
+      false_positive_note: >-
+        Both halves are required: a route without an admitting ingress rule is NOT reach,
+        and an ingress rule without a route is NOT reach. Confirm the route actually
+        targets the destination's CIDR (a default route to a NAT/IGW is egress, not a
+        path to a private peer). Route propagation must be enabled for the route to be
+        live. NACL/firewall DENY on the path => BLOCKED. Hub-mediated paths (where ?dstnet
+        is a TransitGateway or VPN) must use rule 4 — excluding them here prevents
+        duplicate edges with mis-attributed state.
+      narrative: >-
+        {src.name}'s subnet {srcnet.name} routes to {dstnet.name} where {dst.name}
+        lives, and the destination admits {src.name} on the port — a routed network
+        path exists.
+
+  # --- 3) Peered reach: EXACTLY ONE peering hop (NON-TRANSITIVE) ---------------
+  # A single VPC/VNet peering bridges the source's and destination's segments and
+  # the destination admits the source. CRITICAL INVARIANT: peering is NON-TRANSITIVE
+  # — a route learned via A<->B does not propagate to a C peered with B. This rule
+  # matches ONE PeeredWith hop (a direct atomic edge fact, never inferred transitively)
+  # and MUST NOT chain peering-of-peering.
+  #
+  # ENGINE DIRECTIVE: The engine MUST treat PeeredWith as non-transitive. It must
+  # match [?vnetA, PeeredWith, ?vnetB] only as a direct atomic-edge assertion — it
+  # must NOT satisfy this match by walking two PeeredWith hops (A->X->B via engine-
+  # level transitivity). Configure the PeeredWith edge type as non-transitive in the
+  # engine's traversal policy.
+  - id: network-peered-reach
+    emits: CanNetworkReach
+    description: "A source reaches a destination across a SINGLE VPC/VNet peering when the destination's ingress admits it — peering is non-transitive, so exactly one direct hop."
+    applies_to: ["*"]
+    match:
+      - [ ?sg,    CanReachPort, ?dst ]
+      - [ ?src,   LocatedIn,    ?vnetA ]
+      - [ ?dst,   LocatedIn,    ?vnetB ]
+      - [ ?vnetA, PeeredWith,   ?vnetB ]
+    where:
+      - "node_class(?src) in [Compute, Network]"
+      - "node_class(?dst) in [Compute, Data, Storage]"
+      - "node_type(?sg) in [SecurityGroup, Firewall]"
+      - "?vnetA != ?vnetB"
+      # NON-TRANSITIVE: [?vnetA, PeeredWith, ?vnetB] must be a DIRECT atomic edge.
+      # The engine must NOT chain [?vnetA PeeredWith ?vnetX] + [?vnetX PeeredWith ?vnetB].
+      # See ENGINE DIRECTIVE above.
+      - "is_direct_edge(?vnetA, PeeredWith, ?vnetB)"
+      # Emitted CanNetworkReach edges derived via peering carry derived_via: [PeeredWith]
+      # so the engine can distinguish them from routed-reach edges and enforce
+      # the non-transitivity constraint structurally (do not use as a CanReachPort
+      # surrogate for further hop composition).
+    emit:
+      source_type: [Compute, Network]
+      target_type: [Compute, Data, Storage]
+      source: ?src
+      target: ?dst
+      permissions: []
+      conditions: [network_reachability]
+      derived_via: [PeeredWith]
+      state_logic: >-
+        ACTIVE when the peering is Connected on both sides, a route to the peer CIDR is
+        present on both sides, and the destination ingress admits the source.
+        CONDITIONAL(network_reachability) if the remote side or its route table is
+        uncollected. BLOCKED on a NACL/firewall DENY. Inherit the weakest of CanReachPort
+        and the PeeredWith edge.
+        NOTE: the state_logic includes a route-to-peer-CIDR check (both sides must have
+        route table entries for the peer CIDR) even though the match clause does not
+        include an explicit RoutesTo fact — this is because a Connected peering with no
+        route entry is not an active path. The engine must evaluate the route-table
+        check as a CONDITIONAL gate when scoring the emitted edge.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?sg CanReachPort ?dst", "?vnetA PeeredWith ?vnetB" ]
+      false_positive_note: >-
+        THE non-transitivity trap: do not emit reach to a VNet that is only reachable via
+        a SECOND peering hop — peering does not forward transitively. A peering also needs
+        a route-table entry for the peer CIDR on BOTH sides to be live (a Connected peering
+        with no route is not a path). Cross-account/subscription peering additionally
+        requires the remote SG/NSG to admit the source. NACL/firewall DENY => BLOCKED.
+        The derived_via: [PeeredWith] annotation on the emitted edge allows the engine to
+        identify peered-reach edges and prevent using them as a CanReachPort surrogate for
+        further hop composition (which would silently create peering-of-peering paths).
+      narrative: >-
+        {src.name} in {vnetA.name} reaches {dst.name} in {vnetB.name} across their direct
+        peering; a foothold in {vnetA.name} therefore has a network path into {vnetB.name}
+        subject to the destination's ingress rules.
+
+  # --- 4) Transit-hub reach: TRANSITIVE across hub attachments ----------------
+  # A transit hub (Transit Gateway / VWAN hub / NCC hub / Direct Connect gateway /
+  # VPN gateway) forwards between ALL its attachments, subject to its route table.
+  # Unlike peering, this IS transitive: an attachment reaches every other attachment
+  # the hub route table associates. This rule composes two RoutesTo hops THROUGH
+  # the hub node.
+  #
+  # HUB TYPE MAPPING (per nodes.yaml Network class):
+  #   TransitGateway => AWS TGW, Azure VWAN hub, GCP NCC hub
+  #   VPN            => AWS Direct Connect gateway, VPN gateways
+  # There is no generic 'Gateway' type in nodes.yaml; using it would be a dead
+  # letter. Only TransitGateway and VPN are valid hub types here.
+  - id: network-transit-hub-reach
+    emits: CanNetworkReach
+    description: "A source reaches a destination through a shared transit hub (Transit Gateway/VWAN/NCC/Direct Connect gateway/VPN gateway) that forwards between attachments — transitive across the hub's associated route table."
+    applies_to: ["*"]
+    match:
+      - [ ?sg,     CanReachPort, ?dst ]
+      - [ ?src,    LocatedIn,    ?srcnet ]
+      - [ ?dst,    LocatedIn,    ?dstnet ]
+      - [ ?srcnet, RoutesTo,     ?hub ]
+      - [ ?hub,    RoutesTo,     ?dstnet ]
+    where:
+      - "node_class(?src) in [Compute, Network]"
+      - "node_class(?dst) in [Compute, Data, Storage]"
+      - "node_type(?sg) in [SecurityGroup, Firewall]"
+      # ?hub must be a recognized transit device type from nodes.yaml Network class.
+      # TransitGateway covers AWS TGW, Azure VWAN hub, GCP NCC hub.
+      # VPN covers Direct Connect gateways and VPN gateways.
+      # Do NOT use the undefined 'Gateway' type — it matches nothing in the taxonomy.
+      - "node_type(?hub) in [TransitGateway, VPN]"
+      - "?srcnet != ?dstnet"
+      # Exclude hub-mediated paths from rule 2: ?dstnet must not itself be another hub.
+      # (This prevents chaining hub-to-hub paths through rule 4, which would require
+      #  a separate multi-hub composition rule if needed.)
+      - "node_type(?dstnet) not in [TransitGateway, VPN]"
+    emit:
+      source_type: [Compute, Network]
+      target_type: [Compute, Data, Storage]
+      source: ?src
+      target: ?dst
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when both segments are attached to ?hub, the hub route table associates
+        BOTH attachments (no segmentation isolating them), and the destination ingress
+        admits the source. CONDITIONAL(network_reachability) if the hub route table /
+        segmentation is uncollected, or a remote attachment's segment is out of scope.
+        BLOCKED on a hub route-table that isolates the attachments or a NACL/firewall DENY.
+        Inherit the weakest of both RoutesTo hops and the CanReachPort.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?sg CanReachPort ?dst", "?srcnet RoutesTo ?hub", "?hub RoutesTo ?dstnet" ]
+      false_positive_note: >-
+        Transit hubs are transitive ONLY within a shared route table / segment: a TGW with
+        isolated route tables, a VWAN hub routing intent, or an NCC spoke set to no-export
+        does NOT forward between every attachment — check the hub's association/propagation
+        before emitting ACTIVE. A Direct Connect / VPN attachment brings on-prem as a source
+        (the on-prem endpoint must still admit-and-exploit the destination; see MODELING
+        LIMITATIONS: ON-PREM SOURCES). Do not confuse this transitive hub path with rule 3's
+        single non-transitive peering. Hub node types are TransitGateway and VPN per
+        nodes.yaml — no generic 'Gateway' type exists in the taxonomy.
+      narrative: >-
+        {src.name}'s segment and {dst.name}'s segment are both attached to the transit hub
+        {hub.name}, whose route table forwards between them, so {src.name} has a transitive
+        network path to {dst.name} subject to the destination's ingress rules.
+
+  # --- 5) Internet ingress: ExposedToInternet => internet is a valid source ---
+  # A resource reachable from the public internet can be reached by ANY internet
+  # principal. This is the external entry point that seeds "internet -> X" path
+  # queries. It asserts reachability from the AnonymousIdentity only; the exploit
+  # consequence (and any CanEnter*) is the service adapter's / can-control's job.
+  #
+  # This rule inherits the ExposedToInternet state directly — it does not assert ACTIVE
+  # unconditionally. If ExposedToInternet is CONDITIONAL, so is this CanNetworkReach.
+  # No CanReachPort is required here: internet sources are always capable of sending
+  # traffic; the gate is the destination's exposure (ExposedToInternet already embeds
+  # the public-IP + open-ingress + route-to-IGW conjunction from the adapter).
+  #
+  # Messaging targets are included because ExposedToInternet's source set in edges.yaml
+  # includes Messaging (queues/topics with public wildcard resource policies).
+  # CanNetworkReach's target set in edges.yaml includes Storage — also included here.
+  - id: network-internet-ingress-reach
+    emits: CanNetworkReach
+    description: "A resource exposed to the internet is reachable by any internet (anonymous) principal — the external network entry point that seeds internet-origin attack paths."
+    applies_to: ["*"]
+    match:
+      - [ ?dst, ExposedToInternet, ?anon ]
+    where:
+      - "node_class(?anon) == Identity (the AnonymousIdentity / internet principal)"
+      - "node_class(?dst) in [Compute, Data, Storage, Network, Messaging]"
+    emit:
+      source_type: Identity
+      target_type: [Compute, Data, Storage, Network, Messaging]
+      source: ?anon
+      target: ?dst
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        Inherit the ExposedToInternet state directly. ACTIVE when the adapter confirms all
+        exposure prerequisites (public IP, open ingress, route to IGW/equivalent — the full
+        conjunction embedded in ExposedToInternet). CONDITIONAL(network_reachability) when
+        any exposure prerequisite is unconfirmed by collection (e.g. IGW attachment state
+        unknown, or CONDITIONAL ExposedToInternet inherited from adapter). BLOCKED when a
+        WAF, Cloud Armor policy, VPC Service Controls perimeter, or stateless-firewall DENY
+        demonstrably blocks untrusted internet ingress on the path.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?dst ExposedToInternet ?anon" ]
+      false_positive_note: >-
+        This edge asserts only that the INTERNET is a valid network source for ?dst — it is
+        the reachability precondition, not an exploit and not account entry. Do NOT roll it
+        up into CanEnter*/CanExecute* here (service adapters + can-control own that). A WAF
+        or Cloud Armor policy that blocks the relevant traffic is a real control (BLOCKED);
+        a resource exposed only to a known corporate CIDR is not AnonymousIdentity-reachable.
+        Messaging targets (Queue/Topic/EventBus with public wildcard resource policy) are
+        included per ExposedToInternet's declared source set in edges.yaml.
+      narrative: >-
+        {dst.name} is reachable from the public internet, so any anonymous internet principal
+        has a network path to it — the external entry point for attack paths that begin
+        off-cloud.
+
+  # --- 6) Private-link reach: cross-boundary private path => unified reach -----
+  # PrivateLink / PSC / private endpoints give an in-network consumer a private path
+  # to a PaaS/data service, frequently ACROSS account/project/subscription boundaries
+  # without any internet exposure. This promotes that private-path fact into the
+  # unified CanNetworkReach edge so path queries traverse one reachability type,
+  # and flags the cross-boundary lateral-movement significance.
+  #
+  # CONJUNCTION NOTE: Rule 6 does not add a separate CanReachPort clause because
+  # PrivateReachability is designed by the adapters to carry the combined adjacency +
+  # provisional endpoint-SG admission signal. If PrivateReachability is ACTIVE, the
+  # adapter has confirmed the private path AND the endpoint SG. If CONDITIONAL, the
+  # endpoint SG or private path has not been fully confirmed. See MODELING LIMITATIONS:
+  # PRIVATE-LINK CONJUNCTION.
+  #
+  # Storage targets are included because Azure Private Endpoints and GCP PSC commonly
+  # front Storage services (Azure Blob, Azure Files, GCS). PrivateReachability's
+  # declared target set in edges.yaml ([Data, PrivateEndpoint, Compute]) does not yet
+  # include Storage — a companion schema update to edges.yaml is required to formally
+  # add Storage to PrivateReachability.target. This rule anticipates that extension.
+  - id: network-private-link-reach
+    emits: CanNetworkReach
+    description: "A private-link/PSC/private-endpoint path makes a PaaS/data/storage service reachable to an in-network consumer, often across account/project boundaries without internet exposure."
+    applies_to: ["*"]
+    match:
+      - [ ?src, PrivateReachability, ?dst ]
+    where:
+      - "node_class(?src) in [Compute, Network, Messaging]"
+      # PrivateEndpoint is a type within the Network class (node_class == Network).
+      # The filter must use node_class == Network (not the undefined class 'PrivateEndpoint').
+      # Storage is included for private endpoints fronting blob/object storage services.
+      - "node_class(?dst) in [Data, Network, Compute, Storage]"
+    emit:
+      source_type: [Compute, Network, Messaging]
+      target_type: [Data, Network, Compute, Storage]
+      source: ?src
+      target: ?dst
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        Inherit the PrivateReachability state directly. ACTIVE when the private endpoint /
+        PSC endpoint / PrivateLink is provisioned and approved, the consumer has a foothold
+        in the endpoint's VNet/subnet, AND the endpoint SG is confirmed to admit the source.
+        CONDITIONAL(network_reachability) when the in-network foothold is unproven or the
+        endpoint SG has not been evaluated (the private path requires being inside the
+        consumer network — it is not internet-reachable). BLOCKED if the endpoint is not
+        in an approved/available state.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?src PrivateReachability ?dst" ]
+      false_positive_note: >-
+        A private endpoint is reachable ONLY from inside its VNet/subnet (or a peered/routed
+        segment) — it is not an internet path; do not conflate with rule 5. Its lateral-movement
+        value is that it crosses account/project/subscription boundaries WITHOUT the internet:
+        a foothold in the consumer network reaches the provider's PaaS resource directly. The
+        cross-boundary AUTHORIZATION (an approved cross-subscription PE connection) is a
+        CrossAccountTrust fact owned by the adapter, not re-derived here. Storage targets
+        (Azure Blob, Azure Files, GCS) are included because Private Endpoints / PSC commonly
+        front these services; the PrivateReachability schema extension is required to formally
+        cover Storage targets in edges.yaml.
+      narrative: >-
+        {dst.name} is privately reachable from {src.name} over a PrivateLink/PSC/private
+        endpoint; an in-network foothold reaches it directly, crossing any account/project
+        boundary without touching the internet.
+
+  # --- 7) LB-fronted internet reach: internet -> LB -> backend ----------------
+  # Internet-facing load balancers (ALB/NLB/App Gateway/GCP LB) are the dominant
+  # public entry point in cloud environments. The ELB adapter emits ExposedToInternet
+  # on the LB (producing rule-5 CanNetworkReach from ?anon to ?lb) and CanNetworkReach
+  # from the LB to its backend targets (via a separate adapter rule). Rule 7 composes
+  # those two edges into a direct internet-to-backend CanNetworkReach.
+  #
+  # NLB->ALB chaining is covered by the same rule: the NLB emits CanNetworkReach to
+  # the ALB (a Network/LoadBalancer node), which in turn emits CanNetworkReach to its
+  # backends. Rule 7 fires once for NLB->ALB and once for ALB->backend, producing
+  # internet->backend transitively via the engine's graph traversal.
+  - id: network-lb-proxy-reach
+    emits: CanNetworkReach
+    description: "An internet principal that can reach an internet-facing load balancer can also reach the LB's backend targets — composing internet-entry with LB-to-backend forwarding."
+    applies_to: ["*"]
+    match:
+      - [ ?anon, CanNetworkReach, ?lb ]
+      - [ ?lb,   CanNetworkReach, ?backend ]
+    where:
+      # ?anon is the internet/anonymous principal (Identity class: AnonymousIdentity)
+      - "node_class(?anon) == Identity"
+      # ?lb must be a LoadBalancer (Network class) to distinguish LB-proxy paths
+      # from other CanNetworkReach chains (e.g. compute-to-compute).
+      - "node_type(?lb) == LoadBalancer"
+      - "node_class(?backend) in [Compute, Data, Storage, Network]"
+      # Both input edges must be at least CONDITIONAL — do not compose BLOCKED edges.
+      - "state(?anon, CanNetworkReach, ?lb) != BLOCKED"
+      - "state(?lb, CanNetworkReach, ?backend) != BLOCKED"
+    emit:
+      source_type: Identity
+      target_type: [Compute, Data, Storage, Network]
+      source: ?anon
+      target: ?backend
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): the LB's own listener admission rule (port/protocol
+        match, target group health check) and the backend's SG must both be confirmed before
+        upgrading to ACTIVE. Inherit the weakest of the two contributing CanNetworkReach edges.
+        BLOCKED if a WAF / authentication action (OIDC, Cognito, Cloud Armor, App GW WAF policy)
+        demonstrably blocks unauthenticated internet traffic before it reaches the backend.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?anon CanNetworkReach ?lb", "?lb CanNetworkReach ?backend" ]
+      false_positive_note: >-
+        The LB's own listener admission (ALB listener rules, target group routing, NLB
+        protocol/port match) and the backend's SG/NSG are separate gates from network
+        reachability — this rule asserts the NETWORK PATH only. An ALB with an
+        authenticate-oidc or authenticate-cognito action, an App Gateway with a WAF
+        policy blocking unauthenticated requests, or a Cloud Armor policy with
+        preconfigured WAF rules are real controls that cap this edge to BLOCKED for
+        unauthenticated internet traffic. Emit CONDITIONAL until all gates are confirmed.
+      narrative: >-
+        {anon.name} can reach load balancer {lb.name} from the internet, and {lb.name}
+        forwards to {backend.name} — providing a transitive network path from the internet
+        to the backend target.

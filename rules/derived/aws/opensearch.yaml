@@ -1,0 +1,553 @@
+# AWS OpenSearch Service — Derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# OpenSearch Service (formerly Amazon Elasticsearch Service) is a managed search
+# and analytics cluster. The primary attack surface is DATA ACCESS and credential
+# exposure via the domain's HTTP endpoint; it has no customer-configurable
+# execution identity (no ExecutesAs) and no CanModifyCode surface.
+#
+# ATTACK SURFACE SUMMARY:
+#
+# SURFACE 1 — DATA READS + EXFIL (es:ESHttp* data-plane actions):
+#   A principal with es:ESHttpGet / es:ESHttpHead on the domain ARN can issue
+#   signed HTTP GET/HEAD requests to the OpenSearch REST API, reading all indexed
+#   documents visible to it (all if FGAC is disabled; role-mapped indices if
+#   FGAC is enabled). Combined with network reachability, this yields:
+#     CanReadData(principal, domain)                                          [A1]
+#   A principal with es:ESHttpPost / es:ESHttpPut can index/write documents:
+#     CanWriteData(principal, domain)                                         [A2]
+#   Data can be bulk-exported via _search scroll or _bulk GET → CanExfiltrate
+#   derives from CanReadData + network reach (handled by data-plane rules).   [A3]
+#
+# SURFACE 2 — INTERNET EXPOSURE (public endpoint + permissive access policy):
+#   A domain with a public endpoint (no VPCOptions) whose domain access policy
+#   contains Principal:* with no effective IP / condition restriction is
+#   reachable and queryable from any internet host without any credential:
+#     ExposedToInternet(domain, AnonymousIdentity)                            [B1]
+#   When FGAC is enabled on a public domain with a permissive access policy,
+#   IAM authentication is required but the endpoint is still publicly reachable;
+#   downgrade to CONDITIONAL(condition_expression).
+#
+# SURFACE 3 — FGAC MASTER-USER CREDENTIAL (UpdateDomainConfig resets password):
+#   When FGAC is enabled with an INTERNAL user database, the internal master-user
+#   password can be RESET (not read) by any principal with es:UpdateDomainConfig.
+#   This effectively exposes the master credential — the attacker sets a known
+#   password and authenticates to the cluster as master user (cluster admin):
+#     ExposesCredential(domain, internal-master-user-password)                [C1]
+#   The master user can then promote any IAM principal to cluster admin via
+#   role mappings — this is handled by credential-chains (read-secret-yields-
+#   identity) once the ExposesCredential edge is present.
+#
+# SURFACE 4 — CROSS-ACCOUNT DOMAIN ACCESS POLICY:
+#   A domain access policy naming a principal in a foreign AWS account grants
+#   that principal direct data-plane access (es:ESHttp*) without requiring a
+#   cross-account sts:AssumeRole hop:
+#     CrossAccountTrust(resource_policy, foreign_account/principal)           [D1]
+#   A foreign principal with this trust reads/writes domain data:
+#     CanReadData / CanWriteData for the cross-account principal               [D2]
+#
+# WHAT THIS FILE DOES NOT EMIT (cite and defer to linchpins):
+#   * ExecutesAs — OpenSearch domains have no customer-configurable execution
+#     role; the service-linked role is AWS-managed and not attacker-extractable
+#     via the data plane. No ExecutesAs edge.
+#   * CanExecuteAs — follows from ExecutesAs via can-execute-as.yaml; not
+#     applicable here.
+#   * CanExfiltrate — data-plane rules collapse CanReadData + network reach
+#     into CanExfiltrate; not re-derived here.
+#   * CanImpersonate / CanEscalateTo — credential-chains.yaml handles the
+#     ExposesCredential -> credential reset -> impersonation chain; not
+#     re-derived here.
+#   * CanEnterAccount — can-control.yaml enters an account via CrossAccountTrust;
+#     not re-derived here.
+#   * CanModifyCode — OpenSearch does not execute customer-defined code.
+#
+# LINCHPIN CITATIONS (DO NOT RE-DERIVE):
+#   credential-chains.yaml:
+#     execute-then-read-secret / read-secret-yields-identity / impersonate-is-
+#     escalation — when ExposesCredential(domain, master-cred) is emitted and
+#     CredentialsFor(master-cred, cluster-admin-identity) is asserted, the chain
+#     collapses to CanImpersonate → CanEscalateTo.
+#   can-control.yaml:
+#     enter-account-via-assume + control-via-admin — CrossAccountTrust feeds
+#     CanEnterAccount; CanAdminister feeds Controls.
+#
+# PERMISSIONS (from AWS OpenSearch Service Authorization Reference):
+#   es:ESHttpGet        — HTTP GET to REST API (read documents, search)
+#   es:ESHttpHead       — HTTP HEAD to REST API (check index/document existence)
+#   es:ESHttpPost       — HTTP POST to REST API (search with body, scroll, bulk)
+#   es:ESHttpPut        — HTTP PUT to REST API (index/create document, create index)
+#   es:ESHttpDelete     — HTTP DELETE to REST API (delete document/index)
+#   es:UpdateDomainConfig — modify domain access policy, FGAC settings, master user
+#   es:DescribeDomain   — read domain configuration and endpoint
+#   es:CreateDomain     — create a new domain
+#
+# STATE CONVENTIONS (RULE-FORMAT.md):
+#   A derived edge is never stronger than its weakest contributor.
+#   FGAC-enabled domains with a permissive access policy cap ExposedToInternet
+#   at CONDITIONAL(condition_expression), not ACTIVE, because IAM authentication
+#   is still required (unsigned requests are rejected even with Principal:*).
+#   VPC domains are not publicly routed; ExposedToInternet never fires for them.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 11-data-analytics-ml
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # SECTION A — DATA READS AND WRITES (es:ESHttp* IAM actions)
+  # ===========================================================================
+
+  # --- A1) CanReadData via es:ESHttpGet / es:ESHttpHead -----------------------
+  # A principal with effective es:ESHttpGet (or es:ESHttpHead) on the domain ARN
+  # can issue signed HTTP requests to the OpenSearch REST API and read indexed
+  # data. If FGAC is disabled, all indices are accessible; if FGAC is enabled
+  # the read is scoped to the principal's FGAC role mappings (may be a subset).
+  # The edge is ACTIVE when the domain access policy grants the action AND the
+  # principal has the IAM action in its effective permissions. It is CONDITIONAL
+  # on network_reachability for VPC domains (caller must be in-VPC) and on
+  # condition_expression for IP-restricted public domains.
+  - id: aws-opensearch-read-data-via-http-get
+    emits: CanReadData
+    description: "Principal with es:ESHttpGet / es:ESHttpHead on the domain reads indexed data via the OpenSearch REST API."
+    match_effective_permission:
+      action: ["es:ESHttpGet", "es:ESHttpHead"]
+      resource_type: "AWS::OpenSearchService::Domain"
+    where:
+      - "domain access policy does not explicitly deny the action for this principal"
+    emit:
+      source_type: Identity
+      target_type: SearchService
+      source: "<principal>"
+      target: "<OpenSearch domain (SearchService)>"
+      permissions: ["es:ESHttpGet", "es:ESHttpHead"]
+      conditions: [iam_permission, resource_policy, network_reachability]
+      state_logic: >-
+        ACTIVE when the principal's effective IAM permissions include es:ESHttpGet
+        or es:ESHttpHead on the domain ARN AND the domain access policy grants the
+        action (or is open) AND network reach is confirmed. For VPC-only domains
+        (VPCOptions set), this is CONDITIONAL(network_reachability) unless the
+        caller is confirmed to have in-VPC reach (e.g., a compute resource in the
+        same VPC or peered VPC, or with a Private Endpoint connection). For public
+        domains, ACTIVE when the caller can reach the public endpoint via the internet
+        or IAM SigV4 (always possible for any principal in the account).
+        CONDITIONAL(condition_expression) when the domain access policy has an
+        aws:SourceIp or VPC condition restricting access. BLOCKED if either the
+        domain access policy or the principal's IAM policy explicitly denies the
+        action. If FGAC is enabled, scope of readable data is limited to the
+        principal's FGAC role mapping — still CanReadData but potentially partial.
+      false_positive_note: >-
+        Do not emit ACTIVE for VPC-only domains when the caller is not confirmed
+        to have network reach to the VPC endpoint. Do not conflate es:ESHttpGet
+        (data-plane read) with cluster admin — this yields index data access only,
+        not control-plane control. If FGAC is enabled and the principal has no
+        FGAC role mapping, the domain access policy grant is effectively blocked at
+        the FGAC layer; emit CONDITIONAL(condition_expression) in that case.
+      narrative: >-
+        {principal.name} can read indexed data from OpenSearch domain {domain.name}
+        (es:ESHttpGet / es:ESHttpHead); with FGAC disabled all indices are accessible,
+        or with FGAC enabled access is limited to the principal's role-mapped indices.
+
+  # --- A2) CanWriteData via es:ESHttpPost / es:ESHttpPut ----------------------
+  # A principal with effective es:ESHttpPost or es:ESHttpPut on the domain ARN
+  # can index, create, or update documents. This enables data-poisoning attacks
+  # (injecting malicious documents into indices that other services or users
+  # query) and, combined with _bulk API, bulk data overwrite.
+  - id: aws-opensearch-write-data-via-http-put-post
+    emits: CanWriteData
+    description: "Principal with es:ESHttpPost / es:ESHttpPut on the domain can index or update documents via the OpenSearch REST API."
+    match_effective_permission:
+      action: ["es:ESHttpPost", "es:ESHttpPut"]
+      resource_type: "AWS::OpenSearchService::Domain"
+    where:
+      - "domain access policy does not explicitly deny the action for this principal"
+    emit:
+      source_type: Identity
+      target_type: SearchService
+      source: "<principal>"
+      target: "<OpenSearch domain (SearchService)>"
+      permissions: ["es:ESHttpPost", "es:ESHttpPut"]
+      conditions: [iam_permission, resource_policy, network_reachability]
+      state_logic: >-
+        ACTIVE when the principal has effective es:ESHttpPost or es:ESHttpPut on
+        the domain ARN AND the domain access policy grants it AND network reach is
+        confirmed. For VPC-only domains (VPCOptions set), this is
+        CONDITIONAL(network_reachability) unless the caller is confirmed to have
+        in-VPC reach (e.g., a compute resource in the same VPC or peered VPC, or
+        with a Private Endpoint connection). For public domains, ACTIVE when the
+        caller can reach the public endpoint via the internet or IAM SigV4 (always
+        possible for any principal in the account). CONDITIONAL(condition_expression)
+        for IP-restricted public domains. BLOCKED if either policy explicitly denies
+        the action.
+      false_positive_note: >-
+        FGAC role mappings may restrict which indices a principal can write to;
+        emit ACTIVE with a note that the write scope depends on the FGAC
+        configuration when FGAC is enabled. es:ESHttpPost also covers _search
+        (with a request body) which is a read operation; only emit CanWriteData
+        when the action is used to index/create/update documents (the same
+        permission covers both, so CanWriteData is conservative — the principal
+        can write).
+      narrative: >-
+        {principal.name} can index or update documents in OpenSearch domain
+        {domain.name} (es:ESHttpPost / es:ESHttpPut), enabling data poisoning or
+        bulk overwrite of search indices.
+
+  # --- A3) CanExfiltrate: CanReadData + network reach -> data exfiltration ----
+  # A principal with CanReadData on an OpenSearch domain that has network reach
+  # (public endpoint or VPC reachability to a compute resource the attacker
+  # controls) can bulk-export indexed data via HTTP GET/_search, _scroll, or
+  # _bulk APIs and move it out of the boundary.
+  - id: aws-opensearch-exfiltrate-via-http
+    emits: CanExfiltrate
+    description: "A principal with data-plane read access to an internet-exposed or reachable OpenSearch domain can exfiltrate search indices."
+    match:
+      - [ ?principal, CanReadData, ?domain ]
+    where:
+      - "node_type(?domain) == SearchService"
+      - "?domain is ExposedToInternet OR ?principal has network reach to ?domain"
+    emit:
+      source_type: Identity
+      target_type: SearchService
+      source: "<principal>"
+      target: "<OpenSearch domain (SearchService)>"
+      permissions: ["es:ESHttpGet"]
+      conditions: [iam_permission, resource_policy, network_reachability]
+      state_logic: >-
+        ACTIVE when the principal has CanReadData on the domain AND network reach
+        is confirmed (either the domain is ExposedToInternet or the principal is
+        a compute resource in-network to a VPC endpoint, or has signed reach to a
+        public endpoint). CONDITIONAL(network_reachability) if network reach is
+        uncertain. BLOCKED if CanReadData is BLOCKED or network reach is
+        unavailable. CanExfiltrate inherits the state from CanReadData; if
+        CanReadData is CONDITIONAL on network_reachability, so is CanExfiltrate.
+      false_positive_note: >-
+        Do not emit if the principal has only CanRead (config-level) without
+        CanReadData (data-plane). VPC domains require explicit network reach
+        evidence (VPC peering, PrivateLink, compute foothold in-VPC); do not
+        emit ACTIVE without that. Public endpoints are trivially reachable.
+      narrative: >-
+        {principal.name} can exfiltrate search indices from OpenSearch domain
+        {domain.name} by issuing bulk _search / _scroll queries via HTTP GET and
+        moving the data out of the boundary (cross-account, internet, external storage).
+
+  # --- A4) CanDeleteData: es:ESHttpDelete (optional, non-escalation) ----------
+  # A principal with effective es:ESHttpDelete on the domain ARN can delete
+  # documents and indices. While destructive, deletion is not an escalation path
+  # and is non-walkable in paths (walkable: false in edges.yaml). Included for
+  # completeness and impact reporting.
+  - id: aws-opensearch-delete-data-via-http-delete
+    emits: CanDeleteData
+    description: "Principal with es:ESHttpDelete on the domain can delete documents and indices (destructive impact, not escalation)."
+    match_effective_permission:
+      action: "es:ESHttpDelete"
+      resource_type: "AWS::OpenSearchService::Domain"
+    where:
+      - "domain access policy does not explicitly deny the action for this principal"
+    emit:
+      source_type: Identity
+      target_type: SearchService
+      source: "<principal>"
+      target: "<OpenSearch domain (SearchService)>"
+      permissions: ["es:ESHttpDelete"]
+      conditions: [iam_permission, resource_policy, network_reachability]
+      state_logic: >-
+        ACTIVE when the principal has effective es:ESHttpDelete on the domain ARN
+        AND the domain access policy grants it AND network reach is confirmed.
+        CONDITIONAL(network_reachability) for VPC domains. Inherits conditions
+        from CanReadData. BLOCKED if either policy explicitly denies the action.
+      false_positive_note: >-
+        CanDeleteData is not a traversal edge (walkable: false) and is not part of
+        escalation paths; it represents destructive capability only. Include in
+        impact reports but do not follow in privilege escalation chains.
+      narrative: >-
+        {principal.name} can delete documents and indices from OpenSearch domain
+        {domain.name} (es:ESHttpDelete), causing data loss and potential denial
+        of service to applications querying the indices.
+
+  # ===========================================================================
+  # SECTION B — INTERNET EXPOSURE (public endpoint + permissive access policy)
+  # ===========================================================================
+
+  # --- B1) ExposedToInternet: public endpoint + Principal:* access policy ----
+  # An OpenSearch domain with a public endpoint (no VPCOptions) whose domain
+  # access policy allows the es:ESHttp* actions for Principal:* (AWS wildcard or
+  # anonymous) without an effective condition restricting access is reachable and
+  # queryable from any internet host.
+  # When FGAC is disabled: unsigned (unauthenticated) requests may be admitted
+  # depending on the domain version and configuration. When FGAC is enabled:
+  # IAM signature is required even for Principal:*, so this becomes
+  # CONDITIONAL(condition_expression) — the endpoint is publicly routed but
+  # authentication is still required.
+  - id: aws-opensearch-public-permissive-endpoint
+    emits: ExposedToInternet
+    description: "OpenSearch domain with a public endpoint and Principal:* access policy is reachable from the internet; unauthenticated if FGAC is also disabled."
+    match:
+      - [ ?domain, CanRead, ?domain ]    # domain exists (config fact drives where clause)
+    where:
+      - "node_type(?domain) == SearchService"
+      - "?domain.VPCOptions is null or empty (public endpoint)"
+      - "?domain access policy contains Principal AWS '*' or Principal '*' with an Allow for es:ESHttp* and no effective Condition restricting to specific IPs or VPC"
+    emit:
+      source_type: SearchService
+      target_type: AnonymousIdentity
+      source: ?domain
+      target: "<AnonymousIdentity>"
+      permissions: ["es:ESHttpGet", "es:ESHttpPost"]
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when: (a) domain has no VPCOptions (public endpoint), (b) domain
+        access policy explicitly allows es:ESHttp* for Principal:* with no
+        condition restricting source IP or VPC, AND (c) FGAC is disabled (so
+        unsigned requests are admitted without IAM auth). CONDITIONAL(condition_expression)
+        when FGAC is enabled — IAM authentication is required even for Principal:*,
+        so the endpoint is publicly routed but not truly anonymous.
+        CONDITIONAL(condition_expression) when the access policy has an aws:SourceIp
+        condition (still public endpoint but IP-filtered). BLOCKED if VPCOptions
+        is set (domain is not publicly routed). Do not emit if the Principal:*
+        statement has a Deny in a more specific statement covering the same actions.
+      false_positive_note: >-
+        A VPC domain is NEVER internet-exposed regardless of its access policy —
+        do not emit when VPCOptions is set. FGAC-enabled domains with Principal:*
+        still require IAM SigV4 authentication; these are NOT anonymously accessible,
+        only broadly-IAM-accessible — emit CONDITIONAL, not ACTIVE. Honor any
+        aws:SourceIp or aws:VpcSourceIp condition that is present; those restrict
+        the effective internet exposure. Do not rely solely on the absence of a
+        Condition block; check whether the Principal:* Allow is effective after
+        evaluating SCPs and IAM deny statements.
+      narrative: >-
+        OpenSearch domain {domain.name} has a public endpoint and its domain access
+        policy allows es:ESHttp* for all principals without credential requirements —
+        any internet host can query or write to its search indices without
+        authentication (FGAC disabled) or with any valid AWS identity (FGAC enabled).
+
+  # ===========================================================================
+  # SECTION C — FGAC MASTER-USER CREDENTIAL EXPOSURE (UpdateDomainConfig)
+  # ===========================================================================
+
+  # --- C0) CanEscalateTo: UpdateDomainConfig can disable FGAC to bypass all authz --
+  # When FGAC is enabled, it gates per-index/document access. A principal with
+  # es:UpdateDomainConfig can disable FGAC entirely, which removes all per-index
+  # authorization and promotes any IAM principal with es:ESHttp* on the domain
+  # ARN to a de facto cluster admin (can read all indices, modify all data).
+  # This is a configuration-level escalation: from "admin of the domain" to
+  # "cluster admin with all index data access for all IAM-permitted principals."
+  - id: aws-opensearch-fgac-disable-escalation
+    emits: CanEscalateTo
+    description: "A principal with es:UpdateDomainConfig on a FGAC-enabled domain can disable FGAC and grant all IAM-permitted principals cluster-admin data access."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?domain ]
+    where:
+      - "node_type(?domain) == SearchService"
+      - "?domain.AdvancedSecurityOptions.Enabled == true"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<any IAM principal with es:ESHttp* on the domain>"
+      permissions: ["es:UpdateDomainConfig"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        POTENTIAL when the principal has CanModifyConfiguration (es:UpdateDomainConfig)
+        on a FGAC-enabled domain. The principal can invoke UpdateDomainConfig to set
+        advancedSecurityOptions.enabled = false, removing all per-index authorization.
+        After this configuration change, any principal with effective es:ESHttpGet /
+        es:ESHttpPost / es:ESHttpPut on the domain ARN becomes a cluster admin (can read
+        all indices without role mapping restrictions). Model as POTENTIAL because the
+        attacker must first execute the UpdateDomainConfig call; this is not an implicit
+        escalation but a deliberate action-sequence escalation.
+      false_positive_note: >-
+        Only emit when FGAC is currently enabled (AdvancedSecurityOptions.Enabled == true).
+        If FGAC is already disabled, the escalation is moot. Do not emit CanEscalateTo if
+        UpdateDomainConfig is blocked. The "target" of CanEscalateTo should represent
+        the downstream beneficiaries (other IAM principals with es:ESHttp* who are
+        promoted to cluster admin), not the attacker themselves (though they benefit
+        too via CanReadData/CanWriteData). Alternatively, cite can-control.yaml for
+        the downstream derivation: CanModifyConfiguration(X, domain.FGAC.Enabled)
+        + CanReadData(Y, domain) => CanEscalateTo(X, Y).
+      narrative: >-
+        {principal.name} can disable fine-grained access control (FGAC) on OpenSearch
+        domain {domain.name} via es:UpdateDomainConfig. Disabling FGAC removes all
+        per-index and per-document authorization, promoting any IAM principal with
+        es:ESHttp* on the domain to cluster-admin-level data access (read and write
+        all indices).
+
+  # --- C1) ExposesCredential & CanReadSecret: UpdateDomainConfig resets internal master-user ---
+  # When fine-grained access control is enabled with InternalUserDatabaseEnabled,
+  # the internal master user has a password set at domain creation or via the
+  # AdvancedSecurityOptions.MasterUserOptions in UpdateDomainConfig. A principal
+  # with es:UpdateDomainConfig can reset this password to an attacker-chosen value
+  # and then authenticate to the OpenSearch REST API as the master user.
+  # The master user has full cluster admin and can modify role mappings, granting
+  # any IAM principal cluster-admin access.
+  # Model: emit both ExposesCredential (domain -> password) and CanReadSecret
+  # (principal -> password) to feed credential-chains derivations.
+  # credential-chains read-secret-yields-identity handles the impersonation chain.
+  # --- C1a) ExposesCredential: UpdateDomainConfig resets internal master-user ---
+  # Model the domain's exposure of the credential to whoever controls the config.
+  - id: aws-opensearch-fgac-master-user-reset-exposes
+    emits: ExposesCredential
+    description: "FGAC domain with internal user database exposes the master-user password to whoever can call es:UpdateDomainConfig."
+    match_effective_permission:
+      action: "es:UpdateDomainConfig"
+      resource_type: "AWS::OpenSearchService::Domain"
+    where:
+      - "?domain.AdvancedSecurityOptions.Enabled == true"
+      - "?domain.AdvancedSecurityOptions.InternalUserDatabaseEnabled == true"
+    emit:
+      source_type: Data
+      target_type: Secret
+      source: "<OpenSearch domain (SearchService)>"
+      target: "<internal master-user password (Password node)>"
+      permissions: ["es:UpdateDomainConfig"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the domain runs FGAC with InternalUserDatabaseEnabled (so an
+        internal master-user password exists that can be reset). The domain itself
+        exposes the credential to whoever controls UpdateDomainConfig.
+      narrative: >-
+        OpenSearch domain {domain.name} exposes its internal master-user password
+        to any principal with es:UpdateDomainConfig, since the password can be
+        reset to an attacker-chosen value via the UpdateDomainConfig API.
+
+  # --- C1b) CanReadSecret: principal with UpdateDomainConfig can read master password ---
+  # Model the principal's direct access to read/set the credential.
+  - id: aws-opensearch-fgac-master-user-reset
+    emits: CanReadSecret
+    description: "A principal with es:UpdateDomainConfig on a FGAC domain with internal user database can reset and effectively read the master-user password."
+    match_effective_permission:
+      action: "es:UpdateDomainConfig"
+      resource_type: "AWS::OpenSearchService::Domain"
+    where:
+      - "?domain.AdvancedSecurityOptions.Enabled == true"
+      - "?domain.AdvancedSecurityOptions.InternalUserDatabaseEnabled == true"
+    emit:
+      source_type: Identity
+      target_type: Secret
+      source: "<principal>"
+      target: "<internal master-user password (Password node)>"
+      permissions: ["es:UpdateDomainConfig"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective es:UpdateDomainConfig on the domain
+        ARN AND the domain runs FGAC with InternalUserDatabaseEnabled. The principal
+        can reset (and thus read/know) the password. BLOCKED if an SCP or IAM boundary
+        denies es:UpdateDomainConfig. CONDITIONAL(service_state) if the domain is in
+        a non-ACTIVE state where UpdateDomainConfig calls are rejected.
+      false_positive_note: >-
+        Only emit when InternalUserDatabaseEnabled is true. If the master user is
+        an IAM role (MasterUserARN set, InternalUserDatabaseEnabled false),
+        UpdateDomainConfig cannot yield an internal password — the IAM role's own
+        trust policy governs who can assume it. Do not model the IAM master-user
+        ARN case as ExposesCredential; it is a CanAssume/CanModifyTrust path
+        against the master IAM role. The password reset is not a READ of an
+        existing credential — it is a SET of a new known value; model as both
+        ExposesCredential (domain exposes) and CanReadSecret (principal can read)
+        to complete the credential-chains linkage.
+      narrative: >-
+        {principal.name} can reset the internal master-user password for OpenSearch
+        domain {domain.name} (es:UpdateDomainConfig) because FGAC runs with an
+        internal user database; setting a known password gives the attacker full
+        cluster admin access (create/delete indices, modify role mappings, read all
+        data) as the internal master user.
+
+  # ===========================================================================
+  # SECTION D — CROSS-ACCOUNT DOMAIN ACCESS POLICY
+  # ===========================================================================
+
+  # --- D1) CrossAccountTrust: domain access policy grants ESHttp* to foreign account
+  # The OpenSearch domain access policy is a resource-based IAM policy. When it
+  # names a principal in a different AWS account (a role ARN, account principal,
+  # or organizational unit from another account), that foreign principal obtains
+  # direct data-plane access without assuming a role in this account.
+  # can-control.yaml handles the CanEnterAccount roll-up via CrossAccountTrust;
+  # not re-derived here.
+  - id: aws-opensearch-cross-account-access-policy
+    emits: CrossAccountTrust
+    description: "Domain access policy grants es:ESHttp* to a principal in a foreign AWS account, enabling cross-account data access without a role assumption."
+    match_record:
+      resource_type: "AWS::OpenSearchService::Domain"
+      field: "AccessPolicies"
+    where:
+      - "access policy Principal.AWS contains a principal in a different account than the domain"
+      - "the named principal has an Allow for es:ESHttp* actions"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<domain access policy (ResourcePolicy)>"
+      target: "<foreign account or ExternalIdentity>"
+      permissions: ["es:ESHttpGet", "es:ESHttpPost", "es:ESHttpPut", "es:ESHttpDelete", "es:ESHttpHead"]
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the domain access policy explicitly allows es:ESHttp* for a
+        principal ARN or account in a different AWS account with no conditions (or
+        conditions the foreign principal can satisfy, e.g. aws:PrincipalOrgID is the
+        same org). CONDITIONAL(condition_expression) when an aws:PrincipalOrgID,
+        aws:SourceIp, or aws:SourceVpc condition restricts the grant. BLOCKED if a
+        corresponding Deny statement at the domain level overrides the Allow.
+      false_positive_note: >-
+        Distinguish account IDs carefully: a principal ARN in the SAME account as
+        the domain is not cross-account (it is intra-account IAM access). Only emit
+        CrossAccountTrust when the principal account ID differs from the domain
+        account ID. Honor aws:PrincipalOrgID conditions — if the condition requires
+        the caller to be in the same AWS Organization, the trust is scoped to org
+        members (emit CONDITIONAL, not ACTIVE for arbitrary foreign accounts).
+        aws:ResourceAccount is a receiver-side condition, not a cross-account gate.
+      narrative: >-
+        The domain access policy for {domain.name} grants es:ESHttp* to
+        {foreign_principal.name} in account {foreign_account}, enabling direct data
+        access from that account without a cross-account role assumption — the foreign
+        principal can read/write search indices without entering this account via STS.
+
+  # --- D2) CanReadData: cross-account principal reads domain data --------------
+  # When CrossAccountTrust is established (rule D1) and the foreign principal has
+  # the granted es:ESHttpGet / es:ESHttpHead effective in its own account (i.e., it
+  # is allowed to make the call), it can read data from the domain directly.
+  - id: aws-opensearch-cross-account-read-data
+    emits: CanReadData
+    description: "A foreign-account principal allowed by the domain access policy reads OpenSearch data cross-account."
+    match:
+      - [ ?resource_policy, CrossAccountTrust, ?foreign_account ]
+      - [ ?domain, HasPolicy, ?resource_policy ]
+    where:
+      - "node_type(?domain) == SearchService"
+      - "the CrossAccountTrust grant includes es:ESHttpGet or es:ESHttpHead"
+      - "?foreign_principal is the principal named in the cross-account Allow"
+    emit:
+      source_type: Identity
+      target_type: SearchService
+      source: "<foreign principal (ExternalIdentity or Identity in foreign account)>"
+      target: ?domain
+      permissions: ["es:ESHttpGet", "es:ESHttpHead"]
+      conditions: [resource_policy, network_reachability]
+      state_logic: >-
+        Inherit from the CrossAccountTrust edge: ACTIVE when CrossAccountTrust is
+        ACTIVE and network reach from the foreign account to the domain endpoint is
+        satisfied (trivially true for public endpoints; CONDITIONAL(network_reachability)
+        for VPC endpoints where private link / peering to the foreign account is
+        required). CONDITIONAL when the CrossAccountTrust is CONDITIONAL.
+      false_positive_note: >-
+        The foreign principal must also have permission in its OWN account to call
+        es:ESHttpGet (absence of an IAM deny in the caller's identity policies).
+        For public-endpoint domains this is straightforward; for VPC domains the
+        foreign account must have network reachability (VPC peering, PrivateLink)
+        to the OpenSearch VPC endpoint. Do not emit ACTIVE for VPC domains without
+        network reachability evidence.
+      narrative: >-
+        {foreign_principal.name} (account {foreign_account}) can read indexed data
+        from OpenSearch domain {domain.name} directly via cross-account domain access
+        policy grant — no cross-account role assumption required, only signed HTTP
+        requests to the domain endpoint.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP denying es:ESHttpGet / es:ESHttpPost on the domain ARN -> CanReadData /
+#    CanWriteData BLOCKED.
+#  - An SCP denying es:UpdateDomainConfig -> ExposesCredential (FGAC master-user
+#    reset) BLOCKED and CanAdminister BLOCKED.
+#  - A domain access policy Deny for Principal:* on es:ESHttp* at a specific path
+#    overrides an Allow -> do not emit ExposedToInternet ACTIVE.
+#  - VPCOptions set on the domain -> ExposedToInternet BLOCKED (domain not
+#    publicly routed regardless of the access policy).
+#  - FGAC with InternalUserDatabaseEnabled: false (IAM master user only) ->
+#    ExposesCredential (password reset) BLOCKED — no internal password to reset.
+# ---------------------------------------------------------------------------

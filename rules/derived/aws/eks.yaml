@@ -1,0 +1,743 @@
+# AWS EKS — Derived attack-path rules (Phase 7 — containers & Kubernetes)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (ExecutesAs, TrustsExternalIdentity, ExternalIdentityMapsTo, ContainsResourceReference,
+# CanModifyCode on ECR) already lives in /rules/explicit/aws-eks.yaml; these
+# rules combine those explicit edges with IAM / k8s RBAC facts to derive
+# execution and escalation capabilities.
+#
+# PHASE-7 ATTACK SURFACES COVERED:
+#  (a) ACCESS ENTRY / aws-auth ConfigMap: IAM principal -> k8s RBAC cluster-admin
+#      -> pods/exec any pod -> execute as pod's IAM role.
+#  (b) IRSA / EKS Pod Identity: projected SA token -> sts:AssumeRoleWithWebIdentity
+#      -> IAM role credentials (OIDC federation, owned by federation-chains).
+#  (c) ECR supply chain: image push -> propagates to every pulling workload ->
+#      CanModifyCode on each consumer -> CanExecuteAs (owned by container-chains).
+#  (d) NODE IMDS: pods on EC2 nodes (hop-limit 2) reach 169.254.169.254 ->
+#      node group role credentials -> ExposesCredential.
+#  (e) UpdateClusterConfig: change access mode -> re-enable access entry API ->
+#      CanModifyConfiguration on the cluster.
+#
+# LINCHPIN CITATIONS (do NOT re-derive):
+#  - container-chains.yaml: image-push-poisons-consumers (supply-chain fan-out),
+#    cluster-rbac-exec (exec + ExecutesAs -> CanExecuteAs),
+#    workload-identity-federates (IRSA/Pod-Identity bridge to CanFederateAs).
+#  - federation-chains.yaml: federation-maps-to-identity (CanFederateAs from
+#    TrustsExternalIdentity + ExternalIdentityMapsTo), federate-then-enter-account
+#    (cross-account foothold), federate-inherits-capabilities (CanImpersonate).
+#  - can-execute-as.yaml: execute-as-via-command (CanExecuteCommand + ExecutesAs).
+#  - can-control.yaml: escalate-via-execute-as (CanExecuteAs -> CanEscalateTo).
+#  - aws/identity-escalation.yaml: aws-assume-role-web-identity (OIDC trust ->
+#    CanFederateAs for IRSA role trusts).
+#
+# Permissions are the EFFECTIVE actions confirmed by the permission evaluator.
+# State defaults to ACTIVE; unmet conditions yield CONDITIONAL/POTENTIAL;
+# explicit deny/SCP/boundary yields BLOCKED.
+#
+# Docs: https://docs.aws.amazon.com/eks/latest/userguide/
+#       https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonelastickubernetesservice.html
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 7-containers-k8s
+applies_to: [aws]
+
+rules:
+
+  # =========================================================================
+  # (a) ACCESS ENTRY / CLUSTER-ADMIN ESCALATION
+  # =========================================================================
+
+  # --- CreateAccessEntry + AssociateAccessPolicy(ClusterAdmin) -> cluster-admin RBAC
+  - id: aws-eks-access-entry-cluster-admin
+    emits: CanGrantPermission
+    description: >-
+      CreateAccessEntry + AssociateAccessPolicy with AmazonEKSClusterAdminPolicy
+      maps an IAM principal to Kubernetes cluster-admin (system:masters) RBAC.
+      The principal can then exec into any pod and execute as its IAM role.
+    match:
+      - [ ?principal, HasPermission, ?cluster ]
+    where:
+      - "?principal has EFFECTIVE eks:CreateAccessEntry on ?cluster"
+      - "?principal has EFFECTIVE eks:AssociateAccessPolicy on ?cluster"
+      - "?principal can associate policyArn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy with accessScope.type=cluster"
+      - "node_type(?cluster) == KubernetesCluster"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: "<IAM principal (self or chosen ARN) that receives cluster-admin via access entry>"
+      permissions:
+        - "eks:CreateAccessEntry"
+        - "eks:AssociateAccessPolicy"
+      conditions: [iam_permission, condition_expression, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE if the principal has both eks:CreateAccessEntry and
+        eks:AssociateAccessPolicy at the cluster scope AND the
+        AmazonEKSClusterAdminPolicy association scope is cluster-wide
+        (accessScope.type=cluster). CONDITIONAL(iam_permission) if either
+        action is missing or scoped only to specific namespaces
+        (AmazonEKSAdminPolicy namespace-scoped is weaker — do not emit
+        cluster-admin for namespace-scoped associations). BLOCKED if an
+        SCP or permission boundary denies eks:CreateAccessEntry or
+        eks:AssociateAccessPolicy.
+      confidence: 0.95
+      derived_from:
+        - "eks:CreateAccessEntry effective permission on ?cluster"
+        - "eks:AssociateAccessPolicy effective permission on ?cluster with AmazonEKSClusterAdminPolicy"
+      false_positive_note: >-
+        Only AmazonEKSClusterAdminPolicy with accessScope.type=cluster yields
+        full system:masters equivalence. AmazonEKSAdminPolicy is namespace-
+        scoped (not cluster-admin). AmazonEKSClusterAdminPolicy with
+        accessScope.type=namespace is limited to those namespaces — do NOT
+        emit cluster-admin CanGrantPermission for namespace-scoped entries.
+        Honor SCP and permission boundary denials on eks:CreateAccessEntry /
+        eks:AssociateAccessPolicy. If the cluster authenticationMode=CONFIG_MAP
+        only, access entries have no effect — downgrade to POTENTIAL.
+      narrative: >-
+        {principal.name} holds eks:CreateAccessEntry and eks:AssociateAccessPolicy
+        on cluster {cluster.name}. It can create an access entry for any IAM ARN
+        and associate AmazonEKSClusterAdminPolicy (scope: cluster), granting that
+        ARN Kubernetes cluster-admin (system:masters) RBAC — equivalent to
+        unrestricted kubectl access across all namespaces.
+
+  # --- SECOND EMIT: also emit CanModifyConfiguration to allow downstream rules
+  #     to chain from cluster configuration control (e.g., UpdateClusterConfig)
+  - id: aws-eks-access-entry-cluster-admin-config-control
+    emits: CanModifyConfiguration
+    description: >-
+      CreateAccessEntry + AssociateAccessPolicy with AmazonEKSClusterAdminPolicy
+      also grants the principal ability to modify cluster access configuration,
+      enabling chaining to downstream cluster-auth-mode control paths.
+    match:
+      - [ ?principal, HasPermission, ?cluster ]
+    where:
+      - "?principal has EFFECTIVE eks:CreateAccessEntry on ?cluster"
+      - "?principal has EFFECTIVE eks:AssociateAccessPolicy on ?cluster"
+      - "?principal can associate policyArn arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy with accessScope.type=cluster"
+      - "node_type(?cluster) == KubernetesCluster"
+    emit:
+      source_type: Identity
+      target_type: KubernetesCluster
+      source: ?principal
+      target: ?cluster
+      permissions:
+        - "eks:CreateAccessEntry"
+        - "eks:AssociateAccessPolicy"
+      conditions: [iam_permission, condition_expression, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE if both eks:CreateAccessEntry and eks:AssociateAccessPolicy are
+        present at cluster scope (same gate as CanGrantPermission above).
+        CONDITIONAL(iam_permission) if either action is missing or scoped narrowly.
+        BLOCKED if an SCP or permission boundary denies either action.
+      confidence: 0.95
+      derived_from:
+        - "eks:CreateAccessEntry effective permission on ?cluster"
+        - "eks:AssociateAccessPolicy effective permission on ?cluster with AmazonEKSClusterAdminPolicy"
+      false_positive_note: >-
+        This emit models the configuration control aspect of cluster-admin access
+        (ability to manage access entries), separate from the CanGrantPermission
+        to a receiving IAM principal. Both are aspects of the same capability.
+      narrative: >-
+        {principal.name} can modify cluster {cluster.name}'s access configuration
+        via eks:CreateAccessEntry and eks:AssociateAccessPolicy, controlling which
+        IAM principals receive cluster-admin access.
+
+  # --- Cluster-admin RBAC -> pods/exec on any pod in the cluster
+  - id: aws-eks-cluster-admin-exec-command
+    emits: CanExecuteCommand
+    description: >-
+      A principal with Kubernetes cluster-admin RBAC (system:masters binding or
+      equivalent ClusterRole: cluster-admin) can exec into any pod in any
+      namespace via pods/exec. This gives OS-level code execution and access to
+      the pod's mounted SA token / IRSA credential. Matches CanModifyConfiguration
+      on the cluster (indicating cluster-admin access establishment).
+    match:
+      - [ ?principal, CanModifyConfiguration, ?cluster ]
+    where:
+      - "?principal was granted cluster-admin RBAC on ?cluster (directly or via system:masters group)"
+      - "node_type(?cluster) == KubernetesCluster"
+      # cluster-admin holds pods/exec create, pods/* across all namespaces
+    emit:
+      source_type: Identity
+      target_type: KubernetesWorkload
+      source: ?principal
+      target: "<any KubernetesWorkload (pod) running in ?cluster>"
+      permissions:
+        - "eks:DescribeCluster"
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the cluster-admin RBAC is in effect (access entry created,
+        or system:masters group membership confirmed) AND the cluster Kubernetes
+        API is reachable (public endpoint, or private endpoint with network
+        foothold). eks:DescribeCluster is the IAM prerequisite to bootstrap kubectl
+        access to the cluster endpoint. The actual exec capability is the Kubernetes
+        RBAC verb 'pods/exec create' (not an IAM action). CONDITIONAL(service_state)
+        if the endpoint is private-only and network reachability from the attacker's
+        position is unconfirmed. This edge feeds container-chains cluster-rbac-exec
+        for each pod's ExecutesAs.
+      confidence: 0.95
+      derived_from:
+        - "?principal CanModifyConfiguration ?cluster (cluster-admin via aws-eks-access-entry-cluster-admin-config-control)"
+        - "cluster-admin k8s RBAC grants pods/exec create across all namespaces"
+      false_positive_note: >-
+        Requires actual cluster-admin RBAC to be in effect — the CanModifyConfiguration
+        edge from aws-eks-access-entry-cluster-admin-config-control establishes this
+        once the access entry is CREATED. The attacker must also be able to reach
+        the Kubernetes API server endpoint (public endpoint, or private endpoint with
+        a VPC foothold). eks:DescribeCluster is the IAM bootstrap action; the actual
+        exec verb (pods/exec create) is Kubernetes RBAC, not an IAM action. BLOCKED
+        if the cluster is API-private-only and the attacker has no VPC access. Do not
+        emit for namespace-scoped RBAC roles.
+      narrative: >-
+        {principal.name} holds Kubernetes cluster-admin RBAC on {cluster.name}.
+        It can run kubectl exec (pods/exec create) on any pod in any namespace,
+        getting OS-level command execution inside the container and access to its
+        mounted ServiceAccount/IRSA token. eks:DescribeCluster is the IAM prerequisite
+        to bootstrap kubectl access to the cluster endpoint.
+
+  # --- cluster-rbac-exec roll-up (cites container-chains) -> CanExecuteAs pod IAM role
+  - id: aws-eks-pod-exec-execute-as
+    emits: CanExecuteAs
+    description: >-
+      Exec into a running pod (via cluster-admin or direct pods/exec RBAC) inherits
+      the pod's mounted IRSA or Pod Identity token, executing as the pod's IAM role.
+      Cites container-chains cluster-rbac-exec; dedupes on (CanExecuteAs, principal, role).
+    match:
+      - [ ?principal, CanExecuteCommand, ?pod ]
+      - [ ?pod, ExecutesAs, ?iam_role ]
+    where:
+      - "node_type(?pod) == KubernetesWorkload"
+      - "node_type(?iam_role) in [MachineIdentity, Role]"
+      - "?pod has a mounted IRSA or Pod Identity token (automountServiceAccountToken:true or IRSA projected volume, or Pod Identity agent endpoint reachable)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?iam_role
+      permissions:
+        - "eks:DescribeCluster"
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the pod's IRSA or Pod Identity credential is mounted/reachable
+        (projected token volume present, or Pod Identity agent on node reachable at
+        169.254.170.23). CONDITIONAL(service_state) if automountServiceAccountToken=false
+        AND no IRSA projected volume AND no Pod Identity association — then exec yields
+        OS access but not the IAM credential. Inherit weakest from CanExecuteCommand.
+        This dedupes with container-chains cluster-rbac-exec on (CanExecuteAs,
+        ?principal, ?iam_role): cite, do not double-count weight.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "<CanExecuteCommand edge_id>"
+        - "<ExecutesAs edge_id>"
+        - "container-chains: cluster-rbac-exec"
+        - "can-execute-as: execute-as-via-command"
+      false_positive_note: >-
+        Dedupes with container-chains cluster-rbac-exec on (CanExecuteAs, ?principal,
+        ?iam_role) — emit once, do not double-count weight. The service_state gate
+        (whether the pod's token is mounted and accessible) matters: a pod with
+        automountServiceAccountToken:false and no IRSA projected volume and no Pod
+        Identity agent reachability gives OS access but not the IAM credential ->
+        CONDITIONAL(service_state). On Fargate pods, only IRSA/Pod Identity apply
+        (no node IMDS). Scope exec to the pod's actual namespace/name — cluster-admin
+        reaches all, but a namespace-scoped pods/exec grant only reaches pods in that
+        namespace. The escalation consequence is produced by can-control
+        escalate-via-execute-as off this CanExecuteAs — cite, do not duplicate.
+      narrative: >-
+        {principal.name} can exec into pod {pod.name} (CanExecuteCommand via k8s
+        pods/exec). The pod runs as {iam_role.name} (IRSA or Pod Identity); the
+        projected token or agent endpoint credential is readable from inside the
+        container, so {principal.name} executes as {iam_role.name}.
+
+  # =========================================================================
+  # (b) IRSA / EKS POD IDENTITY FEDERATION (bridge to federation-chains)
+  # =========================================================================
+
+  # --- IRSA: Kubernetes SA with IRSA annotation federates into IAM role
+  # (Bridge rule; federation-chains federation-maps-to-identity owns the collapse.
+  # container-chains workload-identity-federates covers the general k8s case;
+  # this rule is the EKS-IRSA-specific emit so EKS-collected trust facts get a
+  # named rule and clear deduplication notes.)
+  - id: aws-eks-irsa-workload-identity
+    emits: CanFederateAs
+    description: >-
+      A Kubernetes ServiceAccount annotated with eks.amazonaws.com/role-arn and a
+      matching IAM role trust policy (Federated = cluster OIDC issuer) lets any pod
+      running as that KSA exchange its projected token for IAM role credentials via
+      sts:AssumeRoleWithWebIdentity. Cites container-chains workload-identity-federates
+      and federation-chains federation-maps-to-identity.
+    match:
+      - [ ?ksa, ExternalIdentityMapsTo, ?iam_role ]
+    where:
+      - "node_type(?ksa) in [WorkloadIdentity, ServiceAccount]"
+      - "?ksa is an EKS Kubernetes ServiceAccount with IRSA annotation (eks.amazonaws.com/role-arn)"
+      - "node_type(?iam_role) in [Role, MachineIdentity]"
+      - "exists TrustsExternalIdentity(?iam_role -> ?ksa) backed by an AWS OIDC provider matching the cluster OIDC issuer URL"
+      - "the IAM role trust Federated principal = cluster OIDC issuer ARN + sts:AssumeRoleWithWebIdentity"
+    emit:
+      source_type: WorkloadIdentity
+      target_type: Role
+      source: ?ksa
+      target: ?iam_role
+      permissions:
+        - "sts:AssumeRoleWithWebIdentity"
+      conditions: [trust_condition]
+      state_logic: >-
+        DELEGATED to federation-chains federation-maps-to-identity and
+        container-chains workload-identity-federates. The ExternalIdentityMapsTo
+        edge already represents a MATCHED trust condition (the mapping was realized
+        when the explicit rule verified sub matching system:serviceaccount:<ns>:<sa>).
+        ACTIVE when the sub condition is SATISFIABLE by the attacker (broad/unpinned
+        like system:serviceaccount:*:* or namespace-only without SA pin, or the
+        attacker can schedule pods as the pinned SA). CONDITIONAL(trust_condition)
+        when the sub is pinned to a specific SA the attacker cannot schedule.
+        BLOCKED if the OIDC provider is deleted or issuer key rotated. This rule
+        dedupes with container-chains workload-identity-federates on
+        (CanFederateAs, ?ksa, ?iam_role) — emit once.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "?ksa ExternalIdentityMapsTo ?iam_role"
+        - "?iam_role TrustsExternalIdentity ?ksa (cluster OIDC issuer trust)"
+        - "container-chains: workload-identity-federates"
+        - "federation-chains: federation-maps-to-identity"
+        - "aws/identity-escalation: aws-assume-role-web-identity"
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE federation-chains and container-chains. This rule
+        dedupes with container-chains workload-identity-federates on
+        (CanFederateAs, ?ksa, ?iam_role) — emit once. The CanEnterAccount /
+        CanImpersonate / CanEscalateTo roll-ups are federation-chains'
+        (federate-then-enter-account, federate-inherits-capabilities) — never
+        re-derive them here. The ExternalIdentityMapsTo explicit rule already
+        filtered for matching trust conditions: the edge only fires when sub
+        condition is satisfied by the specific KSA. This derived rule interprets
+        whether that match is ATTACKER-SATISFIABLE: a pinned sub the attacker
+        cannot schedule as is CONDITIONAL, not ACTIVE. A wildcard or
+        namespace-only sub is ACTIVE. Each cluster has a DISTINCT OIDC issuer
+        URL; do not conflate across clusters.
+      narrative: >-
+        Kubernetes ServiceAccount {ksa.name} (namespace {ksa.namespace}) is
+        annotated with IAM role {iam_role.name}. The role's trust policy trusts
+        the cluster OIDC issuer with condition sub matching this SA.
+        A pod running as {ksa.name} presents its projected SA token to STS
+        (sts:AssumeRoleWithWebIdentity) and obtains credentials for {iam_role.name}
+        with no static key (federation-chains rolls up account foothold and
+        impersonation).
+
+  # --- EKS Pod Identity Association: namespace:SA -> IAM role federation
+  - id: aws-eks-pod-identity-association
+    emits: CanFederateAs
+    description: >-
+      An EKS Pod Identity Association (eks:CreatePodIdentityAssociation) links a
+      Kubernetes namespace:ServiceAccount pair to an IAM role. Pods running as that
+      SA receive IAM credentials from the eks-pod-identity-agent at
+      169.254.170.23. Whoever can create or modify this association can reroute
+      which IAM role any pod in that namespace:SA binding runs as.
+    match:
+      - [ ?ksa, ExternalIdentityMapsTo, ?iam_role ]
+    where:
+      - "node_type(?ksa) in [WorkloadIdentity, ServiceAccount]"
+      - "?ksa is linked via an EKS Pod Identity Association (eks:DescribePodIdentityAssociation)"
+      - "node_type(?iam_role) in [Role, MachineIdentity]"
+      - "?iam_role trust policy trusts pods.eks.amazonaws.com with sts:AssumeRoleWithWebIdentity"
+      - "exists TrustsExternalIdentity(?iam_role -> ?ksa) backed by the Pod Identity trust"
+    emit:
+      source_type: WorkloadIdentity
+      target_type: Role
+      source: ?ksa
+      target: ?iam_role
+      permissions:
+        - "sts:AssumeRoleWithWebIdentity"
+      conditions: [trust_condition, service_state]
+      state_logic: >-
+        ACTIVE when the Pod Identity association is in effect (eks-pod-identity-agent
+        DaemonSet running on the node) and the IAM role trust includes
+        pods.eks.amazonaws.com. The trust condition pin is namespace:SA-scoped —
+        ACTIVE for any pod in the specified namespace running as the specified SA.
+        CONDITIONAL(service_state) if the Pod Identity agent DaemonSet is not
+        installed/running on the target nodes. BLOCKED if the association is deleted
+        or the role trust does not permit pods.eks.amazonaws.com. Cites
+        container-chains workload-identity-federates and federation-chains
+        federation-maps-to-identity for the CanEnter*/CanImpersonate roll-ups.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "?ksa ExternalIdentityMapsTo ?iam_role (Pod Identity Association)"
+        - "?iam_role TrustsExternalIdentity ?ksa (pods.eks.amazonaws.com trust)"
+        - "container-chains: workload-identity-federates"
+        - "federation-chains: federation-maps-to-identity"
+      false_positive_note: >-
+        Dedupes with container-chains workload-identity-federates on
+        (CanFederateAs, ?ksa, ?iam_role) — emit once. The CanEnterAccount /
+        CanImpersonate roll-ups are federation-chains' — never re-derive here.
+        Pod Identity requires the eks-pod-identity-agent DaemonSet on each node
+        (addon: eks-pod-identity-agent); without it the association has no effect ->
+        CONDITIONAL(service_state). The agent endpoint is 169.254.170.23 (not 169.254.169.254
+        IMDS); Fargate pods with Pod Identity are supported and have no IMDS exposure.
+        An attacker who gains eks:CreatePodIdentityAssociation can reroute the SA->role
+        mapping to a different role they control — model this separately via
+        aws-eks-create-pod-identity-association-redirect.
+      narrative: >-
+        Kubernetes ServiceAccount {ksa.name} (namespace {ksa.namespace}) is linked
+        via a Pod Identity Association to IAM role {iam_role.name}. The
+        eks-pod-identity-agent delivers credentials at 169.254.170.23 to any pod
+        running as {ksa.name}; executing code in such a pod grants credentials for
+        {iam_role.name} (federation-chains rolls up account foothold and
+        impersonation).
+
+  # --- Attacker can create/modify a Pod Identity association -> reroute SA -> role
+  - id: aws-eks-create-pod-identity-association-redirect
+    emits: CanModifyConfiguration
+    description: >-
+      eks:CreatePodIdentityAssociation lets an IAM principal link any namespace:SA
+      to any IAM role it can pass (iam:PassRole). An attacker with this permission
+      can reroute an existing SA to a more-privileged role, or add a new association
+      for a SA they can run pods as, gaining that role's credentials at the next
+      pod startup.
+    match:
+      - [ ?principal, HasPermission, ?cluster ]
+    where:
+      - "?principal has EFFECTIVE eks:CreatePodIdentityAssociation on ?cluster"
+      - "?principal has EFFECTIVE iam:PassRole for ?iam_role (trusts pods.eks.amazonaws.com)"
+      - "node_type(?cluster) == KubernetesCluster"
+    emit:
+      source_type: Identity
+      target_type: KubernetesCluster
+      source: ?principal
+      target: ?cluster
+      permissions:
+        - "eks:CreatePodIdentityAssociation"
+        - "iam:PassRole"
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        CONDITIONAL(role_compatibility) — the principal can create a Pod Identity
+        association for a role it can pass (iam:PassRole), but the full exploitation
+        requires the principal to schedule a pod as the target namespace:SA pair.
+        If the principal lacks the Kubernetes RBAC or cluster IAM permissions to
+        create/schedule a pod as the target SA, the association is created but the
+        attacker cannot trigger the credential delivery -> remains CONDITIONAL until
+        a pod is actually scheduled. The eks-pod-identity-agent DaemonSet must also
+        be running on the node (service_state factor). BLOCKED if an SCP denies
+        eks:CreatePodIdentityAssociation or iam:PassRole.
+      confidence: 0.85
+      derived_from:
+        - "eks:CreatePodIdentityAssociation effective permission on ?cluster"
+        - "iam:PassRole effective permission for ?iam_role (pods.eks.amazonaws.com)"
+      false_positive_note: >-
+        This emits CanModifyConfiguration (config of the cluster's workload-identity
+        mapping), not CanExecuteAs directly. The CanExecuteAs consequence follows
+        from: CanModifyConfiguration(?cluster) -> new Pod Identity Association ->
+        aws-eks-pod-identity-association emits CanFederateAs(?ksa -> ?iam_role) ->
+        container-chains / federation-chains roll up CanExecuteAs. Do not shortcut
+        this to CanExecuteAs from CanModifyConfiguration alone. The state is
+        CONDITIONAL because the attacker must ALSO be able to schedule a pod as
+        the target namespace:SA pair (via Kubernetes RBAC, cluster-admin, or
+        eks:CreatePodIdentityAssociation alone if paired with the ability to
+        create workloads). Honor iam:PassRole scoping: must check
+        PassedToService=pods.eks.amazonaws.com (if conditioned). Honor the rule's
+        state: if the role is passable but the attacker has no way to run a pod as
+        the target SA, the reachable state is CONDITIONAL(role_compatibility), not
+        ACTIVE.
+      narrative: >-
+        {principal.name} holds eks:CreatePodIdentityAssociation on cluster
+        {cluster.name} and iam:PassRole for a role trusting pods.eks.amazonaws.com.
+        It can create a Pod Identity Association linking any namespace:SA to that
+        role; pods subsequently started as that SA receive the role's credentials
+        from the pod-identity-agent (169.254.170.23). Realization requires the
+        principal to schedule a pod as the target SA.
+
+  # =========================================================================
+  # (c) IRSA CROSS-ACCOUNT FOOTHOLD (cites federation-chains)
+  # =========================================================================
+
+  # NOTE: Cross-account IRSA foothold (CanEnterAccount from cross-account
+  # CanFederateAs) is OWNED by federation-chains federate-then-enter-account.
+  # That linchpin rule fires on any CanFederateAs with target in a different
+  # account, producing the CanEnterAccount edge. Do not re-derive here.
+
+  # =========================================================================
+  # (d) NODE IMDS CREDENTIAL EXPOSURE
+  # =========================================================================
+
+  # --- EC2 node IMDS reachable by pods (hop-limit 2) -> node group role exposure
+  - id: aws-eks-node-imds-credential
+    emits: ExposesCredential
+    description: >-
+      Pods on EC2 managed nodes with IMDS hop-limit >= 2 can reach 169.254.169.254
+      and retrieve temporary credentials for the node group IAM role. Any code
+      execution inside such a pod inherits the node role without any IRSA or Pod
+      Identity annotation.
+    match:
+      - [ ?node, ExecutesAs, ?node_role ]
+    where:
+      - "node_type(?node) == VirtualMachine  # EC2 node in EKS managed node group"
+      - "node_type(?node_role) in [MachineIdentity, Role]"
+      - "?node.metadataOptions.httpPutResponseHopLimit >= 2  # IMDS reachable by pods"
+      - "pods are co-located on ?node (EKS managed node group, not Fargate)"
+    emit:
+      source_type: Compute
+      target_type: Credential
+      source: ?node
+      target: ?node_role
+      permissions: []
+      conditions: [network_reachability, service_state]
+      state_logic: >-
+        CONDITIONAL(network_reachability): ACTIVE only when the hop-limit is
+        confirmed >= 2 (from ec2:DescribeLaunchTemplates
+        metadataOptions.httpPutResponseHopLimit; default for EKS managed nodes is 2).
+        POTENTIAL when hop-limit is uncollected (assume exploitable until confirmed
+        hardened). BLOCKED when hop-limit = 1 (recommended hardening — pods cannot
+        reach IMDS). NEVER emit for Fargate pods (no host EC2, no IMDS).
+      confidence: 0.8
+      derived_from:
+        - "?node ExecutesAs ?node_role"
+        - "?node.metadataOptions.httpPutResponseHopLimit >= 2 (node IMDS reachable)"
+      false_positive_note: >-
+        NEVER emit for Fargate pods — Fargate has no host EC2 instance and no
+        IMDS exposure. Only for EC2 launch type (managed node groups). Downgrade
+        to POTENTIAL when hop-limit is not collected (unknown); BLOCKED when
+        hop-limit = 1. The node role's temporary STS credentials are retrievable
+        by ANY pod on the node, not just pods with specific RBAC — it is an ambient
+        credential available to all co-located pods. This is a fact edge (the node
+        exposes the temporary credential to co-located pods); the path-finding value
+        comes from attacker code running in any such pod.
+      narrative: >-
+        EC2 node {node.name} (EKS managed node group, IMDS hop-limit >= 2) runs as
+        IAM role {node_role.name}. Any pod co-located on this node can reach the
+        instance metadata endpoint (169.254.169.254) and retrieve temporary STS
+        credentials for {node_role.name} without any IRSA or Pod Identity annotation
+        — the node role's temporary credentials are ambient and available to all
+        pod code on this node.
+
+  # =========================================================================
+  # (e) CLUSTER CONFIGURATION / ACCESS-MODE CONTROL
+  # =========================================================================
+
+  # --- UpdateClusterConfig: change access mode or endpoint settings
+  - id: aws-eks-update-cluster-config-access
+    emits: CanModifyConfiguration
+    description: >-
+      eks:UpdateClusterConfig allows changing the cluster's authenticationMode,
+      endpoint access settings (public/private), and upgrade policy. An attacker
+      with this permission can enable API authenticationMode to allow
+      access entry creation, or change endpoint access to make the API server
+      reachable, enabling follow-on access entry cluster-admin escalation.
+    match:
+      - [ ?principal, HasPermission, ?cluster ]
+    where:
+      - "?principal has EFFECTIVE eks:UpdateClusterConfig on ?cluster"
+      - "node_type(?cluster) == KubernetesCluster"
+    emit:
+      source_type: Identity
+      target_type: KubernetesCluster
+      source: ?principal
+      target: ?cluster
+      permissions:
+        - "eks:UpdateClusterConfig"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE if eks:UpdateClusterConfig is in scope for the cluster. The attack
+        value is highest when combined with eks:CreateAccessEntry +
+        eks:AssociateAccessPolicy: UpdateClusterConfig can switch authenticationMode
+        to API or API_AND_CONFIG_MAP (enabling the access entry API if it was
+        previously set to CONFIG_MAP-only), then the access-entry cluster-admin path
+        fires. CONDITIONAL(iam_permission) if UpdateClusterConfig is missing.
+        BLOCKED if an SCP denies eks:UpdateClusterConfig.
+      confidence: 0.85
+      derived_from:
+        - "eks:UpdateClusterConfig effective permission on ?cluster"
+      false_positive_note: >-
+        eks:UpdateClusterConfig alone does not grant cluster-admin; it is a
+        CanModifyConfiguration fact that feeds downstream access-entry creation
+        (aws-eks-access-entry-cluster-admin). Note: AWS authenticationMode migration
+        is one-directional: from CONFIG_MAP to API or API_AND_CONFIG_MAP is permanent
+        (cannot revert to CONFIG_MAP-only). The attack value is switching FROM
+        CONFIG_MAP to API/API_AND_CONFIG_MAP to enable access entries. Honor SCP
+        denial. Also: changing endpointPublicAccess from false to true expands the
+        network attack surface (feeds ExposedToInternet derivation).
+      narrative: >-
+        {principal.name} holds eks:UpdateClusterConfig on cluster {cluster.name}.
+        It can change the authenticationMode (enabling access entry API if previously
+        CONFIG_MAP-only), or toggle endpoint public/private access, enabling
+        follow-on access-entry cluster-admin escalation or expanding the network
+        attack surface.
+
+  # --- aws-auth ConfigMap write -> cluster-admin (legacy authenticationMode path)
+  - id: aws-eks-authcm-write-cluster-admin
+    emits: CanGrantPermission
+    description: >-
+      Kubernetes write access to the aws-auth ConfigMap in kube-system (obtained after
+      gaining any cluster access) allows adding any IAM ARN to the mapRoles/mapUsers
+      entries with groups: [system:masters], granting cluster-admin to arbitrary IAM
+      principals. This is the legacy (CONFIG_MAP authMode) escalation vector.
+    match:
+      - [ ?principal, CanExecuteCommand, ?any_pod ]
+    where:
+      - "?principal gained cluster access (kubectl) allowing kubectl apply/patch on ConfigMap aws-auth in kube-system"
+      - "cluster authenticationMode is CONFIG_MAP or API_AND_CONFIG_MAP"
+      - "?principal has k8s RBAC that includes configmaps write in kube-system namespace"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: "<any IAM principal mapped to system:masters in aws-auth ConfigMap>"
+      permissions: []
+      k8s_rbac_verbs: [create, update, patch]
+      k8s_rbac_resources: [configmaps]
+      k8s_rbac_scope: "kube-system namespace"
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the cluster authenticationMode is CONFIG_MAP or
+        API_AND_CONFIG_MAP AND the principal has Kubernetes RBAC verbs
+        [create, update, patch] on configmaps in kube-system namespace
+        (obtained via cluster-admin or explicit kube-system configmaps write).
+        BLOCKED when authenticationMode=API (the ConfigMap is ignored in pure
+        API mode). CONDITIONAL(service_state) when authenticationMode is unknown.
+        This is a Kubernetes RBAC grant, not an IAM action; the capability follows
+        post-authentication from obtaining kubectl access to the cluster.
+      confidence: 0.9
+      derived_from:
+        - "?principal CanExecuteCommand on cluster (kubectl access)"
+        - "?principal k8s RBAC: configmaps {create,update,patch} in kube-system"
+        - "cluster authenticationMode in {CONFIG_MAP, API_AND_CONFIG_MAP}"
+      false_positive_note: >-
+        Only relevant when cluster authenticationMode is CONFIG_MAP or
+        API_AND_CONFIG_MAP. Pure API mode (authenticationMode=API) makes this
+        BLOCKED — the aws-auth ConfigMap is ignored. The write is a Kubernetes
+        RBAC capability (verbs create/update/patch on configmaps in kube-system),
+        not an IAM action. Cluster-admin role has this implicitly, but a
+        lower-privilege binding may not. Do not emit if the principal does not
+        have kubectl access or the requisite Kubernetes RBAC configmaps write.
+      narrative: >-
+        {principal.name} has kubectl access to cluster {cluster.name}
+        (authenticationMode: CONFIG_MAP or API_AND_CONFIG_MAP) with Kubernetes
+        RBAC write permission on the aws-auth ConfigMap in kube-system (verbs:
+        create/update/patch on configmaps). It can add any IAM ARN to
+        mapRoles/mapUsers with groups: [system:masters], instantly granting that
+        principal Kubernetes cluster-admin without any EKS API call.
+
+  # =========================================================================
+  # NODEGROUP CODE CONTROL (supply chain via EC2 launch template override)
+  # =========================================================================
+
+  # --- CreateNodegroup + iam:PassRole -> custom AMI/launch template -> code control
+  - id: aws-eks-create-nodegroup-code-control
+    emits: CanModifyCode
+    description: >-
+      eks:CreateNodegroup combined with iam:PassRole (for a role trusting ec2.amazonaws.com
+      or eks.amazonaws.com) allows an attacker to create a new managed node group with
+      an attacker-controlled AMI or launch template. Every node in the group executes
+      the attacker's code, and the attacker can escalate to the node group's IAM role.
+    match:
+      - [ ?principal, HasPermission, ?cluster ]
+    where:
+      - "?principal has EFFECTIVE eks:CreateNodegroup on ?cluster"
+      - "?principal has EFFECTIVE iam:PassRole for ?node_role (trusts ec2.amazonaws.com or eks.amazonaws.com)"
+      - "node_type(?cluster) == KubernetesCluster"
+    emit:
+      source_type: Identity
+      target_type: KubernetesCluster
+      source: ?principal
+      target: ?cluster
+      permissions:
+        - "eks:CreateNodegroup"
+        - "iam:PassRole"
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        CONDITIONAL(role_compatibility) when the principal has both eks:CreateNodegroup
+        on the cluster AND iam:PassRole for a role that trusts ec2.amazonaws.com
+        (standard EC2 node trust) or eks.amazonaws.com. The attacker can create a
+        new managed node group with a custom launch template pointing to an
+        attacker-controlled AMI, gaining CanModifyCode over every node in that group
+        and transitively CanExecuteAs the node's IAM role. BLOCKED if an SCP denies
+        eks:CreateNodegroup or iam:PassRole.
+      confidence: 0.85
+      derived_from:
+        - "eks:CreateNodegroup effective permission on ?cluster"
+        - "iam:PassRole effective permission for ?node_role (trusts ec2.amazonaws.com)"
+      false_positive_note: >-
+        Requires the attacker to supply a custom launch template with an attacker-controlled
+        AMI (or user-data script injection). The node group creation is immediate;
+        code execution on the nodes follows once they are provisioned. Feeds
+        container-chains image-push-poisons-consumers for supply-chain propagation
+        and can-control escalate-via-execute-as for the node role privilege escalation.
+        Honor iam:PassRole scoping: must verify the role trust includes ec2.amazonaws.com.
+      narrative: >-
+        {principal.name} holds eks:CreateNodegroup on cluster {cluster.name} and
+        iam:PassRole for a node IAM role (trusting ec2.amazonaws.com). It can
+        create a new managed node group with a custom launch template pointing to
+        an attacker-controlled AMI, gaining code execution on every node in the
+        group and privileges of the node's IAM role.
+
+  # --- UpdateNodegroupConfig with launch template -> code control on existing nodes
+  - id: aws-eks-update-nodegroup-config-code-control
+    emits: CanModifyConfiguration
+    description: >-
+      eks:UpdateNodegroupConfig allows modifying an existing node group's launch
+      template and scaling configuration. An attacker with this permission can supply
+      a custom launch template with an attacker-controlled AMI or user-data, gaining
+      CanModifyCode on nodes that cycle through the new template.
+    match:
+      - [ ?principal, HasPermission, ?cluster ]
+    where:
+      - "?principal has EFFECTIVE eks:UpdateNodegroupConfig on ?cluster"
+      - "node_type(?cluster) == KubernetesCluster"
+    emit:
+      source_type: Identity
+      target_type: KubernetesCluster
+      source: ?principal
+      target: ?cluster
+      permissions:
+        - "eks:UpdateNodegroupConfig"
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        CONDITIONAL(service_state) — the principal can modify an existing node group's
+        launch template to point to an attacker-controlled AMI or user-data. The
+        CanModifyCode consequence is realized only when existing nodes are cycled
+        (drained, replaced, or restarted) to pick up the new launch template. Until
+        a node replacement occurs, the modification has no effect on running nodes.
+        BLOCKED if an SCP denies eks:UpdateNodegroupConfig.
+      confidence: 0.8
+      derived_from:
+        - "eks:UpdateNodegroupConfig effective permission on ?cluster"
+      false_positive_note: >-
+        The attack value is conditional on node cycling: immediately after the config
+        update, running nodes continue to execute the old AMI/user-data. Only on
+        next scale-up, node replacement, or forced drain does the new launch template
+        apply. Feeds can-control escalate-via-execute-as for the node role privilege
+        escalation. Honor SCP denial. Do not emit ACTIVE for this capability alone;
+        the state is CONDITIONAL(service_state) pending a node replacement trigger.
+      narrative: >-
+        {principal.name} holds eks:UpdateNodegroupConfig on cluster {cluster.name}.
+        It can update the launch template of an existing managed node group to point
+        to an attacker-controlled AMI or user-data script, gaining code execution on
+        nodes as they cycle through the new configuration (on drain/replace/scale-up).
+
+  # =========================================================================
+  # ESCALATION ROLL-UP
+  # =========================================================================
+
+  # NOTE: Privilege escalation from CanExecuteAs (where target role has higher
+  # privilege than the attacker) is OWNED by can-control escalate-via-execute-as.
+  # That linchpin rule fires on any CanExecuteAs where the target's privilege
+  # level exceeds the source, producing the CanEscalateTo edge. Do not re-derive
+  # here; this file emits the service-specific execution capabilities
+  # (CanExecuteCommand, CanExecuteAs, CanModifyConfiguration) that feed the
+  # linchpin rules.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - SCP/permission boundary denying eks:CreateAccessEntry, eks:AssociateAccessPolicy,
+#    eks:CreatePodIdentityAssociation, or eks:UpdateClusterConfig -> emit the edge
+#    with state: BLOCKED and denied_by=<SCP arn/statement>.
+#  - IMDS hop-limit = 1 on all node groups -> aws-eks-node-imds-credential BLOCKED.
+#  - authenticationMode=API on the cluster -> aws-eks-authcm-write-cluster-admin BLOCKED.
+#  - Private-only cluster endpoint + no VPC foothold -> aws-eks-cluster-admin-exec-command
+#    CONDITIONAL(network_reachability).
+#  - Pod Identity agent DaemonSet not installed -> aws-eks-pod-identity-association
+#    CONDITIONAL(service_state).
+#  - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------
+
+# EXPLICIT NORMALIZATION RULES CONSOLIDATED IN /rules/explicit/aws-eks.yaml
+# Derived rules above (rules:) consume ExecutesAs, TrustsExternalIdentity,
+# ExternalIdentityMapsTo, ContainsResourceReference, and CanModifyCode facts
+# produced by the explicit file. Do not duplicate rules here.

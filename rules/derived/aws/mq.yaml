@@ -1,0 +1,291 @@
+# AWS Amazon MQ — Derived attack-path rules (Phase 10 — messaging)
+# ---------------------------------------------------------------------------
+# Amazon MQ is a managed broker service running Apache ActiveMQ or RabbitMQ.
+# It is a Phase-10 event source: a queue/topic on the broker is bound to a
+# Lambda function via a Lambda event-source-mapping (ESM). Whoever can publish
+# to the broker queue triggers the Lambda consumer, which runs as its own
+# execution role.
+#
+# THE CRITICAL IAM/BROKER-AUTH SPLIT — governs every rule in this file:
+#   * mq:* actions control the CONTROL PLANE (broker lifecycle, user records,
+#     configuration). IAM authenticates control-plane API calls only.
+#   * Wire-protocol data-plane access (AMQP, OpenWire, STOMP, MQTT) uses
+#     BROKER-NATIVE CREDENTIALS (username/password) — NOT IAM.
+#   * Amazon MQ does NOT support resource-based policies; no cross-account
+#     grant surface exists on brokers.
+#   * Lambda ESM for Amazon MQ is SAME-ACCOUNT ONLY (AWS restriction).
+#
+# PHASE-10 PATTERN FOR MQ:
+#   The escalation chain is two-stage:
+#     Stage 1 (IAM-observable): create/reset/read broker credential via IAM
+#       (mq:CreateUser / mq:UpdateUser / secretsmanager:GetSecretValue on the
+#       Secrets Manager secret holding the broker password).
+#     Stage 2 (data-plane, CONDITIONAL on network reachability): publish a
+#       message to the bound queue using the obtained credential -> triggers
+#       the Lambda ESM consumer -> Lambda executes as its execution role ->
+#       CanExecuteAs(principal -> Lambda execution role) via messaging-chains
+#       rules 1-2. CONDITIONAL(network_reachability) because the broker is
+#       typically VPC-private; a public broker downgrades this gate.
+#
+# LINCHPINS CITED (DO NOT DUPLICATE):
+#   messaging-chains.yaml — rules 1 and 2 collapse the CanWriteData(principal,
+#     broker) + CanTrigger(broker, Lambda) + ExecutesAs(Lambda, role) chain into
+#     CanExecuteAs. This file emits ONLY the derived service facts:
+#       ExposesCredential(broker -> broker_credential)  [rule A — derived]
+#       (CanModifyConfiguration edges are emitted by /rules/explicit/aws-mq.yaml)
+#       (CanTrigger edges are emitted by /rules/explicit/aws-mq.yaml)
+#       ExposedToInternet(broker -> AnonymousIdentity) [rule C — derived]
+#     and lets messaging-chains + credential-chains roll them up.
+#   credential-chains.yaml — rule 1 (read-secret-yields-identity) owns the
+#     CanReadSecret(principal, secret) + CredentialsFor(secret, identity) =>
+#     CanImpersonate collapse. Broker credentials do NOT yield IAM impersonation
+#     (broker users are not IAM identities); we do NOT emit that chain. The
+#     data-plane publish step is modeled as CanWriteData(principal, broker) —
+#     emitted by the explicit normalization rule below — which messaging-chains
+#     rule 1 picks up via the CanTrigger(broker, Lambda) binding.
+#
+# CONSERVATIVE DESIGN:
+#   * All trigger-based paths are CONDITIONAL(network_reachability) for private
+#     brokers (VPC-only) because the attacker must also have network access to
+#     the wire endpoint to actually publish.
+#   * Broker credentials are not IAM identities; the escalation target is the
+#     Lambda execution role, not the broker user.
+#   * No CrossAccountTrust edges — Amazon MQ has no resource-based policy and
+#     ESM is same-account only.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 10-messaging
+applies_to: [aws]
+
+rules:
+
+  # --- A) Broker exposes its user credentials (wire-protocol) ----------------
+  # An Amazon MQ broker maintains user records (username + password) that
+  # authenticate at the wire-protocol level (AMQP, OpenWire, etc.). These are
+  # broker-native credentials — not IAM identities — but they are secret material
+  # that grants data-plane access to the broker. The broker therefore "exposes" its
+  # user credentials via the Credential node representing each broker user. The
+  # CredentialsFor link from broker user credential to the broker user identity
+  # documents that the credential authenticates to the data plane.
+  #
+  # Note: DescribeUser does NOT return passwords. The credential is observable via
+  # Secrets Manager (the standard storage pattern). The broker "exposes" the
+  # credential in the sense that the broker's existence implies a password was set
+  # at CreateBroker / CreateUser time and is stored somewhere the application can
+  # read it. ExposesCredential(broker -> Credential) = the broker is the source
+  # of the credential material; credential-chains owns the read escalation.
+  - id: aws-mq-broker-exposes-credential
+    emits: ExposesCredential
+    description: "An Amazon MQ broker exposes the wire-protocol credentials of its broker users; these are modeled as Credential nodes and grant data-plane publish/consume access."
+    match:
+      - [ ?broker_user_cred, CredentialsFor, ?broker_user_identity ]
+    where:
+      - "node_type(?broker_user_cred) == Credential"
+      # The credential is documented as authenticating a broker user (a service identity, not IAM)
+      - "node_type(?broker_user_identity) == ServiceIdentity"
+      # Broker user identities are scoped to a specific broker (confirmed via native_id or provider_raw)
+      - "?broker_user_identity.properties.broker_arn exists"
+    optional:
+      # ESM binding indicates the broker is actively used; strengthens confidence
+      - [ ?broker, CanTrigger, ?consumer ]
+    emit:
+      source_type: Messaging
+      target_type: Credential
+      source: "<broker GenericMessaging node from ?broker_user_identity.properties.broker_arn>"
+      target: ?broker_user_cred
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the broker user credential is documented (CredentialsFor edge
+        exists and broker is confirmed via the user identity's broker_arn property).
+        The broker maintains user credentials in its data store regardless of whether
+        they are also in Secrets Manager or whether an ESM binding exists.
+      confidence: "if matched(optional[0]): 0.9 else: 0.8"
+      derived_from: [ "?broker_user_cred CredentialsFor ?broker_user_identity (broker user identity)" ]
+      false_positive_note: >-
+        Broker user credentials are NOT IAM identities — they grant wire-protocol
+        data-plane access only. Reading them does not directly yield IAM privilege;
+        escalation requires also publishing to the broker (network reachable) to
+        trigger a Lambda consumer and inherit the Lambda execution role. Do not
+        conflate broker credential read with IAM role assumption. The ExposesCredential
+        fact feeds credential-chains (read-secret-yields-identity rule) when the
+        credential is read from Secrets Manager, but the credential target must be
+        the Credential node, not the broker directly. A standalone broker with no
+        ESM binding still exposes credentials to any network-reachable attacker;
+        the confidence is slightly lower (0.8) when ESM is absent, reflecting
+        reduced observability but not reducing the actual exposure.
+      narrative: >-
+        {broker.name} (Amazon MQ broker) maintains wire-protocol user credentials
+        for data-plane access. {broker_user_cred.name} is the credential for
+        {broker_user_identity.name}; any principal that can read it can authenticate
+        to the broker data plane and publish messages (if network reachable).
+
+  # --- B) Broker configuration changes yield control via messaging chains -----
+  # Derived rule: when a principal can modify broker configuration (via
+  # mq:UpdateUser, mq:UpdateBroker, or mq:UpdateConfiguration — see explicit
+  # rules), they can potentially change wire-protocol credentials or network
+  # accessibility. The escalation path is:
+  #   CanModifyConfiguration(principal -> broker) [mq:UpdateUser sets known password]
+  #   + network access to broker wire endpoint
+  #   + CanTrigger(broker -> Lambda) [ESM binding exists]
+  #   + ExecutesAs(Lambda -> exec_role)
+  #   => messaging-chains rules 1+2: CanExecuteAs(principal -> exec_role)
+  #      CONDITIONAL(network_reachability, trigger_exists)
+  #
+  # The CanModifyConfiguration edges are emitted by the explicit rules;
+  # messaging-chains.yaml handles the derivation collapse.
+
+  # --- C) Amazon MQ broker publicly accessible → internet exposure -----------
+  # A broker created or updated with PubliclyAccessible: true is reachable from
+  # the internet over its wire-protocol ports (behind an NLB). The broker endpoint
+  # is publicly resolvable; wire-protocol connections can be made from any internet
+  # host (subject to security group rules). Authentication at the wire level still
+  # requires broker credentials, but public exposure is the first gate: no VPN or
+  # VPC presence needed to reach the endpoint. This is an ExposedToInternet fact
+  # on the broker (Messaging node).
+  #
+  # Consequence for attacker: if broker credentials are obtained (via
+  # CanReadSecret on the Secrets Manager secret, or leaked via application logs),
+  # any internet host can publish to the broker and trigger Lambda ESM consumers
+  # WITHOUT needing VPC access. This removes the network_reachability CONDITIONAL
+  # gate from the messaging-chains trigger path.
+  - id: aws-mq-publicly-accessible
+    emits: ExposedToInternet
+    description: "An Amazon MQ broker with PubliclyAccessible=true is reachable from the internet over wire-protocol ports; obtaining broker credentials is sufficient to publish messages and trigger bound Lambda consumers."
+    match:
+      - [ ?broker, CanTrigger, ?consumer ]
+    where:
+      - "node_type(?broker) == GenericMessaging"
+      - "?broker.provider_type == 'AWS::AmazonMQ::Broker'"
+      - "?broker.properties.PubliclyAccessible == true"
+    emit:
+      source_type: Messaging
+      target_type: AnonymousIdentity
+      source: ?broker
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when mq:DescribeBroker returns PubliclyAccessible=true AND the
+        security group attached to the broker allows inbound traffic on the relevant
+        wire-protocol port(s) from 0.0.0.0/0 (or a broad CIDR). CONDITIONAL(network_
+        reachability) when security group rules restrict the inbound source range
+        even though the broker has a public endpoint — broad internet exposure is
+        not confirmed until security group evaluation. Broker authentication (wire-
+        level username/password) is still required; this edge captures public
+        reachability, not unauthenticated access.
+      confidence: 0.85
+      derived_from: [ "mq:DescribeBroker -> PubliclyAccessible=true" ]
+      false_positive_note: >-
+        PubliclyAccessible=true creates a publicly resolvable NLB endpoint, but
+        security groups can still restrict which source IPs can reach the wire
+        ports. Evaluate the security group inbound rules before setting state to
+        ACTIVE: a public endpoint with a security group allowing only a known CIDR
+        is CONDITIONAL(network_reachability). The broker still requires wire-level
+        authentication (username/password); this edge does not imply unauthenticated
+        access. Do not emit ExposedToInternet with target=AnonymousIdentity if the
+        security group denies inbound traffic from public internet sources on all
+        wire-protocol ports.
+      narrative: >-
+        {broker.name} is deployed with PubliclyAccessible=true and a public NLB
+        endpoint; any internet host that obtains broker credentials can connect
+        over wire protocols (ActiveMQ ports: 61616/5671/8883/61614; RabbitMQ: 5671)
+        and publish messages to trigger bound Lambda consumers.
+
+  # --- D) CanReadSecret on MQ credential secret => CanWriteData to broker ----
+  # The Lambda ESM for Amazon MQ stores broker credentials in Secrets Manager
+  # (SourceAccessConfigurations with type BASIC_AUTH). An IAM principal with
+  # secretsmanager:GetSecretValue on that secret obtains the broker username and
+  # password. With network access to the broker endpoint, this yields the ability
+  # to PUBLISH messages to the broker queue — modeled as CanWriteData on the
+  # broker. messaging-chains rule 1 then collapses CanWriteData(principal, broker)
+  # + CanTrigger(broker, Lambda) => CanTrigger(principal, Lambda).
+  #
+  # This rule bridges the IAM-observable credential read to the messaging-chains
+  # service-fact vocabulary. It is CONDITIONAL on network_reachability because
+  # VPC-private brokers require a network foothold to reach the wire endpoint.
+  - id: aws-mq-credential-read-yields-publish
+    emits: CanWriteData
+    description: "Reading the Secrets Manager secret that holds Amazon MQ broker credentials gives the principal the ability to publish to the broker queue (CONDITIONAL on network reachability to the broker endpoint), which messaging-chains then rolls up to CanTrigger on the Lambda consumer."
+    match:
+      - [ ?principal, CanReadSecret, ?secret ]
+      - [ ?secret,    CredentialsFor, ?broker ]
+    where:
+      - "node_type(?secret) == Secret"
+      - "node_type(?broker) == GenericMessaging"
+      - "?broker.provider_type == 'AWS::AmazonMQ::Broker'"
+      # The secret is the Secrets Manager secret referenced by the Lambda ESM
+      # SourceAccessConfigurations entry for this broker (type BASIC_AUTH).
+      - "secret_is_mq_credential_for(?secret, ?broker)"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: ?principal
+      target: ?broker
+      permissions: ["secretsmanager:GetSecretValue"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability) when the broker is VPC-private
+        (PubliclyAccessible=false) — the principal must also have network
+        reachability to the broker wire endpoint. ACTIVE when the broker is
+        publicly accessible (PubliclyAccessible=true) AND the CanReadSecret is
+        ACTIVE (no key_permission gate outstanding). Never stronger than the
+        contributing CanReadSecret state (a KMS-gated secret read stays
+        CONDITIONAL(key_permission) until CanDecrypt is confirmed). A security
+        group that blocks all inbound on wire-protocol ports downgrades to
+        CONDITIONAL or BLOCKED even for public brokers.
+      confidence: 0.8
+      derived_from: [ "?principal CanReadSecret ?secret", "?secret CredentialsFor ?broker" ]
+      false_positive_note: >-
+        This rule bridges IAM credential read to messaging-chains' CanWriteData
+        vocabulary. The bridge is approximate: reading the credential does not
+        AUTOMATICALLY grant publish access — the attacker must also (a) reach the
+        broker wire endpoint (network_reachability gate) and (b) use the credential
+        at the wire level (data-plane action, not IAM-observable). The rule is
+        intentionally CONDITIONAL(network_reachability) to avoid over-claiming active
+        publish capability from a VPC-private broker. The escalation value comes
+        from messaging-chains rule 1 (CanWriteData + CanTrigger) and rule 2
+        (CanTrigger + ExecutesAs -> CanExecuteAs) — do not re-derive those here.
+        Honor the CanReadSecret gate: if the secret is KMS-encrypted and the
+        principal lacks CanDecrypt, the read is CONDITIONAL(key_permission) and
+        this CanWriteData inherits that state. Also: broker user credentials are
+        NOT IAM identities; this does not directly yield CanAssume/CanImpersonate.
+      narrative: >-
+        {principal.name} can read {secret.name} (secretsmanager:GetSecretValue),
+        which holds the wire-protocol credentials for {broker.name}; with network
+        access to the broker endpoint, {principal.name} can publish messages to
+        broker queues and trigger any bound Lambda consumer as its execution role.
+
+# ---------------------------------------------------------------------------
+# EXPLICIT RULES (in /rules/explicit/aws-mq.yaml):
+#
+# These are the directly observable facts (from mq:* and lambda:* API responses)
+# that feed the derived rules above. They are collector normalization steps,
+# not derived attack paths.
+#
+# Rules emitted:
+#   - aws-mq-update-user-can-modify-config: mq:UpdateUser -> CanModifyConfiguration
+#   - aws-mq-update-broker-modifies-config: mq:UpdateBroker -> CanModifyConfiguration
+#   - aws-mq-update-configuration-modifies-config: mq:UpdateConfiguration -> CanModifyConfiguration
+#   - aws-mq-esm-trigger-to-lambda: Lambda ESM for MQ -> CanTrigger
+#   - aws-mq-credential-secret-basic-auth: Secrets Manager secret from ESM -> CredentialsFor
+#   (PubliclyAccessible property is normalization: stored on broker node, not an explicit edge)
+#
+# See /rules/explicit/aws-mq.yaml for full details.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP or permission boundary denying mq:UpdateUser -> explicit rule
+#    CanModifyConfiguration BLOCKED.
+#  - A security group blocking all inbound on wire-protocol ports -> rule C
+#    ExposedToInternet CONDITIONAL or BLOCKED even with PubliclyAccessible=true.
+#  - A KMS customer-managed key on the Secrets Manager secret requiring CanDecrypt
+#    -> rule D CanWriteData CONDITIONAL(key_permission) until CanDecrypt is confirmed
+#    (credential-chains decrypt-gates-secret-read upgrades the CanReadSecret first).
+#  - Amazon MQ does not support resource-based policies -> no CrossAccountTrust
+#    edges for MQ brokers; do not emit.
+#  - Lambda ESM for MQ is same-account only -> do not emit cross-account CanTrigger
+#    via MQ ESM.
+# ---------------------------------------------------------------------------

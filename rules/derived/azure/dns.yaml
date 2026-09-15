@@ -1,0 +1,357 @@
+# Azure DNS / Private DNS — Derived attack-path rules (Phase 8 networking)
+# ---------------------------------------------------------------------------
+# Covers: Microsoft.Network/dnsZones (Azure DNS, public) and
+#         Microsoft.Network/privateDnsZones (Azure Private DNS, internal).
+#
+# Attack surface summary:
+#   (1) EXPOSURE — dangling CNAME / alias record pointing to a deprovisioned
+#       Azure resource -> ExposedToInternet (subdomain takeover).
+#   (2) WEAKEN CONTROLS — write access to DNS record sets (public or private)
+#       -> CanModifyConfiguration on the zone (enables hijack / redirect).
+#       NS record write -> zone delegation hijack (higher blast radius).
+#       Private DNS VNet link write -> extends resolution scope.
+#   (3) ADMINISTRATIVE CONTROL — DNS Zone Contributor / Private DNS Zone
+#       Contributor -> CanAdminister -> Controls (via can-control.yaml, cited).
+#
+# Permissions are verified against the Azure resource-provider operations
+# reference (Microsoft.Network), 2026-09 snapshot. Exact action strings used.
+#
+# Transitive end-to-end network reachability (DNS record redirect composing
+# into CanNetworkReach / session-hijack path) is the FUTURE network-chains
+# linchpin. Do NOT derive it here. Emit per-service FACTS only.
+#
+# can-control.yaml is CITED, not duplicated: CanAdminister -> Controls
+# derivations are handled there and apply equally to DNS zone objects.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 8-networking
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # SECTION 1 — EXPOSURE: dangling CNAME / alias record -> subdomain takeover
+  # ===========================================================================
+
+  - id: azure-dns-dangling-cname-takeover
+    emits: ExposedToInternet
+    description: >-
+      A CNAME or A/AAAA alias DNS record in a public Azure DNS zone pointing to a deprovisioned
+      Azure resource enables subdomain takeover: an external attacker can claim that resource
+      name and inherit DNS resolution for the dangling hostname.
+    where:
+      - "DNS zone is a public zone (Microsoft.Network/dnsZones), NOT a private zone"
+      - "Record type is CNAME, or an A/AAAA record where properties.targetResource.id is set (ARM resource alias)"
+      - "The CNAME value or alias target resolves to an Azure-managed FQDN suffix whose backing resource no longer exists in ARM inventory across all collected subscriptions"
+      - "Target FQDN suffix is from a known-claimable Azure service: *.blob.core.windows.net, *.azurewebsites.net, *.azurefd.net, *.azureedge.net, *.trafficmanager.net, *.azurestaticapps.net, *.azure-api.net, *.cloudapp.azure.com, *.servicebus.windows.net, *.azurecontainer.io, *.azurecr.io (partial list — verify per Microsoft guidance)"
+    emit:
+      source_type: DNS
+      target_type: AnonymousIdentity
+      source: "<public DNS zone containing the dangling record>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      state_logic: >-
+        ACTIVE when: (1) the CNAME value or alias target maps to a known-claimable Azure
+        FQDN suffix AND (2) the backing Azure resource does not exist in collected ARM
+        inventory (resource type + name + subscription confirmed absent).
+        POTENTIAL when the backing resource's subscription is not in collection scope
+        (absence may be a collection gap rather than true deprovisioning).
+        Do not emit ACTIVE for private DNS zones (privateDnsZones) — private zone CNAMEs
+        are not internet-resolvable and do not yield external takeover.
+      derived_from:
+        - "<DNS record set ARM record (zone + record type + CNAME value / alias target)>"
+        - "<ARM inventory cross-reference: target resource not found>"
+      false_positive_note: >-
+        Only emit for known-claimable Azure service FQDN suffixes. Azure public IP addresses
+        (*.eastus.cloudapp.azure.com) allocated to the subscription are NOT claimable externally
+        if they still exist in ARM — confirm the IP resource is absent from the subscription.
+        Internal or on-premises FQDNs (non-Azure suffixes) pointed to by the CNAME are outside
+        Azure's claimable surface and may still be under the organization's control; do not emit.
+        MX, NS, TXT dangling records do not directly enable subdomain takeover in the same way
+        as CNAME/A-alias; they may enable email-spoofing paths but are handled separately.
+        Verify the target resource is genuinely absent — not merely in a subscription outside the
+        collection scope. Downgrade to POTENTIAL whenever collection coverage is incomplete.
+      narrative: >-
+        DNS record {record.name}.{zone.name} is a dangling CNAME pointing to
+        {record.cname_value}, which resolves to a deprovisioned Azure resource. An external
+        party can claim that resource and inherit public DNS resolution for this hostname,
+        enabling subdomain takeover (content injection, cookie theft, OAuth redirect abuse).
+
+  # ===========================================================================
+  # SECTION 2 — WEAKEN CONTROLS: write access to public DNS record sets
+  # ===========================================================================
+
+  - id: azure-dns-record-write-public
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to record sets in a public Azure DNS zone (any record type via wildcard
+      or specific-type write) lets an attacker create or overwrite A, CNAME, MX, or other
+      records, redirecting hostnames under the zone to attacker-controlled infrastructure.
+    match_effective_permission:
+      action: "Microsoft.Network/dnsZones/*/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "effective permission covers Microsoft.Network/dnsZones/*/write OR at least one specific record-type write (A/write, CNAME/write, MX/write, TXT/write, etc.)"
+      - "target is a public DNS zone (Microsoft.Network/dnsZones)"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal>"
+      target: "<public DNS zone>"
+      permissions:
+        - "Microsoft.Network/dnsZones/*/write"
+        - "Microsoft.Network/dnsZones/A/write"
+        - "Microsoft.Network/dnsZones/CNAME/write"
+        - "Microsoft.Network/dnsZones/MX/write"
+        - "Microsoft.Network/dnsZones/TXT/write"
+      state_logic: >-
+        ACTIVE: the principal can write record sets immediately; no secondary precondition
+        required for the capability itself. The effect (redirect, impersonation) is realized
+        when the attacker creates or overwrites a record. A deny assignment covering the
+        relevant write action at the zone or parent scope -> BLOCKED.
+      derived_from:
+        - "<effective RBAC record: dnsZones/*/write or record-type write on the zone>"
+      false_positive_note: >-
+        Scope matters: DNS Zone Contributor scoped to a single zone does not grant write on
+        sibling zones or the parent zone. Always resolve the effective permission at the
+        actual zone resource ID. A principal with only dnsZones/read or dnsZones/*/read
+        has no write capability. NS and SOA write may be bundled or excluded depending on
+        the built-in role; DNS Zone Contributor explicitly includes dnsZones/NS/write and
+        dnsZones/SOA/write. If only a specific record type is writable (e.g., A/write only),
+        annotate the permissions list accordingly rather than emitting with the wildcard.
+      narrative: >-
+        {principal.name} can write DNS record sets in public zone {target.name}
+        (Microsoft.Network/dnsZones/*/write), enabling them to redirect any hostname in
+        the zone to attacker-controlled infrastructure — phishing, session hijack, TLS cert
+        acquisition via DNS-01 ACME challenge, or OAuth redirect abuse.
+
+  - id: azure-dns-ns-write-public
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to NS records in a public DNS zone lets an attacker replace the
+      name-server delegation for the zone (or a sub-zone), routing all subsequent DNS
+      queries through attacker-controlled authoritative nameservers — a higher-blast-radius
+      attack than single-record modification.
+    match_effective_permission:
+      action: "Microsoft.Network/dnsZones/NS/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "effective permission covers Microsoft.Network/dnsZones/NS/write (included in dnsZones/*/write and DNS Zone Contributor)"
+      - "target is a public DNS zone (Microsoft.Network/dnsZones)"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal>"
+      target: "<public DNS zone>"
+      permissions:
+        - "Microsoft.Network/dnsZones/NS/write"
+      state_logic: >-
+        ACTIVE: the attacker can overwrite NS records at the zone immediately. Full takeover
+        requires the parent registrar / delegating zone to also honor the new NS values; within
+        Azure DNS, NS records in child zones can be modified to point outside Azure's nameservers.
+        CONDITIONAL(network_reachability) if the parent zone's delegation cannot be confirmed
+        updated (registrar-level step is outside ARM); emit as ACTIVE for the in-zone write
+        capability and note the registrar dependency in the narrative.
+      derived_from:
+        - "<effective RBAC record: dnsZones/NS/write on the zone>"
+      false_positive_note: >-
+        Overwriting Azure DNS NS records changes what Azure DNS stores, but the authoritative
+        delegation at the parent registrar / parent DNS zone is a separate control plane.
+        For a fully attacker-controlled zone, the attacker would also need to update the
+        registrar delegation (outside ARM scope). However, overwriting a delegated sub-zone's
+        NS record within Azure DNS IS immediately effective for any resolver that queries
+        that sub-zone's NS from Azure's servers. Note TTL caching. Do not conflate this with
+        a full internet-wide hijack unless the parent delegation is also confirmed changeable.
+      narrative: >-
+        {principal.name} can write NS records in public DNS zone {target.name}
+        (Microsoft.Network/dnsZones/NS/write), enabling delegation of the zone (or sub-zone)
+        to attacker-controlled nameservers — all resolution for names in that zone will follow
+        the attacker's authoritative server once TTL expires.
+
+  # ===========================================================================
+  # SECTION 3 — WEAKEN CONTROLS: write access to private DNS record sets
+  # ===========================================================================
+
+  - id: azure-dns-private-record-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to record sets in a private Azure DNS zone (any record type) lets an
+      attacker create or overwrite internal hostname records, redirecting resolution for
+      internal service FQDNs (including private endpoint hostnames) to attacker-controlled
+      private IPs within the VNet — enabling internal MitM or service impersonation.
+    match_effective_permission:
+      action: "Microsoft.Network/privateDnsZones/*/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "effective permission covers Microsoft.Network/privateDnsZones/*/write OR at least one specific record-type write"
+      - "target is a private DNS zone (Microsoft.Network/privateDnsZones)"
+      - "the private zone has at least one active virtualNetworkLink with properties.provisioningState == 'Succeeded'"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal>"
+      target: "<private DNS zone>"
+      permissions:
+        - "Microsoft.Network/privateDnsZones/*/write"
+        - "Microsoft.Network/privateDnsZones/A/write"
+        - "Microsoft.Network/privateDnsZones/CNAME/write"
+      state_logic: >-
+        ACTIVE when the private zone has at least one active VNet link with properties.provisioningState == 'Succeeded' —
+        the record write immediately affects name resolution within linked VNets. Resolution is enabled for every
+        successfully-provisioned link; registrationEnabled is a refinement flag (auto-registration of VM records)
+        not a gate on resolution. CONDITIONAL(network_reachability) if no active VNet link is confirmed (the zone
+        exists but is not yet linked to any VNet, so no workload is currently affected).
+        A deny assignment covering privateDnsZones/*/write -> BLOCKED.
+      derived_from:
+        - "<effective RBAC record: privateDnsZones/*/write on the zone>"
+        - "<virtualNetworkLinks ARM record with properties.provisioningState == 'Succeeded'>"
+      false_positive_note: >-
+        A private DNS zone with no VNet links has zero operational impact; do not emit ACTIVE.
+        Only emit ACTIVE when at least one virtualNetworkLink exists with properties.provisioningState == 'Succeeded'.
+        registrationEnabled is a refinement flag (controls auto-registration of VM records) not a gate on resolution;
+        do not use it as the primary condition. Private zone records are NOT internet-resolvable; this edge
+        models internal redirection, not internet exposure. The attacker requires a foothold inside the VNet or
+        a peered VNet to exploit the redirect — combine with compute LocatedIn edges for full path analysis.
+        Scope: Private DNS Zone Contributor scoped to one zone does not affect sibling private zones.
+      narrative: >-
+        {principal.name} can write DNS record sets in private zone {target.name}
+        (Microsoft.Network/privateDnsZones/*/write). The zone is linked to {link_count}
+        VNet(s). Overwriting A or CNAME records redirects internal FQDN resolution (including
+        private endpoint hostnames) to attacker-controlled IPs within those VNets, enabling
+        internal traffic interception or service impersonation.
+
+  - id: azure-dns-private-vnet-link-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to VNet links on a private DNS zone lets an attacker add new VNet links,
+      extending the zone's resolution scope to additional VNets — including VNets in other
+      subscriptions within the same tenant — expanding the blast radius of any private DNS
+      record modification.
+    match_effective_permission:
+      action: "Microsoft.Network/privateDnsZones/virtualNetworkLinks/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "effective permission covers Microsoft.Network/privateDnsZones/virtualNetworkLinks/write"
+      - "target is a private DNS zone"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal>"
+      target: "<private DNS zone>"
+      permissions:
+        - "Microsoft.Network/privateDnsZones/virtualNetworkLinks/write"
+      state_logic: >-
+        ACTIVE: the principal can add or modify VNet links immediately. Adding a link to a
+        new VNet extends the zone's resolution scope to workloads in that VNet on the next
+        DNS query refresh (TTL-dependent for existing cached records). Cross-subscription VNet
+        links require the principal to also have Microsoft.Network/virtualNetworks/join/action
+        or similar on the target VNet; CONDITIONAL(iam_permission) when that cross-subscription
+        grant is unconfirmed.
+      derived_from:
+        - "<effective RBAC record: privateDnsZones/virtualNetworkLinks/write on the zone>"
+      false_positive_note: >-
+        Adding a VNet link is only meaningful if the attacker can also write record sets in
+        the zone (privateDnsZones/*/write); without record write the link expansion alone does
+        not yield a new redirect. This edge captures the scope-expansion capability; full
+        exploitation chains through azure-dns-private-record-write. Cross-subscription VNet
+        linking additionally requires join rights on the target VNet (Microsoft.Network/
+        virtualNetworks/join/action). Deny assignments at the VNet scope may block the join.
+      narrative: >-
+        {principal.name} can add VNet links to private DNS zone {target.name}
+        (privateDnsZones/virtualNetworkLinks/write), extending the zone's resolution
+        scope to additional VNets (potentially cross-subscription) and amplifying the
+        impact of any record modification in the zone.
+
+  # ===========================================================================
+  # SECTION 4 — ADMINISTRATIVE CONTROL
+  # ===========================================================================
+
+  - id: azure-dns-public-zone-admin
+    emits: CanAdminister
+    description: >-
+      Full administrative control over a public Azure DNS zone (DNS Zone Contributor or
+      equivalent): the principal can manage all record types, zone settings, and zone-level
+      RBAC delegation (where Owner scope is held).
+    match_effective_permission:
+      action: "Microsoft.Network/dnsZones/*"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds DNS Zone Contributor, Network Contributor, Contributor, or Owner; OR a custom role with Microsoft.Network/dnsZones/* at the zone or parent scope"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal>"
+      target: "<public DNS zone>"
+      permissions:
+        - "Microsoft.Network/dnsZones/write"
+        - "Microsoft.Network/dnsZones/*/write"
+      state_logic: >-
+        ACTIVE: the principal has full control of the zone and all its record sets immediately.
+        A deny assignment at the zone or parent scope -> BLOCKED.
+      derived_from:
+        - "<effective RBAC record: dnsZones/* or DNS Zone Contributor at zone scope>"
+      false_positive_note: >-
+        DNS Zone Contributor does NOT include Microsoft.Authorization/*/write; the principal
+        cannot self-assign roles on the zone. Owner does include authorization write. The
+        CanAdminister -> Controls derivation is handled by can-control.yaml (cited, not
+        duplicated here). DNS Zone Contributor applies only to public zones; it does not grant
+        privateDnsZones/* operations.
+      narrative: >-
+        {principal.name} has full administrative control of public DNS zone {target.name}
+        (Microsoft.Network/dnsZones/*), enabling creation, modification, and deletion of
+        all record sets. Combined with can-control.yaml, this yields Controls({target.name}).
+
+  - id: azure-dns-private-zone-admin
+    emits: CanAdminister
+    description: >-
+      Full administrative control over a private Azure DNS zone (Private DNS Zone Contributor
+      or equivalent): the principal can manage all record types, zone settings, and VNet links.
+    match_effective_permission:
+      action: "Microsoft.Network/privateDnsZones/*"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Private DNS Zone Contributor, Network Contributor, Contributor, or Owner; OR a custom role with Microsoft.Network/privateDnsZones/* at the zone or parent scope"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal>"
+      target: "<private DNS zone>"
+      permissions:
+        - "Microsoft.Network/privateDnsZones/write"
+        - "Microsoft.Network/privateDnsZones/*/write"
+        - "Microsoft.Network/privateDnsZones/virtualNetworkLinks/write"
+      state_logic: >-
+        ACTIVE: the principal has full control of the private zone, all its record sets, and
+        VNet links immediately. A deny assignment -> BLOCKED.
+      derived_from:
+        - "<effective RBAC record: privateDnsZones/* or Private DNS Zone Contributor at zone scope>"
+      false_positive_note: >-
+        Private DNS Zone Contributor does NOT include Microsoft.Authorization/*/write. It also
+        does NOT grant dnsZones/* (public zones). The CanAdminister -> Controls derivation is
+        handled by can-control.yaml (cited, not duplicated here). Operational impact requires
+        at least one active VNet link; CanAdminister is still emitted when no link exists
+        (the principal still has the capability), but downstream edges should note the
+        CONDITIONAL(service_state) dependency.
+      narrative: >-
+        {principal.name} has full administrative control of private DNS zone {target.name}
+        (Microsoft.Network/privateDnsZones/*), enabling management of all internal record sets
+        and VNet links. Combined with can-control.yaml, this yields Controls({target.name}).
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - Any Azure deny assignment covering the relevant write action at the DNS zone,
+#     resource group, or subscription scope -> emit the edge with state: BLOCKED and
+#     denied_by=<deny assignment id>.
+#   - Azure Policy (deny effect) blocking dnsZones/*/write or privateDnsZones/*/write
+#     -> BLOCKED.
+#   - DNS zone resource locks (ReadOnly or Delete lock) prevent write operations even
+#     for principals with sufficient RBAC — emit BLOCKED when a ReadOnly lock is
+#     confirmed on the zone resource.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (structural edges) are in:
+# /rules/explicit/azure-dns.yaml
+# (Extracted from this file to run in Phase 1-2, before derived rules.)
+# ---------------------------------------------------------------------------

@@ -1,0 +1,433 @@
+# GCP Identity-Aware Proxy (IAP) — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# IAP is Google Cloud's application-layer authentication proxy. It gates access
+# to App Engine, Cloud Run, Compute Engine (via Cloud Load Balancing), and GKE
+# services, and provides TCP tunneling for direct port-level access to private
+# GCE instances without a public IP.
+#
+# ATTACK SURFACE (three shapes):
+#   (1) TCP TUNNEL: iap.tunnelInstances.accessViaIAP -> CanNetworkReach(Identity
+#       -> VirtualMachine) on any TCP port (SSH/RDP/custom). Headline IAP attack
+#       path: reach a private VM from anywhere with no public IP or VPN required.
+#       CONDITIONAL(network_reachability): requires VPC firewall ingress rule
+#       allowing 35.235.240.0/20 on the target port (Google IAP IP range).
+#   (2) IAP WEB ACCESS: iap.webServiceVersions.accessViaIAP -> CanNetworkReach
+#       (Identity -> PublicEndpoint) to IAP-protected web apps (App Engine, Cloud Run,
+#       GKE, backend services). Mediated by Google authentication.
+#   (3) IAP POLICY ADMIN: iap.tunnel.setIamPolicy / iap.web.setIamPolicy / per-
+#       resource setIamPolicy -> CanModifyPolicy on the IAP resource (NOT emitted
+#       here, CITED from identity-escalation.yaml linchpin rule) -> attacker can
+#       grant themselves accessViaIAP on any protected resource.
+#   (4) DISABLE IAP GATE: compute.backendServices.update (with iap.enabled=false)
+#       -> CanModifyConfiguration on the backend service -> IAP auth removed ->
+#       direct internet/LB access to previously protected app.
+#
+# WHAT THESE RULES DO NOT EMIT:
+#   CanExecuteCommand  — TCP tunnel to port 22 reaches the SSH daemon but does not
+#                        imply OS-level login. SSH access additionally requires OS
+#                        Login (compute.instances.osLogin/osAdminLogin) or a metadata
+#                        SSH key. CanExecuteCommand is derived by gce.yaml using
+#                        those SSH-access primitives. This file emits CanNetworkReach
+#                        (the tunnel reach FACT) as the gate; gce.yaml closes the chain.
+#   CanExecuteAs       — Inherits from gce.yaml rule gcp-gce-execute-as-attached-sa;
+#                        CanNetworkReach + CanExecuteCommand + ExecutesAs => CanExecuteAs.
+#                        CITE can-control.yaml and gce.yaml; do not duplicate.
+#   ExposedToInternet  — IAP bypass (backend directly reachable, bypassing IAP auth)
+#                        is modeled as ExposedToInternet on the backend resource, not
+#                        an IAP edge. That edge requires confirming direct backend
+#                        access (public IP + firewall, run.app URL enabled, etc.) and
+#                        is emitted by the compute service rule (gce.yaml, cloudrun.yaml,
+#                        appengine.yaml), not here.
+#   CanNetworkReach (transitive) — end-to-end composed reachability (IAP tunnel +
+#                        route + peering -> final target) is the network-chains linchpin
+#                        reserved for a future provider-agnostic file. This file emits
+#                        the per-service FACT (IAP tunnel open to a VM) only.
+#
+# STATE MODEL:
+#   ACTIVE      — IAM binding confirmed AND VPC firewall allows 35.235.240.0/20 ingress.
+#   CONDITIONAL(network_reachability) — IAM binding confirmed, firewall rule NOT
+#                confirmed or absent. This is the default state for all IAP tunnel
+#                edges because the firewall rule is a second, independently-observed
+#                fact. Emit ACTIVE only when both the IAM binding AND the firewall
+#                rule are confirmed by the collector.
+#   POTENTIAL   — setIamPolicy held but the policy mutation hasn't been observed.
+#   BLOCKED     — IAM deny policy or org policy denies the relevant permission.
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE:
+#   gce.yaml    — gcp-gce-ssh-metadata / gcp-gce-os-login (CanExecuteCommand on VM
+#                 via SSH; requires separate SSH-access primitives beyond IAP tunnel)
+#               — gcp-gce-execute-as-attached-sa (CanExecuteAs the attached SA once
+#                 code runs on the instance)
+#               — gcp-gce-metadata-token (ExposesCredential for the SA token)
+#   can-control-gcp.yaml — enter-project-via-impersonation (CanEnterProject via SA)
+#   can-control.yaml     — terminal Controls / CanEscalateTo rollups
+#
+# PERMISSIONS — exact strings from the IAP IAM permissions reference:
+#   https://cloud.google.com/iap/docs/managing-access
+#   https://cloud.google.com/iam/docs/permissions-reference (filter: iap.)
+#
+# Network reachability edges are CONDITIONAL(network_reachability) by nature.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 8-networking
+service: iap
+applies_to: [gcp]
+
+rules:
+
+  # =========================================================================
+  # (1) TCP TUNNEL — reach private VMs without public IP
+  # =========================================================================
+
+  # --- IAP TCP tunnel: access a specific instance ---------------------------
+  - id: gcp-iap-tunnel-instance-access
+    emits: CanNetworkReach
+    description: >-
+      A principal with iap.tunnelInstances.accessViaIAP can open a TCP tunnel
+      through Google IAP to any port on the target GCE instance (SSH/22, RDP/3389,
+      or any custom TCP port) without the instance having a public IP. This provides
+      direct network-level reach to a private VM from any location with HTTPS access
+      to Google's infrastructure.
+    match:
+      - [ ?principal, HasPermission, ?instance ]
+    where:
+      - "node_type(?instance) == VirtualMachine"
+      - "effective_permission(?principal, ?instance) contains 'iap.tunnelInstances.accessViaIAP'"
+      - "?instance.provider == 'gcp'"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: ?principal
+      target: ?instance
+      permissions:
+        - "iap.tunnelInstances.accessViaIAP"
+        - "compute.instances.get"
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if effective_permission(?principal, ?instance) contains
+        'iap.tunnelInstances.accessViaIAP'
+        AND vpc_firewall_allows_ingress(?instance, '35.235.240.0/20', any_port):
+          ACTIVE
+        elif iam_permission present but firewall rule not confirmed:
+          CONDITIONAL(network_reachability)
+        elif iam_deny_policy or org_policy blocks iap.tunnelInstances.accessViaIAP:
+          BLOCKED
+        else:
+          CONDITIONAL(iam_permission, network_reachability)
+      confidence: 0.90
+      derived_from:
+        - "HasPermission(?principal, ?instance) [iap.tunnelInstances.accessViaIAP]"
+      false_positive_note: >-
+        Two independently confirmed facts are required for ACTIVE state:
+        (1) The IAM binding granting iap.tunnelInstances.accessViaIAP to ?principal
+            on ?instance (or at zone/project/folder/org level, which inherits down).
+        (2) A VPC firewall ingress rule permitting traffic from 35.235.240.0/20
+            (Google IAP TCP forwarding IP range) on the target port(s). Without this
+            firewall rule, the IAP tunnel is authenticated but the TCP connection is
+            dropped at the GCE firewall — downgrade to CONDITIONAL(network_reachability).
+        Additionally: iap.tunnelInstances.accessViaIAP alone yields CanNetworkReach
+        to the TCP port, NOT CanExecuteCommand. SSH/RDP login additionally requires
+        OS Login permission (compute.instances.osLogin / compute.instances.osAdminLogin)
+        or a metadata SSH key injected on the instance. Those paths are closed by
+        gce.yaml (gcp-gce-os-login, gcp-gce-set-metadata-ssh-keys). Do not conflate
+        TCP tunnel reachability with interactive code execution.
+        compute.instances.get and compute.instances.list are needed by the gcloud
+        wrapper but are recon permissions, not the authorization gate.
+      narrative: >-
+        {principal.name} holds iap.tunnelInstances.accessViaIAP on {instance.name}
+        and can open an IAP TCP tunnel to any port on this private instance
+        (gcloud compute start-iap-tunnel) without the instance needing a public IP.
+        If the VPC firewall allows ingress from 35.235.240.0/20 on the target port,
+        this provides direct network reach equivalent to being on the instance's VPC.
+
+  # --- IAP TCP tunnel via destination group (non-GCE, Cloud Run, on-prem) ---
+  - id: gcp-iap-tunnel-dest-group-access
+    emits: CanNetworkReach
+    description: >-
+      A principal with iap.tunnelDestGroups.accessViaIAP can reach hosts in a
+      TunnelDestGroup via IAP TCP forwarding. DestGroups enable IAP tunnels to
+      non-GCE endpoints (Cloud Run internal, on-prem hosts, or other private
+      services reachable within the VPC). This provides private-network reach to
+      those endpoints without a VPN.
+    match:
+      - [ ?principal, HasPermission, ?destgroup ]
+    where:
+      - "node_type(?destgroup) == PrivateEndpoint"
+      - "?destgroup.provider_type == 'iap.googleapis.com/TunnelDestGroup'"
+      - "effective_permission(?principal, ?destgroup) contains 'iap.tunnelDestGroups.accessViaIAP'"
+    emit:
+      source_type: Identity
+      target_type: PrivateEndpoint
+      source: ?principal
+      target: ?destgroup
+      permissions:
+        - "iap.tunnelDestGroups.accessViaIAP"
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if effective_permission(?principal, ?destgroup) contains
+        'iap.tunnelDestGroups.accessViaIAP'
+        AND network_path_exists_within_vpc(?destgroup):
+          ACTIVE
+        else:
+          CONDITIONAL(network_reachability)
+      confidence: 0.80
+      derived_from:
+        - "HasPermission(?principal, ?destgroup) [iap.tunnelDestGroups.accessViaIAP]"
+      false_positive_note: >-
+        TunnelDestGroups can include CIDR ranges or FQDNs reachable from the VPC.
+        Reachability to the actual target host within the destgroup depends on the
+        VPC-internal routing and firewall rules for those ranges — those are the
+        network-chains linchpin (future work). This rule emits the IAP-authorized
+        reach to the destgroup endpoint, not transitive reach inside the group's
+        CIDR range. Downgrade to CONDITIONAL(network_reachability) when VPC routing
+        to group members is not confirmed.
+      narrative: >-
+        {principal.name} holds iap.tunnelDestGroups.accessViaIAP on destination
+        group {destgroup.name} and can reach the hosts/CIDRs in that group via
+        IAP TCP forwarding — providing private-network access to those endpoints
+        from any location with HTTPS connectivity to Google.
+
+  # --- IAP web access: reach IAP-protected HTTPS application ----------------
+  - id: gcp-iap-web-access
+    emits: CanNetworkReach
+    description: >-
+      A principal with iap.webServiceVersions.accessViaIAP (or parent-level
+      iap.webTypes.accessViaIAP / iap.web.accessViaIAP) can reach an IAP-protected
+      web application (App Engine, Cloud Run, GKE Ingress, or backend service via
+      HTTPS LB) after authenticating through Google IAP. This provides network-level
+      reach to the backend application, though the backend's own authorization layer
+      may further gate access.
+    match:
+      - [ ?principal, HasPermission, ?web_resource ]
+    where:
+      - "node_type(?web_resource) == PublicEndpoint"
+      - "effective_permission(?principal, ?web_resource) intersects ['iap.webServiceVersions.accessViaIAP', 'iap.webServices.accessViaIAP', 'iap.webTypes.accessViaIAP', 'iap.web.accessViaIAP']"
+      - "?web_resource.provider == 'gcp'"
+    emit:
+      source_type: Identity
+      target_type: PublicEndpoint
+      source: ?principal
+      target: ?web_resource
+      permissions:
+        - "iap.webServiceVersions.accessViaIAP"
+        - "iap.webServices.accessViaIAP"
+        - "iap.webTypes.accessViaIAP"
+        - "iap.web.accessViaIAP"
+      conditions: [iam_permission]
+      state_logic: >-
+        if effective_permission(?principal, ?web_resource) intersects
+        ['iap.webServiceVersions.accessViaIAP', 'iap.webServices.accessViaIAP',
+         'iap.webTypes.accessViaIAP', 'iap.web.accessViaIAP']
+        AND NOT iam_deny_policy blocks access: ACTIVE
+        elif iam_deny_policy or org_policy blocks web access: BLOCKED
+        else: CONDITIONAL(iam_permission)
+      confidence: 0.85
+      derived_from:
+        - "HasPermission(?principal, ?web_resource) [iap.web*.accessViaIAP]"
+      false_positive_note: >-
+        IAP web access provides HTTPS-level reach to the protected application after
+        Google authentication. The backend application may have its own authorization
+        layer (Spring Security, Django, Kubernetes RBAC, etc.) that further gates
+        access — IAP access does not guarantee full application compromise. This rule
+        emits only the network reach FACT; additional code-execution or credential
+        read primitives on the backend are required for escalation. See cloudrun.yaml,
+        appengine.yaml, and gce.yaml for backend-specific execution paths.
+      narrative: >-
+        {principal.name} holds iap.webServiceVersions.accessViaIAP on {web_resource.name}
+        and can reach the IAP-protected web application after authenticating through
+        Google IAP. The backend application may have its own authorization layer that
+        further gates access.
+
+  # =========================================================================
+  # (2) IAP POLICY ADMINISTRATION — self-grant / broaden access
+  # =========================================================================
+  #
+  # NOTE: IAP policy mutation (setIamPolicy on iap.tunnel.* and iap.web.*
+  # permissions) is covered by the provider-agnostic identity-escalation.yaml
+  # linchpin rule gcp-set-iam-policy-resource (identity-escalation.yaml line 45)
+  # which emits CanModifyPolicy for ALL resource-level *.setIamPolicy permissions
+  # including iap.tunnel*.setIamPolicy and iap.web*.setIamPolicy. Do NOT duplicate
+  # that rule here. CanModifyPolicy correctly models IAM policy mutation as an
+  # AUTHORIZATION edge (relationship_kind), not EXECUTION (CanModifyConfiguration).
+  # Scope discipline applies: iap.tunnel.setIamPolicy (project-level) covers all
+  # tunnel resources; iap.tunnelInstances.setIamPolicy is instance-scoped, etc.
+
+
+  # =========================================================================
+  # (3) DISABLE IAP — remove authentication gate on backend
+  # =========================================================================
+
+  # --- Disable IAP on a Cloud Load Balancing backend service ----------------
+  - id: gcp-iap-disable-on-backend-service
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with compute.backendServices.update can set iap.enabled=false on
+      a backend service that currently has IAP enabled, disabling the authentication
+      gate. If the backend service is internet-facing (via an external HTTPS load
+      balancer), this immediately exposes the protected application to unauthenticated
+      internet access. This is a weaken-control primitive: IAP removal + internet-facing
+      LB = ExposedToInternet on the backend app.
+    match:
+      - [ ?principal, HasPermission, ?backend_service ]
+    where:
+      - "node_type(?backend_service) == LoadBalancer OR node_type(?backend_service) == PublicEndpoint"
+      - "effective_permission(?principal, ?backend_service) contains 'compute.backendServices.update'"
+      - "?backend_service.iap_enabled == true"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: ?principal
+      target: ?backend_service
+      permissions:
+        - "compute.backendServices.update"
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        if effective_permission(?principal, ?backend_service) contains
+        'compute.backendServices.update'
+        AND ?backend_service.iap_enabled == true
+        AND NOT iam_deny_policy blocks compute.backendServices.update: ACTIVE
+        elif iap_enabled state not confirmed by collector: CONDITIONAL(service_state)
+        else: POTENTIAL(iam_permission)
+      confidence: 0.85
+      derived_from:
+        - "HasPermission(?principal, ?backend_service) [compute.backendServices.update]"
+        - "?backend_service.iap_enabled == true (observed config)"
+      false_positive_note: >-
+        compute.backendServices.update is a broad permission — it is not IAP-specific.
+        The CanModifyConfiguration edge only has meaningful IAP-security impact when:
+        (1) ?backend_service currently has iap_enabled=true (confirm from collector data)
+        (2) The backend service is internet-accessible via an external HTTPS LB (scheme=EXTERNAL)
+        Without (1), there is no IAP to disable. Without (2), disabling IAP does not create
+        internet exposure (internal LB backends still require internal network access).
+        The resulting ExposedToInternet edge (if the LB is external) is NOT emitted here —
+        it is derived by the LB exposure rules (elb.yaml analog for GCP load balancing) once
+        IAP is confirmed disabled. This rule emits only the IAP-disabling capability itself.
+        Also: compute.backendServices.update is governed by the
+        iam.googleapis.com/constraints/compute.restrictCloudArmorConfig org policy which
+        may prevent IAP config changes in hardened environments.
+        NOTE: Companion rules for disabling IAP on Cloud Run (run.services.update with
+        iap_enabled=false) and App Engine (appengine.services.update with iap_enabled=false)
+        are documented in iap.md Section 6 but should be implemented as separate rules in
+        cloudrun.yaml and appengine.yaml respectively when those services model IAP state.
+      narrative: >-
+        {principal.name} holds compute.backendServices.update on {backend_service.name},
+        which currently has IAP enabled (iap.enabled=true). The principal can disable
+        IAP (set iap.enabled=false), removing the Google authentication gate. If this
+        backend service sits behind an external HTTPS load balancer, the application
+        becomes directly accessible without IAP authentication.
+
+# ---------------------------------------------------------------------------
+# EXPLICIT normalization rules — raw config -> explicit edges.
+# Kept co-located; conceptually live in rules/explicit/gcp-iap.yaml.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  # --- HasPermission: IAP tunnel access from IAM binding -------------------
+  - id: gcp-iap-has-permission-tunnel
+    emits: HasPermission
+    description: >-
+      Normalizes an IAP IAM binding granting iap.tunnelInstances.accessViaIAP
+      (or iap.tunnelDestGroups.accessViaIAP) into a HasPermission edge from the
+      grantee identity to the target instance or destination group.
+    applies_to: [gcp]
+    match_record:
+      resource_type: "iap.googleapis.com/TunnelInstance"
+      field: "iamPolicy.bindings[].members"
+    where:
+      - "role == 'roles/iap.tunnelResourceAccessor' OR permission includes 'iap.tunnelInstances.accessViaIAP'"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<grantee identity from binding.members>"
+      target: "<GCE instance referenced by TunnelInstance resource>"
+      permissions: ["iap.tunnelInstances.accessViaIAP"]
+      api_source: "iap.googleapis.com/v1/projects/{project}/iap_tunnel/zones/{zone}/instances/{instance}:getIamPolicy"
+      evidence_field: "iamPolicy.bindings[role=roles/iap.tunnelResourceAccessor].members"
+      narrative: >-
+        {identity.name} is bound to roles/iap.tunnelResourceAccessor (or equivalent
+        custom role) on {instance.name} via IAP IAM policy, granting IAP TCP tunnel
+        access to that instance.
+
+  # --- HasPermission: IAP web access from IAM binding ----------------------
+  - id: gcp-iap-has-permission-web
+    emits: HasPermission
+    description: >-
+      Normalizes an IAP IAM binding granting iap.webServiceVersions.accessViaIAP
+      (or parent-level iap.webTypes.accessViaIAP / iap.web.accessViaIAP) into a
+      HasPermission edge from the grantee to the IAP-protected web resource.
+    applies_to: [gcp]
+    match_record:
+      resource_type: "iap.googleapis.com/WebResource"
+      field: "iamPolicy.bindings[].members"
+    where:
+      - "role == 'roles/iap.httpsResourceAccessor' OR permission includes 'iap.webServiceVersions.accessViaIAP'"
+    emit:
+      source_type: Identity
+      target_type: PublicEndpoint
+      source: "<grantee identity from binding.members>"
+      target: "<IAP-protected web resource>"
+      permissions: ["iap.webServiceVersions.accessViaIAP"]
+      api_source: "iap.googleapis.com/v1/projects/{project}/iap_web/{resourceType}/services/{service}:getIamPolicy"
+      evidence_field: "iamPolicy.bindings[role=roles/iap.httpsResourceAccessor].members"
+      narrative: >-
+        {identity.name} is bound to roles/iap.httpsResourceAccessor (or equivalent)
+        on {resource.name}, granting IAP-authenticated HTTPS access to the protected
+        web application.
+
+  # --- IAP enabled fact on backend service ----------------------------------
+  - id: gcp-iap-enabled-backend-service
+    emits: CanModifyConfiguration
+    description: >-
+      Records that a backend service has IAP enabled (iap.enabled=true) as a
+      service configuration fact. This feeds the gcp-iap-disable-on-backend-service
+      rule and signals that the resource's internet exposure is mediated by IAP.
+      The explicit rule does not itself emit a capability; instead, it materializes
+      the iap.enabled boolean property on the BackendService node which gates the
+      gcp-iap-disable-on-backend-service derived rule (the where clause checks
+      ?backend_service.iap_enabled == true).
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/BackendService"
+      field: "iap.enabled"
+    where:
+      - "iap.enabled == true"
+    emit:
+      source_type: LoadBalancer
+      target_type: LoadBalancer
+      source: "<BackendService node>"
+      target: "<BackendService node (self-referential to mark config state)>"
+      permissions: []
+      api_source: "compute.googleapis.com/v1/projects/{project}/global/backendServices/{service}"
+      evidence_field: "iap.enabled"
+      node_properties:
+        iap_enabled: "true"
+      narrative: >-
+        Backend service {backend.name} has IAP enabled (iap.enabled=true); all
+        requests are authenticated via Google IAP before reaching the backend.
+        This configuration fact enables the gcp-iap-disable-on-backend-service
+        derived rule (which emits CanModifyConfiguration for principals holding
+        compute.backendServices.update).
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An IAM deny policy blocking iap.tunnelInstances.accessViaIAP at any scope
+#     above the instance -> emit CanNetworkReach with state: BLOCKED.
+#   - An org policy constraint disabling IAP (e.g. a VPC Service Controls perimeter
+#     blocking iap.googleapis.com API) -> emit with state: BLOCKED and
+#     denied_by=<perimeter/constraint>.
+#   - Absence of the 35.235.240.0/20 VPC firewall ingress rule -> emit
+#     CanNetworkReach as CONDITIONAL(network_reachability), not BLOCKED (the
+#     firewall rule could be added later; this is a missing precondition, not a deny).
+#   - compute.backendServices.update denied by IAM deny or org policy ->
+#     gcp-iap-disable-on-backend-service emits with state: BLOCKED.
+# ---------------------------------------------------------------------------
+
+# Cross-references:
+#   gce.yaml  — gcp-gce-os-login (CanExecuteCommand via OS Login after IAP tunnel)
+#             — gcp-gce-set-metadata-ssh-keys (metadata SSH key injection)
+#             — gcp-gce-execute-as-attached-sa (CanExecuteAs the instance SA)
+#             — gcp-gce-metadata-token (ExposesCredential for the SA token)
+#   cloudrun.yaml / appengine.yaml — ExposedToInternet on backend if IAP is bypassed
+#   can-control-gcp.yaml — enter-project-via-impersonation (cross-project via SA)
+#   can-control.yaml     — terminal Controls / CanEscalateTo rollups (CITE, not duplicated)

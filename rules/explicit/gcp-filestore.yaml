@@ -1,0 +1,109 @@
+# GCP Filestore — Explicit normalization rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:filestore. These rules run the explicit normalization step
+# to materialize HasPolicy, LocatedIn, and CanModifyConfiguration edges from
+# raw API responses and effective-permission evaluator output.
+# All rules here emit edges with nature: explicit.
+#
+# These rules feed the derived rules in /rules/derived/gcp/filestore.yaml by:
+# - Materializing the HasPolicy edge (for gcp-filestore-nfs-data-access match)
+# - Materializing LocatedIn edges (for network topology resolution)
+# - Normalizing file.instances.update effective permissions to CanModifyConfiguration
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 6-storage-databases
+service: filestore
+applies_to: [gcp]
+
+rules:
+
+  # --- NFS export options materialized as HasPolicy ----------------------
+  # The nfsExportOptions field of a Filestore instance is config data that governs
+  # NFS access control. Materialize it as a HasPolicy edge from the instance to
+  # a synthetic Policy/ResourcePolicy node. This feeds the match clause of
+  # gcp-filestore-nfs-data-access.
+  - id: gcp-filestore-explicit-nfs-export-options
+    emits: HasPolicy
+    applies_to: [gcp]
+    source_record:
+      api: "file.googleapis.com/v1/projects/{project}/locations/{location}/instances/{instance}"
+      field: "fileShares[].nfsExportOptions"
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<Filestore instance node>"
+      target: "<NFS export options / ResourcePolicy node>"
+      api_source: "file.instances.get"
+      evidence_field: "fileShares[].nfsExportOptions"
+      narrative: >-
+        {instance.name} has NFS export options governing which IP ranges can mount
+        the share and with what access mode.
+
+  # --- Filestore instance network attachment materialized as LocatedIn ----
+  # The networks[].network field identifies the VPC(s) the Filestore instance is
+  # attached to. Materialize as LocatedIn edges from the instance to the VirtualNetwork
+  # node. Used for VPC topology resolution and reachability qualification in derived rules.
+  - id: gcp-filestore-explicit-network-located-in
+    emits: LocatedIn
+    applies_to: [gcp]
+    source_record:
+      api: "file.googleapis.com/v1/projects/{project}/locations/{location}/instances/{instance}"
+      field: "networks[].network"
+    emit:
+      source_type: "*"
+      target_type: VirtualNetwork
+      source: "<Filestore instance node>"
+      target: "<VirtualNetwork node>"
+      api_source: "file.instances.get"
+      evidence_field: "networks[].network"
+      narrative: >-
+        {instance.name} is attached to VPC {network.name} at IP {instance.ip}.
+
+  # --- file.instances.update effective permission normalized to CanModifyConfiguration
+  # The explicit normalization of the IAM permission. file.instances.update lets a
+  # caller patch the nfsExportOptions export rules of a Filestore instance, adding
+  # an attacker-controlled CIDR to widen NFS access. This is the control-plane
+  # capability (the API call to googleapis.com); the downstream data-plane access
+  # (CanReadData/CanWriteData on mounted files) is CONDITIONAL on network reachability
+  # and is emitted by derived rules once the export rule is widened.
+  - id: gcp-filestore-export-rule-widen
+    emits: CanModifyConfiguration
+    description: >-
+      file.instances.update lets a caller patch the nfsExportOptions export rules
+      of a Filestore instance via the googleapis.com API, adding an attacker-controlled
+      IP range. This is a control-plane capability scoped to nfsExportOptions config.
+      Subsequent NFS mount access (CanReadData/CanWriteData) requires network reachability.
+    match_effective_permission:
+      action: "file.instances.update"
+      resource_type: "google.file.Instance"
+    emit:
+      source_type: Identity
+      target_type: FileStorage
+      source: "<principal>"
+      target: "<Filestore instance nfsExportOptions>"
+      permissions: ["file.instances.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when file.instances.update is held at the instance scope (via project-
+        or folder-level IAM binding). The control-plane API call (instances.patch) is
+        made to googleapis.com over HTTPS and is NOT gated by network_reachability to
+        the NFS port 2049. BLOCKED if an IAM deny policy or org policy denies
+        file.instances.update at the instance scope or any parent scope.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: []
+      false_positive_note: >-
+        file.instances.update is required and sufficient to patch nfsExportOptions.
+        This edge represents the control-plane mutation capability only. Downstream
+        NFS data-access (CanReadData/CanWriteData on mounted files) requires:
+        (a) the attacker to actually add their IP to the export rules,
+        (b) network reachability (VPC connectivity + no firewall block on TCP/UDP 2049).
+        Derived rules emit the data-plane edges after export rules are widened.
+        An org policy preventing export-rule changes will emit this edge as BLOCKED.
+        A VPC firewall blocking TCP/UDP 2049 blocks the data-plane, not this control-
+        plane edge. The access-mode written by the attacker (READ_WRITE vs READ_ONLY)
+        determines whether downstream CanWriteData also applies.
+      narrative: >-
+        {principal.name} holds file.instances.update on {instance.name} and can
+        modify the NFS export rules (instances.patch) to add an attacker-controlled
+        CIDR range, enabling subsequent NFS mount access if network reachability exists.

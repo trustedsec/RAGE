@@ -1,0 +1,662 @@
+# AWS VPC Lattice — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# VPC Lattice is a managed L7 application networking service that connects
+# microservices across VPCs and accounts. Its attack surface is dominated by:
+#
+#   (1) VPC ASSOCIATIONS: associating a VPC with a service network grants all
+#       clients in that VPC private reachability to every service in the
+#       network. Cross-account associations (on RAM-shared service networks)
+#       collapse the inter-account network boundary at L7.
+#
+#   (2) AUTH POLICY WEAKENING: setting authType NONE or a wildcard auth policy
+#       disables authorization checks, exposing services to any connected VPC
+#       client (or any authenticated principal in any account for cross-account
+#       shared networks).
+#
+#   (3) CROSS-ACCOUNT SHARING (AWS RAM): a service network, service, or
+#       resource configuration can be shared cross-account. A consumer account
+#       with vpc-lattice:CreateServiceNetworkVpcAssociation on a shared service
+#       network gains data-plane access to ALL owner-account services in that
+#       network (CONDITIONAL on auth policy allowing the caller).
+#
+#   (4) PRIVATE RESOURCE REACH: a resource configuration (RDS, IP, domain)
+#       associated with a service network is reachable via the resource gateway
+#       from any connected VPC — PrivateReachability to a backend resource.
+#
+# WHAT THESE RULES EMIT:
+#   - CanNetworkReach: VPC association creates private reach to service network
+#   - CrossAccountTrust: RAM-shared service network + cross-account VPC assoc
+#   - CanModifyConfiguration: weaken/disable auth enforcement
+#   - CanModifyPolicy: replace auth policy content
+#   - ExposedToAccount: authType NONE → any connected-VPC client can invoke
+#   - PrivateReachability: resource configuration reach from connected VPCs
+#
+# WHAT THESE RULES DO NOT EMIT:
+#   - ExposedToInternet: Lattice services have no public IP; they are NOT
+#     internet-exposed. Never emit ExposedToInternet for VPC Lattice services.
+#   - CanExecuteAs / ExecutesAs: Lattice does not host or run user code.
+#   - CanEnterAccount / CanEscalateTo: data-plane access to services in the
+#     owner account ≠ IAM control-plane access. Do NOT emit CanEnterAccount.
+#
+# NETWORK REACHABILITY IS CONDITIONAL by nature (Phase 8 theme). Every
+# CanNetworkReach and PrivateReachability edge is CONDITIONAL(network_reachability)
+# because security groups on the VPC association and on target resources further
+# gate L4 access. Emit the FACTS; the network-chains linchpin (future) composes
+# end-to-end paths.
+#
+# LINCHPINS CITED (NOT DUPLICATED):
+#   * rules/derived/can-control.yaml — control-via-admin: if a principal can
+#     CanAdminister the service network, can-control.yaml rolls that up to
+#     Controls(principal, service_network). Auth policy weakening is a
+#     CanModifyConfiguration fact; the escalation chain is derived elsewhere.
+#   * No CanExecuteAs chain exists for VPC Lattice (no execution identity).
+#
+# PERMISSIONS grounding: AWS Service Authorization Reference
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonvpclattice.html
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonvpclatticeservices.html
+#
+# NODE CLASS CONFORMANCE (schema/nodes.yaml + schema/edges.yaml):
+#   ServiceNetwork   -> generic_type GenericNetwork  (class Network)
+#   Service (Lattice)-> generic_type APIGateway      (class Messaging)
+#   Auth policy      -> generic_type ResourcePolicy  (class Policy)
+#   ResourceConfig   -> generic_type GenericNetwork  (class Network)
+#   PrivateEndpoint  -> generic_type PrivateEndpoint (class Network)
+#   VirtualNetwork   -> generic_type VirtualNetwork  (class Network)
+#
+#   CanNetworkReach:     source [Compute, Network, Identity] target [Compute, Data, Network, PrivateEndpoint]
+#   CanModifyConfiguration: source [Identity]                target [Compute, Messaging, Network, *]
+#   CanModifyPolicy:     source [Identity]                   target [Policy, Identity, *]
+#   CrossAccountTrust:   source [Account, Role, ResourcePolicy, ...] target [Account, ExternalIdentity]
+#   ExposedToAccount:    source [*]                          target [Account, Subscription, Project]
+#   PrivateReachability: source [Compute, Messaging]         target [Data, PrivateEndpoint, Compute]
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 8-networking
+service: vpclattice
+applies_to: [aws]
+
+# ===========================================================================
+# EXPLICIT normalization rules (raw config -> explicit edges).
+# Match collected VPC Lattice config records, not derived edges.
+# ===========================================================================
+explicit_rules:
+
+  # --- Auth policy: cross-account or wildcard Principal ----------------------
+  # The auth policy attached to a service network or service is a
+  # resource-based policy that may name principals from other accounts
+  # (explicit Principal ARNs) or use Principal "*" (any IAM caller).
+  # Either constitutes a CrossAccountTrust signal when the principal set
+  # includes accounts or organizations outside the owner's own account.
+  - id: aws-vpclattice-auth-policy-cross-account
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::VpcLattice::AuthPolicy"
+      field: "policy.Statement[*].Principal"
+    where:
+      - "auth policy is attached to a ServiceNetwork or Service"
+      - "at least one Statement has Effect==Allow and Principal includes an ARN from a different account, OR Principal=='*' without an aws:PrincipalOrgID restricting to the owner's org"
+      - "authType of the parent resource == AWS_IAM (policy is evaluated)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<auth policy node (ResourcePolicy)>"
+      target: "<external Account or ExternalIdentity named in the Principal element>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the auth policy is attached and the parent resource's authType
+        is AWS_IAM. CONDITIONAL(resource_policy) when Principal=='*' without a
+        constraining aws:PrincipalOrgID or aws:PrincipalAccount condition — the
+        allowed account set is unbounded and must be treated as cross-account.
+        BLOCKED when an SCP or permission boundary prevents the cross-account
+        caller from holding the required vpc-lattice-svcs:Invoke permission on
+        their identity-based policy side (auth requires BOTH sides to allow).
+      api_source: "vpc-lattice:GetAuthPolicy"
+      evidence_field: "policy"
+      false_positive_note: >-
+        An auth policy alone is NOT sufficient for cross-account invocation — the
+        caller must ALSO have vpc-lattice-svcs:Invoke (or vpc-lattice-svcs:*)
+        in their identity-based IAM policy, AND must be in a VPC connected to the
+        service network. Without both conditions, the cross-account trust exists
+        in the policy but is not exploitable. Emit CONDITIONAL(resource_policy)
+        rather than ACTIVE when the caller's identity-based policy or network
+        connectivity cannot be confirmed. For Principal '*' with aws:PrincipalOrgID
+        restricting to the same org as the owner, use ExposedToTenant instead of
+        CrossAccountTrust (org-scoped sharing is not a pure cross-account path).
+      narrative: >-
+        The auth policy on {authpolicy.parent_name} allows principals from
+        {target.name} (or any account) to invoke its services
+        (vpc-lattice-svcs:Invoke). Combined with a network foothold in a connected
+        VPC and a matching identity-based policy, this is a cross-account
+        data-plane access path.
+
+# ===========================================================================
+# DERIVED rules — match explicit/derived edges + effective permissions.
+# ===========================================================================
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 0. VPC association record: explicit FACT emission (structural observation)
+  # ---------------------------------------------------------------------------
+  # A VPC association record (status ACTIVE) is the explicit evidence that
+  # clients in the associated VPC can reach services in the service network.
+  # Although CanNetworkReach is declared nature=derived, this rule normalizes
+  # a raw config record (not a derived edge) into the concrete reachability fact.
+  # This differs from POTENTIAL(trigger_exists) rules below: this emits ACTIVE/
+  # CONDITIONAL state on a confirmed structural fact.
+  - id: aws-vpclattice-vpc-association-record
+    emits: CanNetworkReach
+    description: >-
+      A ServiceNetworkVpcAssociation record with status ACTIVE establishes
+      concrete network-plane reachability from the VPC to the service network.
+    applies_to: [aws]
+    match:
+      - [ ?vpc, LocatedIn, ?region ]
+      - [ ?servicenetwork, LocatedIn, ?region ]
+    where:
+      - "node_type(?vpc) == VirtualNetwork"
+      - "node_type(?servicenetwork) == GenericNetwork"
+      - "?servicenetwork.provider_type == 'AWS::VpcLattice::ServiceNetwork'"
+      - "exists ServiceNetworkVpcAssociation record: vpcId=?vpc.id, serviceNetworkId=?servicenetwork.id, status=='ACTIVE'"
+    emit:
+      source_type: VirtualNetwork
+      target_type: GenericNetwork
+      source: ?vpc
+      target: ?servicenetwork
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when the association record status=='ACTIVE'. CONDITIONAL(service_state)
+        when status is CREATE_IN_PROGRESS or UPDATE_IN_PROGRESS. BLOCKED when
+        status==FAILED. CONDITIONAL(network_reachability) always: security groups on
+        the VPC association and on target resource gates L4 access; clients must route
+        to Lattice managed prefix list (169.254.171.x).
+      confidence: 0.95
+      derived_from: []
+      api_source: "vpc-lattice:ListServiceNetworkVpcAssociations"
+      evidence_field: "status"
+      false_positive_note: >-
+        This edge represents L7-plane reachability from the VPC to the service
+        network; individual services may still have auth policies (authType
+        AWS_IAM) that require the caller to be an authenticated IAM principal.
+        Do NOT assume any client can invoke all services just because the VPC
+        is associated — auth policy evaluation is a separate gate.
+      narrative: >-
+        VPC {source.name} is associated with service network {target.name}
+        (status ACTIVE). Clients in this VPC can reach services in the network
+        over the AWS private backbone via Lattice-managed link-local addressing.
+
+  # ---------------------------------------------------------------------------
+  # 1. Create VPC association -> CanNetworkReach (POTENTIAL lateral movement)
+  # ---------------------------------------------------------------------------
+  # A principal with vpc-lattice:CreateServiceNetworkVpcAssociation on a service
+  # network (even a shared one in another account) can add their own VPC to the
+  # network, gaining data-plane access to all services in it. This is the
+  # dominant lateral movement primitive in VPC Lattice.
+  #
+  # STATE: POTENTIAL(trigger_exists) — the association does not yet exist; the
+  # principal CAN create it. Once created (status ACTIVE), the explicit rule
+  # aws-vpclattice-vpc-association-record emits an ACTIVE/CONDITIONAL edge.
+  - id: aws-vpclattice-create-vpc-assoc-lateral
+    emits: CanNetworkReach
+    description: >-
+      A principal with vpc-lattice:CreateServiceNetworkVpcAssociation can connect
+      any VPC they control to the service network, gaining private reachability
+      to all services in the network — lateral movement, including cross-account
+      on RAM-shared service networks.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?servicenetwork ]
+    where:
+      - "node_type(?servicenetwork) == GenericNetwork"
+      - "?servicenetwork.provider_type == 'AWS::VpcLattice::ServiceNetwork'"
+      - "effective_action_on(?principal, ?servicenetwork) contains 'vpc-lattice:CreateServiceNetworkVpcAssociation'"
+    emit:
+      source_type: Identity
+      target_type: GenericNetwork
+      source: ?principal
+      target: ?servicenetwork
+      permissions:
+        - "vpc-lattice:CreateServiceNetworkVpcAssociation"
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        POTENTIAL(trigger_exists): the VPC association does not yet exist.
+        The principal CAN create it (permission confirmed); once created and
+        status turns ACTIVE, the explicit aws-vpclattice-vpc-association-record
+        rule fires and yields CONDITIONAL(network_reachability). Downgrade to
+        BLOCKED if an SCP or permission boundary denies
+        vpc-lattice:CreateServiceNetworkVpcAssociation. For cross-account
+        scenarios on a RAM-shared service network, this becomes
+        CrossAccountTrust + CanNetworkReach (see aws-vpclattice-cross-acct-vpc-assoc).
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal HasPermission ?servicenetwork (vpc-lattice:CreateServiceNetworkVpcAssociation)"
+      false_positive_note: >-
+        POTENTIAL only — the association must be created and must reach ACTIVE
+        status before reachability is established. The created association's
+        security groups (specified at creation time) further gate which clients
+        can use Lattice addresses. Reachability to individual services is also
+        gated by each service's auth policy (authType AWS_IAM requires a valid
+        SigV4 request and a matching identity-based policy on the caller).
+        For cross-account: the principal must also have a VPC in their account
+        to associate — if they lack a VPC they cannot exercise this permission.
+        Do NOT emit ACTIVE; always POTENTIAL until the association record exists.
+      narrative: >-
+        {principal.name} has vpc-lattice:CreateServiceNetworkVpcAssociation on
+        service network {servicenetwork.name}. By associating a VPC they control,
+        they would gain private reachability to all services in the network —
+        a lateral movement pivot (potentially cross-account if the service network
+        is RAM-shared).
+
+  # ---------------------------------------------------------------------------
+  # 1b. Resource configuration association: PrivateReachability fact
+  # ---------------------------------------------------------------------------
+  # A resource configuration associated with a service network (status ACTIVE)
+  # creates PrivateReachability from any compute workload in a VPC connected to
+  # the service network to the resource through the resource gateway.
+  # Source is derived from VPC association (CanNetworkReach); target is the
+  # resource gateway/endpoint. Match the concrete resource config association.
+  - id: aws-vpclattice-resource-config-private-reach
+    emits: PrivateReachability
+    description: >-
+      A ServiceNetworkResourceAssociation with status ACTIVE grants
+      PrivateReachability from connected-VPC clients to the resource through
+      the resource gateway.
+    applies_to: [aws]
+    match:
+      - [ ?vpc, CanNetworkReach, ?servicenetwork ]
+      - [ ?resourcegw, LocatedIn, ?vpc ]
+    where:
+      - "node_type(?vpc) == VirtualNetwork"
+      - "node_type(?servicenetwork) == GenericNetwork"
+      - "node_type(?resourcegw) == PrivateEndpoint"
+      - "?servicenetwork.provider_type == 'AWS::VpcLattice::ServiceNetwork'"
+      - "?resourcegw.provider_type == 'AWS::VpcLattice::ResourceGateway'"
+      - "exists ServiceNetworkResourceAssociation: serviceNetworkId=?servicenetwork.id, resourceGatewayId=?resourcegw.id, status=='ACTIVE'"
+      - "resource configuration type is one of: RDS (via ARN), IP, DOMAIN"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<generic Compute workload in ?vpc (placeholder; specific compute nodes resolve via downstream network-chains linchpin)"
+      target: ?resourcegw
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when resource config association status=='ACTIVE' and the resource
+        gateway is deployed and active in the resource owner's VPC.
+        CONDITIONAL(service_state) when the resource gateway is not yet provisioned
+        or the association is CREATE_IN_PROGRESS. CONDITIONAL(network_reachability)
+        always: target resource's security group must permit ingress from Lattice
+        managed prefix list (169.254.171.x) on the resource port.
+      confidence: 0.9
+      derived_from:
+        - "?vpc CanNetworkReach ?servicenetwork"
+      api_source: "vpc-lattice:ListServiceNetworkResourceAssociations"
+      evidence_field: "status"
+      false_positive_note: >-
+        PrivateReachability means the VPC can ROUTE to the resource via the resource
+        gateway; it does NOT bypass the resource's own authentication (e.g. DB password,
+        IAM DB auth). Auth policies are NOT supported on resource configurations;
+        access control is the resource's own mechanism. Emit only when the resource
+        gateway status is ACTIVE and the resource configuration is concrete.
+      narrative: >-
+        Resource gateway {target.name} is associated with service network
+        {servicenetwork.name}. Clients in connected VPCs can privately reach
+        backend resources (e.g. RDS, IP endpoints) via this gateway — no public
+        endpoint required, no internet traversal.
+
+  # ---------------------------------------------------------------------------
+  # 2. Cross-account VPC association on a RAM-shared service network
+  # ---------------------------------------------------------------------------
+  # When a service network has a CrossAccountTrust edge (from RAM sharing),
+  # and a principal in the consumer account has CreateServiceNetworkVpcAssociation,
+  # this is an explicit cross-account lateral movement path: the consumer VPC
+  # gains reach to all services in the owner-account service network.
+  - id: aws-vpclattice-cross-acct-vpc-assoc
+    emits: CanNetworkReach
+    description: >-
+      A consumer account principal with CreateServiceNetworkVpcAssociation on a
+      RAM-shared service network can associate their VPC, gaining cross-account
+      private reachability to owner-account services.
+    applies_to: [aws]
+    match:
+      - [ ?share_or_sn, CrossAccountTrust, ?consumer_account ]
+      - [ ?principal,   HasPermission,     ?servicenetwork ]
+    where:
+      - "node_type(?consumer_account) == Account"
+      - "node_type(?servicenetwork) == GenericNetwork"
+      - "?servicenetwork.provider_type == 'AWS::VpcLattice::ServiceNetwork'"
+      - "?principal.account == ?consumer_account.id   # principal is IN the consumer account"
+      - "effective_action_on(?principal, ?servicenetwork) contains 'vpc-lattice:CreateServiceNetworkVpcAssociation'"
+      - "?share_or_sn references ?servicenetwork (either the service network itself or a RAM share covering it)"
+    emit:
+      source_type: Identity
+      target_type: GenericNetwork
+      source: ?principal
+      target: ?servicenetwork
+      permissions:
+        - "vpc-lattice:CreateServiceNetworkVpcAssociation"
+      conditions: [iam_permission, network_reachability, resource_policy]
+      state_logic: >-
+        POTENTIAL(trigger_exists): the VPC association does not yet exist.
+        Upgraded to CONDITIONAL(network_reachability) once the association is
+        ACTIVE (explicit rule fires). CONDITIONAL(resource_policy): each service
+        in the network may require the caller to be an authenticated IAM
+        principal per its auth policy. BLOCKED if an SCP denies
+        vpc-lattice:CreateServiceNetworkVpcAssociation on the consumer-account
+        principal or if the RAM share has not been accepted.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?share_or_sn CrossAccountTrust ?consumer_account"
+        - "?principal HasPermission ?servicenetwork (vpc-lattice:CreateServiceNetworkVpcAssociation)"
+      false_positive_note: >-
+        Requires the RAM share to be ACTIVE (accepted or org-wide).
+        CONDITIONAL(service_state) when the share is PENDING_ACCEPTANCE.
+        After association, auth policies on individual services may still gate
+        invocation — this edge represents network plane reachability (can reach
+        the service network), not data plane authorization (can invoke all
+        services). Auth policy evaluation is separate and may further block
+        specific callers. Scope: this edge uses Identity as source (not Network)
+        because the PERMISSION to create the association is what matters here;
+        the resulting reachability is on the consumer VPC (Network), but the
+        capability originates with the principal (Identity). Verify
+        ?principal.account == ?consumer_account before emitting to avoid
+        false owner-account matches.
+      narrative: >-
+        {principal.name} (in account {consumer_account.name}) can create a VPC
+        association on the RAM-shared service network {servicenetwork.name}
+        (vpc-lattice:CreateServiceNetworkVpcAssociation). This would give their
+        VPC cross-account private reachability to all services hosted by the
+        owner account in that network.
+
+  # ---------------------------------------------------------------------------
+  # 3. Cross-account service association (lateral movement primitive)
+  # ---------------------------------------------------------------------------
+  # A principal in an account with vpc-lattice:CreateServiceNetworkServiceAssociation
+  # on a shared service network can associate an attacker-controlled service,
+  # exposing it to all clients in VPCs connected to the service network.
+  # This is a lateral movement / phishing primitive: any legitimate VPC client
+  # can DNS-resolve the service and route traffic to it (if it matches routing rules).
+  - id: aws-vpclattice-service-assoc-exposure
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with vpc-lattice:CreateServiceNetworkServiceAssociation on a
+      service network can associate an attacker-controlled service, exposing it
+      to all connected-VPC clients for phishing/SSRF.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?servicenetwork ]
+    where:
+      - "node_type(?principal) in [Identity]"
+      - "node_type(?servicenetwork) == GenericNetwork"
+      - "?servicenetwork.provider_type == 'AWS::VpcLattice::ServiceNetwork'"
+      - "effective_action_on(?principal, ?servicenetwork) contains 'vpc-lattice:CreateServiceNetworkServiceAssociation'"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: ?principal
+      target: ?servicenetwork
+      permissions:
+        - "vpc-lattice:CreateServiceNetworkServiceAssociation"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        POTENTIAL(trigger_exists): the service association does not yet exist;
+        the principal CAN create it. Once created and status turns ACTIVE,
+        the attacker-controlled service becomes reachable to all connected-VPC
+        clients. BLOCKED if an SCP denies vpc-lattice:CreateServiceNetworkServiceAssociation
+        or if the service network is configured to reject cross-account service
+        associations.
+      confidence: 0.85
+      derived_from:
+        - "?principal HasPermission ?servicenetwork (vpc-lattice:CreateServiceNetworkServiceAssociation)"
+      false_positive_note: >-
+        POTENTIAL only — the service must be created and associated to be reachable.
+        An attacker-controlled service must exist in the caller's account; this
+        edge represents the CAPABILITY to expose it. The service may still be
+        subject to listener rules / routing policies that filter traffic.
+        Auth policy on the service network may also gate access if authType==AWS_IAM,
+        but authType NONE + cross-account share removes that gate entirely.
+      narrative: >-
+        {principal.name} has vpc-lattice:CreateServiceNetworkServiceAssociation
+        on service network {servicenetwork.name}. By associating an
+        attacker-controlled service with this network, they would expose it to
+        all clients in any VPC connected to the network — enabling phishing,
+        traffic hijacking, or SSRF from legitimate service consumers.
+
+  # ---------------------------------------------------------------------------
+  # 4. Listener/rule hijack: traffic redirection to attacker-controlled target
+  # ---------------------------------------------------------------------------
+  # vpc-lattice:UpdateRule or vpc-lattice:UpdateListener lets a principal
+  # redirect an existing listener/rule to an attacker-controlled target group.
+  # This is L7 traffic interception: all clients invoking a legitimate service
+  # path are redirected to the attacker's service, enabling data exfiltration
+  # or SSRF from the client identity/context.
+  - id: aws-vpclattice-listener-rule-hijack
+    emits: CanModifyConfiguration
+    description: >-
+      vpc-lattice:UpdateRule or vpc-lattice:UpdateListener lets a principal
+      redirect traffic to an attacker-controlled target group, intercepting
+      L7 traffic from all service consumers.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?listener_or_rule ]
+    where:
+      - "node_type(?principal) in [Identity]"
+      - "node_type(?listener_or_rule) == GenericNetwork"
+      - "?listener_or_rule.provider_type in ['AWS::VpcLattice::Listener', 'AWS::VpcLattice::Rule']"
+      - "effective_action_on(?principal, ?listener_or_rule) contains 'vpc-lattice:UpdateRule' OR effective_action_on(?principal, ?listener_or_rule) contains 'vpc-lattice:UpdateListener'"
+    emit:
+      source_type: Identity
+      target_type: GenericNetwork
+      source: ?principal
+      target: ?listener_or_rule
+      permissions:
+        - "vpc-lattice:UpdateRule"
+        - "vpc-lattice:UpdateListener"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when vpc-lattice:UpdateRule or vpc-lattice:UpdateListener is
+        confirmed effective on the target ARN. BLOCKED if an SCP or permission
+        boundary denies the Update actions.
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?listener_or_rule (vpc-lattice:UpdateRule | vpc-lattice:UpdateListener)"
+      false_positive_note: >-
+        This represents the capability to REDIRECT traffic; redirection requires
+        specifying an attacker-controlled target group ARN with valid targets.
+        An Update that changes routing behavior (path prefix, hostname, method)
+        to point to a different target group is the security consequence.
+        This is actionable only if the attacker can also create or control the
+        target group (CanCreate on TargetGroup or existing attacker-owned target).
+      narrative: >-
+        {principal.name} can update a Listener or Rule on {listener_or_rule.name}
+        (vpc-lattice:UpdateRule / vpc-lattice:UpdateListener). By redirecting to
+        an attacker-controlled target group, they would intercept L7 traffic from
+        all service consumers, enabling data exfiltration or SSRF attacks.
+
+  # ---------------------------------------------------------------------------
+  # 5. Weaken auth policy -> CanModifyPolicy + CanModifyConfiguration
+  # ---------------------------------------------------------------------------
+  # vpc-lattice:PutAuthPolicy lets a principal REPLACE the auth policy on a
+  # service network or service. This can:
+  #   (a) set authType NONE (disabling all auth checks) via UpdateServiceNetwork
+  #   (b) replace the policy with Principal:"*" (allow any IAM caller)
+  #   (c) remove org/VPC conditions, widening who can invoke
+  # The control-plane action is on the service network or service node;
+  # the security consequence is weakening the authorization gate.
+  - id: aws-vpclattice-weaken-auth-policy
+    emits: CanModifyPolicy
+    description: >-
+      vpc-lattice:PutAuthPolicy lets a principal replace the auth policy on a
+      service or service network, potentially opening services to unauthorized
+      callers (remove org restriction, set Principal:*, disable auth type).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?target ]
+    where:
+      - "node_type(?target) in [GenericNetwork, APIGateway]"
+      - "?target.provider_type in ['AWS::VpcLattice::ServiceNetwork', 'AWS::VpcLattice::Service']"
+      - "effective_action_on(?principal, ?target) contains 'vpc-lattice:PutAuthPolicy'"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: ?principal
+      target: "<auth policy attached to ?target>"
+      permissions:
+        - "vpc-lattice:PutAuthPolicy"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when vpc-lattice:PutAuthPolicy is confirmed effective on the
+        target resource. BLOCKED if an SCP or permission boundary denies
+        vpc-lattice:PutAuthPolicy on the service/service-network ARN.
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?target (vpc-lattice:PutAuthPolicy)"
+      false_positive_note: >-
+        PutAuthPolicy is only actionable when the parent resource's authType
+        is AWS_IAM; if authType is NONE, a PUT still succeeds but the policy
+        is not evaluated (harmless in that state). For maximum impact, the
+        attacker needs BOTH PutAuthPolicy AND the ability to set authType to
+        AWS_IAM (or the target already has authType AWS_IAM) — otherwise the
+        policy change has no security consequence. PutAuthPolicy alone does NOT
+        disable auth — the attacker must write a policy with Principal:"*" or
+        similar; the capability expressed here is that they CAN write such a
+        policy. This is a defense-weakening capability, not an access grant by
+        itself; pair it with CanNetworkReach (connected VPC) for an exploitable
+        chain.
+      narrative: >-
+        {principal.name} can replace the auth policy on {target.name}
+        (vpc-lattice:PutAuthPolicy), potentially allowing any IAM principal in
+        any connected VPC to invoke services (e.g. by setting Principal:"*"
+        without an org or VPC condition).
+
+  - id: aws-vpclattice-disable-auth-type
+    emits: CanModifyConfiguration
+    description: >-
+      vpc-lattice:UpdateServiceNetwork or vpc-lattice:UpdateService with
+      authType=NONE disables auth policy evaluation, making all services in
+      the network (or the individual service) invocable by any connected-VPC
+      client without IAM authentication.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?target ]
+    where:
+      - "node_type(?target) in [GenericNetwork, APIGateway]"
+      - "?target.provider_type in ['AWS::VpcLattice::ServiceNetwork', 'AWS::VpcLattice::Service']"
+      - "effective_action_on(?principal, ?target) intersects ['vpc-lattice:UpdateServiceNetwork', 'vpc-lattice:UpdateService']"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?target
+      permissions:
+        - "vpc-lattice:UpdateServiceNetwork"
+        - "vpc-lattice:UpdateService"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when UpdateServiceNetwork or UpdateService is confirmed effective
+        on the target ARN. BLOCKED when an SCP or permission boundary denies
+        the relevant Update action.
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?target (vpc-lattice:UpdateServiceNetwork | vpc-lattice:UpdateService)"
+      false_positive_note: >-
+        Update actions cover many fields beyond authType (logging, name,
+        certificates, etc.); only the authType field produces a security
+        consequence. This edge conservatively models the full capability.
+        An SCP requiring aws:RequestedRegion or restricting authType changes
+        would reduce the blast radius. Changing authType to NONE on a service
+        network affects ALL services in the network simultaneously — high
+        blast radius. Changing authType on an individual service affects only
+        that service. Do NOT emit ExposedToInternet: even with authType NONE,
+        Lattice services are reachable only from associated VPCs, not the
+        public internet.
+      narrative: >-
+        {principal.name} can set authType=NONE on {target.name}
+        (vpc-lattice:UpdateServiceNetwork / vpc-lattice:UpdateService),
+        disabling all auth policy evaluation. Any client in a connected VPC
+        can then invoke services without presenting IAM credentials.
+
+  # ---------------------------------------------------------------------------
+  # 6. authType NONE -> ExposedToAccount
+  # ---------------------------------------------------------------------------
+  # When a service network or service has authType NONE, any client in any
+  # associated VPC can invoke services without IAM authentication. This is
+  # account-wide (or cross-account if the service network is RAM-shared)
+  # exposure within the connected VPC ecosystem.
+  - id: aws-vpclattice-auth-none-exposed-to-account
+    emits: ExposedToAccount
+    description: >-
+      A VPC Lattice service network or service with authType NONE is accessible
+      to any client in any associated VPC without IAM authentication —
+      account-scoped exposure (or broader if the network is RAM-shared).
+    applies_to: [aws]
+    match: []
+    where:
+      - "node_type(resource) in [GenericNetwork, APIGateway]"
+      - "resource.provider_type in ['AWS::VpcLattice::ServiceNetwork', 'AWS::VpcLattice::Service']"
+      - "resource.authType == 'NONE'"
+      - "exists at least one CanNetworkReach edge to this resource (or a parent service network)"
+    emit:
+      source_type: GenericNetwork
+      target_type: Account
+      source: "<resource (ServiceNetwork or Service)"
+      target: "<AWS Account owning the resource>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): authType=NONE removes the IAM auth gate,
+        but VPC association (CanNetworkReach) is still required for any client to reach
+        the service. A client must exist in a connected VPC to invoke. BLOCKED if an
+        SCP enforces authType == AWS_IAM (some SCPs include a condition requiring
+        vpc-lattice:authType to be AWS_IAM on create/update). Do NOT emit ACTIVE;
+        CanNetworkReach is a prerequisite condition.
+      confidence: 0.9
+      derived_from: []
+      false_positive_note: >-
+        ExposedToAccount, NOT ExposedToInternet. authType NONE does not make
+        the service publicly internet-routable — there is no public IP. Exposure
+        is limited to clients in VPCs associated with the service network. If the
+        service network is RAM-shared cross-account, the exposure extends to those
+        consumer accounts as well, but still only to their VPC-resident clients.
+        Do not emit for authType == AWS_IAM (policy still evaluated even if
+        it contains Principal:'*' — that is handled by CrossAccountTrust).
+      narrative: >-
+        {source.name} has authType=NONE — no auth policy is evaluated for incoming
+        requests. Any client in a VPC associated with the service network can invoke
+        services without IAM credentials, representing account-wide (and potentially
+        cross-account) unauthenticated access within connected VPCs.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying vpc-lattice:CreateServiceNetworkVpcAssociation prevents
+#     lateral VPC association pivots -> emit the lateral edge BLOCKED with
+#     denied_by=<SCP ARN/statement>.
+#   - An SCP requiring vpc-lattice:AuthType==AWS_IAM (some orgs enforce this)
+#     prevents authType NONE -> emit aws-vpclattice-auth-none-exposed-to-account
+#     as BLOCKED when this SCP is confirmed.
+#   - RAM share PENDING_ACCEPTANCE -> downgrade CrossAccountTrust and dependent
+#     CanNetworkReach edges to CONDITIONAL(service_state).
+# ---------------------------------------------------------------------------
+
+# Linchpin citations (aware — NOT applicable to VPC Lattice's attack surface):
+#   /rules/derived/can-execute-as.yaml  — VPC Lattice has no execution identity;
+#                                         N/A. Lattice target groups point to
+#                                         EC2/Lambda, which are modeled in those
+#                                         services' files, not here.
+#   /rules/derived/can-control.yaml     — control-via-admin applies if a principal
+#                                         has full vpc-lattice:* on a service network;
+#                                         that CanAdminister -> Controls roll-up is
+#                                         handled by can-control.yaml. Cited, not
+#                                         duplicated here.
+#   /rules/derived/credential-chains.yaml — VPC Lattice access logs may carry
+#                                            tokens/headers; model at S3/CWL
+#                                            destination, not here.
+#   /rules/derived/network-chains.yaml  — FUTURE linchpin for composing per-service
+#                                         facts (VPC association + SG rules + routing)
+#                                         into end-to-end network reach. VPC Lattice
+#                                         facts (VPC association, PrivateReachability)
+#                                         feed that future file. Do NOT invent the
+#                                         composition here.

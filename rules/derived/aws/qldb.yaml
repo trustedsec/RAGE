@@ -1,0 +1,470 @@
+# AWS QLDB — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Amazon QLDB is a fully managed, serverless, immutable ledger database.
+# It reached end-of-life on July 31, 2025. Rules apply to historical collections
+# and legacy environments where QLDB ledgers were deployed before EOL.
+#
+# RESOURCE MODEL:
+#   Ledger  — top-level resource (NoSQLDatabase). Contains tables, journal.
+#   Table   — materialized view of journal document revisions (NoSQLDatabase).
+#   Journal — append-only, cryptographically verifiable log (not a separate node).
+#
+# PERMISSIONS MODE (critical for correct rule evaluation):
+#   ALLOW_ALL — qldb:SendCommand alone on the ledger ARN grants full data-plane
+#               read/write/delete across ALL tables. No table-level IAM required.
+#   STANDARD  — qldb:SendCommand is required to initiate a session, PLUS
+#               fine-grained qldb:PartiQL* actions on individual table ARNs.
+#
+# ATTACK SURFACE SUMMARY (medium — 6 derived rules):
+#   (1) DATA READ via ALLOW_ALL: qldb:SendCommand on an ALLOW_ALL ledger
+#       → CanReadData on the whole ledger (all tables).
+#   (2) DATA READ via STANDARD (current state): qldb:PartiQLSelect on a table ARN (+ SendCommand
+#       as session gate) → CanReadData scoped to that table (current-state read only).
+#   (3) DATA READ via STANDARD (full history): qldb:PartiQLHistoryFunction on a table ARN (+ SendCommand
+#       as session gate) → CanReadData scoped to that table (all document revisions/version history).
+#   (4) EXFILTRATE via journal export to S3: qldb:ExportJournalToS3 + iam:PassRole for
+#       a role with s3:PutObject → CanExfiltrate. The export contains ALL committed
+#       document revisions from the journal — highest-impact QLDB attack path.
+#   (5) EXFILTRATE via journal stream to Kinesis: qldb:StreamJournalToKinesis + iam:PassRole
+#       for a role with kinesis:PutRecord → CanExfiltrate. Continuous streaming of ALL
+#       committed document revisions to Kinesis (cross-account capable).
+#
+# WHAT THIS FILE DOES NOT DERIVE:
+#   - ExecutesAs: QLDB runs no customer code.
+#   - ExposedToInternet: the session endpoint requires SigV4; unauthenticated
+#     access is impossible.
+#   - CrossAccountTrust: no resource-based policies on ledgers/tables.
+#   - CanWriteData: IAM-gated insert/update is a secondary risk (no escalation
+#     path from write-only; insert is harmful as data poisoning but below the
+#     threat threshold for this low-priority service).
+#   - UpdateLedgerPermissionsMode escalation: the evaluator must confirm BOTH
+#     qldb:UpdateLedgerPermissionsMode AND qldb:SendCommand on a STANDARD ledger
+#     to derive the effective CanReadData downgrade. This dual-permission path is
+#     documented in Rule 1's false-positive note and state_logic (emit CONDITIONAL(service_state)
+#     when both actions are present) — do not split into a separate rule to avoid
+#     false positives when only one action is present.
+#
+# LINCHPIN CITATIONS (do not re-derive here):
+#   * credential-chains.yaml:read-secret-yields-identity
+#       ContainsSecret(table, secret) + CredentialsFor(secret, identity)
+#       -> CanImpersonate — credit to linchpin for full chain.
+#   * credential-chains.yaml:decrypt-gates-secret-read
+#       NOTE: This linchpin upgrades CONDITIONAL(key_permission) on CanReadSecret edges,
+#       not CanReadData. It does NOT apply directly to QLDB data-plane CanReadData edges.
+#       When a QLDB ledger uses a CMK, the QLDB service (qldb.amazonaws.com) must have
+#       kms:Decrypt on the CMK via a KMS grant in the key policy for the read to become ACTIVE.
+#       This is a service-level permission fact (collected from KMS key policy), not an IAM
+#       caller permission. The CanReadData edge should be emitted ACTIVE when the KMS grant
+#       for qldb.amazonaws.com is confirmed present, or CONDITIONAL(key_permission) when unknown.
+#
+# PERMISSIONS: all from the AWS Service Authorization Reference — Amazon QLDB
+#   qldb:SendCommand     — initiates a QLDB Session; in ALLOW_ALL mode, the only
+#                          action needed for full data-plane read/write.
+#   qldb:PartiQLSelect   — runs CQL SELECT on a table (STANDARD mode, table ARN).
+#   qldb:ExportJournalToS3 — triggers a journal export job writing to S3.
+#   iam:PassRole         — required alongside ExportJournalToS3 to pass the
+#                          service role that QLDB assumes for S3 writes.
+#
+# STATE CONVENTIONS (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. CONDITIONAL contributors cap output at CONDITIONAL.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+# RULE-EVALUATION NOTES:
+# - ledger_of(?table): resolves the parent ledger of a QLDB Table node. The adapter
+#   emits a Contains(ledger, table) edge, or the rule-evaluator can resolve the
+#   relationship via table.ledgerName matching a ledger node's name. This allows
+#   table-scoped rules to reference the parent ledger's configuration (permissionsMode,
+#   encryptionDescription.kmsKeyArn).
+
+rules:
+
+  # --- 1) qldb:SendCommand on ALLOW_ALL ledger -> full data-plane read -------
+  # The master-key-level data-access path for QLDB. When a ledger is in
+  # ALLOW_ALL permissions mode, qldb:SendCommand on the ledger ARN is the SOLE
+  # IAM requirement to run arbitrary PartiQL SELECT statements against every
+  # table in the ledger. No table-level grants are checked. An attacker with
+  # SendCommand on an ALLOW_ALL ledger reads all document revisions.
+  #
+  # CRITICAL FALSE-POSITIVE GATE: only emit this rule when permissionsMode is
+  # confirmed as ALLOW_ALL. On a STANDARD-mode ledger, SendCommand alone only
+  # initiates a session; subsequent PartiQL SELECT calls are denied without
+  # table-level qldb:PartiQLSelect grants -> do NOT emit CanReadData from
+  # SendCommand alone on a STANDARD ledger.
+  #
+  # ALLOW_ALL downgrade escalation: a principal with BOTH qldb:UpdateLedgerPermissionsMode
+  # AND qldb:SendCommand can downgrade a STANDARD ledger to ALLOW_ALL before
+  # reading. This dual-permission path is still modeled under this rule (the
+  # emitted state is CONDITIONAL(service_state) when the ledger is currently in
+  # STANDARD mode but the principal can downgrade it). Emit ACTIVE only when the
+  # ledger is already in ALLOW_ALL mode; emit CONDITIONAL(service_state) when
+  # the principal holds UpdateLedgerPermissionsMode and can downgrade.
+  - id: aws-qldb-sendcommand-read-data
+    emits: CanReadData
+    description: >-
+      qldb:SendCommand on an ALLOW_ALL-mode ledger allows the caller to run
+      arbitrary PartiQL SELECT statements against all tables, yielding full
+      data-plane read of all committed document revisions.
+    match:
+      - [ ?principal, HasPermission, ?ledger ]
+    where:
+      - "node_type(?ledger) == NoSQLDatabase"
+      - "?ledger.provider_type == 'AWS::QLDB::Ledger'"
+      - "effective_action(?principal, ?ledger) includes 'qldb:SendCommand'"
+      - "(?ledger.properties.permissionsMode == 'ALLOW_ALL') OR (?ledger.properties.permissionsMode == 'STANDARD' AND effective_action(?principal, ?ledger) includes 'qldb:UpdateLedgerPermissionsMode')"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?ledger
+      permissions: ["qldb:SendCommand"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        if ?ledger.properties.permissionsMode == 'ALLOW_ALL'
+          AND effective_action(?principal, ?ledger) includes 'qldb:SendCommand':
+          if ?ledger.encryptionDescription.kmsKeyArn is a customer-managed key
+          (not 'AWS_OWNED_KMS_KEY'): CONDITIONAL(key_permission) — the QLDB service
+          (qldb.amazonaws.com, not the IAM caller) must have kms:Decrypt on the CMK
+          via a KMS grant in the key policy. This is a service-level permission fact
+          collected from the KMS key policy, not an IAM caller permission. Emit ACTIVE
+          when the KMS grant for qldb.amazonaws.com is confirmed; emit CONDITIONAL(key_permission)
+          when unknown.
+          else: ACTIVE.
+        if ?ledger.properties.permissionsMode == 'STANDARD'
+          AND effective_action(?principal, ?ledger) includes 'qldb:SendCommand'
+          AND effective_action(?principal, ?ledger) includes 'qldb:UpdateLedgerPermissionsMode':
+          CONDITIONAL(service_state) — principal can downgrade to ALLOW_ALL
+          then read all data; downgrade must happen first.
+        else: do not emit.
+      confidence: "contributing_confidence * 0.95"
+      derived_from: [ "<HasPermission edge for qldb:SendCommand on ?ledger>" ]
+      false_positive_note: >-
+        Do NOT emit ACTIVE when permissionsMode is STANDARD and the principal
+        lacks qldb:UpdateLedgerPermissionsMode — SendCommand alone on a STANDARD
+        ledger only opens a session; subsequent SELECT calls are IAM-denied at
+        the table level. Always verify permissionsMode from DescribeLedger output.
+        Do NOT emit when qldb:SendCommand is scoped by a resource ARN that does
+        not cover this ledger. When the ledger uses a customer-managed KMS key
+        (encryptionDescription.kmsKeyArn != 'AWS_OWNED_KMS_KEY'), emit
+        CONDITIONAL(key_permission). The KMS grant that gates data-plane access
+        is held by the QLDB service principal (qldb.amazonaws.com) in the key policy,
+        not the IAM caller. Emit ACTIVE only when the KMS key policy is confirmed
+        to grant kms:Decrypt to qldb.amazonaws.com; this is a service-level fact
+        collected from the KMS key policy, not an IAM caller permission.
+      narrative: >-
+        {principal.name} can initiate a QLDB session (qldb:SendCommand) on
+        {ledger.name}, which is in ALLOW_ALL permissions mode, and run arbitrary
+        PartiQL SELECT statements against all tables without any table-level IAM
+        grants. This yields full data-plane read of all committed document
+        revisions in the ledger journal.
+
+  # --- 2) qldb:PartiQLSelect on table (STANDARD mode) -> table-scoped read ---
+  # In STANDARD mode, data-plane read on a specific table requires BOTH:
+  #   (a) qldb:SendCommand on the ledger ARN (session gate), AND
+  #   (b) qldb:PartiQLSelect on the table ARN (data gate).
+  # The emitted CanReadData is scoped to the individual table node, not the ledger.
+  # qldb:PartiQLHistoryFunction on the same table ARN also enables reading the
+  # full revision history of the table (not just current state).
+  - id: aws-qldb-partiql-select-read-data
+    emits: CanReadData
+    description: >-
+      qldb:PartiQLSelect (plus qldb:SendCommand as session gate) on a STANDARD-mode
+      ledger's table allows the caller to read all documents from that table,
+      yielding data-plane read scoped to the individual table.
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_type(?table) == NoSQLDatabase"
+      - "?table.provider_type == 'AWS::QLDB::Table'"
+      - "effective_action(?principal, ?table) includes 'qldb:PartiQLSelect'"
+      - "effective_action(?principal, ledger_of(?table)) includes 'qldb:SendCommand'"
+      - "ledger_of(?table).properties.permissionsMode == 'STANDARD'"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["qldb:PartiQLSelect", "qldb:SendCommand"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        if effective 'qldb:PartiQLSelect' on ?table.arn AND effective 'qldb:SendCommand'
+        on the parent ledger ARN AND parent ledger permissionsMode == STANDARD:
+          if parent ledger encryptionDescription.kmsKeyArn is customer-managed
+          (not 'AWS_OWNED_KMS_KEY'): CONDITIONAL(key_permission) — the QLDB service
+          (qldb.amazonaws.com, not the IAM caller) must have kms:Decrypt on the CMK
+          via a KMS grant in the key policy. This is a service-level permission fact
+          collected from the KMS key policy, not an IAM caller permission. Emit ACTIVE
+          when the KMS grant for qldb.amazonaws.com is confirmed; emit CONDITIONAL(key_permission)
+          when unknown.
+          else: ACTIVE.
+        else: do not emit.
+      confidence: "contributing_confidence * 0.95"
+      derived_from: [ "<HasPermission edge for qldb:PartiQLSelect on ?table>", "<HasPermission edge for qldb:SendCommand on parent ledger>" ]
+      false_positive_note: >-
+        Requires BOTH qldb:PartiQLSelect on the table ARN AND qldb:SendCommand on the
+        parent ledger ARN to be effective, AND the parent ledger must be in STANDARD mode.
+        Honor the exact resource scope: a grant of qldb:PartiQLSelect scoped to a wildcard
+        ledger ARN (arn:aws:qldb:*:*:ledger/*) covers all tables, but a grant scoped to a
+        specific ledger ARN covers only tables in that ledger. Table ARNs use the
+        system-assigned tableId, not the table name — ensure the ARN in the permission
+        matches the node being evaluated. Do not emit for ALLOW_ALL ledgers (use
+        aws-qldb-sendcommand-read-data instead). For CMK-encrypted ledgers, emit
+        CONDITIONAL(key_permission) when the KMS grant is unknown; the relevant permission
+        check is on the qldb.amazonaws.com service principal in the key policy, not the
+        IAM caller. Emit ACTIVE only when the KMS key policy is confirmed to grant
+        kms:Decrypt to qldb.amazonaws.com.
+      narrative: >-
+        {principal.name} can SELECT documents from {table.name} in {ledger.name}
+        (qldb:PartiQLSelect on the table ARN + qldb:SendCommand on the ledger),
+        reading all current document revisions stored in that table. If {table.name}
+        contains credentials or secrets, this yields further pivots via
+        credential-chains:read-secret-yields-identity.
+
+  # --- 3) qldb:PartiQLHistoryFunction on table (STANDARD mode) -> full revision history read ---
+  # In STANDARD mode, reading the full revision history of a table (all document versions
+  # across all time) requires BOTH:
+  #   (a) qldb:SendCommand on the ledger ARN (session gate), AND
+  #   (b) qldb:PartiQLHistoryFunction on the table ARN (history-read gate).
+  # This grants broader read than qldb:PartiQLSelect (which reads only current state).
+  # The emitted CanReadData is scoped to the individual table node.
+  - id: aws-qldb-partiqlhistory-read-data
+    emits: CanReadData
+    description: >-
+      qldb:PartiQLHistoryFunction (plus qldb:SendCommand as session gate) on a
+      STANDARD-mode ledger's table allows the caller to read all document revisions
+      (full version history) from that table, yielding data-plane read scoped to the
+      individual table with higher impact than current-state-only reads.
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_type(?table) == NoSQLDatabase"
+      - "?table.provider_type == 'AWS::QLDB::Table'"
+      - "effective_action(?principal, ?table) includes 'qldb:PartiQLHistoryFunction'"
+      - "effective_action(?principal, ledger_of(?table)) includes 'qldb:SendCommand'"
+      - "ledger_of(?table).properties.permissionsMode == 'STANDARD'"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["qldb:PartiQLHistoryFunction", "qldb:SendCommand"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        if effective 'qldb:PartiQLHistoryFunction' on ?table.arn AND effective 'qldb:SendCommand'
+        on the parent ledger ARN AND parent ledger permissionsMode == STANDARD:
+          if parent ledger encryptionDescription.kmsKeyArn is customer-managed
+          (not 'AWS_OWNED_KMS_KEY'): CONDITIONAL(key_permission) — the QLDB service
+          (qldb.amazonaws.com, not the IAM caller) must have kms:Decrypt on the CMK
+          via a KMS grant in the key policy. This is a service-level permission fact
+          collected from the KMS key policy, not an IAM caller permission. Emit ACTIVE
+          when the KMS grant for qldb.amazonaws.com is confirmed; emit CONDITIONAL(key_permission)
+          when unknown.
+          else: ACTIVE.
+        else: do not emit.
+      confidence: "contributing_confidence * 0.95"
+      derived_from: [ "<HasPermission edge for qldb:PartiQLHistoryFunction on ?table>", "<HasPermission edge for qldb:SendCommand on parent ledger>" ]
+      false_positive_note: >-
+        Requires BOTH qldb:PartiQLHistoryFunction on the table ARN AND qldb:SendCommand on the
+        parent ledger ARN to be effective, AND the parent ledger must be in STANDARD mode.
+        Honor the exact resource scope: a grant of qldb:PartiQLHistoryFunction scoped to a
+        wildcard ledger ARN (arn:aws:qldb:*:*:ledger/*) covers all tables, but a grant scoped
+        to a specific ledger ARN covers only tables in that ledger. Table ARNs use the
+        system-assigned tableId, not the table name — ensure the ARN in the permission
+        matches the node being evaluated. This permission grants higher impact than qldb:PartiQLSelect
+        (which reads current state only) because it yields ALL document revisions across the
+        entire version history of the table. Do not emit for ALLOW_ALL ledgers (use
+        aws-qldb-sendcommand-read-data instead). For CMK-encrypted ledgers, emit
+        CONDITIONAL(key_permission) when the KMS grant is unknown; the relevant permission
+        check is on the qldb.amazonaws.com service principal in the key policy, not the
+        IAM caller. Emit ACTIVE only when the KMS key policy is confirmed to grant
+        kms:Decrypt to qldb.amazonaws.com.
+      narrative: >-
+        {principal.name} can read full revision history from {table.name} in {ledger.name}
+        (qldb:PartiQLHistoryFunction on the table ARN + qldb:SendCommand on the ledger),
+        accessing all document versions stored in that table across the entire version history.
+        If {table.name} contains credentials or secrets, this yields further pivots via
+        credential-chains:read-secret-yields-identity.
+
+  # --- 5) qldb:ExportJournalToS3 + iam:PassRole -> journal exfiltration ------
+  # ExportJournalToS3 triggers an asynchronous job that writes ALL journal blocks
+  # (every committed document revision across all tables, in the specified time
+  # range) to an S3 bucket specified by the caller. QLDB assumes the caller-supplied
+  # IAM service role (trust: qldb.amazonaws.com) to write the objects. The caller
+  # must hold qldb:ExportJournalToS3 on the ledger AND iam:PassRole for the service
+  # role that has s3:PutObject on the target bucket.
+  #
+  # This is the highest-impact QLDB attack path: the export contains FULL application
+  # data across all tables (not just current state — the entire journal history).
+  # An attacker who can trigger the export and point the service role to a
+  # controlled/cross-account bucket achieves complete data exfiltration.
+  #
+  # The CanExfiltrate target is the ledger node (source of data) rather than
+  # the S3 bucket (that is the destination, modeled separately if needed).
+  - id: aws-qldb-export-journal-exfiltrate
+    emits: CanExfiltrate
+    description: >-
+      qldb:ExportJournalToS3 + iam:PassRole (for a role with s3:PutObject) allows
+      the caller to exfiltrate the entire QLDB journal — all committed document
+      revisions across all tables — to an S3 bucket, including cross-account buckets.
+    match:
+      - [ ?principal, HasPermission, ?ledger ]
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "node_type(?ledger) == NoSQLDatabase"
+      - "?ledger.provider_type == 'AWS::QLDB::Ledger'"
+      - "effective_action(?principal, ?ledger) includes 'qldb:ExportJournalToS3'"
+      - "?role.trust_policy includes 'qldb.amazonaws.com' as a trusted principal"
+      - "effective_action(?principal, ?role) includes 'iam:PassRole'"
+      - "iam:PassRole for ?role permits iam:PassedToService including 'qldb.amazonaws.com' (or unconditioned)"
+      - "effective_action(?principal, ?role) OR effective_action(?role, '*') includes 's3:PutObject' on at least one bucket"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?ledger
+      permissions: ["qldb:ExportJournalToS3", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        if effective 'qldb:ExportJournalToS3' on ?ledger AND ?principal CanPassIdentity ?role
+        AND ?role trusts qldb.amazonaws.com AND effective 's3:PutObject' on ?role:
+          if the s3:PutObject scope is confirmed to be cross-account OR attacker-controlled:
+            ACTIVE — data leaves the account boundary.
+          elif the s3:PutObject scope is confirmed same-account and under normal S3 ACLs/policy:
+            do NOT emit CanExfiltrate (data stays in-account). The exported journal objects
+            are now S3 objects; their read access is governed by aws:s3 CanReadData rules
+            (cross-reference the S3 bucket node and the role's s3:GetObject permission).
+          elif the target bucket/account destination is unknown:
+            CONDITIONAL(resource_policy) — gate on whether the S3 bucket policy or ACL
+            permits access from outside (cross-account write scope).
+        else: do not emit.
+      confidence: "contributing_confidence * 0.90"
+      derived_from: [ "?principal CanPassIdentity ?role", "qldb:ExportJournalToS3 EFFECTIVE on ?ledger" ]
+      false_positive_note: >-
+        Requires BOTH qldb:ExportJournalToS3 on the ledger AND iam:PassRole on a
+        role that trusts qldb.amazonaws.com AND the role has s3:PutObject on at least
+        one bucket. A role passable only to other services (e.g., ec2.amazonaws.com)
+        does NOT enable QLDB export — honor iam:PassedToService conditions and role
+        trust policy principal. The export is asynchronous; it does not immediately
+        transfer data (QLDB queues the job). However, once the job runs, the export
+        is complete and immutable from S3's perspective. Do not emit ACTIVE when only
+        one or two of the three required conditions are present. When the target bucket
+        is confirmed cross-account or attacker-controlled, this is ACTIVE exfiltration;
+        when the bucket/account destination is unknown, emit CONDITIONAL(resource_policy).
+        When the target bucket is confirmed same-account with normal S3 ACLs/policy,
+        do NOT emit CanExfiltrate — the data stays in-account. The exported journal
+        objects are S3 objects; their read access is governed by S3 rules (aws:s3 CanReadData).
+        Cross-reference the S3 bucket node and the role's s3:GetObject permission to determine
+        whether CanReadData applies to the exported data. Note: qldb:ExportJournalToS3 is
+        scoped to a time range — a full-history export requires specifying a range covering
+        ledger creation to present. Partial-range exports are still CanExfiltrate for the
+        data in that range.
+      narrative: >-
+        {principal.name} can trigger a QLDB journal export (qldb:ExportJournalToS3)
+        on {ledger.name} and pass a service role (iam:PassRole) that QLDB assumes to
+        write all journal blocks — including every committed document revision across
+        all tables — to an S3 bucket. If the target bucket is attacker-controlled or
+        cross-account, this constitutes complete data exfiltration of the entire
+        {ledger.name} ledger.
+
+  # --- 6) qldb:StreamJournalToKinesis + iam:PassRole -> journal exfiltration ---
+  # StreamJournalToKinesis streams journal data continuously to a Kinesis Data Stream
+  # instead of a one-time S3 export. Like ExportJournalToS3, it requires a service role
+  # that QLDB assumes (trust: qldb.amazonaws.com) with kinesis:PutRecord or kinesis:PutRecords
+  # on the target stream. The stream can be in a different account, making this a
+  # continuous exfiltration vector for all committed journal blocks.
+  #
+  # This path is structurally identical to ExportJournalToS3 in terms of attack surface:
+  # the relevant distinction for CanExfiltrate is whether data leaves the account boundary,
+  # not whether the transfer is one-time (export) or continuous (stream). A cross-account
+  # Kinesis stream that continuously receives all journal blocks is exfiltration.
+  - id: aws-qldb-stream-journal-kinesis-exfiltrate
+    emits: CanExfiltrate
+    description: >-
+      qldb:StreamJournalToKinesis + iam:PassRole (for a role with kinesis:PutRecord)
+      allows the caller to continuously stream the entire QLDB journal — all committed
+      document revisions across all tables — to a Kinesis Data Stream, including
+      cross-account streams.
+    match:
+      - [ ?principal, HasPermission, ?ledger ]
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "node_type(?ledger) == NoSQLDatabase"
+      - "?ledger.provider_type == 'AWS::QLDB::Ledger'"
+      - "effective_action(?principal, ?ledger) includes 'qldb:StreamJournalToKinesis'"
+      - "?role.trust_policy includes 'qldb.amazonaws.com' as a trusted principal"
+      - "effective_action(?principal, ?role) includes 'iam:PassRole'"
+      - "iam:PassRole for ?role permits iam:PassedToService including 'qldb.amazonaws.com' (or unconditioned)"
+      - "effective_action(?principal, ?role) OR effective_action(?role, '*') includes 'kinesis:PutRecord' OR 'kinesis:PutRecords' on at least one stream"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?ledger
+      permissions: ["qldb:StreamJournalToKinesis", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility, resource_policy]
+      state_logic: >-
+        if effective 'qldb:StreamJournalToKinesis' on ?ledger AND ?principal CanPassIdentity ?role
+        AND ?role trusts qldb.amazonaws.com AND effective 'kinesis:PutRecord' OR 'kinesis:PutRecords'
+        on ?role:
+          if the kinesis:PutRecord scope is confirmed to be cross-account OR attacker-controlled:
+            ACTIVE — journal data continuously leaves the account boundary.
+          elif the stream is confirmed same-account and under normal Kinesis access policies:
+            do NOT emit CanExfiltrate (data stays in-account). The streamed journal records
+            are now Kinesis data; their read access is governed by aws:kinesis CanReadData rules
+            (cross-reference the Kinesis stream node and the role's kinesis:GetRecords permission).
+          elif the target stream/account destination is unknown:
+            CONDITIONAL(resource_policy) — gate on whether the Kinesis stream policy permits
+            access from outside (cross-account write scope).
+        else: do not emit.
+      confidence: "contributing_confidence * 0.90"
+      derived_from: [ "?principal CanPassIdentity ?role", "qldb:StreamJournalToKinesis EFFECTIVE on ?ledger" ]
+      false_positive_note: >-
+        Requires BOTH qldb:StreamJournalToKinesis on the ledger AND iam:PassRole on a
+        role that trusts qldb.amazonaws.com AND the role has kinesis:PutRecord or
+        kinesis:PutRecords on at least one stream. A role passable only to other services
+        (e.g., ec2.amazonaws.com) does NOT enable QLDB streaming — honor iam:PassedToService
+        conditions and role trust policy principal. The stream is continuous; once started,
+        all committed journal blocks are streamed until the stream is deleted or stopped.
+        Do not emit ACTIVE when only one or two of the three required conditions are present.
+        When the target stream is confirmed cross-account or attacker-controlled, this is
+        ACTIVE exfiltration; when the stream/account destination is unknown, emit
+        CONDITIONAL(resource_policy). When the target stream is confirmed same-account
+        with normal Kinesis access policies, do NOT emit CanExfiltrate — the data stays
+        in-account. The streamed journal records are Kinesis data; their read access is
+        governed by aws:kinesis CanReadData rules. Cross-reference the Kinesis stream node
+        and the role's kinesis:GetRecords permission to determine whether CanReadData applies.
+      narrative: >-
+        {principal.name} can start a QLDB journal stream (qldb:StreamJournalToKinesis)
+        on {ledger.name} and pass a service role (iam:PassRole) that QLDB assumes to
+        continuously write all journal blocks — including every committed document
+        revision across all tables — to a Kinesis Data Stream. If the target stream is
+        attacker-controlled or cross-account, this constitutes continuous data exfiltration
+        of the entire {ledger.name} ledger.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying qldb:SendCommand at the account scope -> emit the
+#     aws-qldb-sendcommand-read-data and aws-qldb-partiql-select-read-data edges
+#     with state: BLOCKED and denied_by = <SCP arn/statement>.
+#   - An SCP denying qldb:ExportJournalToS3 or iam:PassRole -> emit
+#     aws-qldb-export-journal-exfiltrate with state: BLOCKED.
+#   - An SCP denying qldb:StreamJournalToKinesis or iam:PassRole -> emit
+#     aws-qldb-stream-journal-kinesis-exfiltrate with state: BLOCKED.
+#   - A KMS key policy or SCP denying kms:Decrypt on the ledger's CMK leaves
+#     CanReadData CONDITIONAL(key_permission) and blocks the
+#     credential-chains:decrypt-gates-secret-read upgrade.
+#   - A permissions boundary capping qldb:SendCommand -> BLOCKED for
+#     aws-qldb-sendcommand-read-data.
+# ---------------------------------------------------------------------------
+
+# No explicit normalization records are required for QLDB.
+# The service contributes no ExecutesAs, no resource-based policy CrossAccountTrust,
+# no CanTrigger, and no ExposesCredential edges beyond what the standard
+# ContainsSecret/CredentialsFor path (handled by the linchpins) provides.
+#
+# EOL note: QLDB reached end-of-life July 31, 2025. These rules apply to
+# historical collections and legacy environments. Rule evaluation should check
+# ledger state (ACTIVE vs DELETED) and suppress output for deleted ledgers.

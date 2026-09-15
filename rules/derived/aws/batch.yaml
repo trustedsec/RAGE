@@ -1,0 +1,283 @@
+# AWS Batch — compute execution-path rules (Phase 4)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edges from schema/edges.yaml. Permissions are the exact
+# identifiers from the AWS Batch Service Authorization Reference. The identity
+# an attacker inherits is the job definition's jobRoleArn (task role, retrieved
+# via the ECS container-credentials endpoint) or, on EC2 compute environments,
+# the ECS instance role (via IMDS).
+#
+# Scope discipline: iam:PassRole is the primary guardrail. Honor the
+# iam:PassedToService condition (batch.amazonaws.com / ecs-tasks.amazonaws.com)
+# and the passed-role resource scope. SubmitJob on an EXISTING definition needs
+# no PassRole because it reuses the role already bound to that definition.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 4-compute-serverless
+applies_to: [aws]
+
+rules:
+
+  # --- Explicit: a running Batch job runs as its jobRoleArn --------------------
+  - id: aws-batch-executes-as-job-role
+    emits: ExecutesAs
+    description: "A Batch job/task executes as the jobRoleArn bound to its job definition."
+    match_record: {resource_type: "AWS::Batch::JobDefinition", field: "containerProperties.jobRoleArn"}
+    where:
+      - "job definition has a non-empty jobRoleArn"
+    emit:
+      source_type: Compute
+      source: "<BatchJob (running job / job-definition workload)>"
+      target: "<jobRoleArn>"
+      state: ACTIVE
+      conditions: [service_state]
+      false_positive_note: "If jobRoleArn is empty the job has no task role; emit ExecutesAs only for the EC2 instance role in that case (see aws-batch-executes-as-instance-role)."
+      narrative: "Batch job {job.name} executes as {role.name} (jobRoleArn on its job definition), retrievable via the ECS task-credentials endpoint."
+
+  - id: aws-batch-executes-as-instance-role
+    emits: ExecutesAs
+    description: "On EC2 compute environments the container host executes as the ECS instance role."
+    match_record: {resource_type: "AWS::Batch::ComputeEnvironment", field: "computeResources.instanceRole"}
+    where:
+      - "compute environment type is EC2/SPOT (not FARGATE/FARGATE_SPOT)"
+    emit:
+      source_type: Compute
+      source: "<BatchJob on EC2 compute environment>"
+      target: "<instanceRole (ECS instance profile role)>"
+      state: CONDITIONAL
+      conditions: [service_state]
+      false_positive_note: "Fargate and EKS compute environments have no attacker-reachable EC2 instance role; only emit for EC2/SPOT CEs."
+      narrative: "Batch jobs on EC2 compute environment {ce.name} run on hosts with instance role {role.name}, reachable via IMDS."
+
+  # --- CanModifyCode: register a definition with attacker image+command -------
+  - id: aws-batch-register-job-definition-code
+    emits: CanModifyCode
+    match_effective_permission: {action: "batch:RegisterJobDefinition", resource_type: "AWS::Batch::JobDefinition"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<job definition (new revision)>"
+      permissions: ["batch:RegisterJobDefinition"]
+      conditions: [iam_permission, condition_expression]
+      false_positive_note: "batch:Image / batch:Privileged / batch:User condition keys may restrict the image, privilege, or user; honor them before claiming arbitrary code."
+      narrative: "{principal.name} can register a Batch job definition with an attacker-chosen image and command (batch:RegisterJobDefinition)."
+
+  # --- CanModifyCode: SubmitJob with container overrides on an existing def ----
+  - id: aws-batch-submit-job-override-code
+    emits: CanModifyCode
+    description: "SubmitJob with container command/environment overrides runs attacker-chosen code against an existing definition's image without registering a new revision."
+    match_effective_permission: {action: "batch:SubmitJob", resource_type: "AWS::Batch::JobDefinition"}
+    where:
+      - "principal has batch:SubmitJob on the target definition and queue"
+      - "container command/environment overrides are not blocked by an IAM condition (batch:Image / batch:User / batch:Privileged not denied)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<existing job definition (ContainerTask)>"
+      permissions: ["batch:SubmitJob"]
+      conditions: [iam_permission, condition_expression]
+      false_positive_note: "Container overrides (command/environment) may be restricted by an IAM condition on batch:SubmitJob (batch:Image/batch:User/batch:Privileged); if overrides are blocked this yields no code control. SubmitJob-with-overrides changes the command/env only, not the container image itself."
+      narrative: "{principal.name} can submit an existing Batch definition with command/environment overrides, running attacker-chosen code against its image without registering a new revision (batch:SubmitJob)."
+
+  # --- CanModifyConfiguration: choose the execution identity + settings -------
+  - id: aws-batch-register-job-definition-config
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "batch:RegisterJobDefinition", resource_type: "AWS::Batch::JobDefinition"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<job definition (new revision)>"
+      permissions: ["batch:RegisterJobDefinition"]
+      note: "Sets jobRoleArn/executionRoleArn, env, secrets, privileged flag."
+      narrative: "{principal.name} can register a job definition choosing its execution identity and container settings (batch:RegisterJobDefinition)."
+
+  - id: aws-batch-update-compute-environment-config
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "batch:UpdateComputeEnvironment", resource_type: "AWS::Batch::ComputeEnvironment"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<compute environment>"
+      permissions: ["batch:UpdateComputeEnvironment"]
+      narrative: "{principal.name} can change the instance role / capacity of compute environment {ce.name} (batch:UpdateComputeEnvironment)."
+
+  # --- CanPassIdentity: PassRole for job role / execution role / instance role -
+  - id: aws-batch-pass-job-role
+    emits: CanPassIdentity
+    match_effective_permission: {action: "iam:PassRole", resource_type: "AWS::IAM::Role"}
+    where:
+      - "principal has batch:RegisterJobDefinition"
+      - "PassedToService condition (if any) includes ecs-tasks.amazonaws.com (job/execution role) or batch.amazonaws.com (service role)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<jobRoleArn / executionRoleArn passable in scope>"
+      permissions: ["iam:PassRole", "batch:RegisterJobDefinition"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: "iam:PassRole scoped by iam:PassedToService or ARN: a role passable only to ec2.amazonaws.com does NOT become a Batch task role. Honor the condition."
+      narrative: "{principal.name} can pass {role.name} as a Batch job/execution role (iam:PassRole + batch:RegisterJobDefinition)."
+
+  - id: aws-batch-pass-instance-role
+    emits: CanPassIdentity
+    match_effective_permission: {action: "iam:PassRole", resource_type: "AWS::IAM::Role"}
+    where:
+      - "principal has batch:CreateComputeEnvironment OR batch:UpdateComputeEnvironment"
+      - "PassedToService condition (if any) includes ec2.amazonaws.com / ecs.amazonaws.com"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<instanceRole / service role passable in scope>"
+      permissions: ["iam:PassRole", "batch:CreateComputeEnvironment"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      narrative: "{principal.name} can pass {role.name} as the EC2 instance role of a Batch compute environment (iam:PassRole + batch:CreateComputeEnvironment)."
+
+  # --- CanInvoke: SubmitJob drives execution of a definition ------------------
+  - id: aws-batch-submit-job-invoke
+    emits: CanInvoke
+    match_effective_permission: {action: "batch:SubmitJob", resource_type: "AWS::Batch::JobDefinition"}
+    where:
+      - "principal also has batch:SubmitJob on the target job-queue"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<job definition>"
+      permissions: ["batch:SubmitJob"]
+      conditions: [iam_permission]
+      target_type_note: "The Batch job definition (ContainerTask) is treated as an invokable Workflow-equivalent CanInvoke target: SubmitJob drives its execution, completing an ExecutesAs escalation. Downstream validators should accept ContainerTask/Workflow as a CanInvoke target for this service; if the schema target set is enforced strictly, model this instead as CanTrigger (Identity -> Compute)."
+      narrative: "{principal.name} can submit job definition {def.name} to a queue (batch:SubmitJob), causing it to run."
+
+  # --- CanTrigger: an existing schedule/rule/state machine that submits a job -
+  - id: aws-batch-trigger-scheduled-submit
+    emits: CanTrigger
+    description: "An EventBridge rule / EventBridge Scheduler target or a Step Functions state that calls batch:SubmitJob against a definition is an attacker-reachable execution trigger."
+    match_record: {resource_type: "AWS::Events::Rule / AWS::Scheduler::Schedule / AWS::StepFunctions::StateMachine", field: "target/state -> batch:SubmitJob"}
+    where:
+      - "an EventBridge rule target, EventBridge Scheduler target, or Step Functions state invokes batch:SubmitJob against the job definition"
+    emit:
+      target_type: Compute
+      source: "<EventBridge rule / Scheduler schedule / Step Functions state machine>"
+      target: "<job definition (ContainerTask)>"
+      state: CONDITIONAL
+      conditions: [trigger_exists]
+      false_positive_note: "Only emit when an existing schedule/rule/state machine actually targets batch:SubmitJob for this definition; a trigger that must first be created is POTENTIAL, not CONDITIONAL. The submitted job runs as the definition's jobRoleArn."
+      narrative: "Batch job definition {def.name} can be executed by an existing EventBridge rule/Scheduler/Step Functions trigger that submits it (CanTrigger)."
+
+  # --- DERIVED: CanExecuteAs by registering+submitting a controlled definition -
+  - id: aws-batch-execute-as-register-submit
+    emits: CanExecuteAs
+    description: "Register a job definition with attacker code + a passed privileged jobRole, then submit it."
+    match:
+      - [ ?principal, CanModifyCode, ?jobdef ]
+      - [ ?principal, CanPassIdentity, ?jobrole ]
+    where:
+      - "?principal has EFFECTIVE batch:SubmitJob on a job-queue"
+      - "?jobrole passable to ecs-tasks.amazonaws.com (PassedToService satisfied)"
+      - "?jobrole.privilege_level >= ?principal.privilege_level"
+    optional:
+      - [ ?principal, CanInvoke, ?jobdef ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "?principal"
+      target: "?jobrole"
+      permissions: ["batch:RegisterJobDefinition", "iam:PassRole", "batch:SubmitJob"]
+      state_logic: "ACTIVE if batch:SubmitJob on a queue is present else CONDITIONAL(iam_permission)"
+      conditions_from: [ ?jobdef, ?jobrole ]
+      false_positive_note: "Do not emit if PassedToService excludes ecs-tasks, or if batch:Privileged/batch:Image conditions neutralize the payload. Escalation only when jobRole is more privileged than the attacker."
+      derived_from: [ CanModifyCode, CanPassIdentity ]
+      narrative: "{principal.name} can register a Batch job definition it controls, pass privileged role {jobrole.name} to it, and submit it — executing arbitrary code as {jobrole.name}."
+
+  # --- DERIVED: CanExecuteAs by reusing an EXISTING definition's role ----------
+  - id: aws-batch-execute-as-submit-existing
+    emits: CanExecuteAs
+    description: "Submit an existing definition (with command override) whose bound jobRole is privileged — no PassRole needed."
+    match:
+      - [ ?principal, CanInvoke, ?jobdef ]
+      - [ ?jobdef,    ExecutesAs, ?jobrole ]
+    where:
+      - "?principal has batch:SubmitJob with container command/env override permitted (no condition blocks overrides)"
+      - "?jobrole.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "?principal"
+      target: "?jobrole"
+      permissions: ["batch:SubmitJob"]
+      state: ACTIVE
+      conditions_from: [ ?jobdef, ?jobrole ]
+      false_positive_note: "Only escalates when the existing definition already binds a MORE-privileged jobRoleArn. If the definition has no jobRoleArn or an equal/lower-priv role, do not emit. Container overrides may be restricted by policy."
+      derived_from: [ CanInvoke, ExecutesAs ]
+      narrative: "{principal.name} can submit existing Batch definition {jobdef.name} with a command override, executing as its privileged role {jobrole.name} (batch:SubmitJob) without needing iam:PassRole."
+
+  # --- DERIVED: instance-role theft via privileged / host container -----------
+  - id: aws-batch-instance-role-via-privileged
+    emits: CanRetrieveToken
+    description: "A privileged Batch container on an EC2 compute environment can read the instance role from IMDS."
+    match:
+      - [ ?principal, CanExecuteAs, ?jobrole ]
+      - [ ?job,       ExecutesAs,   ?instancerole ]
+    where:
+      - "?job runs on an EC2/SPOT compute environment"
+      - "container registered/submitted with privileged=true (batch:Privileged not denied) OR host access available"
+    emit:
+      source: "?principal"
+      target: "?instancerole"
+      permissions: ["batch:RegisterJobDefinition", "batch:SubmitJob"]
+      state: CONDITIONAL
+      conditions: [service_state, condition_expression]
+      false_positive_note: "Fargate/EKS CEs expose no EC2 instance role; a hardened CE with IMDSv2 hop-limit 1 + batch:Privileged denied blocks this — mark BLOCKED. Only applies to EC2/SPOT compute environments. This rule emits only CanRetrieveToken(->instanceRole); the retrieved credential rolls up to CanExecuteAs(?principal -> ?instancerole) via the generic CanRetrieveToken + target-Identity derivation, keeping the rule single-edge while still connecting the escalation graph."
+      derived_from: [ CanExecuteAs, ExecutesAs ]
+      narrative: "{principal.name} can run a privileged Batch container on EC2 compute environment and read the instance-role credentials {instancerole.name} from IMDS."
+
+  # --- DERIVED: create workload bound to a passed role -------------------------
+  - id: aws-batch-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create/register Batch workload bound to a passed identity (create + pass)."
+    match:
+      - [ ?principal, CanPassIdentity, ?jobrole ]
+    where:
+      - "?principal has batch:RegisterJobDefinition AND batch:SubmitJob"
+      - "?jobrole passable to ecs-tasks.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "?principal"
+      target: "?jobrole"
+      permissions: ["batch:RegisterJobDefinition", "batch:SubmitJob", "iam:PassRole"]
+      state_logic: "ACTIVE if iam:PassRole PassedToService admits ecs-tasks.amazonaws.com and batch:SubmitJob is present; else CONDITIONAL(iam_permission, condition_expression)."
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      conditions_from: [ ?jobrole ]
+      derived_from: [ CanPassIdentity ]
+      false_positive_note: "iam:PassRole scoped by iam:PassedToService/ARN — a role passable only to ec2.amazonaws.com does not become a Batch task role; honor the condition. Differs from aws-batch-execute-as-register-submit: CanCreateWorkloadAs is the capability to create the bound workload (register + PassRole + SubmitJob), whereas CanExecuteAs is the realized execution of attacker code as ?jobrole. This rule captures the create/bind step; the execute rule captures the running outcome."
+      narrative: "{principal.name} can create a new Batch job definition bound to {jobrole.name} and run it (register + PassRole + SubmitJob)."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance: if an SCP / permission boundary denies
+# batch:RegisterJobDefinition, batch:SubmitJob, batch:CreateComputeEnvironment,
+# or iam:PassRole at the effective scope, emit the corresponding edge with
+# state: BLOCKED and denied_by=<SCP/boundary statement>. Likewise, a
+# batch:Privileged=false or restrictive batch:Image/batch:User condition that
+# neutralizes the payload downgrades the instance-role rule to BLOCKED.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw config -> explicit edges). These belong in
+# rules/explicit/aws/ but are noted here for completeness of Batch coverage.
+explicit_rules:
+  - id: aws-batch-jobdef-executes-as
+    emits: ExecutesAs
+    from_field: "AWS::Batch::JobDefinition.containerProperties.jobRoleArn"
+    note: "Emit ExecutesAs(BatchJob -> jobRoleArn) when jobRoleArn present."
+  - id: aws-batch-ce-instance-role
+    emits: ExecutesAs
+    from_field: "AWS::Batch::ComputeEnvironment.computeResources.instanceRole"
+    note: "Emit ExecutesAs(BatchJob-on-CE -> instanceRole) for EC2/SPOT CEs only."
+  - id: aws-batch-jobdef-secrets
+    emits: ContainsSecret
+    from_field: "AWS::Batch::JobDefinition.containerProperties.secrets[].valueFrom"
+    note: "Job definition references Secrets Manager / SSM SecureString ARNs."
+  - id: aws-batch-jobdef-env-plaintext-cred
+    emits: ExposesCredential
+    from_field: "AWS::Batch::JobDefinition.containerProperties.environment"
+    note: "Emit ExposesCredential(JobDefinition -> Credential/Identity) when a plaintext environment value pattern-matches credential material (access key, password, token). Plaintext creds in containerProperties.environment leak on DescribeJobDefinitions. Defer non-matching values to the generic env-scanning rule."

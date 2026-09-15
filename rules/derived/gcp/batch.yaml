@@ -1,0 +1,232 @@
+# GCP Batch — Phase 4 execution / attack-path rules
+# ---------------------------------------------------------------------------
+# Catalog key gcp:batch. Emits COMMON edges from schema/edges.yaml only.
+# Permissions are the EFFECTIVE batch.* / iam.* actions the evaluator must
+# confirm on the given resource scope before the edge is emitted. Permission
+# identifiers are verbatim from the Batch IAM reference:
+#   batch.jobs.create/delete/get/list, batch.tasks.get/list,
+#   batch.states.report, batch.operations.get/list, batch.locations.get/list,
+#   batch.resourceAllowances.create/delete/get/list/update.
+#
+# CENTRAL PIVOT (differs from GCF/Cloud Run):
+#   A Batch job is IMMUTABLE and runs ON CREATION. There is NO batch.jobs.update
+#   and NO invoke/call permission. So the ONLY execution primitive is
+#   "batch.jobs.create" -- create == deploy == run. The attacker fully controls
+#   the runnable (container image / script) of any job they create, and the VMs
+#   run as allocationPolicy.serviceAccount.email (default = Compute Engine
+#   default SA). This collapses the normal code+config+invoke chain into a single
+#   create+actAs step.
+#
+# State discipline:
+#   - Execution edges are ACTIVE on create -- NO trigger_exists / invoke gating
+#     (contrast with GCF). Do not downgrade to CONDITIONAL(trigger_exists).
+#   - Choosing a runtime SA requires iam.serviceAccounts.actAs on that SA (per-SA
+#     scope), INCLUDING the default Compute Engine SA (per the Batch custom-service-
+#     account guide -- it is not an actAs-free fallback); missing actAs -> POTENTIAL.
+#   - Batch jobs have NO per-resource IAM policy: never emit setIamPolicy /
+#     CanInvoke / ExposedToInternet for a job. Access is project/location scoped.
+#   - IAM deny policy / org policy denying an action -> BLOCKED (denied_by=...).
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 4-compute-serverless
+service: batch
+applies_to: [gcp]
+
+rules:
+
+  # --- Explicit: job VMs run as the runtime service account ------------------
+  - id: gcp-batch-executes-as
+    emits: ExecutesAs
+    match_record: {resource_type: "google.batch.Job", field: "allocationPolicy.serviceAccount.email"}
+    where: ["runtime SA = allocationPolicy.serviceAccount.email, or the Compute Engine default SA PROJECT_NUMBER[email protected] if unset"]
+    emit:
+      source_type: Compute
+      source: "<batch job>"
+      target: "<runtime service account>"
+      permissions: []
+      note: "Zero-cost fact. Default Compute Engine SA typically holds roles/editor."
+      narrative: "{job.name} executes as runtime service account {sa.name} on its Batch-provisioned Compute Engine VMs."
+
+  # --- Job creation is the execution primitive (create == run) --------------
+  - id: gcp-batch-can-create-job
+    emits: CanCreate
+    match_effective_permission: {action: "batch.jobs.create", resource_type: "google.batch.Job"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<project/location Batch scope>"
+      permissions: ["batch.jobs.create"]
+      escalation: "Submit a job with an attacker-controlled runnable. Turning creation into execution as a runtime SA additionally requires iam.serviceAccounts.actAs on that SA (default or custom); batch.jobs.create alone cannot start a job. See gcp-batch-execute-as-via-create / -via-default-sa for the actAs-gated execution edge. No invoke/trigger needed once actAs is held."
+      note: "Batch has no batch.jobs.update and no per-job IAM policy; the runnable is fully attacker-controlled at create time only. This bare CanCreate edge is not execution on its own -- actAs on a usable SA (including the default Compute Engine SA) is required to run the job."
+      narrative: "{principal.name} can create Batch jobs in {scope.name} (batch.jobs.create); running attacker-supplied code as a runtime SA additionally requires iam.serviceAccounts.actAs on that SA."
+
+  # --- actAs on the chosen runtime SA (PassRole analog) ---------------------
+  # NOTE: the generic actAs->CanPassIdentity edge is emitted by the identity
+  # rule gcp-sa-act-as; this rule records the Batch-specific pairing for clarity.
+  - id: gcp-batch-passidentity-actas
+    emits: CanPassIdentity
+    match_effective_permission: {action: "iam.serviceAccounts.actAs", resource_type: "google.iam.ServiceAccount"}
+    where: ["?principal has batch.jobs.create in the target project/location"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<chosen runtime service account>"
+      permissions: ["iam.serviceAccounts.actAs"]
+      conditions: [role_compatibility, iam_permission]
+      false_positive_note: "actAs is per-SA: actAs on sa-a does NOT let you run as sa-b. Only emit for SAs the caller can actAs; no actAs -> POTENTIAL. The default Compute Engine SA also requires iam.serviceAccounts.actAs (per the official Batch custom-service-account guide) -- it is NOT an actAs-free shortcut."
+      narrative: "{principal.name} can set {sa.name} as the runtime SA of a Batch job it creates (iam.serviceAccounts.actAs)."
+
+  # --- CanCreateWorkloadAs: create a job bound to an actAs-able SA -----------
+  - id: gcp-batch-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new Batch job whose VMs run as a passable SA (create + actAs)."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has batch.jobs.create in the target project/location"
+      - "?principal has iam.serviceAccounts.actAs on ?sa"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["batch.jobs.create", "iam.serviceAccounts.actAs"]
+      escalation: "Deploy a Batch job whose runtime SA is a privileged SA; it runs attacker code immediately."
+      false_positive_note: "actAs must apply to the chosen SA. Without it -> POTENTIAL. The default Compute Engine SA is not an exception: actAs is required on it too (per the official Batch custom-service-account guide)."
+      narrative: "{principal.name} can create a Batch job bound to {sa.name} (batch.jobs.create + iam.serviceAccounts.actAs), executing code as {sa.name}."
+
+  # --- CanExecuteAs via job creation (chosen SA) ----------------------------
+  - id: gcp-batch-execute-as-via-create
+    emits: CanExecuteAs
+    description: "Create a job with an attacker runnable bound to an actAs-able SA; ExecutesAs completes it. ACTIVE on create (no invoke/trigger)."
+    match:
+      - [ ?principal, CanCreateWorkloadAs, ?sa ]
+    where:
+      - "?principal has batch.jobs.create in the target project/location"
+      - "?principal has iam.serviceAccounts.actAs on ?sa"
+      - "?sa.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<runtime service account>"
+      permissions: ["batch.jobs.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE only when iam.serviceAccounts.actAs on ?sa is confirmed present (the job then runs immediately -- Batch has no invoke step and no trigger_exists condition). If actAs is not confirmed on ?sa -> POTENTIAL(iam_permission). Never downgrade to CONDITIONAL(trigger_exists)."
+      conditions_from: [ ?sa ]
+      false_positive_note: "No trigger/invoke gating -- unlike GCF, do NOT downgrade to CONDITIONAL(trigger_exists). Escalation only when SA privilege exceeds caller's; the default Compute Engine editor SA qualifies (but still requires actAs on it). actAs is per-SA."
+      narrative: "{principal.name} can create a Batch job (batch.jobs.create) whose VMs run attacker code as {sa.name} (iam.serviceAccounts.actAs); the job runs on creation, no invocation needed."
+
+  # --- CanExecuteAs via default Compute Engine SA (no explicit actAs) --------
+  - id: gcp-batch-execute-as-via-default-sa
+    emits: CanExecuteAs
+    description: "Create a job WITHOUT specifying a runtime SA -> runs as the Compute Engine default SA (usually roles/editor)."
+    match:
+      - [ ?principal, CanCreate, ?scope ]
+      - [ ?job,       ExecutesAs, ?defaultsa ]
+    where:
+      - "?principal has batch.jobs.create in ?scope"
+      - "?principal has iam.serviceAccounts.actAs on ?defaultsa (required even for the default Compute Engine SA)"
+      - "?defaultsa == the Compute Engine default SA of ?scope.project (PROJECT_NUMBER[email protected])"
+      - "?defaultsa.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<Compute Engine default service account>"
+      permissions: ["batch.jobs.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission]
+      state_logic: "CONDITIONAL(iam_permission) by default -- creating a job with the default Compute Engine SA still requires iam.serviceAccounts.actAs on that default SA (per the Batch custom-service-account guide). ACTIVE only when the caller actually holds actAs on the default Compute Engine SA; otherwise POTENTIAL/CONDITIONAL(iam_permission)."
+      conditions_from: [ ?defaultsa ]
+      false_positive_note: "Service Account User (iam.serviceAccounts.actAs) is required on the job's service account -- including the default Compute Engine SA -- per the official Batch custom-service-account guide. Do NOT treat the omitted/default SA as an actAs-free shortcut: a principal with batch.jobs.create but WITHOUT actAs on the default Compute Engine SA cannot start the job. Default SA is usually roles/editor -> high value once actAs is confirmed."
+      narrative: "{principal.name} can create a Batch job without a custom SA (batch.jobs.create); its VMs run attacker code as the default Compute Engine SA {sa.name} (typically roles/editor)."
+
+  # --- ExposesCredential / CanRetrieveToken: runtime SA token via metadata ---
+  - id: gcp-batch-exposes-runtime-sa
+    emits: ExposesCredential
+    description: "Code running in the job VM reads the runtime SA token from the GCE metadata server."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    emit:
+      source: "<batch job>"
+      target: "<runtime service account>"
+      permissions: []
+      note: "Metadata endpoint: http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token (header Metadata-Flavor: Google)."
+      narrative: "{job.name} exposes credentials for {sa.name} to any code it runs (GCE metadata server token endpoint)."
+
+  - id: gcp-batch-retrieve-runtime-sa-token
+    emits: CanRetrieveToken
+    description: "Attacker with execution in the job can mint the runtime SA token."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    emit:
+      source: "<principal>"
+      target: "<runtime service account>"
+      permissions: []
+      narrative: "{principal.name}, executing in a Batch job, can retrieve an access token for {sa.name} from the metadata server."
+
+  # --- Cross-project entry via job creation with a powerful SA ---------------
+  - id: gcp-batch-cross-project-create
+    emits: CanEnterProject
+    description: "A principal in project A creates a Batch job in project B whose runtime SA has power in B."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    where:
+      - "?job.project != ?principal.project"
+      - "?sa has bindings granting privilege in ?job.project"
+    emit:
+      source_type: Identity
+      target_type: Project
+      source: "<principal>"
+      target: "<job.project>"
+      permissions: ["batch.jobs.create", "iam.serviceAccounts.actAs"]
+      false_positive_note: "actAs is only needed when a non-default runtime SA is chosen (the usual cross-project case). Only cross-boundary when principal and job live in different projects AND the runtime SA is privileged in the job's project. Org policy iam.disableCrossProjectServiceAccountUsage can block cross-project SA use -> BLOCKED."
+      narrative: "{principal.name} can run code as {sa.name} in project {project.name} via a Batch job it creates, entering that project."
+
+  # --- Escalation roll-up ----------------------------------------------------
+  - id: gcp-batch-escalate-to-runtime-sa
+    emits: CanEscalateTo
+    description: "CanExecuteAs a runtime SA of strictly greater privilege."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    where:
+      - "?sa.privilege_level > ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<runtime service account>"
+      permissions: []
+      narrative: "{principal.name} can escalate to {sa.name} by creating a Batch job that runs as it."
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw config -> explicit edges). These belong in
+# /rules/explicit/gcp-batch.yaml; recorded here for completeness. They match raw
+# Batch API records, not other edges.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-batch-explicit-executes-as
+    emits: ExecutesAs
+    source_record: {api: "batch.projects.locations.jobs.get", field: "allocationPolicy.serviceAccount.email"}
+    default: "Compute Engine default SA PROJECT_NUMBER[email protected] when unset"
+    emit: {source: "<batch job>", target: "<runtime service account>"}
+
+  - id: gcp-batch-explicit-can-create
+    emits: CanCreate
+    source_record: {api: "IAM effective policy (Policy Analyzer)", field: "batch.jobs.create at project/location scope"}
+    emit: {source: "<principal>", target: "<project/location Batch scope>"}
+
+  - id: gcp-batch-explicit-cross-project-trust
+    emits: CrossProjectTrust
+    source_record: {api: "batch.projects.locations.jobs.get", field: "allocationPolicy.serviceAccount.email"}
+    where: ["the runtime SA belongs to a different project than the job"]
+    emit: {source: "<job.project>", target: "<runtime SA project | external identity>"}
+
+# Deny-policy / org-policy handling: if an IAM deny policy or org policy denies
+# batch.jobs.create or iam.serviceAccounts.actAs at the effective scope, emit the
+# edge as BLOCKED with denied_by=<deny/org policy>, so the UI explains why the
+# path does not work. Org policy iam.disableCrossProjectServiceAccountUsage
+# specifically blocks cross-project runtime SAs.

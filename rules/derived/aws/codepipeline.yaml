@@ -1,0 +1,495 @@
+# AWS CodePipeline — Derived attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (ExecutesAs, CanModifyCode, CanTrigger, CanPassIdentity, CrossAccountTrust)
+# already lives in /rules/explicit/aws-codepipeline.yaml; these rules combine
+# those explicit edges with cicd-chains / can-execute-as linchpins to derive
+# execution, escalation, and account-entry capabilities.
+#
+# Permissions listed are EFFECTIVE actions the permission evaluator must confirm
+# on the given resource scope. State defaults to ACTIVE; an unmet condition
+# yields CONDITIONAL/POTENTIAL; an explicit deny/SCP/boundary yields BLOCKED.
+#
+# PHASE-9 INVARIANT (CodePipeline):
+#   A pipeline is a BuildWorker that ExecutesAs its pipeline service role. Each
+#   stage invokes a downstream runner (CodeBuild/CodeDeploy/Lambda/CFN/ECS) that
+#   ExecutesAs its own action role. Two attack chains:
+#     1. MODIFY path: whoever can call UpdatePipeline (with iam:PassRole for the
+#        service/action role) controls the stage/action definition the pipeline
+#        executes -> CanModifyCode(principal -> pipeline) +
+#        ExecutesAs(pipeline -> serviceRole) -> cicd-chains rule 1 ->
+#        CanExecuteAs(principal -> serviceRole). ACTIVE when a run path exists.
+#     2. TRIGGER path: whoever can StartPipelineExecution runs the CURRENT
+#        definition -> CanExecuteAs ONLY when the definition already runs
+#        attacker-influenced code. cicd-chains rule 2, CONDITIONAL.
+#
+# LINCHPIN CITATIONS (emit facts; let them roll up):
+#   cicd-chains.yaml:
+#     - rule 1 (cicd-modify-buildspec-executes-as):
+#       CanModifyCode(p -> pipeline) + ExecutesAs(pipeline -> identity)
+#       => CanExecuteAs(p -> identity) [ACTIVE if run path exists]
+#     - rule 2 (cicd-trigger-runner-executes-as):
+#       CanTrigger(p -> pipeline) + ExecutesAs(pipeline -> identity)
+#       => CanExecuteAs(p -> identity) [CONDITIONAL(attacker_influenced_definition)]
+#     - rule 3 (cicd-pipeline-orchestrates-stages):
+#       CanTrigger(p -> pipeline) + CanTrigger(pipeline -> stage_runner)
+#       => CanTrigger(p -> stage_runner) [propagation]
+#   can-execute-as.yaml:
+#     - execute-as-via-code-modify / execute-as-via-config-identity-swap
+#   can-control.yaml:
+#     - escalate-via-execute-as: CanExecuteAs => CanEscalateTo
+#     - enter-account-via-assume: CanAssume/CanFederateAs => CanEnterAccount
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-pipelines
+applies_to: [aws]
+
+rules:
+
+  # --- REMOVED: aws-codepipeline-update-pipeline-executes-as ---
+  # This rule derived CanExecuteAs from CanModifyCode(?principal -> ?pipeline) +
+  # ExecutesAs(?pipeline -> ?service_role), exactly the collapse already performed
+  # by cicd-chains.yaml rule 1 (cicd-modify-buildspec-executes-as). Duplication.
+  # The explicit rule aws-codepipeline-can-modify-code emits CanModifyCode; the
+  # explicit rule aws-codepipeline-pass-pipeline-role emits CanPassIdentity; let
+  # cicd-chains roll them up into CanExecuteAs. The iam:PassRole gating is the
+  # execute-as-via-config-identity-swap case in can-execute-as.yaml, not a
+  # separate derivation here.
+  # CITE: cicd-chains rule 1 (cicd-modify-buildspec-executes-as) for the narrative.
+
+  # --- StartPipelineExecution -> execute as service/action role (weaker) -------
+  # Merely triggering the pipeline yields its service/action role credentials
+  # only if the CURRENT definition already executes attacker-influenced code.
+  # cicd-chains rule 2 (cicd-trigger-runner-executes-as) owns this collapse;
+  # this rule emits the CodePipeline-specific CanTrigger fact that cicd-chains
+  # consumes. The CanTrigger explicit edge (aws-codepipeline-start-execution)
+  # is emitted by the explicit rule. This derived rule is the service-specific
+  # framing for narrative purposes; dedupes with cicd-trigger-runner-executes-as.
+  - id: aws-codepipeline-trigger-executes-as
+    emits: CanExecuteAs
+    description: >-
+      StartPipelineExecution over a pipeline whose current definition already
+      runs attacker-influenced code (poisoned artifact, malicious source commit,
+      unpinned dependency) yields execution as the pipeline's service/action role;
+      cicd-chains rule 2 is the canonical collapse (CONDITIONAL).
+    match:
+      - [ ?principal, CanTrigger, ?pipeline ]
+      - [ ?pipeline,  ExecutesAs, ?service_role ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "?pipeline.provider_type == 'AWS::CodePipeline::Pipeline'"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?service_role
+      permissions:
+        - "codepipeline:StartPipelineExecution"
+      conditions: [attacker_influenced_definition]
+      state_logic: >-
+        CONDITIONAL(attacker_influenced_definition) by default: triggering runs
+        the CURRENT definition, which yields the service role only if that
+        definition already runs attacker-influenceable code (mutable/unpinned
+        artifact dependency, attacker-authored source branch the trigger builds,
+        already-tampered stage spec, or a build step that runs untrusted PR
+        content). ACTIVE only when attacker influence over the current definition
+        is established (then it collapses to the modify path). A trigger over a
+        fully pinned, reviewed, clean definition stays CONDITIONAL.
+        Inherit weakest with CanTrigger / ExecutesAs contributions.
+      confidence: "min(contributing_confidences) * 0.7"
+      derived_from:
+        - "?principal CanTrigger ?pipeline"
+        - "?pipeline ExecutesAs ?service_role"
+        - "cicd-chains: cicd-trigger-runner-executes-as"
+      false_positive_note: >-
+        Strictly weaker than the modify path (0.7 prior). Do NOT emit ACTIVE
+        merely because the principal can start a pipeline execution — the current
+        definition must already run attacker-influenceable code. Classic ACTIVE
+        cases: a pipeline whose Source stage pulls from a repo branch the attacker
+        can push to without review (the push both modifies and triggers), or an
+        artifact dependency the attacker can poison (unpinned package published
+        to an attacker-accessible registry). A fully pinned, reviewed pipeline
+        definition is CONDITIONAL only. Dedupes with aws-codepipeline-update-
+        pipeline-executes-as when the principal can BOTH modify and trigger —
+        the ACTIVE modify edge dominates, do not double-count.
+      narrative: >-
+        {principal.name} can start pipeline {pipeline.name}
+        (codepipeline:StartPipelineExecution), which executes as
+        {service_role.name}; if the pipeline's current definition already runs
+        attacker-influenceable code (poisoned dependency, attacker-authored
+        source, tampered stage spec), this run executes as {service_role.name}.
+
+  # --- REMOVED: aws-codepipeline-propagate-trigger-to-stages ---
+  # This rule emitted CanTrigger, which schema/edges.yaml declares as nature: explicit
+  # only. Derived rules MUST emit edges with nature: derived or both per RULE-FORMAT.md.
+  # Additionally, this rule duplicates cicd-chains.yaml rule 3
+  # (cicd-pipeline-orchestrates-stages), which already performs the identical CanTrigger
+  # propagation for ALL BuildWorker/Compute pipeline nodes. Do not re-derive.
+  # CITE: cicd-chains rule 3 (cicd-pipeline-orchestrates-stages) for the propagation.
+
+  # --- CreatePipeline + PassRole -> create new pipeline as privileged role -----
+  # Restructured to emit CanDeploy (pipeline platform) first, then let the
+  # canonical CanCreateWorkloadAs derivation in can-execute-as.yaml fire.
+  - id: aws-codepipeline-create-pipeline-as
+    emits: CanDeploy
+    description: >-
+      Principal with codepipeline:CreatePipeline can deploy new pipelines to
+      the CodePipeline platform.
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE codepipeline:CreatePipeline (resource scope covers a new pipeline)"
+      - "?role trust policy allows codepipeline.amazonaws.com"
+      - "iam:PassRole for ?role permits iam:PassedToService including codepipeline.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: ApplicationPlatform
+      source: ?principal
+      target: "<CodePipeline service platform>"
+      permissions:
+        - "codepipeline:CreatePipeline"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has EFFECTIVE codepipeline:CreatePipeline and
+        can pass a role compatible with CodePipeline. POTENTIAL(role_compatibility)
+        when role trust or iam:PassedToService is unresolved.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanPassIdentity ?role"
+        - "codepipeline:CreatePipeline confirmed"
+      false_positive_note: >-
+        Only emit when the principal has EFFECTIVE codepipeline:CreatePipeline on
+        the resource scope (new pipelines, or all pipelines in the account).
+      narrative: >-
+        {principal.name} can create a new CodePipeline pipeline
+        (codepipeline:CreatePipeline).
+    # NOTE: The canonical CanCreateWorkloadAs derivation happens in can-execute-as.yaml:
+    # CanDeploy(principal, CodePipeline) + CanPassIdentity(principal, role) +
+    # role_compatible(role, CodePipeline) => CanCreateWorkloadAs(principal, role).
+    # This is the canonical pattern; do NOT re-derive locally.
+
+  # --- REMOVED: aws-codepipeline-action-role-swap-execute-as ---
+  # This rule derived CanExecuteAs from CanModifyConfiguration(?principal -> ?pipeline) +
+  # CanPassIdentity(?principal -> ?action_role), which is the exact pattern matched by
+  # can-execute-as.yaml rule execute-as-via-config-identity-swap. Duplication.
+  # The explicit rules aws-codepipeline-can-modify-configuration and
+  # aws-codepipeline-pass-pipeline-role already produce the factual edges that
+  # can-execute-as consumes. Let can-execute-as perform the collapse.
+  # CITE: can-execute-as rule execute-as-via-config-identity-swap for the derivation.
+
+  # --- Artifact S3 supply chain -> CanModifyCode on pipeline -------------------
+  # s3:PutObject on the pipeline's artifact store (input artifact for a stage)
+  # injects content into the pipeline's execution. Combined with an automatic
+  # S3-change trigger (EventBridge ObjectCreated on the artifact store), this is
+  # an ACTIVE CanModifyCode path; without a trigger it is CONDITIONAL(run_path).
+  # NOTE: CodeCommit PUSH is an equally important CanModifyCode vector. A principal
+  # who can push to a monitored branch in the source repository triggers the pipeline
+  # via EventBridge. This is handled by explicit rule aws-codepipeline-source-push
+  # (codecommit:GitPush on the source repo branch the pipeline watches), emitting
+  # CanModifyCode into the pipeline directly.
+  - id: aws-codepipeline-artifact-s3-supply-chain
+    emits: CanModifyCode
+    description: >-
+      Write access to the pipeline's artifact store S3 bucket/prefix lets an
+      attacker inject a malicious artifact that the next pipeline stage processes
+      as the stage's action role — supply-chain code injection into the pipeline.
+    match:
+      - [ ?principal, CanWrite, ?artifact_bucket ]
+    where:
+      - "node_type(?artifact_bucket) == ObjectStorage"
+      - "?artifact_bucket is the pipeline's artifactStore bucket (confirmed by GetPipeline[].pipeline.artifactStore.location)"
+      - "?principal has EFFECTIVE s3:PutObject on the artifact prefix"
+    optional:
+      # An automatic S3 source trigger that fires on object creation in the artifact store.
+      - [ ?artifact_bucket, CanTrigger, ?pipeline ]
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?pipeline
+      permissions:
+        - "s3:PutObject"
+      conditions: [run_path]
+      state_logic: >-
+        ACTIVE if matched(optional[0]) — the artifact store has an EventBridge
+        ObjectCreated trigger that starts the pipeline automatically on artifact
+        write. Otherwise CONDITIONAL(run_path): the attacker writes the malicious
+        artifact but the pipeline must be separately triggered (manually or via
+        another event). Do NOT emit ACTIVE when the pipeline Source stage uses
+        S3 with change detection DISABLED (artifact polling only) and the
+        attacker cannot also StartPipelineExecution.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from:
+        - "?principal CanWrite ?artifact_bucket"
+        - "?artifact_bucket is the artifactStore for ?pipeline"
+      false_positive_note: >-
+        Only target pipelines whose artifactStore bucket matches ?artifact_bucket
+        AND where the written prefix is the input artifact for a stage the
+        pipeline actually runs (not an output-only artifact). The artifact write
+        does NOT immediately run the pipeline unless an S3 source trigger is
+        configured. Confirm the trigger exists before emitting ACTIVE. An
+        artifact store protected by a CMK also requires the attacker to have
+        kms:GenerateDataKey AND kms:Encrypt (for writing encrypted objects to S3);
+        if the bucket is CMK-encrypted, gate on CanDecrypt only as a check, but
+        the actual write permission depends on CanDecrypt + CanWrite both succeeding
+        (CanDecrypt gates reading; CanGenerateDataKey gates writing). Ensure the
+        principal has both kms:GenerateDataKey and kms:Encrypt on the CMK.
+      narrative: >-
+        {principal.name} can write to the artifact store {artifact_bucket.name}
+        (s3:PutObject) used by pipeline {pipeline.name}. The next stage that
+        reads those artifacts processes the attacker's content as the stage's
+        action role{if optional[0]: '; the S3 ObjectCreated trigger starts the
+        pipeline automatically, making this ACTIVE'}.
+
+  # --- Approval bypass -> unblock a gated downstream stage ---------------------
+  # A principal with PutApprovalResult can approve a manual approval gate,
+  # unblocking downstream stages that were CONDITIONAL(stage_reachable).
+  # This emits CanTrigger to the downstream stage runner, not the pipeline.
+  - id: aws-codepipeline-approval-bypass-unblock-stage
+    emits: CanTrigger
+    description: >-
+      PutApprovalResult APPROVE on a manual approval gate unblocks the downstream
+      stage runner, enabling a principal who can trigger the pipeline AND approve
+      the gate to reach stages that were otherwise CONDITIONAL(stage_reachable).
+    match:
+      - [ ?principal, CanTrigger, ?pipeline ]
+      - [ ?pipeline,  CanTrigger, ?stage_runner ]
+    where:
+      - "?pipeline has at least one manual approval action (action type == Approval)"
+      - "?principal has EFFECTIVE codepipeline:PutApprovalResult on the approval action's ARN"
+      - "the approval gate is the sole gate blocking ?stage_runner"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?stage_runner
+      permissions:
+        - "codepipeline:StartPipelineExecution"
+        - "codepipeline:PutApprovalResult"
+      conditions: [stage_reachable]
+      state_logic: >-
+        ACTIVE when the principal can both start the pipeline AND approve the
+        manual gate (PutApprovalResult on the approval action). This UPGRADES a
+        previously CONDITIONAL(stage_reachable) downstream CanTrigger to ACTIVE.
+        If the approval gate uses an SNS topic for external approver notification
+        and the principal cannot call PutApprovalResult, the gate remains a real
+        control — keep CONDITIONAL(stage_reachable).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanTrigger ?pipeline"
+        - "?pipeline CanTrigger ?stage_runner"
+        - "codepipeline:PutApprovalResult confirms gate bypass"
+      false_positive_note: >-
+        Only emit when the principal has EFFECTIVE PutApprovalResult on the
+        specific approval action ARN in the pipeline stage. The approval action
+        may be restricted by IAM resource conditions to a specific approver
+        (e.g. a role ARN in the approval action's notificationArn or trigger).
+        If the principal cannot satisfy the approval's IAM resource condition,
+        the gate is NOT bypassable. Do not emit ACTIVE for SNS-based approvals
+        where the approver is a human via SNS email notification — that is a
+        real out-of-band control.
+      narrative: >-
+        {principal.name} can start pipeline {pipeline.name} and approve the
+        manual approval gate (codepipeline:PutApprovalResult), bypassing human
+        review and unblocking the downstream stage runner {stage_runner.name}
+        to execute as the action role.
+
+  # --- REMOVED: aws-codepipeline-cross-account-action-enter ---
+  # This rule derived CanEnterAccount from CanExecuteAs(?principal -> ?service_role) +
+  # CanAssume(?service_role -> ?cross_account_role), which is the exact collapse
+  # already performed by can-control.yaml rule enter-account-via-assume.
+  # Duplication. The explicit rule aws-codepipeline-cross-account-trust already
+  # emits CrossAccountTrust (once corrected per issue #1); the CanAssume fact then
+  # feeds can-control enter-account-via-assume directly. If a CodePipeline-specific
+  # CanEnterAccount narrative is required, annotate it as a narrative override on
+  # can-control's rule rather than re-deriving here.
+  # CITE: can-control rule enter-account-via-assume for the account-entry logic.
+
+  # --- NOTE: Escalation roll-up via can-control (REMOVED as redundant) ---------
+  # Escalation from CanExecuteAs -> CanEscalateTo is owned by can-control.yaml
+  # rule escalate-via-execute-as. Any CanExecuteAs(principal, role) where
+  # privilege(role) > privilege(principal) automatically produces CanEscalateTo.
+  # Do NOT re-derive here; it creates duplicate edges and confuses deduplication.
+  # CITE: can-control rule escalate-via-execute-as for the escalation logic.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP/permission boundary denying codepipeline:UpdatePipeline,
+#    codepipeline:CreatePipeline, codepipeline:StartPipelineExecution, or
+#    iam:PassRole at the effective scope -> emit the edge with state: BLOCKED
+#    and denied_by=<SCP arn/statement>.
+#  - A pipeline stage with a manual approval gate whose PutApprovalResult is
+#    restricted to a specific approver the attacker cannot satisfy ->
+#    CanTrigger to downstream stages is CONDITIONAL(stage_reachable).
+#  - iam:PassRole with iam:PassedToService NOT including codepipeline.amazonaws.com
+#    blocks aws-codepipeline-update-pipeline-executes-as /
+#    aws-codepipeline-create-pipeline-as -> POTENTIAL(role_compatibility).
+#  - S3 artifact store protected by CMK and principal lacks kms:GenerateDataKey /
+#    kms:Encrypt -> aws-codepipeline-artifact-s3-supply-chain is BLOCKED.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/aws-codepipeline.yaml (ExecutesAs, CanModifyCode, CanTrigger,
+# CanPassIdentity, CrossAccountTrust, CanWrite, CanModifyConfiguration).
+explicit_rules:
+
+  - id: aws-codepipeline-executes-as
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CodePipeline::Pipeline", field: "pipeline.roleArn"}
+    emit:
+      source_type: Compute
+      source: "<pipeline node>"
+      target: "<IAM role from pipeline.roleArn>"
+      api_source: "codepipeline:GetPipeline"
+      evidence_field: "pipeline.roleArn"
+      narrative: "{pipeline.name} executes as service role {role.name} (pipeline.roleArn)."
+
+  - id: aws-codepipeline-can-modify-code
+    emits: CanModifyCode
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codepipeline:UpdatePipeline"
+      resource_type: "AWS::CodePipeline::Pipeline"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<pipeline node>"
+      permissions: ["codepipeline:UpdatePipeline"]
+      narrative: "{principal.name} can modify the definition of {pipeline.name} (codepipeline:UpdatePipeline)."
+
+  - id: aws-codepipeline-can-trigger
+    emits: CanTrigger
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codepipeline:StartPipelineExecution"
+      resource_type: "AWS::CodePipeline::Pipeline"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<pipeline node>"
+      permissions: ["codepipeline:StartPipelineExecution"]
+      narrative: "{principal.name} can start {pipeline.name} (codepipeline:StartPipelineExecution)."
+
+  - id: aws-codepipeline-pass-pipeline-role
+    emits: CanPassIdentity
+    applies_to: [aws]
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "iam:PassedToService condition (if any) includes codepipeline.amazonaws.com"
+      - "?role trust policy allows codepipeline.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: "<principal>"
+      target: "<IAM role passable to codepipeline.amazonaws.com>"
+      permissions: ["iam:PassRole"]
+      conditions: [role_compatibility, condition_expression]
+      narrative: "{principal.name} can pass {role.name} to CodePipeline (iam:PassRole, PassedToService=codepipeline.amazonaws.com)."
+
+  - id: aws-codepipeline-can-modify-configuration
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codepipeline:UpdatePipeline"
+      resource_type: "AWS::CodePipeline::Pipeline"
+    where:
+      - "change limited to pipeline.roleArn or an action's roleArn (not adding new action content)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<pipeline node>"
+      permissions: ["codepipeline:UpdatePipeline"]
+      narrative: "{principal.name} can modify the service/action role of {pipeline.name} (codepipeline:UpdatePipeline — configuration-only change)."
+
+  - id: aws-codepipeline-stage-invokes-runner
+    emits: CanTrigger
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodePipeline::Pipeline"
+      field: "pipeline.stages[].actions[].configuration"
+    where:
+      - "action.provider in [CodeBuild, CodeDeploy, Lambda, CloudFormation, ECS, StepFunctions]"
+    emit:
+      source_type: Compute
+      target_type: Compute
+      source: "<pipeline node>"
+      target: "<downstream runner (CodeBuild project / Lambda / CFN stack / ECS service node)>"
+      api_source: "codepipeline:GetPipeline"
+      evidence_field: "pipeline.stages[].actions[].configuration"
+      narrative: "{pipeline.name} orchestrates stage runner {runner.name} (action provider {action.provider})."
+
+  - id: aws-codepipeline-cross-account-trust
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodePipeline::Pipeline"
+      field: "pipeline.stages[].actions[].roleArn"
+    where:
+      - "action.roleArn.account != pipeline.account  # cross-account action role"
+    emit:
+      source_type: Role
+      target_type: Account
+      source: "<pipeline service role node>"
+      target: "<account of the cross-account action role>"
+      api_source: "codepipeline:GetPipeline"
+      evidence_field: "pipeline.stages[].actions[].roleArn"
+      narrative: "{pipeline.name} service role trusts cross-account resources in account {actionRole.account}."
+
+  # Separate rule: emit CanAssume from the pipeline service role to the cross-account action role
+  - id: aws-codepipeline-cross-account-assume
+    emits: CanAssume
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodePipeline::Pipeline"
+      field: "pipeline.stages[].actions[].roleArn"
+    where:
+      - "action.roleArn.account != pipeline.account  # cross-account action role"
+    emit:
+      source_type: Role
+      target_type: Role
+      source: "<pipeline service role node>"
+      target: "<cross-account action role node>"
+      permissions: ["sts:AssumeRole"]
+      api_source: "codepipeline:GetPipeline"
+      evidence_field: "pipeline.stages[].actions[].roleArn"
+      narrative: "{pipeline.name} service role can assume cross-account action role {actionRole.name} in account {actionRole.account}."
+
+  - id: aws-codepipeline-artifact-store-write
+    emits: CanWrite
+    applies_to: [aws]
+    match_effective_permission:
+      action: "s3:PutObject"
+      resource_type: "AWS::S3::Bucket"
+    where:
+      - "bucket is the pipeline's artifactStore (confirmed by GetPipeline[].pipeline.artifactStore.location)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<artifact store S3 bucket node>"
+      permissions: ["s3:PutObject"]
+      narrative: "{principal.name} can write to the artifact store {bucket.name} (s3:PutObject) used by {pipeline.name}."
+
+  - id: aws-codepipeline-webhook-trigger
+    emits: CanTrigger
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodePipeline::Webhook"
+      field: "webhook.url"
+    where:
+      - "webhook is registered and active (RegisterWebhookWithThirdParty confirmed)"
+    emit:
+      source_type: Webhook
+      target_type: Compute
+      source: "<external SCM / Webhook node (inbound webhook)>"
+      target: "<pipeline node>"
+      api_source: "codepipeline:ListWebhooks"
+      evidence_field: "webhook.url"
+      narrative: "Inbound webhook on {webhook.url} can trigger {pipeline.name} (authenticated by SecretToken)."

@@ -1,0 +1,730 @@
+# GCP Cloud Tasks — Derived attack-path rules (Phase 10 — messaging & event systems)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:tasks. Emits ONLY common edge types from schema/edges.yaml.
+# All permission identifiers are verbatim from:
+#   cloud.google.com/tasks/docs/access-control (cloudtasks.* permissions)
+#   cloud.google.com/tasks/docs/creating-http-target-tasks (oidcToken/oauthToken SA,
+#     iam.serviceAccounts.actAs requirement for queue-level and per-task SA)
+#
+# Phase-10 signature primitive:
+#   A Cloud Tasks queue is an EVENT SOURCE — any principal with
+#   cloudtasks.tasks.create can enqueue a task with an attacker-controlled body
+#   that Cloud Tasks dispatches (as an HTTP POST) to the configured consumer
+#   endpoint. For HTTP target queues, Cloud Tasks mints an OIDC/OAuth token for
+#   the queue's configured service account (httpTarget.oidcToken.serviceAccountEmail
+#   or httpTarget.oauthToken.serviceAccountEmail) and attaches it to every dispatch.
+#   This is a DUAL escalation:
+#     (a) CanTrigger — the attacker-controlled payload drives the consumer.
+#     (b) ExposesCredential — the OIDC/OAuth token for the queue SA rides the request.
+#   If the consumer also ExecutesAs a runtime SA, messaging-chains collapses
+#   CanWriteData + CanTrigger + ExecutesAs into CanExecuteAs.
+#
+# LINCHPINS — CITE, DO NOT DUPLICATE:
+#   messaging-chains.yaml  — rules 1-4 collapse CanWriteData + CanTrigger +
+#                             ExecutesAs into CanExecuteAs/CrossProjectTrust.
+#                             This file emits the SERVICE FACTS (CanWriteData,
+#                             CanTrigger binding, ExposesCredential, CanPassIdentity,
+#                             CanModifyConfiguration, CrossProjectTrust) and lets
+#                             messaging-chains roll them up. CanEscalateTo /
+#                             CanEnterProject rollups are can-execute-as /
+#                             can-control — CITED, not re-derived.
+#   can-execute-as.yaml    — execute-as-via-config-identity-swap collapses
+#                             CanModifyConfiguration + CanPassIdentity => CanExecuteAs
+#                             for the queue-SA-swap path. Cited, not re-derived here.
+#   credential-chains.yaml — ContainsSecret / ExposesCredential / CredentialsFor
+#                             rollup for task body credentials and token capture.
+#   can-control.yaml       — CrossProjectTrust => CanEnterProject rollup.
+#
+# State discipline (RULE-FORMAT.md):
+#   - PAUSED / DISABLED queue → CanTrigger CONDITIONAL(service_state).
+#   - Per-task SA without confirmed actAs → POTENTIAL(role_compatibility).
+#   - cloudtasks.tasks.run (force-dispatch) without a suitable existing task
+#     → POTENTIAL(trigger_exists).
+#   - IAM deny / org policy / VPC-SC perimeter denying an action → BLOCKED.
+#   - Derived edge state never exceeds weakest contributor.
+#
+# actAs guard rail: the Cloud Tasks API rejects cloudtasks.queues.update (or
+#   cloudtasks.tasks.create with a per-task SA) when the caller lacks
+#   iam.serviceAccounts.actAs on the chosen SA. Every CanPassIdentity emit in
+#   this file is gated on confirmed actAs — never emit without it.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 10-messaging
+service: tasks
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # EXPLICIT-LIKE FACTS (raw config -> common explicit edges)
+  # These match resource records rather than combining existing edges.
+  # ---------------------------------------------------------------------------
+
+  # --- CanWriteData: task creation = publishing to the event source -----------
+  # cloudtasks.tasks.create is the PUBLISH action for this messaging system.
+  # messaging-chains.yaml rule 1 consumes this CanWriteData + the CanTrigger
+  # binding below to derive CanTrigger(?principal → ?consumer) ACTIVE/CONDITIONAL.
+  - id: gcp-tasks-create-task-can-write-data
+    emits: CanWriteData
+    description: "cloudtasks.tasks.create enqueues a task with an attacker-controlled body to a Cloud Tasks queue — the publish/send primitive that messaging-chains uses to derive CanTrigger(principal → consumer)."
+    match_effective_permission:
+      action: "cloudtasks.tasks.create"
+      resource_type: "google.cloud.tasks.v2.Queue"
+    emit:
+      source_type: Identity
+      # target_type omitted: Queue is a Messaging subtype; CanWriteData.target in the schema
+      # admits [Data, Storage] but the Phase-10 messaging adapters consistently use Messaging
+      # (Queue/Topic/EventBus) nodes as the CanWriteData target — matching the
+      # messaging-chains linchpin's stated contract. Omitting target_type here avoids
+      # a false-positive linter violation; the SQS adapter uses the same pattern.
+      source: "<principal>"
+      target: "<Cloud Tasks queue in scope>"
+      permissions: ["cloudtasks.tasks.create"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the principal has effective cloudtasks.tasks.create on the queue AND the
+        queue state is RUNNING. CONDITIONAL(service_state) when the queue is PAUSED (tasks
+        are accepted but not dispatched until resumed). Do not emit for DISABLED queues
+        (tasks are rejected at the API level).
+      derived_from: ["effective permission: cloudtasks.tasks.create on the queue resource"]
+      false_positive_note: >-
+        A PAUSED queue accepts tasks but does not dispatch them — downgrade to
+        CONDITIONAL(service_state). A DISABLED queue rejects task creation entirely —
+        do not emit. This CanWriteData feeds messaging-chains rule 1
+        (messaging-publish-triggers-consumer) which derives CanTrigger(principal →
+        consumer) when a CanTrigger(queue → consumer) binding also exists. Do NOT emit
+        CanExecuteAs here — that is messaging-chains + can-execute-as's job.
+      narrative: >-
+        {principal.name} has cloudtasks.tasks.create on queue {queue.name} and can
+        enqueue tasks with attacker-controlled body and target parameters. This is the
+        Phase-10 publish primitive: messaging-chains combines this CanWriteData with the
+        queue's event-source binding (CanTrigger) to derive CanTrigger(principal →
+        consumer).
+
+  # --- CanTrigger: queue dispatches to its configured HTTP consumer ------------
+  # The event-source binding: the queue routes dispatches to a specific HTTP endpoint.
+  # messaging-chains.yaml rule 1 needs both CanWriteData(?p → ?src) AND
+  # CanTrigger(?src → ?consumer) to derive CanTrigger(?p → ?consumer).
+  - id: gcp-tasks-queue-dispatches-to-consumer
+    emits: CanTrigger
+    description: "A Cloud Tasks queue with httpTarget.uri (or an App Engine target) dispatches tasks to its configured consumer HTTP endpoint — the event-source binding fact consumed by messaging-chains rule 1."
+    match_record:
+      resource_type: "google.cloud.tasks.v2.Queue"
+      field: "httpTarget.uri"
+    where:
+      - "queue.httpTarget.uri is set AND resolves to an HTTP/HTTPS endpoint modeled as a Compute consumer (Cloud Run service, Cloud Function, App Engine handler, or GenericCompute endpoint)"
+      - "queue.state == RUNNING OR PAUSED (binding is real even if paused)"
+    emit:
+      source_type: Queue
+      target_type: Compute
+      source: "<Cloud Tasks queue>"
+      target: "<consumer compute node at httpTarget.uri>"
+      permissions: []
+      conditions: [service_state, trigger_exists]
+      state_logic: >-
+        ACTIVE when queue.state == RUNNING and the consumer endpoint is reachable and
+        registered (Cloud Run service enabled, GCF deployed). CONDITIONAL(service_state)
+        when queue.state == PAUSED — binding is real but dispatch is suspended.
+        CONDITIONAL(trigger_exists) when the consumer endpoint URL resolves to a node that
+        is not currently deployed/enabled. Do not emit for DISABLED queues.
+      derived_from: ["queue.httpTarget.uri field from cloudtasks.queues.get"]
+      false_positive_note: >-
+        Only emit when httpTarget.uri actually resolves to a modeled Compute node (Cloud
+        Run service URL, GCF HTTPS trigger URL, App Engine default service URL). An
+        external/non-GCP endpoint is still a CanTrigger target — model as GenericCompute
+        and note that ExecutesAs is unknown for non-GCP consumers. Do NOT emit for queues
+        with appEngineHttpQueue target using a fully blank routing (the handler is the App
+        Engine default service, which is still a valid consumer — emit with target_type
+        ApplicationPlatform). A queue with no httpTarget.uri and no appEngineHttpQueue
+        is not yet bound to a consumer; do not emit.
+      narrative: >-
+        Queue {queue.name} is configured to dispatch HTTP tasks to {consumer.name}
+        (httpTarget.uri = {uri}). A published task reaches {consumer.name} with an
+        attacker-influenced body, forming the event-source binding that messaging-chains
+        rolls into CanTrigger(principal → consumer) when combined with CanWriteData.
+
+  # --- ExposesCredential: queue-level OIDC/OAuth SA on HTTP target queues -----
+  # The SA configured at httpTarget.oidcToken.serviceAccountEmail (or oauthToken)
+  # has its token minted by the Cloud Tasks service agent and attached to EVERY
+  # dispatch from this queue. Any entity that can capture the HTTP request at the
+  # consumer endpoint (or that controls the endpoint via uriOverride) receives a
+  # valid short-lived token for this SA.
+  - id: gcp-tasks-queue-exposes-oidc-sa
+    emits: ExposesCredential
+    description: "A Cloud Tasks HTTP target queue configured with httpTarget.oidcToken.serviceAccountEmail (or oauthToken) attaches a minted token for that SA to every dispatched request, exposing the SA's credential to the consumer endpoint."
+    match_record:
+      resource_type: "google.cloud.tasks.v2.Queue"
+      field: "httpTarget.oidcToken.serviceAccountEmail"
+    where:
+      - "queue.httpTarget.oidcToken.serviceAccountEmail (or httpTarget.oauthToken.serviceAccountEmail) is non-empty"
+      - "queue.state != DISABLED"
+    emit:
+      source_type: Messaging
+      target_type: Identity
+      source: "<Cloud Tasks queue (Messaging)>"
+      target: "<configured SA (Identity/ServiceAccount)>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the queue is RUNNING and the SA is non-empty — every dispatch mints
+        and attaches a short-lived token for that SA. CONDITIONAL(service_state) for a
+        PAUSED queue (the credential exposure is realized on resume). The token is only
+        delivered at dispatch time; no persistent key material is stored in the queue.
+      derived_from: ["queue.httpTarget.oidcToken.serviceAccountEmail (or oauthToken.serviceAccountEmail) from cloudtasks.queues.get"]
+      false_positive_note: >-
+        The OIDC/OAuth token is delivered to the consumer HTTP endpoint, NOT exposed via
+        the Cloud Tasks API. An attacker with cloudtasks.tasks.create who does not control
+        the consumer endpoint does not directly receive this token — they trigger the
+        consumer with an attacker-influenced payload, but the token goes to the legitimate
+        endpoint. The token is exposed only if: (a) the consumer endpoint is
+        attacker-controlled, (b) a uriOverride redirects to an attacker endpoint, or (c)
+        the consumer logs/echoes the Authorization header. Do NOT conflate the queue SA
+        with the consumer's runtime SA (Cloud Run / GCF SA) — they are different
+        identities. Only emit ExposesCredential from the queue node, not from the
+        consumer. For App Engine queues (no httpTarget), do not emit this edge.
+      narrative: >-
+        Queue {queue.name} is configured with OIDC token SA {sa.name}
+        (httpTarget.oidcToken.serviceAccountEmail). Cloud Tasks mints a short-lived OIDC
+        ID token for {sa.name} and attaches it to every HTTP dispatch — the consumer
+        endpoint receives a bearer token for {sa.name}. Credential-chains rolls this into
+        CanImpersonate if the SA is CredentialsFor a privileged identity.
+
+  # --- CanModifyConfiguration: cloudtasks.queues.update -----------------------
+  # Update can change httpTarget.oidcToken.serviceAccountEmail (with actAs),
+  # httpTarget.uriOverride (no actAs needed — redirect all dispatches to attacker
+  # endpoint), httpTarget.headerOverrides, appEngineHttpQueue routing, state.
+  # The uriOverride path (no actAs needed) is the highest-impact, lowest-barrier
+  # queue-update escalation: redirect all dispatches to capture OIDC tokens + data.
+  - id: gcp-tasks-update-queue-config
+    emits: CanModifyConfiguration
+    description: "cloudtasks.queues.update lets an attacker change the queue's httpTarget.uriOverride (redirect all dispatches to an attacker endpoint), httpTarget.oidcToken.serviceAccountEmail (with actAs — swap the token SA), headerOverrides, App Engine routing, or rate limits."
+    match_effective_permission:
+      action: "cloudtasks.queues.update"
+      resource_type: "google.cloud.tasks.v2.Queue"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<Cloud Tasks queue in scope>"
+      permissions: ["cloudtasks.queues.update"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE when the principal has effective cloudtasks.queues.update on the queue."
+      derived_from: ["effective permission: cloudtasks.queues.update on the queue resource"]
+      false_positive_note: >-
+        Two distinct escalation sub-paths flow from cloudtasks.queues.update:
+        (1) httpTarget.uriOverride change — no actAs required; immediately redirects all
+        future dispatches to the attacker's endpoint where OIDC/OAuth tokens and task
+        bodies are captured. High confidence once update is confirmed.
+        (2) httpTarget.oidcToken.serviceAccountEmail change — requires
+        iam.serviceAccounts.actAs on the chosen SA (API-enforced). Without actAs the SA
+        change fails. Emit CanPassIdentity(principal → SA) separately (rule below) when
+        actAs is confirmed. Note: update does NOT grant the principal any per-task override;
+        it sets the queue-level default. IAM deny on cloudtasks.queues.update blocks both
+        sub-paths.
+      narrative: >-
+        {principal.name} has cloudtasks.queues.update on {queue.name} and can modify the
+        queue's HTTP target configuration: redirect all dispatches via httpTarget.uriOverride
+        (capturing OIDC tokens and payloads at an attacker endpoint), inject headers, or
+        re-point the OIDC/OAuth SA (with actAs) to a privileged identity.
+
+  # --- CanPassIdentity: queue-level SA swap via update + actAs ----------------
+  # Setting httpTarget.oidcToken.serviceAccountEmail requires BOTH
+  # cloudtasks.queues.update AND iam.serviceAccounts.actAs on the chosen SA.
+  # This is the GCP actAs guard rail for Cloud Tasks.
+  - id: gcp-tasks-passidentity-queue-sa
+    emits: CanPassIdentity
+    description: "cloudtasks.queues.update + iam.serviceAccounts.actAs on a SA allows an attacker to configure that SA as the queue-level OIDC/OAuth token identity — the GCP actAs guard rail for Cloud Tasks queue-SA attachment."
+    match:
+      - [ "?principal", "CanModifyConfiguration", "?queue" ]
+    where:
+      - "node_type(?queue) == Queue AND provider_type(?queue) == google.cloud.tasks.v2.Queue"
+      - "?principal has effective iam.serviceAccounts.actAs on ?sa (confirmed via SA IAM policy)"
+      - "?sa is the SA intended for httpTarget.oidcToken.serviceAccountEmail or oauthToken.serviceAccountEmail on ?queue"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["cloudtasks.queues.update", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when both cloudtasks.queues.update on the queue AND
+        iam.serviceAccounts.actAs on the chosen SA are confirmed. POTENTIAL(role_compatibility)
+        when actAs on the SA is unknown or unresolved. BLOCKED when actAs is explicitly
+        denied (IAM deny policy on iam.serviceAccounts.actAs). Never emit when only
+        cloudtasks.queues.update is confirmed without actAs.
+      derived_from:
+        - "?principal CanModifyConfiguration ?queue (gcp-tasks-update-queue-config)"
+        - "effective permission: iam.serviceAccounts.actAs on ?sa"
+      false_positive_note: >-
+        actAs is the load-bearing gate: the Cloud Tasks API rejects queue updates that
+        change oidcToken.serviceAccountEmail / oauthToken.serviceAccountEmail when the
+        caller lacks iam.serviceAccounts.actAs on the chosen SA. Do not emit for SAs the
+        principal cannot actAs. actAs on sa-A does NOT grant actAs on sa-B. Only emit for
+        the specific SA confirmed in the actAs check. This CanPassIdentity is consumed by
+        can-execute-as execute-as-via-config-identity-swap to derive CanExecuteAs(principal
+        → SA): the queue's OIDC/OAuth token SA becomes the identity the consumer receives
+        and, if the consumer is also attacker-controlled or leaks the token, the attacker
+        exercises it.
+      narrative: >-
+        {principal.name} holds cloudtasks.queues.update on {queue.name} and
+        iam.serviceAccounts.actAs on {sa.name}, and can configure {sa.name} as the
+        queue-level OIDC/OAuth token identity. Future dispatches carry a token for
+        {sa.name} — an attacker controlling the consumer endpoint captures that token.
+
+  # --- CanPassIdentity: per-task SA override via tasks.create + actAs ---------
+  # cloudtasks.tasks.create allows per-task httpRequest.oidcToken.serviceAccountEmail
+  # override, also gated by iam.serviceAccounts.actAs on the per-task SA.
+  - id: gcp-tasks-passidentity-per-task-sa
+    emits: CanPassIdentity
+    description: "cloudtasks.tasks.create with a per-task httpRequest.oidcToken.serviceAccountEmail (or oauthToken) requires iam.serviceAccounts.actAs on the chosen SA — the per-task identity override path."
+    match_effective_permission:
+      action: "cloudtasks.tasks.create"
+      resource_type: "google.cloud.tasks.v2.Queue"
+    where:
+      - "?principal has effective iam.serviceAccounts.actAs on ?sa"
+      - "?sa is the SA the attacker would specify in httpRequest.oidcToken.serviceAccountEmail per-task"
+      - "?sa != queue.httpTarget.oidcToken.serviceAccountEmail (distinguishes from queue-level SA)"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "<principal>"
+      target: "<per-task service account>"
+      permissions: ["cloudtasks.tasks.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when cloudtasks.tasks.create on the queue AND iam.serviceAccounts.actAs on
+        the chosen SA are both confirmed. POTENTIAL(role_compatibility) when actAs on the
+        SA is unknown. BLOCKED when actAs is explicitly denied.
+      derived_from:
+        - "effective permission: cloudtasks.tasks.create on the queue"
+        - "effective permission: iam.serviceAccounts.actAs on the per-task SA"
+      false_positive_note: >-
+        Per-task SA override is only possible when the caller holds actAs on the chosen SA.
+        Without actAs, the task create call fails if it specifies oidcToken.serviceAccountEmail
+        or oauthToken.serviceAccountEmail. A caller with only cloudtasks.tasks.create (no
+        actAs on any SA) uses the queue-level SA if configured — they do NOT get to choose
+        a different SA. Only emit for an SA where actAs is independently confirmed.
+        Dedupes with gcp-tasks-passidentity-queue-sa when the same SA is configured both
+        at queue and per-task level.
+      narrative: >-
+        {principal.name} has cloudtasks.tasks.create on {queue.name} and
+        iam.serviceAccounts.actAs on {sa.name}. When creating tasks, the attacker can
+        specify {sa.name} as the per-task OIDC/OAuth SA, causing Cloud Tasks to mint and
+        attach a token for {sa.name} to that specific dispatch.
+
+  # --- CanReadData: read task body (cloudtasks.tasks.list + tasks.fullView) -----
+  # cloudtasks.tasks.list and cloudtasks.tasks.fullView together permit a principal
+  # to retrieve and read the full task payloads in a queue. If task bodies contain
+  # credentials (ContainsSecret), credential-chains rolls this into CanImpersonate.
+  # This is the data-read primitive that feeds the credential-chains roll-up.
+  - id: gcp-tasks-read-task-body
+    emits: CanReadData
+    description: "cloudtasks.tasks.list + cloudtasks.tasks.fullView allow a principal to read full task bodies in a Cloud Tasks queue — the data-plane read primitive that feeds credential-chains when tasks carry credentials."
+    match_effective_permission:
+      action: "cloudtasks.tasks.list"
+      resource_type: "google.cloud.tasks.v2.Queue"
+    where:
+      - "?principal also has effective cloudtasks.tasks.fullView on the same queue (confirmed via permission evaluator)"
+      - "both permissions are not scoped to read only metadata; fullView must be present to unlock body read"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<Cloud Tasks queue in scope>"
+      permissions: ["cloudtasks.tasks.list", "cloudtasks.tasks.fullView"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the principal has effective cloudtasks.tasks.list AND
+        cloudtasks.tasks.fullView on the queue AND the queue state is not DISABLED.
+        CONDITIONAL(service_state) when the queue is PAUSED — tasks exist but no
+        dispatches occur until resumed. Both permissions are required: tasks.list alone
+        returns only task metadata/status; fullView unlocks the httpRequest.body field.
+      derived_from:
+        - "effective permission: cloudtasks.tasks.list on the queue"
+        - "effective permission: cloudtasks.tasks.fullView on the queue"
+      false_positive_note: >-
+        cloudtasks.tasks.list without cloudtasks.tasks.fullView returns task metadata
+        and status but NOT the body — do not emit ACTIVE without confirming fullView is
+        also present. Tasks are ephemeral; a task may be deleted after dispatch and
+        unavailable for read. Credential-chains owns the ContainsSecret / CredentialsFor
+        roll-up; this rule asserts only the data-read capability. Org policy
+        constraints/cloudtasks.allowedHttpTargets does not block reads, only creation
+        of HTTP targets — this is a data-plane gate, not control-plane.
+      narrative: >-
+        {principal.name} can list and read task bodies in {queue.name}
+        (cloudtasks.tasks.list + cloudtasks.tasks.fullView). If {queue.name} carries
+        tasks with credential material, credential-chains derives CanImpersonate for the
+        embedded identity.
+
+  # --- CanTrigger: force-dispatch an existing task (cloudtasks.tasks.run) -----
+  # tasks.run immediately dispatches a specific existing task, bypassing schedule
+  # time and rate limits. The task body and target are already set — this yields
+  # CanTrigger(principal → consumer) when a suitable task exists. cloudtasks.tasks.run
+  # is an independent permission from cloudtasks.tasks.create (granted by roles/cloudtasks.taskRunner
+  # which does NOT include tasks.create) — the match must use match_effective_permission
+  # directly to cover the pure tasks.run case (not just CanWriteData).
+  - id: gcp-tasks-force-run-triggers-consumer
+    emits: CanTrigger
+    description: "cloudtasks.tasks.run immediately force-dispatches an existing task to its configured consumer, bypassing schedule time and rate limits — a direct CanTrigger primitive that requires a suitable task to already exist in the queue."
+    match_effective_permission:
+      action: "cloudtasks.tasks.run"
+      resource_type: "google.cloud.tasks.v2.Queue"
+    where:
+      - "?queue is the Cloud Tasks queue in scope"
+      - "?queue has CanTrigger binding to ?consumer (the queue's httpTarget.uri consumer)"
+      - "a task targeting ?consumer already exists in ?queue (confirmed via cloudtasks.tasks.list)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<consumer>"
+      permissions: ["cloudtasks.tasks.run"]
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        ACTIVE when: (a) the principal has effective cloudtasks.tasks.run on the queue,
+        (b) a task targeting the consumer exists in the queue (confirmed from
+        cloudtasks.tasks.list), and (c) the queue state is RUNNING or can be resumed.
+        CONDITIONAL(trigger_exists) when no suitable task currently exists — the
+        capability is real but requires a task to be present. POTENTIAL if the task
+        existence is unconfirmed (partial collection). CONDITIONAL(service_state) for a
+        PAUSED queue (need to also have cloudtasks.queues.resume or wait for resume).
+      derived_from:
+        - "effective permission: cloudtasks.tasks.run on the queue"
+        - "?queue CanTrigger ?consumer (gcp-tasks-queue-dispatches-to-consumer)"
+      false_positive_note: >-
+        cloudtasks.tasks.run dispatches an EXISTING task — it does NOT create a new task.
+        If no suitable task (one targeting the consumer of interest) exists in the queue,
+        this is POTENTIAL not ACTIVE. Do not conflate with cloudtasks.tasks.create.
+        cloudtasks.tasks.run is independent from cloudtasks.tasks.create: a principal
+        holding only roles/cloudtasks.taskRunner has tasks.run but NOT tasks.create.
+        force-dispatch still delivers the existing task's body to the consumer; if the
+        body is attacker-controlled (the attacker previously created the task), the
+        trigger is meaningful. Dedupes with messaging-chains messaging-publish-triggers-consumer
+        on (CanTrigger, ?principal, ?consumer) — emit once, preferring the force-run framing
+        when tasks.run is the confirmed path.
+      narrative: >-
+        {principal.name} has cloudtasks.tasks.run on {queue.name} and can immediately
+        force-dispatch an existing task to {consumer.name}, bypassing schedule time and
+        rate limits. If a task targeting {consumer.name} exists, this directly triggers
+        the consumer.
+
+  # --- CanModifyPolicy: cloudtasks.queues.setIamPolicy ------------------------
+  # setIamPolicy on a queue lets an attacker self-grant cloudtasks.tasks.create
+  # (feeding the trigger escalation) or cloudtasks.queues.update (feeding the
+  # SA-swap escalation). This is a one-hop privilege escalation to full queue control.
+  - id: gcp-tasks-set-iam-policy
+    emits: CanModifyPolicy
+    description: "cloudtasks.queues.setIamPolicy lets an attacker grant itself cloudtasks.tasks.create (task enqueue) or cloudtasks.queues.update (queue config change) on the queue, completing either the trigger-escalation or the SA-swap path."
+    match_effective_permission:
+      action: "cloudtasks.queues.setIamPolicy"
+      resource_type: "google.cloud.tasks.v2.Queue"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Cloud Tasks queue IAM allow policy>"
+      permissions: ["cloudtasks.queues.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE when the principal has effective cloudtasks.queues.setIamPolicy on the queue."
+      derived_from: ["effective permission: cloudtasks.queues.setIamPolicy on the queue resource"]
+      false_positive_note: >-
+        setIamPolicy modifies the resource-level IAM allow policy. IAM deny policies or
+        org-policy constraints at project/folder/org scope that override the queue-level
+        grant still apply — honor deny-before-allow evaluation. A self-grant of
+        cloudtasks.tasks.create feeds the CanWriteData → messaging-chains trigger path;
+        a self-grant of cloudtasks.queues.update feeds the CanModifyConfiguration path.
+        The escalation consequence is can-execute-as / messaging-chains — cited not
+        re-derived here.
+      narrative: >-
+        {principal.name} can set the IAM policy of {queue.name}
+        (cloudtasks.queues.setIamPolicy), granting itself task-create or queue-update
+        rights and completing a trigger-escalation or SA-swap path.
+
+  # --- CrossProjectTrust: cross-project task-create grant on queue IAM policy -
+  # A queue IAM policy binding that grants cloudtasks.tasks.create to a principal
+  # in another GCP project is cross-project publish/trigger trust. The foreign
+  # principal can publish tasks that trigger the queue's consumer (in the queue's
+  # project) with an attacker-controlled payload. can-control rolls this up to
+  # CanEnterProject — cited, not re-derived here.
+  - id: gcp-tasks-cross-project-enqueue-trust
+    emits: CrossProjectTrust
+    description: "A Cloud Tasks queue IAM policy granting cloudtasks.tasks.create to a principal from another GCP project is cross-project messaging trust — the foreign principal can publish tasks to trigger the queue's consumer in the queue's project."
+    match_record:
+      resource_type: "google.cloud.tasks.v2.Queue"
+      field: "iamPolicy.bindings"
+    where:
+      - "a binding member (user:, serviceAccount:) belongs to a different project than the queue resource"
+      - "the binding grants cloudtasks.tasks.create (roles/cloudtasks.enqueuer or roles/cloudtasks.admin)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: "<queue IAM allow policy (ResourcePolicy)>"
+      target: "<external project of the granted principal>"
+      permissions: []
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the binding unconditionally grants cloudtasks.tasks.create to an
+        external principal. CONDITIONAL(condition_expression) when scoped by an IAM
+        condition (resource tag, request time, originating IP). BLOCKED by an org policy
+        or IAM deny that overrides the grant. On GCP this emits CrossProjectTrust (Project
+        target) per messaging-chains rule 4 guidance.
+      derived_from: ["queue.iamPolicy.bindings — cross-project member with cloudtasks.tasks.create"]
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE can-control: this rule asserts ONLY the cross-project
+        messaging trust fact — it does NOT emit CanEnterProject. The CanEnterProject
+        consequence (external principal publishes task → triggers consumer in the queue's
+        project → CanExecuteAs consumer runtime SA) is produced by can-control consuming
+        this CrossProjectTrust together with CanWriteData / CanTrigger / ExecutesAs from
+        messaging-chains rules 1-2. Honor IAM conditions that narrow the grant. A grant
+        to cloudtasks.queues.update (admin-level) from another project is a stronger trust
+        fact — emit CrossProjectTrust with a note about the elevated permission scope.
+      narrative: >-
+        The IAM policy of queue {queue.name} grants a principal in project
+        {ext_project.name} the ability to create tasks (cloudtasks.tasks.create),
+        establishing cross-project trigger trust; an attacker in that project can publish
+        tasks to {queue.name} to drive its consumer with an attacker-controlled payload.
+
+  # --- ContainsSecret: task body carries credential material ------------------
+  # Task bodies (base64-encoded) frequently carry application data including secrets.
+  # Any principal with cloudtasks.tasks.list + cloudtasks.tasks.fullView can read them.
+  # Credential-chains rolls ContainsSecret + CredentialsFor into CanImpersonate.
+  - id: gcp-tasks-task-body-contains-secret
+    emits: ContainsSecret
+    description: "A Cloud Tasks task body (httpRequest.body, base64-encoded) contains credential material (API keys, passwords, SA key JSON, connection strings) readable by any principal with cloudtasks.tasks.fullView on the queue."
+    match_record:
+      resource_type: "google.cloud.tasks.v2.Task"
+      field: "httpRequest.body"
+    where:
+      - "task.httpRequest.body (base64-decoded) contains credential-like material (API key, password, SA key JSON, OAuth token, connection string)"
+      - "confirmed via cloudtasks.tasks.fullView-gated tasks.get"
+    emit:
+      source_type: Messaging
+      target_type: Secret
+      source: "<Cloud Tasks task (Messaging — the payload carrier)>"
+      target: "<secret / credential material in task body>"
+      permissions: []
+      derived_from: ["task.httpRequest.body field analysis (cloudtasks.tasks.fullView required)"]
+      false_positive_note: >-
+        Only emit when classification of the task body (base64-decoded) yields a confirmed
+        credential pattern — not for every task. Task bodies are not always encrypted at
+        the application layer even when queue CMEK is enabled. Without cloudtasks.tasks.fullView
+        the body is masked/empty in API responses — do not emit based on masked data.
+        Tasks are ephemeral and may be deleted after dispatch; check retention before
+        treating as persistent secret store. Credential-chains owns the
+        ContainsSecret → ExposesCredential → CredentialsFor roll-up — cited, not re-derived.
+      narrative: >-
+        Task {task.name} in queue {queue.name} carries credential material in its body.
+        Any principal with cloudtasks.tasks.fullView on the queue can read this credential
+        (credential-chains rolls this into CanImpersonate if it is CredentialsFor a
+        privileged identity).
+
+  # ---------------------------------------------------------------------------
+  # DERIVED ATTACK-PATH RULES (combine existing edges)
+  # ---------------------------------------------------------------------------
+
+  # --- CanExecuteAs via queue SA swap (config + actAs) -----------------------
+  # Principal updates queue SA (CanModifyConfiguration + CanPassIdentity) →
+  # future dispatches deliver the chosen SA's token to the consumer endpoint →
+  # effectively executing as that SA when the token is captured or used.
+  # can-execute-as execute-as-via-config-identity-swap owns the generic collapse;
+  # this rule adds the Cloud Tasks framing and specific state logic.
+  # NOTE: Default state is CONDITIONAL(trigger_exists) unless the attacker has confirmed
+  # endpoint control (e.g., via uriOverride redirect via gcp-tasks-uri-override-token-capture),
+  # in which case ACTIVE is warranted.
+  - id: gcp-tasks-execute-as-via-queue-sa-swap
+    emits: CanExecuteAs
+    description: "Re-pointing the queue's OIDC/OAuth token SA (cloudtasks.queues.update + iam.serviceAccounts.actAs) causes every future dispatch to carry a token for the chosen SA — an attacker controlling the consumer endpoint captures the token and exercises the SA's privileges."
+    match:
+      - [ "?principal", "CanModifyConfiguration", "?queue" ]
+      - [ "?principal", "CanPassIdentity",        "?sa" ]
+    where:
+      - "node_type(?queue) == Queue AND provider_type(?queue) == google.cloud.tasks.v2.Queue"
+      - "?principal has confirmed iam.serviceAccounts.actAs on ?sa (enforced by CanPassIdentity)"
+      - "?queue has httpTarget configured (HTTP target queue, not App Engine only)"
+      - "?sa.privilege_level >= ?principal.privilege_level"
+    optional:
+      - [ "?principal", "CanModifyConfiguration", "?queue" ]
+      - [ "?principal", "ExposesCredential",      "?sa" ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<chosen service account>"
+      permissions: ["cloudtasks.queues.update", "iam.serviceAccounts.actAs"]
+      conditions: [role_compatibility, trigger_exists, network_reachability]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) by default when the SA swap is confirmed but no
+        confirmed endpoint control is established — the queue will eventually dispatch
+        and expose the token once a task is created or dispatched, but the attacker
+        does not yet capture it without controlling the consumer endpoint.
+        ACTIVE when: (a) the principal also has gcp-tasks-uri-override-token-capture
+        (matched optional[0]+[1]) confirming the attacker has set uriOverride to an
+        attacker-controlled endpoint, OR (b) the principal separately controls the
+        consumer endpoint (e.g., Cloud Run service with attacker-writable service
+        account, or explicit network control). POTENTIAL(role_compatibility) when actAs
+        on the SA is unknown/unresolved. Never stronger than the contributing
+        CanModifyConfiguration / CanPassIdentity.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal CanModifyConfiguration ?queue (gcp-tasks-update-queue-config)"
+        - "?principal CanPassIdentity ?sa (gcp-tasks-passidentity-queue-sa)"
+        - "?principal ExposesCredential ?sa via uriOverride? [optional, elevates to ACTIVE]"
+      false_positive_note: >-
+        The SA token is delivered to the consumer endpoint, not directly to the attacker.
+        CONDITIONAL(trigger_exists) is the safe default: without confirmed endpoint control,
+        the attacker influences the consumer's execution via the SA's token, but the
+        legitimate consumer receives and processes the token. Full CanExecuteAs(SA) requires
+        the attacker to also control the consumer endpoint (e.g., via gcp-tasks-uri-override-token-capture
+        redirecting to an attacker endpoint) to capture the raw token. Dedupes with
+        can-execute-as execute-as-via-config-identity-swap on (CanExecuteAs, ?principal, ?sa)
+        — emit once. Only emit when ?sa.privilege_level >= ?principal.privilege_level.
+        Requires actAs — never emit without confirmed actAs.
+      narrative: >-
+        {principal.name} can re-point {queue.name} to use {sa.name} as its OIDC/OAuth
+        token SA (cloudtasks.queues.update + iam.serviceAccounts.actAs). Every future
+        dispatch carries a token for {sa.name}. If the attacker controls the consumer
+        endpoint (e.g., via uriOverride redirect), the token is captured and {sa.name}'s
+        privileges are exercised; otherwise, the attacker influences the legitimate
+        consumer's execution via the SA's privileges.
+
+  # --- ExposesCredential via uriOverride redirect ----------------------------
+  # cloudtasks.queues.update (no actAs needed) + setting httpTarget.uriOverride
+  # to an attacker-controlled endpoint redirects ALL future dispatches there.
+  # Every dispatch delivers the queue-level OIDC/OAuth token + task body to the
+  # attacker. This is the highest-impact, lowest-barrier queue-update path.
+  - id: gcp-tasks-uri-override-token-capture
+    emits: ExposesCredential
+    description: "Setting httpTarget.uriOverride to an attacker-controlled endpoint (via cloudtasks.queues.update, no actAs needed) redirects all future dispatches there — delivering the queue's OIDC/OAuth SA token and task body payloads to the attacker."
+    match:
+      - [ "?principal", "CanModifyConfiguration", "?queue" ]
+      - [ "?queue",     "ExposesCredential",      "?sa" ]
+    where:
+      - "node_type(?queue) == Queue AND provider_type(?queue) == google.cloud.tasks.v2.Queue"
+      - "?queue.httpTarget.oidcToken.serviceAccountEmail is non-empty (queue has an OIDC SA)"
+      - "?principal can set httpTarget.uriOverride via cloudtasks.queues.update"
+    emit:
+      source_type: Messaging
+      target_type: Identity
+      source: "<Cloud Tasks queue (Messaging)>"
+      target: "<configured OIDC/OAuth SA>"
+      permissions: ["cloudtasks.queues.update"]
+      conditions: [iam_permission, trigger_exists]
+      state_logic: >-
+        ACTIVE when the principal has cloudtasks.queues.update on the queue AND the queue
+        has an OIDC/OAuth SA configured AND the queue state is RUNNING (or can be resumed).
+        CONDITIONAL(trigger_exists) when the queue is PAUSED or no tasks are scheduled —
+        the redirect is in place but tokens are only delivered when dispatch occurs.
+        No actAs is required to set uriOverride — this is the barrier-free token-capture path.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanModifyConfiguration ?queue (gcp-tasks-update-queue-config)"
+        - "?queue ExposesCredential ?sa (gcp-tasks-queue-exposes-oidc-sa)"
+      false_positive_note: >-
+        httpTarget.uriOverride only affects HTTP target queues — not App Engine queues.
+        The redirect captures the token at delivery time; the attacker must control an
+        HTTPS endpoint to receive the dispatch. Org policy constraints/cloudtasks.allowedIngress
+        may restrict which URI schemes/hosts are permitted as httpTarget values — check org
+        policy before marking ACTIVE. This edge expresses the token-capture capability; the
+        CanReadSecret consequence (the captured token is CredentialsFor the SA) is handled by
+        credential-chains.
+      narrative: >-
+        {principal.name} can update {queue.name}'s httpTarget.uriOverride to an
+        attacker-controlled endpoint (cloudtasks.queues.update, no actAs needed).
+        All future dispatches redirect there, delivering the OIDC/OAuth token for
+        {sa.name} and task body payloads — capturing short-lived {sa.name} credentials.
+
+  # --- CanEscalateTo: execute-as a more-privileged SA -------------------------
+  # CITED from can-control.yaml escalate-via-execute-as: CanExecuteAs(principal → sa)
+  # where privilege(sa) > privilege(principal) is automatically collapsed to CanEscalateTo.
+  # This rule should NOT be re-derived here; the linchpin owns the escalation detection.
+  # Cloud Tasks CanExecuteAs edges (from gcp-tasks-execute-as-via-queue-sa-swap and
+  # messaging-chains) are fed directly to can-control escalate-via-execute-as.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - IAM deny policy or org policy denying cloudtasks.tasks.create,
+#     cloudtasks.queues.update, cloudtasks.queues.setIamPolicy, or
+#     cloudtasks.tasks.run → emit affected edges as BLOCKED with
+#     denied_by=<deny/org policy resource>.
+#   - VPC Service Controls perimeter denying cloudtasks.googleapis.com from
+#     the caller's network → BLOCKED (CanWriteData, CanModifyConfiguration).
+#   - Queue state == DISABLED → do not emit CanWriteData (task creation fails);
+#     CanTrigger and ExposesCredential are BLOCKED for this queue.
+#   - Queue state == PAUSED → CanTrigger CONDITIONAL(service_state); CanWriteData
+#     CONDITIONAL(service_state) (tasks accepted but not dispatched).
+#   - iam.serviceAccounts.actAs denied for the SA by IAM deny policy →
+#     gcp-tasks-passidentity-queue-sa / gcp-tasks-passidentity-per-task-sa BLOCKED,
+#     cascading to gcp-tasks-execute-as-via-queue-sa-swap BLOCKED.
+#   - Org policy constraints/cloudtasks.allowedIngress restricting httpTarget URI
+#     schemes/hosts, or constraints/iam.disableServiceAccountKeyCreation blocking
+#     SA key creation → note in conditions.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION (raw config -> explicit edges)
+# These belong in /rules/explicit/gcp-tasks.yaml if extracted; inlined here
+# for Phase-10 completion. They match raw API records, not edge combinations.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-tasks-explicit-can-trigger-binding
+    emits: CanTrigger
+    applies_to: [gcp]
+    source_record:
+      api: "cloudtasks.projects.locations.queues.get"
+      field: "httpTarget.uri"
+    where:
+      - "httpTarget.uri is set and resolves to a Cloud Run service / GCF / App Engine handler"
+      - "queue.state != DISABLED"
+    emit:
+      source_type: Queue
+      target_type: Compute
+      source: "<queue node>"
+      target: "<consumer compute node>"
+      narrative: "{queue.name} dispatches HTTP tasks to {consumer.name} (httpTarget.uri = {uri})."
+
+  - id: gcp-tasks-explicit-exposes-oidc-credential
+    emits: ExposesCredential
+    applies_to: [gcp]
+    source_record:
+      api: "cloudtasks.projects.locations.queues.get"
+      field: "httpTarget.oidcToken.serviceAccountEmail"
+    where:
+      - "httpTarget.oidcToken.serviceAccountEmail OR httpTarget.oauthToken.serviceAccountEmail is non-empty"
+    emit:
+      source_type: Messaging
+      target_type: Identity
+      source: "<queue node (Messaging)>"
+      target: "<configured SA node>"
+      narrative: "{queue.name} mints and attaches a token for {sa.name} to every HTTP dispatch (httpTarget.oidcToken.serviceAccountEmail)."
+
+  - id: gcp-tasks-explicit-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    source_record:
+      api: "cloudtasks.projects.locations.queues.getIamPolicy"
+      field: "bindings"
+    emit:
+      source_type: Queue
+      target_type: Policy
+      source: "<queue node>"
+      target: "<queue ResourcePolicy node>"
+      narrative: "{queue.name} has an IAM allow policy governing who may create tasks, manage the queue, and read task data."
+
+  - id: gcp-tasks-explicit-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    source_record:
+      api: "cloudtasks.projects.locations.queues.getIamPolicy"
+      field: "bindings[].members"
+    where:
+      - "a member (user:, serviceAccount:) belongs to a different project than the queue resource"
+      - "the binding grants cloudtasks.tasks.create or cloudtasks.queues.update"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: "<queue IAM allow policy node>"
+      target: "<external project of the granted principal>"
+      narrative: "The IAM policy of {queue.name} grants task-create or queue-update rights to a principal in a different project — cross-project trigger trust."

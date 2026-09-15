@@ -1,0 +1,298 @@
+# AWS Keyspaces (for Apache Cassandra) — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Keyspaces is a managed Cassandra-compatible NoSQL service. Its IAM permission
+# namespace is `cassandra:`. All data-plane access is IAM-gated (SigV4); there
+# are no resource-based policies and no execution identity on tables.
+#
+# ATTACK SURFACE SUMMARY (low — 2 conservative rules):
+#   (1) DATA READ: cassandra:Select -> CanReadData. If the table is SSE-KMS with a
+#       CMK, the read is CONDITIONAL(key_permission).
+#       Data stored in Keyspaces may include application secrets -> ContainsSecret.
+#       Roll-up (ContainsSecret + CredentialsFor -> CanImpersonate) is handled by
+#       the provider-agnostic linchpin: credential-chains:read-secret-yields-identity.
+#   (2) DATA WRITE: cassandra:Modify -> CanWriteData. Enables data-injection attacks
+#       against applications that trust Keyspaces table contents.
+#
+# WHAT THIS FILE DOES NOT DERIVE:
+#   - ExecutesAs: Keyspaces tables run no code.
+#   - ExposedToInternet: the service endpoint requires SigV4; unauthenticated
+#     access is impossible.
+#   - CrossAccountTrust: no resource-based policies.
+#   - CanExfiltrate via export/snapshot-share: no direct export API for Keyspaces.
+#     NOTE: cassandra:Restore enables within-account PITR-based table copy, which
+#     is modeled separately in aws-keyspaces-restore-exfiltrate.
+#
+# LINCHPIN CITATIONS (do not re-derive here):
+#   * credential-chains.yaml:read-secret-yields-identity
+#       ContainsSecret(table, secret) + CredentialsFor(secret, identity)
+#       -> CanImpersonate — credit to linchpin for full chain.
+#
+# KEY-PERMISSION GATES (NOT yet handled by linchpins; TBD):
+#   * SSE-KMS decrypt on read: CanReadData emitted CONDITIONAL(key_permission);
+#     credential-chains:decrypt-gates-secret-read upgrades CanReadSecret (on a
+#     Secret node) but not CanReadData. A new provider-agnostic linchpin rule
+#     matching [ ?principal, CanReadData, ?target ] (state CONDITIONAL key_permission)
+#     + [ ?principal, CanDecrypt, ?key ] + wraps(?key, ?target) is needed.
+#   * SSE-KMS GenerateDataKey on write: CanWriteData emitted CONDITIONAL(key_permission)
+#     when the table uses a CMK. Cite the same new linchpin for upgrade.
+#
+# PERMISSIONS: all from the AWS Service Authorization Reference — Amazon Keyspaces.
+#   cassandra:Select — maps to CQL SELECT; grants data-plane read on a table.
+#   cassandra:Modify — maps to CQL INSERT/UPDATE/DELETE; grants data-plane write.
+#
+# STATE CONVENTIONS (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. CONDITIONAL contributors cap output at CONDITIONAL.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # --- 1) cassandra:Select -> data-plane read ---------------------------------
+  # The primary Keyspaces attack-path primitive: IAM-effective cassandra:Select
+  # on a table allows arbitrary CQL SELECT (full table scan via ALLOW FILTERING,
+  # targeted partition reads, or index reads). The caller can extract all row data.
+  # If the table has an SSE-KMS CMK, the decryption is gated on kms:Decrypt on the
+  # CMK (AWS Keyspaces decrypts on the caller's behalf but the IAM policy must
+  # allow kms:Decrypt). For CMK-encrypted tables emit CONDITIONAL(key_permission);
+  # for AWS-managed key, emit ACTIVE. No linchpin currently upgrades CONDITIONAL
+  # CanReadData edges — this gap is noted in LINCHPIN CITATIONS above.
+  - id: aws-keyspaces-select-read-data
+    emits: CanReadData
+    description: >-
+      IAM-effective cassandra:Select on a Keyspaces table allows full data-plane
+      read (CQL SELECT), yielding all row data including any secret material.
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_type(?table) == NoSQLDatabase"
+      - "?table.provider_type == 'AWS::Cassandra::Table'"
+      - "effective_action(?principal, ?table) includes 'cassandra:Select'"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["cassandra:Select"]
+      conditions_dynamic: >-
+        if ?table.encryptionSpecification.kmsKeyIdentifier is a customer-managed
+        key (not alias/aws/cassandra or AWS-managed key): [iam_permission, key_permission];
+        else: [iam_permission]
+      state_logic: >-
+        if ?table.encryptionSpecification.kmsKeyIdentifier is a customer-managed
+        key (not alias/aws/cassandra or AWS-managed): CONDITIONAL(key_permission) —
+        the caller needs kms:Decrypt on the CMK for AWS Keyspaces to return
+        decrypted data. When the principal is confirmed to hold CanDecrypt on that
+        exact CMK, a provider-agnostic linchpin rule (TBD) should upgrade this to
+        ACTIVE.
+        Otherwise (SSE uses the AWS-managed key alias/aws/cassandra): ACTIVE.
+      confidence: "contributing_confidence * 0.95"
+      derived_from: [ "<HasPermission edge for cassandra:Select on ?table>" ]
+      false_positive_note: >-
+        Honor the exact resource scope of the cassandra:Select permission — a grant
+        scoped to system keyspace ARNs (system_schema, system_schema_mcs) does not
+        confer access to application-data tables. Verify the effective resource ARN
+        includes the application table ARN. cassandra:Select at the keyspace ARN
+        (arn:aws:cassandra:<region>:<account>:/keyspace/<keyspace-name>) grants read
+        on all tables in that keyspace; apply the same CMK check per table's
+        encryptionSpecification.kmsKeyIdentifier. Do not emit ACTIVE when the table
+        uses a customer-managed KMS key and the principal's kms:Decrypt on that key
+        has not been confirmed; emit CONDITIONAL(key_permission) instead.
+      narrative: >-
+        {principal.name} can run CQL SELECT statements against {table.name}
+        (cassandra:Select), reading all application data stored in the table.
+        If {table.name} contains credentials or secrets, this yields further
+        pivots via credential-chains:read-secret-yields-identity.
+
+  # --- 2) cassandra:Modify -> data-plane write --------------------------------
+  # cassandra:Modify maps to CQL INSERT, UPDATE, DELETE, and BATCH. An attacker
+  # with this permission can tamper with or inject data into any Cassandra table,
+  # affecting applications that consume those rows without separate validation.
+  # If the table has an SSE-KMS CMK, writes also require kms:GenerateDataKey on the
+  # CMK (AWS Keyspaces calls GenerateDataKey to encrypt new data before persisting).
+  # Emit CONDITIONAL(key_permission) when a CMK is detected, ACTIVE otherwise.
+  # Write access is lower priority than read (no direct credential harvest), but
+  # it enables data-poisoning and application-level injection paths.
+  - id: aws-keyspaces-modify-write-data
+    emits: CanWriteData
+    description: >-
+      IAM-effective cassandra:Modify on a Keyspaces table allows CQL INSERT,
+      UPDATE, and DELETE, enabling data tampering and injection attacks.
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_type(?table) == NoSQLDatabase"
+      - "?table.provider_type == 'AWS::Cassandra::Table'"
+      - "effective_action(?principal, ?table) includes 'cassandra:Modify'"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["cassandra:Modify"]
+      conditions_dynamic: >-
+        if ?table.encryptionSpecification.kmsKeyIdentifier is a customer-managed
+        key (not alias/aws/cassandra or AWS-managed key): [iam_permission, key_permission];
+        else: [iam_permission]
+      state_logic: >-
+        if ?table.encryptionSpecification.kmsKeyIdentifier is a customer-managed
+        key (not alias/aws/cassandra or AWS-managed): CONDITIONAL(key_permission) —
+        the caller needs kms:GenerateDataKey on the CMK for AWS Keyspaces to encrypt
+        new data before writing. When the principal is confirmed to hold
+        GenerateDataKey on that exact CMK, a provider-agnostic linchpin rule (TBD)
+        should upgrade this to ACTIVE.
+        Otherwise (SSE uses AWS-managed key alias/aws/cassandra): ACTIVE when
+        cassandra:Modify is effective on the table ARN.
+      confidence: "contributing_confidence * 0.9"
+      derived_from: [ "<HasPermission edge for cassandra:Modify on ?table>" ]
+      false_positive_note: >-
+        Honor the exact resource ARN scope. cassandra:Modify on a specific table ARN
+        does not confer write on other tables in the same keyspace unless the grant
+        covers the keyspace wildcard. Keyspace-level cassandra:Modify grants apply
+        to all tables in that keyspace; check each table's encryptionSpecification
+        for CMK gates. IAM conditions (e.g., aws:RequestedRegion, aws:PrincipalTag)
+        may further restrict the effective permission — honor all condition_expression
+        gates from the permission evaluator.
+      narrative: >-
+        {principal.name} can INSERT, UPDATE, or DELETE rows in {table.name}
+        (cassandra:Modify), enabling data-tampering or injection attacks against
+        applications that consume {table.name} contents without independent validation.
+
+  # --- 3) cassandra:Restore -> data exfiltration via PITR table copy ----------
+  # cassandra:Restore permits point-in-time recovery (PITR) restore of a table to a
+  # new table within the same keyspace. While the Keyspaces service documentation
+  # does not expose a direct "export snapshot" API, the Restore action enables
+  # within-account exfiltration: a principal with cassandra:Restore on a source table
+  # + cassandra:Create on the target keyspace + cassandra:Select on the target keyspace
+  # can copy the entire table history to a new table under the attacker's control and
+  # read its contents. This is a CanReadData-class escalation (data duplicated into
+  # attacker-accessible scope). cassandra:Select at the keyspace ARN level covers all
+  # tables created within it, including the restored table.
+  - id: aws-keyspaces-restore-exfiltrate
+    emits: CanReadData
+    description: >-
+      cassandra:Restore on a source table + cassandra:Create + cassandra:Select on the
+      target keyspace permits PITR-based table copy exfiltration: attacker restores
+      source table data to a new table they control and can read via cassandra:Select.
+    match:
+      - [ ?principal, HasPermission, ?source_table ]
+      - [ ?principal, HasPermission, ?keyspace ]
+    where:
+      - "node_type(?source_table) == NoSQLDatabase"
+      - "?source_table.provider_type == 'AWS::Cassandra::Table'"
+      - "?source_table.pointInTimeRecovery.status == 'ENABLED'"
+      - "effective_action(?principal, ?source_table) includes 'cassandra:Restore'"
+      - "node_type(?keyspace) == NoSQLDatabase"
+      - "?keyspace.provider_type == 'AWS::Cassandra::Keyspace'"
+      - "effective_action(?principal, ?keyspace) includes 'cassandra:Create'"
+      - "effective_action(?principal, ?keyspace) includes 'cassandra:Select'"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?source_table
+      permissions: ["cassandra:Restore", "cassandra:Create", "cassandra:Select"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds IAM-effective cassandra:Restore on the source
+        table ARN, cassandra:Create on the target keyspace ARN, AND cassandra:Select
+        on the target keyspace ARN (Select at keyspace level covers all tables in the
+        keyspace including the restored one). The source table must have
+        pointInTimeRecovery.status == ENABLED. This is an exfiltration vector: the
+        principal can restore the full table history to a new table within the keyspace
+        and query that restored table to read all historical data. Without confirmed
+        Select permission on the destination keyspace, the edge should be emitted as
+        CONDITIONAL(iam_permission) — the attacker can copy the data but cannot yet
+        read the restored copy.
+      confidence: "contributing_confidence * 0.85"
+      derived_from: [ "<HasPermission edge for cassandra:Restore on ?source_table>", "<HasPermission edge for cassandra:Create on ?keyspace>", "<HasPermission edge for cassandra:Select on ?keyspace>" ]
+      false_positive_note: >-
+        PITR restore is only available if the source table has point-in-time recovery
+        enabled (?source_table.pointInTimeRecovery.status == ENABLED). The collector
+        should verify this via GetTable. cassandra:Restore scoped to a specific table
+        ARN is required; a generic wildcard grant on tables must still match the source
+        table resource. cassandra:Create and cassandra:Select scoped to the keyspace
+        ARN are sufficient (no per-table Create or Select actions exist; keyspace-level
+        grants cover all tables in that keyspace).
+      narrative: >-
+        {principal.name} can restore {source_table.name} from point-in-time backup to
+        a new table in the same keyspace (cassandra:Restore + cassandra:Create) and
+        read the restored table (cassandra:Select on keyspace), effectively exfiltrating
+        all historical data in {source_table.name} to an attacker-controlled,
+        queryable table.
+
+  # --- 3b) cassandra:Alter + cassandra:Restore -> enable PITR then exfiltrate -----
+  # When PITR is disabled on a source table, a principal with cassandra:Alter can
+  # enable it, then use cassandra:Restore + cassandra:Create + cassandra:Select to
+  # exfiltrate (a two-step escalation path). This is POTENTIAL when PITR is DISABLED,
+  # requiring the attacker to first enable PITR via Alter, then execute the restore
+  # path. The edge is emitted as POTENTIAL because it requires a prerequisite action
+  # (Enable PITR) that is not yet verified in a single-shot evaluation.
+  - id: aws-keyspaces-alter-enable-pitr-then-restore
+    emits: CanReadData
+    description: >-
+      cassandra:Alter on a source table to enable PITR, then cassandra:Restore +
+      cassandra:Create + cassandra:Select on the target keyspace permits PITR exfiltration
+      even when PITR is initially disabled. This is a two-step escalation path
+      (POTENTIAL state).
+    match:
+      - [ ?principal, HasPermission, ?source_table ]
+      - [ ?principal, HasPermission, ?keyspace ]
+    where:
+      - "node_type(?source_table) == NoSQLDatabase"
+      - "?source_table.provider_type == 'AWS::Cassandra::Table'"
+      - "?source_table.pointInTimeRecovery.status != 'ENABLED'"
+      - "effective_action(?principal, ?source_table) includes 'cassandra:Alter'"
+      - "effective_action(?principal, ?source_table) includes 'cassandra:Restore'"
+      - "node_type(?keyspace) == NoSQLDatabase"
+      - "?keyspace.provider_type == 'AWS::Cassandra::Keyspace'"
+      - "effective_action(?principal, ?keyspace) includes 'cassandra:Create'"
+      - "effective_action(?principal, ?keyspace) includes 'cassandra:Select'"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?source_table
+      permissions: ["cassandra:Alter", "cassandra:Restore", "cassandra:Create", "cassandra:Select"]
+      conditions: [iam_permission]
+      state_logic: >-
+        POTENTIAL when the principal holds cassandra:Alter (to enable PITR on the
+        source table), cassandra:Restore on the source table, cassandra:Create on the
+        target keyspace, AND cassandra:Select on the target keyspace, but the source
+        table currently has pointInTimeRecovery.status != ENABLED. The attacker must
+        first execute cassandra:Alter to enable PITR, then cassandra:Restore to create
+        the exfiltration copy, then read it via cassandra:Select. This is a prerequisite
+        chain and is emitted as POTENTIAL (may be activated if PITR is enabled via
+        Alter in a subsequent step).
+      confidence: "contributing_confidence * 0.80"
+      derived_from: [ "<HasPermission edge for cassandra:Alter on ?source_table>", "<HasPermission edge for cassandra:Restore on ?source_table>", "<HasPermission edge for cassandra:Create on ?keyspace>", "<HasPermission edge for cassandra:Select on ?keyspace>" ]
+      false_positive_note: >-
+        This rule only fires when pointInTimeRecovery.status is NOT ENABLED (or is
+        explicitly DISABLED). When PITR is enabled, use the aws-keyspaces-restore-exfiltrate
+        rule (ACTIVE state) instead. cassandra:Alter must be effective on the source
+        table ARN; keyspace-level Alter grants do not apply to individual table
+        modifications in all Keyspaces versions — verify the resource scope of the
+        Alter permission. cassandra:Create and cassandra:Select on the keyspace ARN
+        are sufficient (keyspace-level grants cover all tables).
+      narrative: >-
+        {principal.name} can enable point-in-time recovery on {source_table.name}
+        (cassandra:Alter), then restore to a new table and read it (cassandra:Restore +
+        cassandra:Create + cassandra:Select on keyspace), exfiltrating all table data
+        even though PITR was initially disabled. This is a two-step path requiring Alter
+        to be executed first.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying cassandra:Select or cassandra:Modify at the account scope
+#     -> emit the edge with state: BLOCKED and denied_by = <SCP arn/statement>.
+#   - A KMS key policy or SCP denying kms:Decrypt on the table's CMK leaves
+#     CanReadData CONDITIONAL(key_permission) and blocks the
+#     credential-chains:decrypt-gates-secret-read upgrade.
+# ---------------------------------------------------------------------------
+
+# No explicit normalization records are required for Keyspaces.
+# The service contributes no ExecutesAs, no resource-based policy CrossAccountTrust,
+# no CanTrigger, and no ExposesCredential edges beyond what the standard
+# ContainsSecret/CredentialsFor path (handled by the linchpins) provides.

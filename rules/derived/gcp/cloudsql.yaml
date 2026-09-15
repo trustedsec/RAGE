@@ -1,0 +1,652 @@
+# GCP Cloud SQL — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:cloudsql. Emits ONLY common edge types from schema/edges.yaml.
+# Permissions are verbatim from the Cloud SQL IAM reference:
+#   cloud.google.com/sql/docs/mysql/iam-permissions
+#   cloud.google.com/sql/docs/postgres/iam-permissions
+#   cloud.google.com/sql/docs/mysql/connect-overview
+#   cloud.google.com/sql/docs/mysql/iam-authentication
+#   cloud.google.com/sql/docs/mysql/admin-api/rest/v1beta4/instances/export
+#   cloud.google.com/sql/docs/mysql/manage-users
+#   cloud.google.com/sql/docs/mysql/authorize-networks
+#   cloud.google.com/sql/docs/mysql/ssl-proxy
+#
+# CENTRAL ATTACK-PATH THEME (Phase 6):
+#   Cloud SQL is a managed relational database (MySQL, PostgreSQL, SQL Server).
+#   Its attack surface clusters into four primitives:
+#
+#   (1) CREDENTIAL GRAB (password reset + SSL certs):
+#       cloudsql.users.update resets any DB user password — including root/admin.
+#       Unlike GCS HMAC keys or Cosmos listKeys, Cloud SQL has NO "export master
+#       key" API; the credential-grab primitive is password reset. Resetting root
+#       grants full SQL access to all databases in the instance =>
+#       CanResetCredential(Identity -> GenericIdentity [DB root user]) => CanReadData.
+#       cloudsql.sslCerts.create returns the client-cert private key once in the
+#       API response; the principal can authenticate as the cert's mapped DB user
+#       => CanReadData when the instance requires SSL cert auth and network is reachable.
+#
+#   (2) DATA READ + EXFIL:
+#       cloudsql.instances.connect + IAM DB authentication (when the instance
+#       has database_flags cloudsql.iam_authentication=on and the principal holds
+#       cloudsql.instances.login) => CanReadData without a DB password.
+#       cloudsql.instances.export writes a full SQL dump/CSV to a GCS bucket =>
+#       CanExfiltrate when the destination bucket is attacker-accessible. The
+#       Cloud SQL service agent performs the write; the calling principal needs
+#       cloudsql.instances.export.
+#
+#   (3) PUBLIC EXPOSURE:
+#       A Cloud SQL instance with a public IP (ipv4Enabled=true) AND an
+#       authorizedNetworks entry of 0.0.0.0/0 is TCP-reachable from the internet
+#       on the DB port. requireSsl does NOT prevent network reachability. =>
+#       ExposedToInternet(RelationalDatabase -> AnonymousIdentity).
+#
+#   (4) CONFIGURATION UNLOCK:
+#       cloudsql.instances.update can enable IAM database authentication
+#       (database_flags: cloudsql.iam_authentication=on). When toggled ON, any
+#       principal with roles/cloudsql.instanceUser (includes cloudsql.instances.login)
+#       can log into the DB using its IAM token via Auth Proxy without a DB
+#       password. => CanModifyConfiguration(Identity -> RelationalDatabase) leading
+#       to unlocked CanReadData for instanceUser principals.
+#
+# LINCHPIN CITATIONS (do NOT re-derive these roll-ups here):
+#   * /rules/derived/credential-chains.yaml — read-secret-yields-identity and
+#     execute-then-read-secret collapse ContainsSecret -> CredentialsFor ->
+#     CanImpersonate chains. Cloud SQL rule gcp-cloudsql-explicit-contains-secret
+#     emits ContainsSecret; credential-chains handles the downstream roll-up.
+#   * /rules/derived/can-control.yaml — control-via-admin rolls CanAdminister
+#     into Controls. Cloud SQL rule gcp-cloudsql-explicit-can-administer (in
+#     /rules/explicit/gcp-cloudsql.yaml) emits CanAdminister so can-control.yaml
+#     can derive Controls without duplication.
+#   * /rules/derived/can-execute-as.yaml — execute-as-via-code-modify and
+#     execute-as-via-command are provider-agnostic; Cloud SQL has no CanModifyCode
+#     surface, so those rules do not apply here.
+#
+# STATE: defaults to ACTIVE; unmet condition => CONDITIONAL or POTENTIAL;
+# explicit deny / VPC-SC perimeter => BLOCKED.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 6-storage-databases
+service: cloudsql
+applies_to: [gcp]
+
+rules:
+
+  # ===========================================================================
+  # SECTION 1 — CREDENTIAL GRAB (password reset + SSL cert)
+  # ===========================================================================
+
+  # --- CanResetCredential moved to /rules/explicit/gcp-cloudsql.yaml (nature: explicit) ---
+  # Explicit normalization rule gcp-cloudsql-explicit-can-reset-credential is now in
+  # /rules/explicit/gcp-cloudsql.yaml because CanResetCredential has nature: explicit
+  # in edges.yaml and must not be emitted from a derived file.
+
+  # --- CanReadData: password-reset leads to effective data read ---------------
+  # Password reset (CanResetCredential) on root/admin -> connect as root -> read all data.
+  # This rule collapses CanResetCredential on an instance to CanReadData on that same instance.
+  # Note: DB root/admin users are GenericIdentity (engine-internal, not GCP IAM-backed).
+  - id: gcp-cloudsql-reset-password-read-data
+    emits: CanReadData
+    description: "A principal that can reset the root/admin DB user password on a Cloud SQL instance gains full SQL read access to all databases in that instance."
+    match:
+      - [ ?principal, CanResetCredential, ?db_user ]
+    where:
+      - "node_type(?db_user) == GenericIdentity  # Cloud SQL root/admin DB user (internal engine identity)"
+      - "?db_user is a root or admin-level built-in DB user of a Cloud SQL instance (?instance)"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: ?instance
+      permissions: ["cloudsql.users.update"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        inherit_weakest(CanResetCredential): if CanResetCredential is ACTIVE and a
+        network path exists to the instance (public IP or Auth Proxy via
+        cloudsql.instances.connect), this is ACTIVE; if the instance is only
+        reachable via private IP and no Auth Proxy path is modeled, downgrade to
+        CONDITIONAL(network_reachability); if CanResetCredential is CONDITIONAL or
+        BLOCKED, inherit that state. The attacker must connect AFTER resetting the
+        password; the two steps must be feasible (not blocked by network isolation).
+      false_positive_note: >-
+        This chain (reset + connect) requires TWO conditions: (1) cloudsql.users.update
+        effective on the instance, AND (2) a network path to connect to the DB
+        (public IP reachable OR Cloud SQL Auth Proxy available, which requires
+        cloudsql.instances.connect). If the instance is private-IP-only and the
+        attacker has no VPC foothold, downgrade to CONDITIONAL(network_reachability).
+        Do not emit ACTIVE when the instance state is not RUNNABLE. Only chain to
+        full CanReadData when the targeted user is root/admin with all-database
+        access; partial user resets yield partial access — lower confidence (0.7).
+      narrative: >-
+        {principal.name} can reset the root password of {instance.name}
+        (cloudsql.users.update) and then authenticate as root to read all databases
+        in the instance.
+      derived_from: ["?principal CanResetCredential ?db_user", "?db_user is root user of ?instance"]
+
+  # --- CanReadCredential via SSL certificate private key exposure ---------------
+  # A principal with cloudsql.sslCerts.create on an instance can obtain a client
+  # SSL certificate + private key (returned once in API response field certPrivateKey).
+  # This is a one-shot credential exposure at cert-creation time, not a persistent
+  # ACTIVE state. The credential-chains linchpin (read-secret-yields-identity) then
+  # handles the downstream roll-up: if the cert's CN maps to a PostgreSQL DB user
+  # (MySQL does not use CN-to-username mapping), the attacker can authenticate to
+  # the DB as that user → CanReadData.
+  # NOTE: This is a POTENTIAL credential exposure (one-time event at cert creation),
+  # not an ACTIVE persistent state like password hashes.
+  - id: gcp-cloudsql-explicit-ssl-cert-exposes-credential
+    emits: CanReadCredential
+    description: "cloudsql.sslCerts.create returns a client SSL certificate private key (one-time, in the API response), which serves as a database authentication credential."
+    match_effective_permission:
+      action: "cloudsql.sslCerts.create"
+      resource_type: "google.sql.Instance"
+    where:
+      - "the principal calls cloudsql.sslCerts.create and receives the private key in the API response"
+    emit:
+      source_type: Identity
+      target_type: Credential
+      source: "<principal>"
+      target: "<SSL Certificate (private key)>"
+      permissions: ["cloudsql.sslCerts.create"]
+      conditions: [iam_permission]
+      state_logic: >-
+        POTENTIAL when cloudsql.sslCerts.create is confirmed effective. The attacker can
+        CREATE the certificate and receive the private key in the response (one-time event).
+        The key is NOT retrievable after creation (sslCerts.get/list do not return the
+        private key). CONDITIONAL(iam_permission) when the permission is uncertain;
+        BLOCKED when VPC-SC perimeter blocks sqladmin.googleapis.com.
+      false_positive_note: >-
+        The private key is returned ONLY at cert creation time in the API response field
+        certPrivateKey as a one-shot event. Listing existing certs (sslCerts.list/get)
+        returns only the public certificate and common name, NOT the private key.
+        This is a POTENTIAL edge (attacker can create the cert and get the key) — not
+        ACTIVE (which would imply persistent access). After obtaining the private key,
+        the attacker still must satisfy DB-level cert auth requirements to authenticate:
+        - MySQL: REQUIRE X509 clause on the user account + CN matching policy
+        - PostgreSQL: pg_hba.conf cert method configured, CN mapped to a DB user
+        These DB-level configs are not visible via the sqladmin API; downgrade to
+        CONDITIONAL(service_state) if DB-level cert auth cannot be confirmed.
+        The Certificate node serves as the credential. The downstream credential-chains
+        rules (CredentialsFor, CanReadSecret) model the authentication path.
+      narrative: >-
+        {principal.name} holds cloudsql.sslCerts.create on {instance.name} and can
+        create a client SSL certificate, receiving the private key in the API response.
+        The certificate serves as a database authentication credential.
+      derived_from:
+        - "cloudsql.sslCerts.create effective permission on google.sql.Instance"
+        - "API response field certPrivateKey contains the private key at cert-creation time"
+
+  # --- CanReadData via SSL certificate database authentication (PostgreSQL-specific) --------
+  # DEPRECATED RULE — use credential-chains + database auth configuration checks instead.
+  # Clients should emit this via:
+  #   ExposesCredential(Identity -> Certificate) from gcp-cloudsql-explicit-ssl-cert-exposes-credential-explicit
+  #   → credential-chains reads the downstream CredentialsFor + CanReadSecret roll-up
+  # This rule remains for reference but DOES NOT emit (replaced by explicit + credential-chains).
+  #
+  # HISTORICAL NOTE: The old rule incorrectly assumed requireSsl=true or ssl-mode=VERIFY_CA/VERIFY_IDENTITY
+  # meant "client cert auth required", which is factually wrong:
+  # - requireSsl=true enforces TLS encryption (server cert) — does NOT require client certs.
+  # - ssl-mode=VERIFY_CA/VERIFY_IDENTITY are CLIENT-SIDE Auth Proxy options (client verifies server cert).
+  # - Real cert auth requires REQUIRE X509 on the MySQL user or pg_hba.conf cert method on PostgreSQL.
+  # These DB-level configs are not visible via the sqladmin API and cannot be assumed from instance config.
+  # The rule was over-claiming CanReadData(ACTIVE) based on false conditions.
+  # DELETE THIS RULE after migration to credential-chains model.
+
+  # ===========================================================================
+  # SECTION 2 — IAM DB AUTHENTICATION (CanReadData without a DB password)
+  # ===========================================================================
+
+  # --- CanReadData via IAM database authentication ----------------------------
+  - id: gcp-cloudsql-iam-auth-read-data
+    emits: CanReadData
+    description: "When a Cloud SQL instance has IAM database authentication enabled (cloudsql.iam_authentication=on), a principal with cloudsql.instances.login can authenticate to the DB using its IAM token via Cloud SQL Auth Proxy — no DB password needed."
+    match_effective_permission:
+      action: "cloudsql.instances.login"
+      resource_type: "google.sql.Instance"
+    where:
+      - "instance.settings.databaseFlags contains cloudsql.iam_authentication=on"
+      - "an IAM DB user of type CLOUD_IAM_USER or CLOUD_IAM_SERVICE_ACCOUNT exists for this principal"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Cloud SQL Instance node>"
+      permissions: ["cloudsql.instances.login", "cloudsql.instances.connect"]
+      conditions: [iam_permission, service_state, network_reachability]
+      state_logic: >-
+        ACTIVE when: (1) the instance has database_flags cloudsql.iam_authentication=on,
+        (2) the principal holds cloudsql.instances.login (in roles/cloudsql.instanceUser),
+        (3) a corresponding IAM DB user record (CLOUD_IAM_USER or
+        CLOUD_IAM_SERVICE_ACCOUNT) exists in the instance for this principal,
+        AND (4) a network path exists to the instance (public IP with
+        authorizedNetworks allowing the principal's source IP, OR Cloud SQL Auth Proxy
+        path via cloudsql.instances.connect on a private IP instance). CONDITIONAL(service_state)
+        when the IAM auth flag cannot be confirmed. CONDITIONAL(iam_permission) when
+        the IAM DB user record is absent (flag alone does not auto-create DB user —
+        must be explicitly created). CONDITIONAL(network_reachability) when the instance
+        is private-IP-only and no Auth Proxy path is confirmed. BLOCKED when VPC-SC
+        perimeter blocks sqladmin API.
+      false_positive_note: >-
+        Three separate conditions must ALL be true: (A) the INSTANCE-LEVEL flag
+        database_flags.cloudsql.iam_authentication=on, (B) an IAM DB user record
+        for this principal exists in the instance (visible via cloudsql.users.list as
+        type CLOUD_IAM_USER or CLOUD_IAM_SERVICE_ACCOUNT), AND (C) a network path to
+        reach the DB port (public IP reachable from principal's source, OR Cloud SQL
+        Auth Proxy via cloudsql.instances.connect). Holding roles/cloudsql.instanceUser
+        at project level does NOT auto-create an IAM DB user — admin must explicitly
+        add it. Do NOT emit ACTIVE for instances where flag is absent, no IAM DB user
+        exists, or the instance is not network-reachable. cloudsql.instances.connect
+        (in roles/cloudsql.client) is required for Auth Proxy tunnel; without it,
+        the principal cannot reach the DB port even with IAM auth enabled.
+        For PostgreSQL, the IAM DB username is the email with @domain stripped (for SAs);
+        for MySQL, it is the full email.
+      narrative: >-
+        {principal.name} holds cloudsql.instances.login (roles/cloudsql.instanceUser)
+        on {instance.name}, which has IAM database authentication enabled
+        (cloudsql.iam_authentication=on) and an IAM DB user record for {principal.name};
+        it can authenticate to the DB using its short-lived IAM token via Cloud SQL
+        Auth Proxy (requires cloudsql.instances.connect and a network path to the instance)
+        without a DB password.
+      derived_from:
+        - "cloudsql.instances.login effective permission on google.sql.Instance"
+        - "google.sql.Instance.settings.databaseFlags[cloudsql.iam_authentication]=on"
+        - "google.sql.User type=CLOUD_IAM_USER|CLOUD_IAM_SERVICE_ACCOUNT for principal"
+        - "network_reachability to instance (public IP or Auth Proxy path)"
+
+  # ===========================================================================
+  # SECTION 3 — DATA EXFILTRATION (cloudsql.instances.export)
+  # ===========================================================================
+
+  # --- CanExfiltrate: SQL dump export to a GCS bucket ------------------------
+  - id: gcp-cloudsql-export-exfiltrate
+    emits: CanExfiltrate
+    description: "cloudsql.instances.export triggers the Cloud SQL service agent to write a full SQL dump (or CSV export) to a GCS bucket; when the destination bucket is attacker-accessible, this constitutes data exfiltration."
+    match_effective_permission:
+      action: "cloudsql.instances.export"
+      resource_type: "google.sql.Instance"
+    where:
+      - "the Cloud SQL service agent (service-PROJECT_NUMBER@gcp-sa-cloud-sql.iam.gserviceaccount.com) holds storage.objects.create on a destination GCS bucket the attacker can read or control"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Cloud SQL Instance node>"
+      permissions: ["cloudsql.instances.export"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when cloudsql.instances.export is confirmed effective AND the Cloud SQL
+        service agent (service-PROJECT_NUMBER@gcp-sa-cloud-sql.iam.gserviceaccount.com)
+        holds storage.objects.create on a same-project GCS bucket (verified from service
+        agent's IAM grants within this project) AND the attacker can read that bucket.
+        CONDITIONAL(resource_policy) for cross-project destination buckets where the
+        service agent's cross-project grant cannot be confirmed from the analyzed project's IAM.
+        CONDITIONAL(iam_permission) when the service agent's GCS grant cannot be confirmed.
+        BLOCKED when VPC-SC perimeter blocks sqladmin.googleapis.com.
+      false_positive_note: >-
+        The export is performed SERVER-SIDE by the Cloud SQL service agent
+        (service-PROJECT_NUMBER@gcp-sa-cloud-sql.iam.gserviceaccount.com), NOT the
+        calling principal directly. The calling principal needs cloudsql.instances.export
+        to trigger the export; the service agent needs storage.objects.create on the
+        DESTINATION bucket. If the service agent lacks that grant, export fails with 403.
+
+        For SAME-PROJECT exfiltration (ACTIVE case): the destination is a bucket in the
+        same project. The attacker with cloudsql.instances.export can trigger the export
+        to that bucket. If the attacker also holds IAM grants on that bucket (e.g.
+        storage.buckets.get, storage.objects.get), they can read the exported dump
+        directly. ACTIVE when both conditions hold: (1) service agent has
+        storage.objects.create on bucket, (2) attacker can read bucket.
+
+        For CROSS-PROJECT exfiltration (CONDITIONAL case): the destination bucket is in
+        a foreign project. The attacker cannot see the foreign project's IAM policies
+        from the source project's analysis. The service agent's cross-project grant must
+        be pre-established by the foreign bucket owner — the attacker CANNOT retroactively
+        grant storage.objects.create to the service agent in a bucket they do not already
+        control (granting the service agent requires knowledge of its identity and write
+        permission on the bucket). Thus, cross-project export is only realistic if the
+        attacker has PRE-PROVISIONED the service agent's write grant on the foreign bucket
+        BEFORE the attack. This requires out-of-band pre-configuration. Flag this case as
+        CONDITIONAL(resource_policy) with a note that it assumes pre-granted cross-project access.
+
+        For ATTACKER-OWNED BUCKETS: if the destination is an attacker-controlled bucket
+        in a different project, the attacker must have PRE-GRANTED the source project's
+        Cloud SQL service agent write access to that bucket. This is a realistic path only
+        if the attacker set it up in advance (e.g., owns both projects or was granted
+        cross-project permissions beforehand).
+
+        The export produces a full schema+data SQL dump or CSV; all table data is included
+        unless filtered by the export request's database/table spec.
+      narrative: >-
+        {principal.name} holds cloudsql.instances.export on {instance.name} and can
+        trigger a full SQL dump to a GCS bucket where the Cloud SQL service agent has
+        write permission; the dump is exfiltrated and readable by the attacker.
+      derived_from:
+        - "cloudsql.instances.export effective permission on google.sql.Instance"
+        - "Cloud SQL service agent storage.objects.create on destination GCS bucket"
+
+  # ===========================================================================
+  # SECTION 3.5 — CONFIGURATION UNLOCK: PUBLIC IP EXPOSURE
+  # ===========================================================================
+
+  # --- ExposedToInternet: CanModifyConfiguration (cloudsql.instances.update) can enable public IP
+  # A principal with cloudsql.instances.update can modify ipConfiguration to enable
+  # public IP (ipv4Enabled=true) and add authorizedNetworks entry 0.0.0.0/0, making
+  # the instance internet-reachable. This is a POTENTIAL CanModifyConfiguration ->
+  # ExposedToInternet escalation (configuration change COULD unlock network exposure).
+  # NOTE: This rule models CAPABILITY (attacker CAN expose), not current state (already exposed).
+  # If instance is already public + open, gcp-cloudsql-public-ip-open-network emits the
+  # ACTIVE edge for current state. NEVER emit ACTIVE from this rule to avoid duplicate scoring.
+  - id: gcp-cloudsql-enable-public-ip-exposed
+    emits: ExposedToInternet
+    description: "cloudsql.instances.update can enable public IP (ipv4Enabled=true) and add 0.0.0.0/0 to authorizedNetworks, making the instance internet-reachable from any network."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?instance ]
+    where:
+      - "node_type(?instance) == RelationalDatabase"
+      - "?principal holds cloudsql.instances.update permission"
+      - "instance currently has ipv4Enabled=false OR authorizedNetworks does not contain 0.0.0.0/0"
+    emit:
+      source_type: RelationalDatabase
+      target_type: AnonymousIdentity
+      source: ?instance
+      target: "<AnonymousIdentity>"
+      permissions: ["cloudsql.instances.update"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        POTENTIAL when cloudsql.instances.update is confirmed effective and the instance
+        does not currently have both public IP AND 0.0.0.0/0 authorized (the attacker
+        CAN make it exposed by executing the configuration change). Never ACTIVE from this
+        rule; if the instance is already public + 0.0.0.0/0, gcp-cloudsql-public-ip-open-network
+        emits ACTIVE and this rule is suppressed by its where-clause guards.
+      false_positive_note: >-
+        This rule models the CAPABILITY to expose the instance (POTENTIAL), not the
+        current state (which gcp-cloudsql-public-ip-open-network handles as ACTIVE).
+        Two rules emit ExposedToInternet with different purposes:
+        - gcp-cloudsql-public-ip-open-network: ACTIVE when instance IS already exposed (current state)
+        - gcp-cloudsql-enable-public-ip-exposed: POTENTIAL when instance CAN BE exposed (attacker capability)
+        This rule's where-clause ensures it fires only when NOT already exposed, preventing
+        duplicate ACTIVE edges and path-scoring inflation. Toggling ipv4Enabled requires
+        instance restart; authorizedNetworks changes are immediate. After the change, any
+        internet host can connect to the DB port and attempt authentication/exploitation.
+      narrative: >-
+        {principal.name} holds cloudsql.instances.update on {instance.name} and can
+        enable public IP (ipv4Enabled=true) and add 0.0.0.0/0 to authorizedNetworks,
+        making the database internet-reachable and exploitable from any network.
+      derived_from:
+        - "?principal CanModifyConfiguration ?instance"
+        - "cloudsql.instances.update permission allows ipConfiguration modification"
+
+  # ===========================================================================
+  # SECTION 4 — PUBLIC EXPOSURE
+  # ===========================================================================
+
+  # --- ExposedToInternet: public IP + 0.0.0.0/0 authorized network -----------
+  - id: gcp-cloudsql-public-ip-open-network
+    emits: ExposedToInternet
+    description: "A Cloud SQL instance with a public IP (ipv4Enabled=true) and an authorized network of 0.0.0.0/0 is TCP-reachable from the internet on the DB port, exposing it to unauthenticated network-level attack (brute-force, known CVEs)."
+    match_record:
+      resource_type: "google.sql.Instance"
+      field: "settings.ipConfiguration.ipv4Enabled == true AND settings.ipConfiguration.authorizedNetworks[].value contains 0.0.0.0/0"
+    where:
+      - "instance.state == RUNNABLE"
+    emit:
+      source_type: RelationalDatabase
+      target_type: AnonymousIdentity
+      source: "<Cloud SQL Instance node>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when ipv4Enabled=true AND an authorizedNetworks entry with value
+        0.0.0.0/0 (or ::/0 for IPv6) is present AND instance.state == RUNNABLE;
+        CONDITIONAL(service_state) when instance state cannot be confirmed or is
+        SUSPENDED; BLOCKED when an org policy (e.g.
+        constraints/sql.restrictAuthorizedNetworks) prevents 0.0.0.0/0 entries
+        or when Cloud Armor / a WAF-equivalent blocks the DB port.
+      false_positive_note: >-
+        requireSsl=true does NOT prevent network reachability — the instance is still
+        TCP-reachable; TLS enforcement is a transport-layer control, not a network-
+        access control. requireSsl only means unauthenticated plaintext connections
+        are rejected; a TLS-capable attacker can still reach the port.
+        authorizedNetworks is an IP allowlist: only 0.0.0.0/0 (or a superset like
+        ::/0) constitutes full internet exposure. Specific CIDR entries (e.g.
+        10.0.0.0/8) are NOT internet-exposed. Check each authorizedNetworks[].value
+        entry individually; do not flag instances where only private CIDRs are listed.
+        Instances with ONLY private IP (ipv4Enabled=false) are NOT internet-exposed
+        via this vector even if authorizedNetworks is unconstrained (private-only
+        instances have no public IP to reach). Also check the instance has a
+        RUNNABLE state; SUSPENDED / FAILED instances are not actively serving connections.
+      narrative: >-
+        Cloud SQL instance {instance.name} has a public IP address with authorized
+        network 0.0.0.0/0; any internet host can connect to its DB port
+        ({instance.backendType}: 3306/MySQL, 5432/PostgreSQL, 1433/SQL Server)
+        and attempt authentication — including password brute-force or exploitation
+        of DB engine vulnerabilities.
+      derived_from:
+        - "google.sql.Instance.settings.ipConfiguration.ipv4Enabled == true"
+        - "google.sql.Instance.settings.ipConfiguration.authorizedNetworks[].value == 0.0.0.0/0"
+        - "google.sql.Instance.state == RUNNABLE"
+
+  # ===========================================================================
+  # SECTION 5 — CONFIGURATION UNLOCK (IAM DB AUTH TOGGLE)
+  # ===========================================================================
+
+  # --- CanModifyConfiguration: enable IAM database authentication moved to explicit ---
+  # Explicit normalization rule gcp-cloudsql-explicit-enable-iam-auth is now in
+  # /rules/explicit/gcp-cloudsql.yaml because CanModifyConfiguration has nature: explicit
+  # in edges.yaml and must not be emitted from a derived file.
+
+  # ===========================================================================
+  # SECTION 6 — DATA CONTAINS SECRETS (credential pivot)
+  # ===========================================================================
+
+  # --- ContainsSecret moved to /rules/explicit/gcp-cloudsql.yaml (nature: explicit) ---
+  # Explicit normalization rule gcp-cloudsql-explicit-contains-secret is now in
+  # /rules/explicit/gcp-cloudsql.yaml because ContainsSecret has nature: explicit
+  # in edges.yaml and must not be emitted from a derived file. The credential-chains
+  # linchpin (read-secret-yields-identity) handles the roll-up from ContainsSecret
+  # + CredentialsFor + CanReadSecret into CanImpersonate.
+
+  # ===========================================================================
+  # SECTION 7 — ESCALATION ROLL-UP
+  # ===========================================================================
+
+  # ===========================================================================
+  # SECTION 7.5 — DATA EXFILTRATION: CLONE & READ REPLICA
+  # ===========================================================================
+
+  # --- CanExfiltrate: cloudsql.instances.clone creates a full accessible copy ---
+  # cloudsql.instances.clone (included in roles/cloudsql.admin) creates a full copy
+  # of a Cloud SQL instance accessible to the cloning principal in the same project.
+  # This is a direct data exfiltration primitive equivalent in impact to
+  # cloudsql.instances.export but bypasses the service-agent GCS grant requirement.
+  - id: gcp-cloudsql-clone-exfiltrate
+    emits: CanExfiltrate
+    description: "cloudsql.instances.clone creates a full copy of a Cloud SQL instance (with all databases and data) accessible to the cloning principal in the same project — direct data exfiltration without external GCS access."
+    match_effective_permission:
+      action: "cloudsql.instances.clone"
+      resource_type: "google.sql.Instance"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Cloud SQL Instance node (source)>"
+      permissions: ["cloudsql.instances.clone"]
+      conditions: [iam_permission, service_state, network_reachability]
+      state_logic: >-
+        ACTIVE when cloudsql.instances.clone is confirmed effective and the source
+        instance is RUNNABLE; CONDITIONAL(service_state) when the instance state
+        cannot be confirmed; BLOCKED when an org policy prevents instance cloning.
+        Note: After cloning, the principal must also hold DB authentication credentials
+        (or IAM DB auth if enabled) to actually query the cloned instance.
+      false_positive_note: >-
+        cloudsql.instances.clone is listed in roles/cloudsql.admin as a distinct
+        permission. The clone is created as a new instance in the same project,
+        accessible by the cloning principal via standard Cloud SQL access controls.
+        The clone contains all databases and data from the source instance as of the
+        clone creation time.
+
+        IMPORTANT: After the clone is created, the attacker still requires DB-level
+        access to query it. Cloning alone does NOT grant data access; the principal
+        must ALSO satisfy one of:
+        - Hold cloudsql.instances.connect + valid DB user password
+        - Hold cloudsql.instances.login + IAM DB auth enabled on the cloned instance
+
+        This CanExfiltrate edge assumes the attacker can subsequently authenticate
+        (either via DB password or IAM auth). Unlike export (which writes to a GCS
+        bucket the service agent can access), clone creates a managed Cloud SQL
+        instance the attacker can query directly IF they hold the auth credentials.
+        This is often a higher-value exfil path than export because it preserves DB
+        structure and allows live querying (not just a one-time dump).
+      narrative: >-
+        {principal.name} holds cloudsql.instances.clone (via roles/cloudsql.admin)
+        on {instance.name} and can create a full copy of the database instance
+        in the same project, exfiltrating all data to a cloned instance the attacker
+        can query directly (assuming DB authentication credentials are available).
+      derived_from: ["cloudsql.instances.clone effective permission on google.sql.Instance"]
+
+  # --- CanWriteData: SQL dump / CSV import data poisoning ------------------
+  # cloudsql.instances.import (included in roles/cloudsql.admin) imports a SQL dump
+  # or CSV from a GCS source file directly into a live Cloud SQL instance. This can:
+  # - Overwrite/augment existing table data
+  # - Inject stored procedures or triggers (MySQL/PostgreSQL)
+  # - Modify schema (with appropriate SQL statements in the dump)
+  # The attacker with cloudsql.instances.import + access to a source file in GCS
+  # (or ability to create one) can poison the database. This is the inverse of export
+  # exfiltration and has material attack value (data modification, stored procedure
+  # injection for privilege escalation or lateral movement via trigger execution).
+  - id: gcp-cloudsql-import-write-data
+    emits: CanWriteData
+    description: "cloudsql.instances.import can import a SQL dump or CSV from a GCS bucket into a Cloud SQL instance, allowing data modification, schema changes, and stored procedure injection."
+    match_effective_permission:
+      action: "cloudsql.instances.import"
+      resource_type: "google.sql.Instance"
+    where:
+      - "the principal holds cloudsql.instances.import permission"
+      - "a source SQL dump or CSV file exists in a GCS bucket the principal can write to or control"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Cloud SQL Instance node>"
+      permissions: ["cloudsql.instances.import"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when cloudsql.instances.import is confirmed effective AND the instance
+        is RUNNABLE AND a source file (SQL dump or CSV) is available in a GCS bucket
+        that the principal can write to (or already controls). If no source file is
+        pre-positioned, downgrade to POTENTIAL (attacker CAN create a malicious dump
+        and trigger import). CONDITIONAL(resource_policy) when the source bucket's
+        accessibility cannot be confirmed from the analyzed principal's grants.
+      false_positive_note: >-
+        The Cloud SQL service agent (service-PROJECT_NUMBER@gcp-sa-cloud-sql.iam.gserviceaccount.com)
+        reads the source file from GCS. The calling principal needs cloudsql.instances.import
+        to trigger the import; the service agent needs storage.objects.get on the source
+        GCS file. If the service agent lacks that grant, import fails with 403.
+
+        Import can modify data (INSERT/UPDATE/DELETE via SQL statements in the dump) or
+        inject code (stored procedures, triggers, views with privileged operations). On
+        MySQL/PostgreSQL, stored procedure triggers can execute external commands or
+        access resources; on SQL Server, CLR-based procedures (if enabled) offer code
+        execution. This is a CanWriteData edge (data modification), but may also unlock
+        downstream escalation via triggered code execution (model in can-execute-as
+        if triggered execution is relevant).
+
+        Unlike export (which is an attacker read of the dump), import is an attacker
+        WRITE (control of dump contents) that modifies the live DB. Common attack paths:
+        - Data poisoning: modify application data -> application processes malicious data
+        - Stored procedure injection: add procs that run on schedule or trigger -> lateral movement
+        - Schema injection: add columns/tables to trigger application logic errors
+
+        Require confirmation that a source file is accessible OR model as POTENTIAL
+        (attacker can create malicious dump if they have write access to the source bucket).
+      narrative: >-
+        {principal.name} holds cloudsql.instances.import on {instance.name} and can
+        import a SQL dump or CSV from a GCS bucket into the database, potentially
+        modifying data, injecting stored procedures, or altering the schema.
+      derived_from:
+        - "cloudsql.instances.import effective permission on google.sql.Instance"
+        - "source GCS file is accessible to the principal (write access to bucket)"
+
+  # --- NOTE: Cross-project read replica path modeled as explicit edge ----------
+  # A read replica in a different project creates cross-project access. This is
+  # handled by an EXPLICIT normalization rule gcp-cloudsql-read-replica-cross-project
+  # in /rules/explicit/gcp-cloudsql.yaml (CrossProjectTrust has nature: explicit,
+  # not derived). Do not re-derive this rule here.
+
+  # ===========================================================================
+  # SECTION 8 — ESCALATION ROLL-UP
+  # ===========================================================================
+
+  # --- CanEscalateTo: reset root password yields escalation to full DB access -
+  - id: gcp-cloudsql-escalate-via-password-reset
+    emits: CanEscalateTo
+    description: "A principal who can reset the root DB user password and then read all data in a Cloud SQL instance has escalated to full DBA-level database privilege."
+    match:
+      - [ ?principal, CanResetCredential, ?db_user ]
+      - [ ?principal, CanReadData,        ?instance ]
+    where:
+      - "node_type(?db_user) == GenericIdentity   # Cloud SQL root/admin DB user (internal engine identity)"
+      - "node_type(?instance) == RelationalDatabase"
+      - "?db_user is the root user of ?instance"
+      - "?principal.privilege_level < elevated"
+    emit:
+      source_type: Identity
+      target_type: GenericIdentity
+      source: ?principal
+      target: ?db_user
+      permissions: ["cloudsql.users.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        inherit_weakest(CanResetCredential, CanReadData): ACTIVE when both contributing
+        edges are ACTIVE; inherits CONDITIONAL/BLOCKED from whichever contributor is
+        weakest. Only emit when the CanReadData is derived from the password-reset chain
+        (gcp-cloudsql-reset-password-read-data), not from independent IAM auth (which is
+        a legitimate access path, not escalation from credential reset).
+      false_positive_note: >-
+        This is a DATA-PLANE escalation: the principal gains DBA-level SQL access
+        over all databases in the instance, which is above its prior privilege level.
+        It is NOT a GCP IAM management-plane escalation (no new IAM role is gained).
+        can-control.yaml escalate-via-execute-as handles CanExecuteAs paths — do not
+        re-derive that here. Only emit when the principal's effective DB privilege
+        before the reset is less than DBA (e.g., it had no DB credentials at all or
+        was a read-only DB user). Target is the root DB user (GenericIdentity, internal
+        engine identity not HumanIdentity), not the principal itself — the escalation
+        is to that identity. See gcp-cloudsql-explicit-can-reset-credential for context.
+      narrative: >-
+        {principal.name} can escalate to full DBA-level access on {instance.name} by
+        resetting the root DB user password (cloudsql.users.update) and connecting as
+        root — gaining read/write/admin access to all databases in the instance.
+      derived_from:
+        - "?principal CanResetCredential ?db_user"
+        - "?principal CanReadData ?instance (via gcp-cloudsql-reset-password-read-data)"
+
+# ---------------------------------------------------------------------------
+# BLOCKED-EDGE GUIDANCE:
+#   - VPC Service Controls perimeter enclosing sqladmin.googleapis.com blocks
+#     cloudsql.instances.export, cloudsql.users.update, cloudsql.sslCerts.create
+#     calls from out-of-perimeter principals -> emit those edges as BLOCKED with
+#     denied_by = <perimeter resource name>.
+#   - An IAM deny policy explicitly denying cloudsql.users.update ->
+#     CanResetCredential BLOCKED.
+#   - Org policy constraints/sql.restrictAuthorizedNetworks prevents 0.0.0.0/0
+#     entries -> ExposedToInternet BLOCKED(scp_or_org_policy).
+#   - Org policy constraints/sql.restrictPublicIp prevents public IP assignment ->
+#     ExposedToInternet BLOCKED(scp_or_org_policy).
+#   - Instance state SUSPENDED or FAILED -> ExposedToInternet and CanReadData
+#     edges are CONDITIONAL(service_state) or moot — flag in evidence, not BLOCKED.
+#
+# LINCHPIN CROSS-REFERENCES (edges this file emits feed into):
+#   * gcp-cloudsql-contains-secret (ContainsSecret) ->
+#     credential-chains.yaml read-secret-yields-identity (when CredentialsFor and
+#     CanReadSecret are also emitted) => CanImpersonate(principal, identity).
+#     CITE credential-chains, do not re-derive here.
+#   * gcp-cloudsql-reset-credential (CanResetCredential) ->
+#     gcp-cloudsql-reset-password-read-data (CanReadData) ->
+#     gcp-cloudsql-escalate-via-password-reset (CanEscalateTo).
+#   * gcp-cloudsql-iam-auth-read-data (CanReadData) ->
+#     can-control.yaml control-via-admin (if role is admin-equivalent) or
+#     credential-chains execute-then-read-secret (if workload CanExecuteAs then reads).
+#   * gcp-cloudsql-export-exfiltrate (CanExfiltrate) — terminal data exfil edge.
+#   * gcp-cloudsql-public-ip-open-network (ExposedToInternet) — entry-point for
+#     network-reachability-based queries.
+# ---------------------------------------------------------------------------
+

@@ -1,0 +1,313 @@
+# AWS ECS / Fargate — Execution & credential rules (Phase 4: Compute)
+# ---------------------------------------------------------------------------
+# Emits COMMON edges (schema/edges.yaml). Permissions are the EFFECTIVE actions
+# the permission evaluator must confirm at the given resource scope before an
+# edge is emitted. State defaults to ACTIVE unless a listed condition is unmet
+# (CONDITIONAL/POTENTIAL) or an explicit deny/SCP/boundary applies (BLOCKED).
+#
+# ECS has NO resource-based policy. Cross-principal execution is driven by IAM
+# identity policies + iam:PassRole (scoped by iam:PassedToService) and the two
+# task roles' trust of ecs-tasks.amazonaws.com. Honor PassRole scoping and role
+# trust (role_compatibility) — see false_positive_note on each rule.
+#
+# ECS roles per task:
+#   task role       (taskRoleArn)      -> identity the container CODE runs as
+#   execution role  (executionRoleArn) -> identity the ECS AGENT runs as (ECR/secrets/logs)
+#   instance role   (EC2 launch type)  -> host instance profile, reachable via host IMDS
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 4-compute-serverless
+applies_to: [aws]
+
+rules:
+
+  # --- ExecutesAs facts (explicit; zero-cost) --------------------------------
+  # These are normalization outputs; also stated here for completeness so the
+  # derived rules below have their contributor edges. Emitted by rules/explicit.
+  - id: aws-ecs-task-executes-as-taskrole
+    emits: ExecutesAs
+    description: "A running ECS task executes as its configured task role (taskRoleArn)."
+    match_record: {resource_type: "AWS::ECS::TaskDefinition", field: "taskRoleArn"}
+    emit:
+      source_type: Compute
+      source: "<ECS task / task definition>"
+      target: "<task role (taskRoleArn)>"
+      state_logic: "ACTIVE if taskRoleArn present; else no edge (falls back to instance role on EC2 launch type)"
+      narrative: "{task.name} executes as task role {role.name} (taskRoleArn); container code runs with its permissions."
+
+  - id: aws-ecs-task-executes-as-executionrole
+    emits: ExecutesAs
+    description: "The ECS agent for a task executes as the task execution role (executionRoleArn)."
+    match_record: {resource_type: "AWS::ECS::TaskDefinition", field: "executionRoleArn"}
+    emit:
+      source_type: Compute
+      source: "<ECS task / task definition>"
+      target: "<task execution role (executionRoleArn)>"
+      narrative: "{task.name} agent executes as execution role {role.name} (executionRoleArn); pulls images/secrets/logs."
+
+  # --- PassRole scoping (ECS-specific CanPassIdentity) -----------------------
+  - id: aws-ecs-pass-task-role
+    emits: CanPassIdentity
+    description: "Principal can pass a role to ECS tasks (iam:PassRole scoped to ecs-tasks)."
+    match_effective_permission: {action: "iam:PassRole", resource_type: "AWS::IAM::Role"}
+    where:
+      - "iam:PassedToService condition (if any) includes ecs-tasks.amazonaws.com"
+      - "?role trust policy allows ecs-tasks.amazonaws.com (role_compatibility)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<task or execution role passable to ecs-tasks>"
+      permissions: ["iam:PassRole"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: "Only emit if iam:PassedToService is absent or includes ecs-tasks.amazonaws.com AND the role trusts ecs-tasks.amazonaws.com. A role passable only to ec2/lambda does NOT yield ECS task execution."
+      narrative: "{principal.name} can pass {role.name} to ECS (iam:PassRole, PassedToService=ecs-tasks.amazonaws.com)."
+
+  # --- RegisterTaskDefinition = code/config control --------------------------
+  - id: aws-ecs-register-task-definition
+    emits: CanModifyConfiguration
+    description: "RegisterTaskDefinition lets attacker author image/command/env and choose the task role."
+    match_effective_permission: {action: "ecs:RegisterTaskDefinition", resource_type: "AWS::ECS::TaskDefinition"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<new task definition revision>"
+      permissions: ["ecs:RegisterTaskDefinition"]
+      note: "RegisterTaskDefinition ALONE is not execution; it writes a template. Pair with RunTask/StartTask/CreateService/UpdateService + a satisfiable PassRole to reach CanExecuteAs."
+      false_positive_note: "Do not emit CanExecuteAs from RegisterTaskDefinition by itself. It only becomes execution when a run/deploy action is also permitted and the chosen role is passable + trusts ecs-tasks."
+      narrative: "{principal.name} can register a task definition (ecs:RegisterTaskDefinition) with an attacker-controlled image, command, and taskRoleArn."
+
+  - id: aws-ecs-register-task-definition-modifycode
+    emits: CanModifyCode
+    description: "RegisterTaskDefinition authors the image/command/entryPoint a task runs = ECS-native code-authoring primitive."
+    match_effective_permission: {action: "ecs:RegisterTaskDefinition", resource_type: "AWS::ECS::TaskDefinition"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<container image / ContainerRegistry referenced by the task definition>"
+      permissions: ["ecs:RegisterTaskDefinition"]
+      note: "Per provider doc sections 5 & 17, RegisterTaskDefinition is the ECS-native CanModifyCode primitive: the attacker fully controls image, command, and entryPoint on the new revision. This feeds the canonical CanExecuteAs derivation (CanModifyCode(X,C)+ExecutesAs(C,I)=>CanExecuteAs)."
+      false_positive_note: "RegisterTaskDefinition ALONE is not execution; it only authors a template/revision. It becomes CanExecuteAs only when paired with RunTask/StartTask/CreateService/UpdateService and a satisfiable PassRole for the chosen role (see aws-ecs-execute-as-runtask / aws-ecs-execute-as-updateservice)."
+      narrative: "{principal.name} can author the image/command/entryPoint a task runs (ecs:RegisterTaskDefinition), controlling the executable content of the new task definition revision."
+
+  # --- CanExecuteAs via RunTask/StartTask ------------------------------------
+  - id: aws-ecs-execute-as-runtask
+    emits: CanExecuteAs
+    description: "Register + run an attacker container as a passable task role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE ecs:RegisterTaskDefinition (author image/command/taskRoleArn)"
+      - "?principal has EFFECTIVE ecs:RunTask OR ecs:StartTask on the target cluster"
+      - "?role is a task role (settable as taskRoleArn) that trusts ecs-tasks.amazonaws.com"
+      - "iam:PassRole for ?role includes PassedToService=ecs-tasks.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<task role>"
+      permissions: ["iam:PassRole", "ecs:RegisterTaskDefinition", "ecs:RunTask"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      state_logic: "ACTIVE if RunTask/StartTask + RegisterTaskDefinition + satisfiable PassRole all present; else CONDITIONAL(iam_permission)"
+      escalation: "Run an attacker-authored container bound to a privileged task role and execute code as it."
+      false_positive_note: "Honor iam:PassedToService=ecs-tasks.amazonaws.com and role trust. Fargate has capacity requirements but no extra IAM gate; EC2 launch type also needs cluster capacity (service_state) but that does not block the capability."
+      narrative: "{principal.name} can register a task definition (ecs:RegisterTaskDefinition) selecting {role.name} (iam:PassRole) and run it (ecs:RunTask), executing attacker code as {role.name}."
+
+  - id: aws-ecs-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new ECS workload (task/service) bound to a passable task role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE ecs:RegisterTaskDefinition"
+      - "?principal has EFFECTIVE (ecs:RunTask OR ecs:CreateService) on the target cluster"
+      - "role_compatible(?role, ecs-tasks.amazonaws.com)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<task role>"
+      permissions: ["iam:PassRole", "ecs:RegisterTaskDefinition", "ecs:RunTask|ecs:CreateService"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: "Same PassRole/trust scoping as aws-ecs-execute-as-runtask."
+      narrative: "{principal.name} can create an ECS workload bound to {role.name} (ecs:RegisterTaskDefinition + ecs:RunTask/CreateService + iam:PassRole), running as it."
+
+  # --- CanExecuteAs via UpdateService (redeploy existing service) -------------
+  - id: aws-ecs-execute-as-updateservice
+    emits: CanExecuteAs
+    description: "Redeploy an existing service onto an attacker task definition revision."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE ecs:RegisterTaskDefinition"
+      - "?principal has EFFECTIVE ecs:UpdateService on the target service"
+      - "?role settable as taskRoleArn on the new revision, trusts ecs-tasks.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<task role>"
+      permissions: ["iam:PassRole", "ecs:RegisterTaskDefinition", "ecs:UpdateService"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      escalation: "Swap a running service to an attacker-authored task definition and execute as the chosen role."
+      false_positive_note: "UpdateService without RegisterTaskDefinition can still redeploy an EXISTING revision (attacker cannot change code) — that yields CanExecuteAs only if the attacker already controls that revision's image/command. Require both perms for the author-and-run path."
+      narrative: "{principal.name} can register a task definition and update service {service.name} to it (ecs:RegisterTaskDefinition + ecs:UpdateService), executing attacker code as {role.name}."
+
+  # --- ECS Exec (command execution in a running container) --------------------
+  - id: aws-ecs-exec-command
+    emits: CanExecuteCommand
+    description: "ECS Exec runs OS commands inside a running container."
+    match_effective_permission: {action: "ecs:ExecuteCommand", resource_type: "AWS::ECS::Task"}
+    where:
+      - "target task/service launched with enableExecuteCommand=true (service_state)"
+      - "task role holds ssmmessages:CreateControlChannel/CreateDataChannel/OpenControlChannel/OpenDataChannel"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<running ECS task/container>"
+      permissions: ["ecs:ExecuteCommand"]
+      conditions: [iam_permission, service_state, condition_expression]
+      state_logic: "ACTIVE if enableExecuteCommand=true AND task role has ssmmessages channel perms; else CONDITIONAL(service_state)/POTENTIAL"
+      false_positive_note: "ecs:ExecuteCommand is useless unless the task was started with enableExecuteCommand=true and the task role carries the ssmmessages:* channel permissions. Without both, downgrade to CONDITIONAL/POTENTIAL. Condition keys ecs:cluster/ecs:container-name may scope which containers are reachable."
+      narrative: "{principal.name} can run commands inside task {task.name} (ecs:ExecuteCommand) via ECS Exec (SSM channel)."
+
+  - id: aws-ecs-exec-execute-as
+    emits: CanExecuteAs
+    description: "ECS Exec into a task -> execute as its task role."
+    match:
+      - [ ?principal, CanExecuteCommand, ?task ]
+      - [ ?task, ExecutesAs, ?role ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<task role>"
+      permissions: ["ecs:ExecuteCommand"]
+      conditions: [iam_permission, service_state]
+      derived_from: ["<CanExecuteCommand edge>", "<ExecutesAs edge>"]
+      false_positive_note: "Inherits enableExecuteCommand + ssmmessages gating from aws-ecs-exec-command; never ACTIVE unless that edge is ACTIVE."
+      narrative: "{principal.name} can exec into {task.name} (ecs:ExecuteCommand), which executes as {role.name}, and thus run code as {role.name}."
+
+  # --- Credential exposure: task metadata / credential endpoint --------------
+  - id: aws-ecs-task-credential-endpoint
+    emits: CanRetrieveToken
+    description: "Code in an ECS task reads the task role's temp credentials from the metadata endpoint."
+    match:
+      - [ ?task, ExecutesAs, ?role ]
+    where:
+      - "?task has code-execution foothold (any CanExecuteAs/CanExecuteCommand into ?task)"
+      - "taskRoleArn is set (credential endpoint serves the task role)"
+    emit:
+      source: "<ECS task / container>"
+      target: "<task role>"
+      permissions: []
+      conditions: [service_state]
+      note: "Reachable at http://169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI (task metadata endpoint v4). Emits CanRetrieveToken (not ExposesCredential) because this is a purpose-built token-MINT endpoint that vends the task role's own short-lived credentials to code in the task. Contrast aws-ecs-ec2-host-imds, which emits ExposesCredential for the incidental LEAK of the shared host instance-role via host IMDS. Path-finding should treat these as the two distinct ECS credential-exposure primitives (task-scoped mint vs host-scoped leak)."
+      false_positive_note: "Only serves the TASK role and only if taskRoleArn is set. On EC2 launch type with no task role, code falls back to the instance role (see aws-ecs-ec2-host-imds), a different target. Fargate has no host IMDS fallback."
+      narrative: "Code in {task.name} can read {role.name}'s temporary credentials from the ECS task credential endpoint (169.254.170.2)."
+
+  - id: aws-ecs-ec2-host-imds
+    emits: ExposesCredential
+    description: "EC2-launch container reaches host IMDS and reads the container-instance role."
+    match:
+      - [ ?instance, ContainsResourceReference, ?task ]
+      - [ ?instance, ExecutesAs, ?instancerole ]
+    where:
+      - "launchType = EC2 (Fargate has no host IMDS) [region_or_boundary]"
+      - "host IMDS not blocked (ECS_AWSVPC_BLOCK_IMDS unset / hop limit permits) [network_reachability]"
+    emit:
+      source: "<ECS task / container>"
+      target: "<EC2 container-instance role>"
+      conditions: [network_reachability, service_state]
+      state_logic: "CONDITIONAL(network_reachability) — POTENTIAL if IMDS-block status unknown"
+      note: "This rule emits ExposesCredential (a credential-LEAK fact: a co-located host IMDS role reachable from the container) rather than CanRetrieveToken. Contrast aws-ecs-task-credential-endpoint, which emits CanRetrieveToken because the task credential endpoint is a purpose-built token-MINT endpoint scoped to the task role. The split is intentional: instance-role exposure is an incidental leak of a shared host credential, whereas the task endpoint is the task's own designed token source."
+      false_positive_note: "NEVER emit for Fargate tasks (no host IMDS). On EC2 launch type, only if the awsvpc IMDS block / hop limit does not prevent 169.254.169.254 access. Mark POTENTIAL when block status is uncollected. Requires the task->container-instance placement fact (aws-ecs-task-on-container-instance) and the instance's ExecutesAs the instance role."
+      narrative: "Container in {task.name} (EC2 launch type) can reach host IMDS (169.254.169.254) and read the container-instance role {instancerole.name}."
+
+  # --- Execution role -> secrets --------------------------------------------
+  - id: aws-ecs-execution-role-secrets
+    emits: CanReadSecret
+    description: "Task execution role reads Secrets Manager / SSM secrets referenced in the task definition."
+    match:
+      - [ ?task, ExecutesAs, ?execrole ]
+      - [ ?task, ContainsSecret, ?secret ]
+    where:
+      - "?execrole has EFFECTIVE secretsmanager:GetSecretValue OR ssm:GetParameters on ?secret"
+      - "?execrole has kms:Decrypt if the secret is CMK-encrypted [key_permission]"
+    emit:
+      source: "<task execution role>"
+      target: "<Secret referenced by task def secrets/environment>"
+      permissions: ["secretsmanager:GetSecretValue", "ssm:GetParameters"]
+      conditions: [iam_permission, key_permission]
+      false_positive_note: "Only secrets referenced by the task definition's secrets/environment (or otherwise granted to the execution role) are exposed. CMK-encrypted secrets additionally require kms:Decrypt (key_permission) — omit the edge if the key policy denies."
+      narrative: "Execution role {execrole.name} of {task.name} can read secret {secret.name} (secretsmanager:GetSecretValue) injected into the container."
+
+  # --- Trigger creation: scheduled / EventBridge-driven task -----------------
+  - id: aws-ecs-scheduled-task
+    emits: CanSchedule
+    description: "Create an EventBridge/Scheduler target that runs an ECS task as a passable role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE events:PutRule + events:PutTargets (or scheduler:CreateSchedule)"
+      - "?principal has EFFECTIVE ecs:RegisterTaskDefinition"
+      - "EventBridge target role can iam:PassRole the task role to ecs-tasks.amazonaws.com"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<EventBridge rule / schedule driving the task>"
+      permissions: ["events:PutRule", "events:PutTargets", "ecs:RegisterTaskDefinition", "iam:PassRole"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: "Requires the EventBridge/Scheduler target role to itself be able to pass the task role to ecs-tasks. Persistence-oriented; combine with aws-ecs-execute-as-runtask for the execution edge."
+      narrative: "{principal.name} can schedule an ECS task (events:PutRule/PutTargets + ecs:RegisterTaskDefinition + iam:PassRole), driving attacker code as {role.name} on a schedule."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: if an SCP or permission boundary denies iam:PassRole,
+# ecs:RegisterTaskDefinition, ecs:RunTask/StartTask, ecs:CreateService/
+# UpdateService, or ecs:ExecuteCommand at the effective scope, the evaluator
+# emits the corresponding edge with state: BLOCKED and denied_by=<SCP arn/stmt>
+# so the UI can explain why the ECS privesc does not work.
+# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# Explicit normalization rules (raw ECS config -> explicit edges).
+# These belong in rules/explicit/aws-ecs.yaml; recorded here for completeness.
+# ===========================================================================
+explicit_rules:
+
+  - id: aws-ecs-taskdef-taskrole-executesas
+    emits: ExecutesAs
+    source_record: {resource_type: "AWS::ECS::TaskDefinition", field: "taskRoleArn"}
+    edge: {source: "<task/taskdef>", target: "<taskRoleArn>"}
+    note: "Zero-cost fact; drives CanExecuteAs and credential-endpoint derivations."
+
+  - id: aws-ecs-taskdef-executionrole-executesas
+    emits: ExecutesAs
+    source_record: {resource_type: "AWS::ECS::TaskDefinition", field: "executionRoleArn"}
+    edge: {source: "<task/taskdef>", target: "<executionRoleArn>"}
+    note: "Agent identity; drives aws-ecs-execution-role-secrets."
+
+  - id: aws-ecs-taskdef-secrets-containssecret
+    emits: ContainsSecret
+    source_record: {resource_type: "AWS::ECS::TaskDefinition", field: "containerDefinitions[].secrets[].valueFrom"}
+    edge: {source: "<task def>", target: "<Secret/SSM parameter ARN>"}
+    note: "valueFrom ARNs reference Secrets Manager / SSM Parameter Store entries."
+
+  - id: aws-ecs-cluster-contains-service
+    emits: Contains
+    source_record: {resource_type: "AWS::ECS::Cluster", field: "services/tasks"}
+    edge: {source: "<cluster>", target: "<service/task>"}
+    note: "Structural containment cluster -> service -> task."
+
+  - id: aws-ecs-task-on-container-instance
+    emits: ContainsResourceReference
+    source_record: {resource_type: "AWS::ECS::Task", field: "containerInstanceArn"}
+    edge: {source: "<EC2 container instance (VirtualMachine)>", target: "<ECS task / container>"}
+    note: "EC2 launch-type placement fact: the container instance hosts the task. Emitted only when launchType=EC2 and containerInstanceArn is set (Fargate tasks have no container instance). Materializes the task->host binding that aws-ecs-ec2-host-imds keys on; uses ContainsResourceReference (source Compute -> target *) because LocatedIn's target class excludes Compute."
+
+  - id: aws-ecs-container-instance-executesas
+    emits: ExecutesAs
+    source_record: {resource_type: "AWS::EC2::Instance", field: "iamInstanceProfile"}
+    edge: {source: "<EC2 container instance (VirtualMachine)>", target: "<container-instance role>"}
+    note: "EC2 container instance runs as its instance-profile role; reachable via host IMDS by co-located EC2-launch tasks. Drives aws-ecs-ec2-host-imds."

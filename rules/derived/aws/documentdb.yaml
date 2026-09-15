@@ -1,0 +1,473 @@
+# AWS DocumentDB — Derived attack-path rules (Phase 6 — Storage & Databases)
+# ---------------------------------------------------------------------------
+# DocumentDB is a MongoDB-compatible managed document database. Its control
+# plane uses the `rds:` IAM action prefix. The service does NOT run
+# attacker-controllable code and does NOT carry an execution-identity IAM role,
+# so the canonical CanExecuteAs/CanModifyCode/ExecutesAs patterns do NOT apply.
+#
+# The Phase-6 attack surface is governed by three primitives:
+#
+#   (1) CREDENTIAL GRAB (highest value): the cluster master password is stored
+#       in Secrets Manager when ManageMasterUserPassword=true. A principal with
+#       secretsmanager:GetSecretValue on that ARN reads plaintext master creds.
+#       credential-chains.yaml:read-secret-yields-identity handles the
+#       CanReadSecret + CredentialsFor -> CanImpersonate roll-up; cite it, do
+#       not re-derive. The master-creds CanReadData edge is emitted HERE.
+#
+#   (2) DATA EXFIL: rds:ModifyDBClusterSnapshotAttribute with AttributeName=restore
+#       shares a cluster snapshot cross-account. The receiving account restores a
+#       full copy of all cluster data -> CanExfiltrate.
+#
+#   (3) PUBLIC EXPOSURE: PubliclyAccessible=true + VPC SG open on TCP 27017 ->
+#       ExposedToInternet. Emitted by explicit normalization (aws-documentdb.yaml);
+#       the derived rule here collapses the combined cluster + SG condition.
+#
+# LINCHPIN CITATIONS (do not re-derive, only cite):
+#   credential-chains.yaml : read-secret-yields-identity (ContainsSecret +
+#       CanReadSecret + CredentialsFor -> CanImpersonate -> CanEscalateTo)
+#   can-control.yaml       : escalate-via-execute-as (not triggered here; cited
+#       for completeness — DocumentDB has no ExecutesAs edge)
+#
+# PERMISSIONS: all from AWS Service Authorization Reference for Amazon DocumentDB
+#   (which uses the rds:* action prefix for control-plane operations):
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazondocumentdb.html
+#   No permissions are invented.
+#
+# DATA-PLANE NOTE: DocumentDB uses MongoDB wire-protocol (SCRAM) authentication
+#   only. There is no IAM-native data-plane API (no rds-db:connect, no Data API).
+#   All data-plane access is gated on possessing valid MongoDB credentials.
+#   CanReadData is therefore conditional on credential possession, not raw IAM.
+#
+# STATE CONVENTIONS (RULE-FORMAT.md): a derived edge is never stronger than its
+#   weakest contributor. CONDITIONAL contributors cap output at CONDITIONAL.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # (1) CREDENTIAL GRAB -> FULL DATA-PLANE ACCESS
+  # ===========================================================================
+
+  # --- Password reset via ModifyDBCluster -> CanReadData ----------------------
+  # rds:ModifyDBCluster allows resetting the master DB password to an attacker-chosen
+  # value without knowing the current password. This is a direct control-plane escalation:
+  # a single IAM permission grants superuser DB access. The reset is destructive
+  # (disrupts legitimate access) and highly detectable (CloudTrail), but it is a
+  # single-permission capability that must be modeled as CanReadData. Document
+  # that the DB state may be CONDITIONAL(service_state) if the cluster is not
+  # AVAILABLE, and note network reachability when the cluster is private.
+  - id: aws-documentdb-modify-cluster-resets-password
+    emits: CanReadData
+    description: >-
+      rds:ModifyDBCluster with MasterUserPassword resets the cluster's master password
+      to an attacker-known value, granting superuser MongoDB access without knowing
+      the current password — a single control-plane escalation primitive.
+    match:
+      - [ ?principal, CanModifyConfiguration, ?cluster ]
+    where:
+      - "node_type(?cluster) == NoSQLDatabase"
+      - "?cluster.provider_type == 'AWS::DocDB::DBCluster'"
+      - "?principal has EFFECTIVE rds:ModifyDBCluster on ?cluster ARN"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?cluster
+      permissions: ["rds:ModifyDBCluster"]
+      conditions: [iam_permission, scp_or_org_policy, service_state, network_reachability]
+      state_logic: >-
+        ACTIVE when rds:ModifyDBCluster is confirmed EFFECTIVE on the cluster ARN,
+        the cluster is PubliclyAccessible=true with a permissive SG allowing inbound
+        TCP 27017 from the attacker's network position, and the cluster is in AVAILABLE
+        state. The password reset itself is a control-plane action (succeeds regardless
+        of network), but completing data-plane MongoDB access requires network
+        reachability on port 27017.
+        CONDITIONAL(network_reachability) when rds:ModifyDBCluster is EFFECTIVE but
+        the cluster is NOT PubliclyAccessible (private VPC only) — the attacker must
+        have a network path to port 27017 on the cluster endpoint (e.g., VPC foothold,
+        VPN, or proximity to the private subnet) to connect after resetting the password.
+        CONDITIONAL(service_state) when the cluster is not in AVAILABLE state (CREATING,
+        MODIFYING, STOPPING) — ModifyDBCluster is accepted but may be deferred to the
+        next maintenance window. Emit ACTIVE if AVAILABLE; emit CONDITIONAL(service_state)
+        if deferred.
+        BLOCKED when an SCP or permission boundary explicitly denies rds:ModifyDBCluster
+        on the cluster.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanModifyConfiguration ?cluster (rds:ModifyDBCluster effective permission)"
+      false_positive_note: >-
+        This rule emits CanReadData because resetting the master password IS gaining
+        data access — after the reset the attacker connects as superuser. However, it
+        is a DESTRUCTIVE mutation: it disrupts legitimate master-user access and is
+        highly detectable in CloudTrail (ModifyDBCluster call + MasterUserPassword
+        change). This pattern mirrors aws-rds-modify-instance-resets-password for RDS.
+        The cluster must be AVAILABLE (not STOPPED, CREATING, or in MODIFYING state
+        for another operation) for the modification to proceed immediately; a STOPPED
+        cluster may still accept the modify call (state_logic: defer to maintenance
+        window — emit ACTIVE and note the deferral). Do NOT downgrade to CONDITIONAL
+        for this case unless an explicit IAM condition blocks MasterUserPassword
+        changes (uncommon on DocumentDB). Network reachability is needed for data-plane
+        access (MongoDB connection) but the password reset itself is a control-plane
+        capability (does not require VPC foothold).
+      narrative: >-
+        {principal.name} can reset the master DB password for the DocumentDB cluster
+        {cluster.name} (rds:ModifyDBCluster) without knowing the current password, then
+        connect as the database superuser to read, modify, or drop all MongoDB documents.
+        This is the highest-value single-permission DocumentDB escalation primitive.
+
+  # --- Master-password secret -> CanReadData ----------------------------------
+  # When ManageMasterUserPassword=true the cluster stores and rotates the master
+  # password in Secrets Manager. The secret ARN is discoverable via
+  # rds:DescribeDBClusters -> DBClusters[].MasterUserSecret.SecretArn.
+  #
+  # Pattern:
+  #   ContainsSecret(cluster -> secret)          [explicit, from MasterUserSecret.SecretArn]
+  #   CanReadSecret(principal -> secret)          [secretsmanager:GetSecretValue on that ARN]
+  # => CanReadData(principal -> cluster)
+  #
+  # The downstream credential chain (CanReadSecret + CredentialsFor -> CanImpersonate
+  # -> CanEscalateTo) is owned by credential-chains.yaml:read-secret-yields-identity.
+  # This rule emits only the data-access edge: reading the master creds gives full
+  # MongoDB admin access to all databases on the cluster.
+  - id: aws-documentdb-read-data-via-master-creds
+    emits: CanReadData
+    description: >-
+      A principal that can read the DocumentDB master-password secret from Secrets Manager
+      can authenticate to the cluster as the master MongoDB user, gaining full data-plane
+      access (read/write/drop) across all databases on the cluster.
+    match:
+      - [ ?cluster,    ContainsSecret,  ?secret ]
+      - [ ?principal,  CanReadSecret,   ?secret ]
+    where:
+      - "node_type(?cluster) == NoSQLDatabase"
+      - "?cluster.provider_type == 'AWS::DocDB::DBCluster'"
+      - "node_type(?secret) == Secret"
+      - "?secret.source_field == 'MasterUserSecret.SecretArn'"
+      # Data-plane requires network reachability (private by default; public if
+      # PubliclyAccessible=true + SG open on 27017). CONDITIONAL when private.
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?cluster
+      permissions: ["secretsmanager:GetSecretValue"]
+      conditions: [iam_permission, resource_policy, key_permission, network_reachability]
+      state_logic: >-
+        Inherit weakest state from the two contributing edges.
+        If CanReadSecret is CONDITIONAL(key_permission) (Secrets Manager secret
+        encrypted with a CMK the principal cannot decrypt), emit CONDITIONAL(key_permission).
+        If CanReadSecret is ACTIVE and the cluster is NOT PubliclyAccessible (private
+        VPC only), emit CONDITIONAL(network_reachability) — the principal must have
+        a network path to port 27017 on the cluster endpoint.
+        If CanReadSecret is ACTIVE and the cluster is PubliclyAccessible=true with a
+        permissive SG, emit ACTIVE — credentials are sufficient for data-plane access.
+        BLOCKED when the contributing CanReadSecret is BLOCKED (explicit deny on
+        secretsmanager:GetSecretValue via SCP, resource policy, or KMS deny).
+        Note: DocumentDB has no IAM-native data-plane API; this edge is gated on the
+        MongoDB wire-protocol connection being network-reachable. The credential-chain
+        roll-up (CanImpersonate/CanEscalateTo) is owned by
+        credential-chains:read-secret-yields-identity — cite, do not re-derive.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?cluster ContainsSecret ?secret (MasterUserSecret.SecretArn)"
+        - "?principal CanReadSecret ?secret (secretsmanager:GetSecretValue)"
+        - "credential-chains:read-secret-yields-identity (CanImpersonate roll-up — cited not re-derived)"
+      false_positive_note: >-
+        Three independent conditions must hold: (1) the cluster uses ManageMasterUserPassword=true
+        so the secret exists and is populated; for caller-supplied passwords there is no
+        Secrets Manager link and ContainsSecret is not emitted -> this rule does not fire.
+        (2) The principal has EFFECTIVE secretsmanager:GetSecretValue on the specific
+        secret ARN — honor KMS encryption of the secret (CONDITIONAL(key_permission) if
+        the secret is wrapped with a CMK the principal cannot decrypt; cite
+        credential-chains:decrypt-gates-secret-read for the gate resolution).
+        (3) The cluster endpoint must be network-reachable (private VPC by default) —
+        emit CONDITIONAL(network_reachability) unless PubliclyAccessible=true + SG open
+        on port 27017. Do NOT emit ACTIVE when network reachability is unresolved.
+        The master-user account has full MongoDB admin rights; if the cluster's IAM
+        condition restricts the secret to specific principals, honor it.
+      narrative: >-
+        {principal.name} can read the DocumentDB master-password secret {secret.name}
+        from Secrets Manager (secretsmanager:GetSecretValue), obtaining the MongoDB
+        admin username and password for cluster {cluster.name}; possessing these credentials
+        grants full data-plane access — read, write, and drop — across all databases on
+        the cluster.
+
+  # ===========================================================================
+  # (2) SNAPSHOT CROSS-ACCOUNT SHARING -> DATA EXFILTRATION
+  # ===========================================================================
+
+  # --- ModifyDBClusterSnapshotAttribute(restore=any/all) -> snapshot exfil ----
+  # rds:ModifyDBClusterSnapshotAttribute with AttributeName=restore and any value
+  # (ValuesToAdd=["all"] for public, ValuesToAdd=[<account-id>] for targeted) shares
+  # a cluster snapshot, making it restorable by any account (if "all") or a specific
+  # account (if scoped). Any restoring account can call rds:RestoreDBClusterFromSnapshot
+  # to spin up a full copy of the cluster and access all documents in all databases —
+  # without needing any network access to the original cluster. This is CanExfiltrate
+  # (capability for principal to make snapshot shareable). Highest-severity exfil vector.
+  #
+  # Collapse public and targeted cases into a single rule: the CAPABILITY to make the
+  # snapshot shareable is identical (rds:ModifyDBClusterSnapshotAttribute). The public
+  # case (restore=all) is higher blast radius but operationally the same permission.
+  # ExposedToInternet for public snapshots is emitted by explicit rule
+  # aws-documentdb-snapshot-public-exposed (not here).
+  - id: aws-documentdb-snapshot-exfiltration-capability
+    emits: CanExfiltrate
+    description: >-
+      rds:ModifyDBClusterSnapshotAttribute allows a principal to make a DocumentDB
+      cluster snapshot shareable (publicly if ValuesToAdd=['all'], or to a specific
+      account if ValuesToAdd=[<account-id>]). Any restoring account can then call
+      rds:RestoreDBClusterFromSnapshot to exfiltrate a full database copy.
+    match:
+      - [ ?principal, HasPermission, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?snapshot.provider_type == 'AWS::DocDB::DBClusterSnapshot'"
+      - "?principal has EFFECTIVE rds:ModifyDBClusterSnapshotAttribute on ?snapshot ARN"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["rds:ModifyDBClusterSnapshotAttribute"]
+      conditions: [iam_permission, scp_or_org_policy, key_permission]
+      state_logic: >-
+        ACTIVE when rds:ModifyDBClusterSnapshotAttribute is confirmed EFFECTIVE on the
+        snapshot ARN — identity-based policy, no SCP deny, no permission boundary block.
+        The attacker's CAPABILITY to SHARE the snapshot (emit CanExfiltrate as ACTIVE)
+        is unconditional. CONDITIONAL(key_permission) when the snapshot is encrypted with
+        a CMK: any account attempting to restore the shared snapshot must also be granted
+        kms:Decrypt on the CMK — without that, the restore fails in the restoring account.
+        However, this gates the RESTORER, not the SHARER. Emit ACTIVE for the sharing
+        capability; note the CMK key-grant requirement as a downstream gate on the
+        restoring account. BLOCKED when an SCP or permission boundary denies
+        rds:ModifyDBClusterSnapshotAttribute. Org-level SCP disallowing snapshot sharing
+        would block this — emit BLOCKED when confirmed.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?snapshot (rds:ModifyDBClusterSnapshotAttribute effective permission)"
+      false_positive_note: >-
+        The attacker need only have rds:ModifyDBClusterSnapshotAttribute on the snapshot ARN.
+        The rule fires regardless of whether the share target is 'all' (public) or a specific
+        account ID (targeted) — both are CanExfiltrate from the sharer's perspective. Restore
+        is performed by the external account, so CanExfiltrate models the AUTHORIZATION
+        CAPABILITY, not the completed restore. Public snapshots without CMK encryption
+        (default AES-256 AWS-managed encryption) are transparent to the restoring account —
+        only CMK-encrypted snapshots require a cross-account key grant. Score
+        CMK-encrypted snapshots as CONDITIONAL(key_permission) for the restoring account,
+        but ACTIVE for the sharing step itself. The blast radius distinction (public vs.
+        targeted) is captured by the evidence trail (public snapshots → ExposedToInternet
+        via aws-documentdb-snapshot-public-exposed; targeted snapshots → CrossAccountTrust
+        via aws-documentdb-snapshot-cross-account-trust).
+      narrative: >-
+        {principal.name} can make the DocumentDB cluster snapshot {snapshot.name}
+        shareable (rds:ModifyDBClusterSnapshotAttribute), enabling target account(s) to
+        restore a full copy of all cluster documents — data exfiltration without network
+        access to the live cluster.
+
+  # ===========================================================================
+  # (3) SNAPSHOT RESTORE -> DATA ACCESS (targeted cross-account scenario)
+  # ===========================================================================
+
+  # --- CrossAccountTrust(snapshot) + rds:RestoreDBClusterFromSnapshot -> CanReadData --
+  # When a DocumentDB cluster snapshot is shared with a specific AWS account via
+  # rds:ModifyDBClusterSnapshotAttribute (AttributeName=restore, AttributeValues=[accountId]),
+  # that account gains restore access (explicit CrossAccountTrust edge emitted by
+  # aws-documentdb-snapshot-cross-account-trust). A principal in that account with
+  # rds:RestoreDBClusterFromSnapshot can restore the snapshot, creating a new cluster
+  # containing all original data. This completes the exfiltration path: restoring
+  # principal reads all data from the restored cluster.
+  - id: aws-documentdb-snapshot-restore-yields-data
+    emits: CanReadData
+    description: >-
+      A principal in the snapshot's restore-authorized account with rds:RestoreDBClusterFromSnapshot
+      can restore a shared DocumentDB cluster snapshot to a new cluster, obtaining full
+      read access to all original data without network access to the source cluster.
+    match:
+      - [ ?snapshot, CrossAccountTrust, ?account ]
+      - [ ?principal, CanModifyConfiguration, ?cluster ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?snapshot.provider_type == 'AWS::DocDB::DBClusterSnapshot'"
+      - "node_type(?account) == Account"
+      - "?principal's home account == ?account"
+      - "?principal has EFFECTIVE rds:RestoreDBClusterFromSnapshot on ?snapshot ARN"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["rds:RestoreDBClusterFromSnapshot"]
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        CONDITIONAL(service_state) when the principal has EFFECTIVE rds:RestoreDBClusterFromSnapshot
+        and the snapshot's restore-authorized account matches the principal's home account.
+        The restore must actually be executed to read data; the snapshot is not live data
+        until restored. Emit CONDITIONAL(service_state) to model the capability to perform
+        the restore (not yet realized until the attacker runs RestoreDBClusterFromSnapshot).
+        ACTIVE only if evidence shows a restore has already been executed (the restored
+        cluster exists and is AVAILABLE). BLOCKED when an SCP or permission boundary
+        denies rds:RestoreDBClusterFromSnapshot on the target cluster.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?snapshot CrossAccountTrust ?account (explicit from aws-documentdb-snapshot-cross-account-trust)"
+        - "?principal CanModifyConfiguration (rds:RestoreDBClusterFromSnapshot effective permission)"
+      false_positive_note: >-
+        The principal must be in the receiving account (CrossAccountTrust target account).
+        The snapshot must be shared (CrossAccountTrust edge present). The principal must
+        have rds:RestoreDBClusterFromSnapshot on the snapshot ARN or cluster resource. The
+        restore operation creates a new cluster resource that the attacker controls; model
+        the target as the Snapshot node (source of data) since the new cluster doesn't
+        exist until the restore completes. CONDITIONAL(service_state) reflects that the
+        restore must be triggered, not that permissions exist statically.
+      narrative: >-
+        {principal.name} in account {account.id} can restore the DocumentDB cluster snapshot
+        {snapshot.name} (rds:RestoreDBClusterFromSnapshot), creating a new cluster with access
+        to all original cluster documents. This completes the snapshot exfiltration path:
+        the snapshot is shared cross-account, then restored to the attacker's account for full data read access.
+
+  # --- Automated snapshot copy + share -> exfiltration --
+  # DocumentDB clusters with automated backups enabled generate automated snapshots
+  # (retained per the backup retention policy). These snapshots CANNOT be directly
+  # shared via rds:ModifyDBClusterSnapshotAttribute (the API rejects the operation).
+  # However, a principal with rds:CopyDBClusterSnapshot can copy an automated snapshot
+  # to a manual snapshot. The manual copy can then be shared via ModifyDBClusterSnapshotAttribute.
+  # This two-step path (copy → share) is a combined CanExfiltrate capability.
+  - id: aws-documentdb-copy-snapshot-to-share
+    emits: CanExfiltrate
+    description: >-
+      rds:CopyDBClusterSnapshot + rds:ModifyDBClusterSnapshotAttribute together enable
+      exfiltration of automated DocumentDB cluster snapshots: copy an automated snapshot
+      to manual, then share the manual copy cross-account or publicly.
+    match:
+      - [ ?principal, HasPermission, ?cluster ]
+    where:
+      - "node_type(?cluster) == NoSQLDatabase"
+      - "?cluster.provider_type == 'AWS::DocDB::DBCluster'"
+      - "?cluster has automated backups enabled (BackupRetentionPeriod > 0)"
+      - "?principal has EFFECTIVE rds:CopyDBClusterSnapshot on the cluster's automated snapshots"
+      - "?principal has EFFECTIVE rds:ModifyDBClusterSnapshotAttribute on snapshot ARNs"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?cluster
+      permissions: ["rds:CopyDBClusterSnapshot", "rds:ModifyDBClusterSnapshotAttribute"]
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        CONDITIONAL(service_state) when the principal has EFFECTIVE rds:CopyDBClusterSnapshot
+        and rds:ModifyDBClusterSnapshotAttribute, AND the cluster has automated backups
+        enabled (BackupRetentionPeriod > 0). The prerequisite (automated snapshot exists)
+        is satisfied by the backup retention setting. The two-step operation (copy then
+        modify) is required; a single permission does not enable exfil. Emit CONDITIONAL
+        to model the multi-step capability. BLOCKED when an SCP or permission boundary
+        denies either rds:CopyDBClusterSnapshot or rds:ModifyDBClusterSnapshotAttribute.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal HasPermission (rds:CopyDBClusterSnapshot + rds:ModifyDBClusterSnapshotAttribute)"
+        - "?cluster automated backups enabled (BackupRetentionPeriod > 0)"
+      false_positive_note: >-
+        Both permissions must be present on the principal. The cluster must have automated
+        backups enabled (BackupRetentionPeriod > 0). The capability is a two-step operation:
+        (1) copy an automated snapshot to manual via rds:CopyDBClusterSnapshot, (2) share
+        the manual copy via rds:ModifyDBClusterSnapshotAttribute. Emit to the cluster
+        (source of data), not the snapshot, since the manual snapshot doesn't exist until
+        the copy completes. This rule bridges the gap noted in the BLOCKED-edge guidance:
+        automated snapshots cannot be directly shared, but the copy+share combo enables
+        exfiltration and should be modeled as a CanExfiltrate capability.
+      narrative: >-
+        {principal.name} can copy an automated DocumentDB backup snapshot to a manual
+        snapshot (rds:CopyDBClusterSnapshot) and then share it cross-account or publicly
+        (rds:ModifyDBClusterSnapshotAttribute), enabling exfiltration of all cluster data
+        via a two-step process.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP or permission boundary denying secretsmanager:GetSecretValue on the
+#     master-password secret ARN -> aws-documentdb-read-data-via-master-creds BLOCKED.
+#   - A KMS deny (key policy / SCP) on the CMK wrapping the Secrets Manager secret ->
+#     CanReadSecret stays CONDITIONAL(key_permission); cite
+#     credential-chains:decrypt-gates-secret-read for gate resolution when principal
+#     also holds kms:Decrypt on the wrapping key.
+#   - An SCP denying rds:ModifyDBClusterSnapshotAttribute ->
+#     aws-documentdb-snapshot-exfiltration-capability BLOCKED.
+#   - PubliclyAccessible=false OR restrictive VPC SG on port 27017 ->
+#     aws-documentdb-read-data-via-master-creds CONDITIONAL(network_reachability),
+#     not ACTIVE (credentials are necessary but not sufficient without network reach).
+#   - ManageMasterUserPassword not set (no Secrets Manager-managed password) ->
+#     ContainsSecret not emitted -> aws-documentdb-read-data-via-master-creds does
+#     not fire; data-plane access still possible via other credential stores but not
+#     modeled by this rule.
+#   - Automated snapshot (not a manual snapshot) -> ModifyDBClusterSnapshotAttribute
+#     is not permitted on automated snapshots directly -> use rds:CopyDBClusterSnapshot
+#     to copy to manual first (modeled by aws-documentdb-copy-snapshot-to-share).
+#   - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------
+
+  # --- Public cluster exposure -> ExposedToInternet ----------------------------
+  # DocumentDB cluster with PubliclyAccessible=true (flag on cluster) AND a VPC
+  # security group attached to the cluster allowing inbound TCP 27017 from 0.0.0.0/0
+  # or ::/0 (SG rule checked via ec2:DescribeSecurityGroups). This requires combining
+  # two independent data sources:
+  #   (1) rds:DescribeDBClusters -> PubliclyAccessible flag
+  #   (2) ec2:DescribeSecurityGroups -> inbound rule on port 27017 from 0.0.0.0/0
+  #
+  # Multi-source derivations (combining cluster config + SG rules) belong in the
+  # rules: section, not explicit_rules: (which is for single-field explicit emission).
+  # Cite RDS peer rule aws-rds-public-instance for the identical primitive applied
+  # to RDS; DocumentDB uses the same MongoDB wire protocol on port 27017.
+  - id: aws-documentdb-public-cluster
+    emits: ExposedToInternet
+    description: >-
+      A DocumentDB cluster with PubliclyAccessible=true and a VPC security group
+      permitting inbound TCP 27017 from 0.0.0.0/0 or ::/0 is network-reachable from
+      the public internet. Valid MongoDB credentials (obtained via credential-grab paths)
+      enable connection without VPC foothold.
+    match:
+      - [ ?cluster, AttachedTo, ?sg ]
+    where:
+      - "node_type(?cluster) == NoSQLDatabase"
+      - "?cluster.provider_type == 'AWS::DocDB::DBCluster'"
+      - "?cluster.properties.PubliclyAccessible == true"
+      - "?sg allows inbound TCP 27017 from 0.0.0.0/0 or ::/0"
+    emit:
+      source_type: NoSQLDatabase
+      target_type: AnonymousIdentity
+      source: ?cluster
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        ACTIVE when both PubliclyAccessible=true AND an inbound SG rule allows port
+        27017 from 0.0.0.0/0 or ::/0 (network-reachable from the internet). Derive the
+        state from the cluster's configuration + SG attachment (both must be confirmed).
+        CONDITIONAL(network_reachability) if PubliclyAccessible=true but the SG blocks
+        port 27017 or restricts it to specific CIDRs (not internet-open). BLOCKED if an
+        organizational SCP or service control policy restricts public exposure.
+      confidence: "1.0"
+      derived_from:
+        - "?cluster PubliclyAccessible=true (from rds:DescribeDBClusters)"
+        - "?cluster attached SG allows inbound TCP 27017 from 0.0.0.0/0 or ::/0 (from ec2:DescribeSecurityGroups)"
+      false_positive_note: >-
+        Two independent data sources MUST both confirm: (1) PubliclyAccessible must
+        equal true on the cluster resource. (2) The cluster's attached security group
+        must have an inbound rule allowing 0.0.0.0/0 (or ::/0 for IPv6) on TCP 27017.
+        A cluster with PubliclyAccessible=true but a restrictive SG (port 27017 closed
+        or open only to specific CIDRs like corporate office IPs) is NOT ExposedToInternet.
+        Valid MongoDB credentials are still required — this edge represents network
+        reach only, not authentication. Combine with credential-grab attack paths
+        (master creds via Secrets Manager, password reset via rds:ModifyDBCluster) to
+        model full data access. Mirror aws-rds-public-instance pattern: both check
+        PubliclyAccessible + SG port rule and emit to AnonymousIdentity.
+      narrative: >-
+        {cluster.name} is reachable from the public internet (PubliclyAccessible=true
+        and VPC security group allows inbound on port 27017 from 0.0.0.0/0). An attacker
+        with valid MongoDB credentials can connect without needing a VPC foothold.
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/aws-documentdb.yaml (ContainsSecret from MasterUserSecret.SecretArn,
+# CrossAccountTrust from snapshot sharing attributes, CanModifyConfiguration from
+# rds:ModifyDBCluster permission, ExposedToInternet from public snapshots).

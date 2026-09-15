@@ -1,0 +1,803 @@
+# AWS CodeBuild — Derived attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# CodeBuild is the canonical Phase-9 service for AWS: a build/deploy runner
+# (BuildWorker) that executes AS a service IAM role. Whoever can modify the
+# buildspec or trigger a build runs code as that role.
+#
+# PHASE-9 HEADLINE:
+#   codebuild:StartBuild with buildspecOverride = RCE as the project's service
+#   role. No iam:PassRole required — the role is already bound. UpdateProject
+#   changes the PERSISTENT buildspec (all future builds). Source-repository
+#   write + an existing webhook is a codeless RCE path.
+#
+# LINCHPIN CITATIONS (DO NOT RE-DERIVE):
+#   cicd-chains.yaml:
+#     cicd-modify-buildspec-executes-as — collapses CanModifyCode(runner) +
+#       ExecutesAs(runner, identity) => CanExecuteAs (ACTIVE when run path
+#       exists; CONDITIONAL(run_path) otherwise).
+#     cicd-trigger-runner-executes-as — collapses CanTrigger(runner) +
+#       ExecutesAs => CanExecuteAs CONDITIONAL(attacker_influenced_definition).
+#     cicd-external-ci-federates-as — external OIDC/WIF CI => CanFederateAs
+#       (cited; federation-chains rolls up CanEnter*/CanImpersonate).
+#   can-execute-as.yaml:
+#     execute-as-via-code-modify — generic CanModifyCode + ExecutesAs => CanExecuteAs.
+#     execute-as-via-config-identity-swap — CanModifyConfiguration + CanPassIdentity
+#       => CanExecuteAs (UpdateProject + PassRole role-swap case).
+#   credential-chains.yaml:
+#     execute-then-read-secret — CanExecuteAs(role) + CanReadSecret(role -> secret) =>
+#       CanReadSecret(principal -> secret).
+#
+# THIS FILE EMITS service FACTS (ExecutesAs, CanModifyCode, CanModifyConfiguration,
+# CanPassIdentity, CanTrigger, ExposesCredential, ContainsSecret) plus a handful of
+# CodeBuild-specific derived edges that the linchpins require as input.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-pipelines
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # SECTION A — EXPLICIT NORMALIZATION FACTS
+  # (config -> first-class graph edges)
+  # ===========================================================================
+
+  # --- A1) Project executes as its service role --------------------------------
+  - id: aws-cb-executes-as
+    emits: ExecutesAs
+    description: "A CodeBuild project runs every build as its configured IAM service role."
+    match_record:
+      resource_type: "AWS::CodeBuild::Project"
+      field: "serviceRole"
+    where:
+      - "project.serviceRole is non-empty (all valid CodeBuild projects have a service role)"
+    emit:
+      source_type: BuildWorker
+      target_type: MachineIdentity
+      source: "<CodeBuild Project (BuildWorker)>"
+      target: "<IAM role from project.serviceRole>"
+      state: ACTIVE
+      conditions: [service_state]
+      permissions: []
+      derived_from: ["AWS::CodeBuild::Project.serviceRole (BatchGetProjects)"]
+      false_positive_note: >-
+        Every CodeBuild project must have exactly one serviceRole; emit this edge for
+        every project regardless of trigger configuration. The role is bound to the
+        project at create/update time — not to the individual build run.
+      narrative: >-
+        CodeBuild project {project.name} runs every build as IAM role
+        {role.name} (project.serviceRole). Code executing in any build of this
+        project holds {role.name}'s AWS credentials via the ECS task-credential
+        endpoint.
+
+  # --- A2) CanModifyCode via StartBuild with buildspecOverride -----------------
+  - id: aws-cb-can-modify-code-startbuild
+    emits: CanModifyCode
+    description: "codebuild:StartBuild allows supplying buildspecOverride, running arbitrary commands as the project's service role."
+    match_effective_permission:
+      action: "codebuild:StartBuild"
+      resource_type: "AWS::CodeBuild::Project"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<CodeBuild Project (BuildWorker)>"
+      permissions: ["codebuild:StartBuild"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective codebuild:StartBuild on the project
+        scope; the StartBuild API always accepts buildspecOverride regardless of the
+        project's stored buildspec — the attacker can inject any shell commands.
+        BLOCKED if an SCP or permission boundary denies codebuild:StartBuild.
+      derived_from: ["effective codebuild:StartBuild on project scope"]
+      false_positive_note: >-
+        codebuild:StartBuild always permits buildspecOverride; there is no separate
+        IAM action to restrict overrides. Any principal with StartBuild can inject an
+        arbitrary buildspec. Do NOT emit CanTrigger instead — StartBuild is always
+        CanModifyCode because the override is always available. Scope strictly: a
+        Resource block limiting to specific project ARNs restricts the target set.
+      narrative: >-
+        {principal.name} can call codebuild:StartBuild on {project.name} with
+        buildspecOverride, injecting arbitrary shell commands that execute as the
+        project's service role {role.name}.
+
+  # --- A2b) CanModifyCode via StartBuildBatch with buildspecOverride -----------
+  - id: aws-cb-can-modify-code-startbuildbatch
+    emits: CanModifyCode
+    description: "codebuild:StartBuildBatch allows supplying buildspecOverride for the primary build in the batch, running arbitrary commands as the project's service role."
+    match_effective_permission:
+      action: "codebuild:StartBuildBatch"
+      resource_type: "AWS::CodeBuild::Project"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<CodeBuild Project (BuildWorker)>"
+      permissions: ["codebuild:StartBuildBatch"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective codebuild:StartBuildBatch on the project
+        scope; the StartBuildBatch API accepts buildspecOverride for the primary build
+        within the batch, allowing arbitrary command injection. BLOCKED if an SCP or
+        permission boundary denies codebuild:StartBuildBatch.
+      derived_from: ["effective codebuild:StartBuildBatch on project scope"]
+      false_positive_note: >-
+        StartBuildBatch is a variant of StartBuild that queues multiple builds (a batch);
+        the buildspecOverride parameter applies to the primary build. Any principal with
+        StartBuildBatch on a batch-enabled project can inject arbitrary buildspec into
+        the primary build. This is equivalent to StartBuild's CanModifyCode capability
+        for projects configured for batch builds. A project may allow StartBuildBatch
+        but not StartBuild (or vice versa) — both must be checked to enumerate all
+        modification paths. Scope strictly: a Resource block limiting to specific project
+        ARNs restricts the target set.
+      narrative: >-
+        {principal.name} can call codebuild:StartBuildBatch on {project.name} with
+        buildspecOverride, injecting arbitrary shell commands into the primary build
+        that execute immediately as the project's service role {role.name}.
+
+  # --- A3) CanModifyCode via UpdateProject (persistent buildspec change) -------
+  - id: aws-cb-can-modify-code-updateproject
+    emits: CanModifyCode
+    description: "codebuild:UpdateProject rewrites the project's stored buildspec, affecting all future builds."
+    match_effective_permission:
+      action: "codebuild:UpdateProject"
+      resource_type: "AWS::CodeBuild::Project"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<CodeBuild Project (BuildWorker)>"
+      permissions: ["codebuild:UpdateProject"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective codebuild:UpdateProject on the project;
+        the change persists and every subsequent build runs the attacker's buildspec.
+        BLOCKED if denied by SCP or boundary.
+      derived_from: ["effective codebuild:UpdateProject on project scope"]
+      false_positive_note: >-
+        UpdateProject also changes env vars, environment image, VPC config, and service
+        role; this CanModifyCode edge specifically captures the buildspec rewrite
+        (source.buildspec field). A separate CanModifyConfiguration edge captures the
+        non-code config changes. Both may be emitted from a single UpdateProject grant.
+      narrative: >-
+        {principal.name} can call codebuild:UpdateProject on {project.name}, rewriting
+        its buildspec so that every future build executes attacker-controlled commands
+        as {role.name}.
+
+  # --- A4) CanModifyCode via source write + project-source binding (supply chain) ---
+  - id: aws-cb-can-modify-code-source-write
+    emits: CanModifyCode
+    description: "Writing to the project's source repository/bucket on the tracked branch injects code into future builds when the buildspec is stored in-source."
+    match:
+      - [ ?principal, CanWrite, ?source ]
+    where:
+      - "?source is the source repository or bucket (CodeCommit repo / S3 bucket / GitHub/Bitbucket/GitLab repo) tracked by project ?project"
+      - "project.source.buildspec is empty OR project.source.buildspec == 'buildspec.yml' (stored in source) — NOT an inline or override buildspec"
+      - "?source is the branch/ref the project's webhook or primary source monitors"
+    optional:
+      - [ ?webhook, CanTrigger, ?project ]
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: "<CodeBuild Project (BuildWorker) that tracks ?source>"
+      permissions: []
+      conditions: [service_state, trigger_exists]
+      state_logic: >-
+        ACTIVE when the principal can write to the tracked branch AND an existing
+        webhook fires on push (matched(optional[0]) or webhook_exists(?project));
+        CONDITIONAL(trigger_exists) when the push would not automatically trigger a
+        build (manual build only, no webhook); CONDITIONAL(branch_protection) when
+        branch-protection or required-review gates the write (in which case the
+        upstream CanWrite is already CONDITIONAL and this edge inherits it).
+      derived_from: ["?principal CanWrite ?source", "project.source binding (BatchGetProjects)", "webhook config"]
+      false_positive_note: >-
+        ONLY emit when the project reads its buildspec FROM source (default behavior
+        when no inline buildspec is set). If the project has an explicit inline
+        buildspec (source.buildspec contains YAML content, not a filename) or a
+        buildspecOverride is always supplied at start time, the source write does NOT
+        control the buildspec — downgrade to POTENTIAL or do not emit. Branch
+        protection (required reviews, status checks) on the tracked branch makes the
+        contributing CanWrite CONDITIONAL; inherit that state. This edge models the
+        supply-chain path: repo write + webhook = codeless RCE as the service role.
+      narrative: >-
+        {principal.name} can write to {source.name} (the source tracked by
+        {project.name}); since the project reads its buildspec from source, a push to
+        the monitored branch injects attacker-controlled commands into the next build,
+        which runs as {role.name}.
+
+  # --- A5) CanModifyConfiguration via UpdateProject (non-buildspec settings) ---
+  - id: aws-cb-can-modify-configuration
+    emits: CanModifyConfiguration
+    description: "codebuild:UpdateProject modifies env vars, image, VPC, privileged mode, and service role (config side)."
+    match_effective_permission:
+      action: "codebuild:UpdateProject"
+      resource_type: "AWS::CodeBuild::Project"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<CodeBuild Project (BuildWorker)>"
+      permissions: ["codebuild:UpdateProject"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective codebuild:UpdateProject. Changes include
+        environment variables (incl. secret ARN references), environment image, VPC
+        subnet/security-group placement, privileged mode flag, and service role (the
+        last requires iam:PassRole — see CanPassIdentity rule). BLOCKED by SCP/boundary
+        denial.
+      derived_from: ["effective codebuild:UpdateProject on project scope"]
+      false_positive_note: >-
+        This edge covers the configuration side of UpdateProject (env vars, image, VPC,
+        privileged mode). The buildspec rewrite side is captured by
+        aws-cb-can-modify-code-updateproject. Both edges may co-exist for the same
+        principal and project. Service-role swap additionally requires iam:PassRole —
+        model that separately via aws-cb-pass-role.
+      narrative: >-
+        {principal.name} can call codebuild:UpdateProject on {project.name}, modifying
+        its environment variables, container image, VPC placement, or privileged mode —
+        configuration changes that influence execution context and can expose or
+        exfiltrate secrets.
+
+  # --- A6) CanPassIdentity for the CodeBuild service role ----------------------
+  - id: aws-cb-pass-role
+    emits: CanPassIdentity
+    description: "iam:PassRole to codebuild.amazonaws.com lets the principal assign any passable role as the project service role (via CreateProject or UpdateProject)."
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "PassedToService condition (if present) allows codebuild.amazonaws.com OR condition is absent (unconditioned)"
+      - "principal has codebuild:CreateProject OR codebuild:UpdateProject (checked separately; either is sufficient to bind the passed role)"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: "<principal>"
+      target: "<IAM role passable to codebuild.amazonaws.com>"
+      permissions: ["iam:PassRole", "codebuild:CreateProject | codebuild:UpdateProject"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      state_logic: >-
+        ACTIVE when iam:PassRole is not restricted by iam:PassedToService or the
+        condition admits codebuild.amazonaws.com AND principal has
+        codebuild:CreateProject or codebuild:UpdateProject;
+        CONDITIONAL(role_compatibility) when the PassedToService condition is
+        present but the service value is unknown/unresolved;
+        BLOCKED if PassedToService explicitly excludes codebuild.amazonaws.com or an
+        SCP denies iam:PassRole at the effective scope.
+      derived_from: ["effective iam:PassRole on role scope", "effective codebuild:CreateProject or codebuild:UpdateProject"]
+      false_positive_note: >-
+        Honor iam:PassedToService strictly. A role passable only to
+        lambda.amazonaws.com or ec2.amazonaws.com does NOT create a CodeBuild path.
+        The combination of iam:PassRole + (codebuild:CreateProject OR
+        codebuild:UpdateProject) is required; PassRole alone (no project create/update)
+        cannot bind the role to a build. UpdateProject changing the service role of an
+        EXISTING project is the more likely abuse vector (no need to create a new
+        project from scratch).
+      narrative: >-
+        {principal.name} can pass {role.name} to CodeBuild (iam:PassRole scoped to
+        codebuild.amazonaws.com) and bind it as the service role of a new or existing
+        project (codebuild:CreateProject / codebuild:UpdateProject). The next build of
+        that project executes as {role.name}.
+
+  # --- A7) CanTrigger via direct StartBuild (no override = trigger only) -------
+  - id: aws-cb-can-trigger-startbuild
+    emits: CanTrigger
+    description: "codebuild:StartBuild without modifying the buildspec triggers execution of the current (stored) definition."
+    match_effective_permission:
+      action: "codebuild:StartBuild"
+      resource_type: "AWS::CodeBuild::Project"
+    where:
+      - "THIS rule models the trigger-only semantic; the code-modify semantic is captured by aws-cb-can-modify-code-startbuild. Both edges are emitted from the same StartBuild permission — they are not mutually exclusive. Graph consumers should understand that a StartBuild principal is always CanModifyCode (via override) AND CanTrigger."
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<CodeBuild Project (BuildWorker)>"
+      permissions: ["codebuild:StartBuild"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective codebuild:StartBuild on the project
+        scope. This models the trigger-only use (starting a build to run the existing
+        buildspec). cicd-chains cicd-trigger-runner-executes-as consumes this edge to
+        produce CONDITIONAL CanExecuteAs when the current definition already runs
+        attacker-influenced code. Because StartBuild also grants CanModifyCode (via
+        buildspecOverride), cicd-modify-buildspec-executes-as fires ACTIVE in addition.
+        The two CanExecuteAs edges dedupe at (type, source, target).
+      derived_from: ["effective codebuild:StartBuild on project scope"]
+      false_positive_note: >-
+        This edge is weaker than CanModifyCode for escalation purposes (it yields only
+        CONDITIONAL CanExecuteAs from cicd-trigger-runner-executes-as). Since
+        codebuild:StartBuild always permits override, the CanModifyCode edge (rule A2)
+        is always co-emitted and yields ACTIVE CanExecuteAs via cicd-modify-buildspec-
+        executes-as. Do not suppress this CanTrigger — it feeds cicd-chains rule 2 and
+        cicd-chains rule 3 for pipeline orchestration cases.
+      narrative: >-
+        {principal.name} can trigger a build of {project.name}
+        (codebuild:StartBuild), running its current buildspec as {role.name}.
+
+  # --- A8) CanTrigger from a webhook (structural, from config) -----------------
+  - id: aws-cb-webhook-trigger
+    emits: CanTrigger
+    description: "A project webhook lets qualifying push/PR events trigger a build without any codebuild:StartBuild permission."
+    match_record:
+      resource_type: "AWS::CodeBuild::Project"
+      field: "webhook"
+    where:
+      - "project.webhook is non-null (webhook exists on this project)"
+    emit:
+      source_type: Webhook
+      target_type: BuildWorker
+      source: "<Webhook attached to project>"
+      target: "<CodeBuild Project (BuildWorker)>"
+      state: ACTIVE
+      conditions: []
+      permissions: []
+      derived_from: ["AWS::CodeBuild::Project.webhook (BatchGetProjects)"]
+      false_positive_note: >-
+        Emit for each project that has a non-null webhook field. The webhook's
+        filterGroups determine which VCS events qualify (push to branch, PR open/sync,
+        tag push, etc.). The Webhook node is the source; the Project is the target.
+        When project.webhook is non-null, the trigger exists — state is ACTIVE by
+        definition. A principal that can PUSH to the source repository (CanWrite to
+        source) AND the webhook fires on push effectively gains CanTrigger on the project
+        without any codebuild:* permission — see rule A4 for that path.
+      narrative: >-
+        {project.name} has a webhook; a qualifying push or pull-request event to
+        {source.name} automatically starts a build that runs as {role.name}.
+
+  # --- A9) CanTrigger from CodePipeline BUILD action ---------------------------
+  - id: aws-cb-pipeline-trigger
+    emits: CanTrigger
+    description: "A CodePipeline BUILD stage action invokes codebuild:StartBuild on the project; the pipeline orchestrates the build trigger."
+    match_record:
+      resource_type: "AWS::CodePipeline::Pipeline"
+      field: "stages[].actions[].actionTypeId.provider=CodeBuild + configuration.ProjectName"
+    emit:
+      source_type: Workflow
+      target_type: BuildWorker
+      source: "<CodePipeline (Workflow/Messaging node)>"
+      target: "<CodeBuild Project (BuildWorker)>"
+      state: CONDITIONAL
+      conditions: [trigger_exists, service_state]
+      permissions: []
+      derived_from: ["AWS::CodePipeline::Pipeline stage action configuration (codepipeline:GetPipeline)"]
+      false_positive_note: >-
+        A CodePipeline that has a CodeBuild BUILD action effectively CanTrigger the
+        project. The pipeline's service role needs codebuild:StartBuild on the project;
+        this rule emits the structural CanTrigger from the pipeline node to the project
+        node. cicd-chains rule 3 (cicd-pipeline-orchestrates-stages) propagates a
+        principal's CanTrigger on the pipeline to the project, which then feeds
+        cicd-trigger-runner-executes-as for CanExecuteAs on the project's service role.
+      narrative: >-
+        CodePipeline {pipeline.name} has a BUILD stage that triggers {project.name}; a
+        principal that can start the pipeline can reach the CodeBuild build and its
+        service role {role.name}.
+
+  # --- A10) CanTrigger via creating a webhook ----------------------------------
+  - id: aws-cb-can-create-webhook
+    emits: CanTrigger
+    description: "codebuild:CreateWebhook allows a principal to add a new webhook trigger to a project, creating a POTENTIAL trigger surface that activates when qualifying VCS events fire."
+    match_effective_permission:
+      action: "codebuild:CreateWebhook"
+      resource_type: "AWS::CodeBuild::Project"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<CodeBuild Project (BuildWorker)>"
+      permissions: ["codebuild:CreateWebhook"]
+      conditions: []
+      state_logic: >-
+        POTENTIAL: the principal can create a webhook on the project, establishing a
+        trigger that will fire when qualifying VCS events occur. The webhook does not
+        yet exist (or is not yet configured to fire on the attacker's branch/event), so
+        the trigger is POTENTIAL rather than ACTIVE. Once the webhook is created and
+        the VCS event fires (e.g., a push to the monitored branch by the attacker or
+        a collaborator), it becomes ACTIVE and the build runs. BLOCKED if SCP denies
+        codebuild:CreateWebhook.
+      derived_from: ["effective codebuild:CreateWebhook on project scope"]
+      false_positive_note: >-
+        This edge models the capability to ESTABLISH a trigger, not to FIRE it. The
+        CreateWebhook permission is typically gated by codebuild:UpdateProject
+        (webhook configuration is part of project configuration), so check both. The
+        attacker can define the webhook's filterGroups to match events they control
+        (their own branch, a PR label, a tag push pattern). Once created and an event
+        fires, the webhook is ACTIVE. This is a supply-chain attack on batch-enabled
+        or webhook-configured projects: the attacker can plant a trigger without needing
+        direct codebuild:StartBuild permission.
+      narrative: >-
+        {principal.name} can call codebuild:CreateWebhook on {project.name}, adding a
+        webhook trigger that will fire when qualifying VCS events occur (e.g., push to
+        branch, PR open). Once created, any push matching the webhook's filterGroups
+        automatically starts a build as {role.name}.
+
+  # --- A11) CanModifyConfiguration via modifying a webhook ----------------------
+  - id: aws-cb-can-modify-webhook
+    emits: CanModifyConfiguration
+    description: "codebuild:UpdateWebhook allows a principal to modify an existing webhook's filter groups or event types, potentially broadening the trigger surface."
+    match_effective_permission:
+      action: "codebuild:UpdateWebhook"
+      resource_type: "AWS::CodeBuild::Project"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<CodeBuild Project (BuildWorker)>"
+      permissions: ["codebuild:UpdateWebhook"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective codebuild:UpdateWebhook on the project
+        scope; modifying an existing webhook (its filterGroups, events, filters) allows
+        the attacker to broaden the trigger to events they control (their own branch,
+        their own PR) or to add new events (tag pushes, releases). If the webhook was
+        not yet configured to fire on the attacker's chosen event, UpdateWebhook can
+        add it. This is a configuration modification that enables a trigger the attacker
+        can arm. BLOCKED if SCP denies codebuild:UpdateWebhook.
+      derived_from: ["effective codebuild:UpdateWebhook on project scope"]
+      false_positive_note: >-
+        UpdateWebhook is typically gated by codebuild:UpdateProject (webhook is part of
+        project config). The attacker modifies the existing webhook (not creating a new
+        one) to match their controlled events. If the webhook was already active on a
+        different event, narrowing it to only the attacker's event is defensive; only
+        count as escalation if the modification BROADENS the trigger surface (adds events
+        or removes branch filters). When possible, evaluate the before/after filterGroups;
+        if not available, emit conservatively as CanModifyConfiguration ACTIVE.
+      narrative: >-
+        {principal.name} can call codebuild:UpdateWebhook on {project.name}, modifying
+        the webhook's trigger filters to match events they control; the attacker can
+        broaden the trigger to their own branch, PR, or tag push, causing builds to
+        execute as {role.name}.
+
+  # ===========================================================================
+  # SECTION B — CREDENTIAL EXPOSURE FACTS
+  # ===========================================================================
+
+  # --- B1) ContainsSecret (SSM/Secrets Manager env var references) -------------
+  - id: aws-cb-contains-secret-env
+    emits: ContainsSecret
+    description: "CodeBuild project env vars of type SECRETS_MANAGER or PARAMETER_STORE reference secret material injected into every build's environment."
+    match_record:
+      resource_type: "AWS::CodeBuild::Project"
+      field: "environment.environmentVariables[].type"
+    where:
+      - "environmentVariable.type in [SECRETS_MANAGER, PARAMETER_STORE]"
+    emit:
+      source_type: BuildWorker
+      target_type: Secret
+      source: "<CodeBuild Project (BuildWorker)>"
+      target: "<Secret / SSM Parameter referenced by environmentVariable.value ARN>"
+      state: ACTIVE
+      permissions: []
+      derived_from: ["AWS::CodeBuild::Project.environment.environmentVariables (BatchGetProjects)"]
+      false_positive_note: >-
+        The secret is resolved at build start by CodeBuild (using the service role's
+        permissions: secretsmanager:GetSecretValue or ssm:GetParameter). The
+        ContainsSecret edge asserts that build code CAN read the secret via the process
+        environment. Credential-chains will then link this to the secret's
+        CredentialsFor target if the secret authenticates an identity.
+      narrative: >-
+        {project.name} injects the value of {secret.name} into every build as an
+        environment variable; code running in the build can read the secret from the
+        process environment.
+
+  # --- B2) ExposesCredential (plaintext env var that looks like a credential) --
+  - id: aws-cb-exposes-plaintext-cred-env
+    emits: ExposesCredential
+    description: "A CodeBuild project environment variable with type PLAINTEXT whose value pattern-matches credential material exposes that credential to build code."
+    match_record:
+      resource_type: "AWS::CodeBuild::Project"
+      field: "environment.environmentVariables[].type"
+    where:
+      - "environmentVariable.type == PLAINTEXT"
+      - "environmentVariable.value matches credential pattern (access key ID, secret key, password, token, bearer prefix)"
+    emit:
+      source_type: BuildWorker
+      target_type: Credential
+      source: "<CodeBuild Project (BuildWorker)>"
+      target: "<Credential inferred from env var value pattern>"
+      state: ACTIVE
+      permissions: []
+      derived_from: ["AWS::CodeBuild::Project.environment.environmentVariables (BatchGetProjects)"]
+      false_positive_note: >-
+        Only emit when the value clearly matches a credential pattern (e.g. AKIA…
+        AWS access key ID, a long random string with SECRET or TOKEN in the name, a
+        password-prefix pattern). Low-confidence matches should be emitted with
+        confidence 0.5 and reviewed by analysts. Plaintext env vars are also visible
+        in codebuild:BatchGetBuilds output — they leak at the control-plane level
+        without needing code execution.
+      narrative: >-
+        {project.name} stores a credential as a plaintext environment variable; any
+        code in the build (or anyone who can call BatchGetProjects/BatchGetBuilds) can
+        read the credential value.
+
+  # --- B2b) CanReadCredential via control-plane credential leak ----------------
+  # FUTURE RULE: codebuild:BatchGetBuilds / codebuild:BatchGetProjects output
+  # includes plaintext environment variable values in the build/project response.
+  # A principal with only these read permissions (no build execution) can harvest
+  # credentials from plaintext env vars without triggering a build. This would emit
+  # CanReadCredential(Identity -> Credential) at ACTIVE state.
+  # TODO: emit as rule B2b once normalizers support control-plane credential
+  # extraction from Build/Project config responses.
+
+  # --- B3) ExposesCredential (service role token accessible in build) ----------
+  - id: aws-cb-exposes-role-credential
+    emits: ExposesCredential
+    description: "The build container exposes the project service role's short-lived credentials via the ECS task-credential endpoint."
+    match:
+      - [ ?project, ExecutesAs, ?role ]
+    where:
+      - "node_type(?project) == BuildWorker"
+    emit:
+      source_type: BuildWorker
+      target_type: MachineIdentity
+      source: ?project
+      target: ?role
+      permissions: []
+      state: ACTIVE
+      derived_from: ["?project ExecutesAs ?role"]
+      false_positive_note: >-
+        Every CodeBuild build exposes the service role credentials to the running code
+        via the ECS container-credentials endpoint (AWS_CONTAINER_CREDENTIALS_FULL_URI
+        and AWS_CONTAINER_CREDENTIALS_RELATIVE_URI env vars). This is not a
+        misconfiguration — it is the intended mechanism. The edge asserts that code
+        execution in the build equals holding the role's credentials. Not an escalation
+        by itself; it expresses the credential-exposure fact. Escalation requires a
+        contributing CanModifyCode / CanTrigger edge.
+      narrative: >-
+        {project.name} exposes the credentials of its service role {role.name} to any
+        code running inside the build via the ECS task-credential endpoint.
+
+  # ===========================================================================
+  # SECTION C — DERIVED EXECUTION / ESCALATION EDGES
+  # ===========================================================================
+
+  # --- C1) CanExecuteAs via StartBuild override --------------------------------
+  # DELETED: This rule duplicated cicd-chains.cicd-modify-buildspec-executes-as.
+  # The linchpin rule consumes CanModifyCode(principal -> project) + ExecutesAs(project -> role)
+  # and emits CanExecuteAs with the correct state logic (ACTIVE for StartBuild via override,
+  # CONDITIONAL for UpdateProject). This file emits the contributing FACTS (A1-A4 CanModifyCode,
+  # A1 ExecutesAs, A7-A9 CanTrigger); cicd-chains rolls them up. See file header LINCHPIN CITATIONS.
+
+  # --- C2) CanExecuteAs by creating a new project (CreateProject + PassRole) ---
+  - id: aws-cb-execute-as-create-project
+    emits: CanExecuteAs
+    description: "Create a new CodeBuild project bound to a passable privileged role and start a build to execute as that role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE codebuild:CreateProject (any resource scope that would cover a new project ARN)"
+      - "?principal has EFFECTIVE codebuild:StartBuild (or the created project has a webhook)"
+      - "?role.trust_policy allows codebuild.amazonaws.com (or unknown/unresolved — downgrade to POTENTIAL)"
+      - "iam:PassRole for ?role admits iam:PassedToService == codebuild.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "codebuild:CreateProject", "codebuild:StartBuild"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when ?role trust policy allows codebuild.amazonaws.com AND principal has
+        codebuild:CreateProject AND codebuild:StartBuild (or a webhook trigger is
+        reachable); POTENTIAL(role_compatibility) when the role trust policy is unknown
+        (codebuild.amazonaws.com admission not confirmed); BLOCKED if PassedToService
+        condition excludes codebuild.amazonaws.com or SCP denies the required actions.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["?principal CanPassIdentity ?role (aws-cb-pass-role)", "codebuild:CreateProject check", "codebuild:StartBuild check", "cicd-chains.cicd-modify-buildspec-executes-as (cite)"]
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to lambda.amazonaws.com or
+        ec2.amazonaws.com cannot be bound to CodeBuild — downgrade to POTENTIAL or do
+        not emit. Also honor the role trust policy: a role that has no codebuild.amazonaws.com
+        principal trust will fail to be assumed by the build, causing CreateProject to
+        fail at service validation — downgrade to POTENTIAL when trust is not confirmed.
+        The role_compatibility condition captures this. This is weaker than rule C1
+        because it requires CreateProject, PassRole, AND StartBuild (three permissions);
+        C1 only requires StartBuild on an existing project.
+      narrative: >-
+        {principal.name} can create a new CodeBuild project bound to {role.name}
+        (iam:PassRole + codebuild:CreateProject) and start a build
+        (codebuild:StartBuild), executing arbitrary code as {role.name}.
+
+  # --- C3) CanCreateWorkloadAs (create-and-bind primitive) --------------------
+  - id: aws-cb-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Principal can create a CodeBuild project bound to a passed identity (create + PassRole)."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE codebuild:CreateProject"
+      - "?role trust policy allows codebuild.amazonaws.com (or unknown — POTENTIAL)"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "codebuild:CreateProject"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when iam:PassRole admits codebuild.amazonaws.com AND CreateProject is
+        effective AND role trust is confirmed; POTENTIAL(role_compatibility) when trust
+        is unresolved; BLOCKED if SCP denies iam:PassRole or codebuild:CreateProject.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["?principal CanPassIdentity ?role (aws-cb-pass-role)", "codebuild:CreateProject check"]
+      false_positive_note: >-
+        CanCreateWorkloadAs captures the create+bind capability; the full CanExecuteAs
+        is separately derived (rule C2) once StartBuild is also confirmed. This edge
+        is useful for surface-enumeration queries ("who can create a workload bound to
+        this role?") independent of whether they can also start a build.
+      narrative: >-
+        {principal.name} can create a CodeBuild project bound to {role.name}
+        (iam:PassRole + codebuild:CreateProject), making it possible to later
+        execute code as {role.name} by starting a build.
+
+  # --- C4) CanExecuteAs via UpdateProject role swap ----------------------------
+  - id: aws-cb-execute-as-role-swap
+    emits: CanExecuteAs
+    description: "UpdateProject + PassRole swaps the service role of an existing project; the next build runs as the new (attacker-chosen) role."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?project ]
+      - [ ?principal, CanPassIdentity,        ?role ]
+    where:
+      - "node_type(?project) == BuildWorker"
+      - "?project is an AWS::CodeBuild::Project"
+      - "?role trust policy allows codebuild.amazonaws.com (or unknown — POTENTIAL)"
+      - "(matched(optional[0]) OR trigger_exists(?project)) — a run path exists (the principal can also StartBuild or the project has a webhook)"
+    optional:
+      - [ ?principal, CanTrigger, ?project ]
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["codebuild:UpdateProject", "iam:PassRole", "codebuild:StartBuild?"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when UpdateProject + PassRole is confirmed AND a run path exists
+        (matched(optional[0]) — the principal can also StartBuild — or the project has
+        a webhook). This where clause enforces the run-path gate, ensuring this rule
+        only emits ACTIVE; the CONDITIONAL(trigger_exists) case (role swapped but no
+        trigger established) is produced by the generic can-execute-as linchpin
+        execute-as-via-config-identity-swap. POTENTIAL(role_compatibility) when the
+        role trust for codebuild.amazonaws.com is unresolved. BLOCKED if SCP denies
+        iam:PassRole or codebuild:UpdateProject.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: ["?principal CanModifyConfiguration ?project (aws-cb-can-modify-configuration)", "?principal CanPassIdentity ?role (aws-cb-pass-role)", "can-execute-as.execute-as-via-config-identity-swap (cite)"]
+      false_positive_note: >-
+        This is the UpdateProject-based role-swap escalation with an established run path.
+        It requires both codebuild:UpdateProject AND iam:PassRole; UpdateProject alone
+        cannot change the serviceRole without PassRole. The new role is bound to the
+        project permanently (until the next UpdateProject); this is a persistent
+        configuration change that affects all future builds. A run path is REQUIRED —
+        the where clause ensures this rule only fires ACTIVE when one exists (the
+        principal can StartBuild or a webhook is present on the project). The
+        CONDITIONAL(trigger_exists) case — role swapped but no established trigger — is
+        owned by the generic can-execute-as linchpin. Honor role trust policy for
+        codebuild.amazonaws.com.
+      narrative: >-
+        {principal.name} can call codebuild:UpdateProject to swap {project.name}'s
+        service role to {role.name} (iam:PassRole + codebuild:UpdateProject); the next
+        build (started by {principal.name} or fired by a webhook) executes as {role.name}.
+
+  # --- C5) CanEscalateTo roll-up -----------------------------------------------
+  # DELETED: This rule duplicated can-control.yaml's escalate-via-execute-as.
+  # The generic linchpin rule consumes CanExecuteAs(principal -> identity) and emits
+  # CanEscalateTo when identity.privilege_level > principal.privilege_level.
+  # This file produces CanExecuteAs via the cicd-chains linchpin; the escalation
+  # consequence is can-control's responsibility. See file header LINCHPIN CITATIONS.
+
+  # --- C6) CanEnterAccount via cross-account CodeBuild invocation --------------
+  - id: aws-cb-cross-account-execute
+    emits: CanEnterAccount
+    description: "A cross-account principal that can start or modify a CodeBuild build gains a foothold in the project's account via the service role."
+    match:
+      - [ ?principal, CanExecuteAs, ?role ]
+    where:
+      - "?principal.account != ?role.account  (cross-account: principal in account A, role in account B)"
+      - "the CanExecuteAs was produced by an aws-cb-* rule"
+      - "cross_account_grant_evidenced(?principal, ?project) — an identity-based IAM policy in ?role.account is observed granting ?principal codebuild:StartBuild / codebuild:UpdateProject on the project ARN"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?principal
+      target: "<account that owns ?role>"
+      permissions: []
+      state_logic: >-
+        CONDITIONAL(cross_account_grant_evidenced) by default — a cross-account
+        CanExecuteAs is only realized if the target account has explicitly granted the
+        external principal the required codebuild:StartBuild / codebuild:UpdateProject
+        permission on the project ARN. Emit ACTIVE only when such a grant is observed
+        in the target account's IAM policies. Inherit weakest with the contributing
+        CanExecuteAs: a CONDITIONAL/BLOCKED CanExecuteAs caps or blocks this edge.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["?principal CanExecuteAs ?role (aws-cb-* rule)", "hierarchy-chains (cite)", "cross-account IAM grant evidence"]
+      false_positive_note: >-
+        Cross-account codebuild:StartBuild requires an explicit identity-based grant in
+        the PROJECT ACCOUNT's IAM policies naming the external principal and the
+        codebuild:StartBuild / codebuild:UpdateProject actions on the project ARN.
+        CodeBuild has no resource-based policy to make this grant. Only emit ACTIVE when
+        such a grant is observed. The account entered is the account owning the project
+        and service role, not the attacker's account. When the grant is not evidenced,
+        emit CONDITIONAL(cross_account_grant_evidenced) so analysts can verify it was
+        not missed by the collector.
+      narrative: >-
+        {principal.name} (account {principal.account}) can execute code in a CodeBuild
+        project in account {target.name} (confirmed by observed cross-account IAM grant),
+        obtaining the service role's credentials and gaining a foothold in account
+        {target.name}.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - SCP or permission boundary denying codebuild:StartBuild -> CanModifyCode
+#    (aws-cb-can-modify-code-startbuild) BLOCKED, and all downstream CanExecuteAs
+#    edges derived from it BLOCKED.
+#  - SCP denying codebuild:UpdateProject -> CanModifyCode / CanModifyConfiguration
+#    from UpdateProject BLOCKED.
+#  - iam:PassRole with iam:PassedToService NOT including codebuild.amazonaws.com ->
+#    CanPassIdentity (aws-cb-pass-role) BLOCKED -> C2/C3/C4 derivations blocked.
+#  - Branch protection (required reviews, status checks) on the source branch ->
+#    CanWrite(source) is CONDITIONAL -> aws-cb-can-modify-code-source-write
+#    inherits CONDITIONAL, never ACTIVE without the gate satisfied.
+#  - An SCP requiring codebuild:EnvironmentType or other service-control conditions
+#    that restrict buildspec capabilities -> reduce confidence on C1/C2; do not
+#    emit ACTIVE if a service control definitively blocks arbitrary command execution.
+# ---------------------------------------------------------------------------
+
+# Linchpin citations (these rules produce the CanExecuteAs / CanEscalateTo /
+# CanEnter* roll-ups; do NOT re-derive them):
+#   cicd-chains.cicd-modify-buildspec-executes-as
+#     Consumes CanModifyCode(?p, ?project) + ExecutesAs(?project, ?role)
+#     => CanExecuteAs(?p -> ?role) ACTIVE (run path = StartBuild, webhook, pipeline).
+#   cicd-chains.cicd-trigger-runner-executes-as
+#     Consumes CanTrigger(?p, ?project) + ExecutesAs(?project, ?role)
+#     => CanExecuteAs(?p -> ?role) CONDITIONAL(attacker_influenced_definition).
+#   cicd-chains.cicd-pipeline-orchestrates-stages
+#     Propagates CanTrigger(?p -> pipeline) through CanTrigger(pipeline -> project)
+#     => CanTrigger(?p -> project), feeding rule 2 on the project's ExecutesAs.
+#   can-execute-as.execute-as-via-code-modify
+#     Generic collapse dedupes with cicd-chains on (CanExecuteAs, ?p, ?role).
+#   can-execute-as.execute-as-via-config-identity-swap
+#     Collapses CanModifyConfiguration + CanPassIdentity => CanExecuteAs (C4 above
+#     is the CodeBuild-specific framing; the generic rule dedupes on the same tuple).
+#   credential-chains.execute-then-read-secret
+#     CanExecuteAs(?p -> ?role) + CanReadSecret(?role -> ?secret)
+#     => CanReadSecret(?p -> ?secret) (the service role's env-secret access).
+#   credential-chains.read-secret-yields-identity
+#     CanReadSecret(?p -> ?secret) + CredentialsFor(?secret -> ?identity)
+#     => CanImpersonate(?p -> ?identity) (if the secret is for a non-human identity).
+#   can-control.yaml
+#     CanExecuteAs(?p -> ?role) + ?role Controls/CanAdminister boundary
+#     => CanEscalateTo or Controls (objective roll-up).
+
+explicit_rules:
+  # These belong in /rules/explicit/aws-codebuild.yaml if created.
+  # Listed here for reference; the linchpins above consume these edges.
+  - id: aws-cb-executes-as-explicit
+    emits: ExecutesAs
+    applies_to: [aws]
+    from_field: "AWS::CodeBuild::Project.serviceRole"
+    note: "Emit ExecutesAs(CodeBuildProject(BuildWorker) -> serviceRole(MachineIdentity/Role)) for every project with a non-empty serviceRole."
+
+  - id: aws-cb-contains-secret-env-explicit
+    emits: ContainsSecret
+    applies_to: [aws]
+    from_field: "AWS::CodeBuild::Project.environment.environmentVariables[].value (type==SECRETS_MANAGER or PARAMETER_STORE)"
+    note: "Emit ContainsSecret(CodeBuildProject -> Secret) for each SM/SSM env var reference."
+
+  - id: aws-cb-exposes-cred-plaintext-explicit
+    emits: ExposesCredential
+    applies_to: [aws]
+    from_field: "AWS::CodeBuild::Project.environment.environmentVariables[].value (type==PLAINTEXT, credential pattern match)"
+    note: "Emit ExposesCredential(CodeBuildProject -> Credential) when a plaintext env var value matches a credential pattern."
+
+  - id: aws-cb-webhook-trigger-explicit
+    emits: CanTrigger
+    applies_to: [aws]
+    from_field: "AWS::CodeBuild::Project.webhook"
+    note: "Emit CanTrigger(Webhook -> CodeBuildProject) when project.webhook is non-null."
+
+  - id: aws-cb-pipeline-trigger-explicit
+    emits: CanTrigger
+    applies_to: [aws]
+    from_field: "AWS::CodePipeline::Pipeline.stages[].actions[].configuration.ProjectName (actionTypeId.provider==CodeBuild)"
+    note: "Emit CanTrigger(CodePipeline(Workflow) -> CodeBuildProject(BuildWorker)) for each CodeBuild BUILD action in the pipeline."

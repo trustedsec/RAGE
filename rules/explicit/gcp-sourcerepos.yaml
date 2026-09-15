@@ -1,0 +1,132 @@
+# Normalizing GCP Cloud Source Repositories into explicit edges.
+# ===========================================================================
+# The adapter collects raw CSR records via:
+#   * sourcerepo.projects.repos.list / .get
+#       -> repository metadata (name, size, url, mirrorConfig, pubsubConfigs)
+#   * sourcerepo.projects.repos.getIamPolicy
+#       -> IAM allow policy (bindings: role, members, condition)
+#   * sourcerepo.projects.getConfig
+#       -> project-level CSR config (pubsubConfigs, enablePrivateKeyCheck)
+#   * cloudbuild.projects.triggers.list
+#       -> Cloud Build triggers referencing this repo's name (to link the
+#          CSR ArtifactRepository node to the BuildWorker via ContainsResourceReference)
+#   * Cloud Asset Inventory (recommended for bulk):
+#       cloudasset.assets.searchAllResources
+#       cloudasset.assets.searchAllIamPolicies
+#
+# These rules translate ONE observed raw fact into ONE explicit edge. They
+# do NOT combine edges — derived combination lives in
+# /rules/derived/gcp/sourcerepos.yaml and cicd-chains.yaml.
+#
+# Key normalization decisions encoded here:
+#   * Every CSR repository maps to generic_type ArtifactRepository
+#     (provider_type: google.sourcerepo.Repository). CSR repos are not compute;
+#     they are source stores.
+#   * A Cloud Build trigger whose triggerTemplate.repoName (or repositoryEventConfig
+#     for 2nd-gen triggers) references this repo is linked via
+#     ContainsResourceReference(trigger -> repo) so cicd-chains can propagate
+#     CanModifyCode(principal -> repo) through to the BuildWorker.
+#   * Project-level IAM bindings (roles/source.writer, roles/source.admin at
+#     the project scope) apply to ALL CSR repos in the project; the effective-
+#     permission evaluator (match_effective_permission in derived rules) handles
+#     this fan-out — not repeated here per-repo.
+#   * mirrorConfig (GitHub/Bitbucket mirror) is recorded as a property on the
+#     repo node; a mirrored repo's effective "source of truth" is external;
+#     collectors should annotate mirrored repos as readonly-mirror so that
+#     CanModifyCode edges are not emitted for push permission (push goes to the
+#     upstream, not CSR). This property drives the BLOCKED annotation in derived
+#     rules for mirrored repos.
+#
+# Permission names verbatim from
+# cloud.google.com/source-repositories/docs/access-control.
+# ===========================================================================
+
+rules:
+
+  # --- Repository contained in project (structural) --------------------------
+  - id: gcp-sr-located-in
+    emits: LocatedIn
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.sourcerepo.Repository"
+      field: "name (projects/<project>/repos/<repo>)"
+    emit:
+      source_type: ArtifactRepository
+      target_type: Project
+      source: "<CSR repository node>"
+      target: "<GCP project that contains this repository>"
+      api_source: "sourcerepo.projects.repos.list"
+      evidence_field: "name (project segment)"
+      narrative: "{repo.name} is a Cloud Source Repository located in project {project.name}."
+
+  # --- Repository IAM allow policy -> HasPolicy ------------------------------
+  # Every CSR repository has its own IAM allow policy. Record it so derived
+  # rules targeting CanModifyPolicy and CrossProjectTrust/TrustsExternalIdentity
+  # have a ResourcePolicy node to target.
+  - id: gcp-sr-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.sourcerepo.Repository"
+      field: "iamPolicy.bindings"
+    emit:
+      source_type: ArtifactRepository
+      target_type: ResourcePolicy
+      source: "<CSR repository node>"
+      target: "<ResourcePolicy node for the repository's IAM allow policy>"
+      api_source: "sourcerepo.projects.repos.getIamPolicy"
+      evidence_field: "iamPolicy.bindings"
+      narrative: "{repo.name} has an IAM allow policy governing who can clone, push, and administer the repository."
+
+  # --- Cloud Build trigger references this repo -> ContainsResourceReference --
+  # A Cloud Build trigger that watches a CSR repo is linked here so that
+  # cicd-chains can propagate CanModifyCode(principal -> repo) through to the
+  # BuildWorker. One ContainsResourceReference edge per trigger-repo pairing.
+  # The trigger node (EventRule) is modeled by Cloud Build normalization;
+  # this rule only records the reference FROM the trigger TO the CSR repo.
+  - id: gcp-sr-trigger-refs-repo
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.cloudbuild.Trigger"
+      field: "triggerTemplate.repoName"
+    where:
+      - "triggerTemplate.repoName is set (1st-gen CSR-backed trigger)"
+    emit:
+      source_type: "*"
+      target_type: ArtifactRepository
+      source: "<Cloud Build Trigger (EventRule)>"
+      target: "<CSR repository named by triggerTemplate.repoName>"
+      api_source: "cloudbuild.projects.triggers.list"
+      evidence_field: "triggerTemplate.repoName"
+      narrative: "Cloud Build trigger {trigger.name} watches CSR repository {repo.name}; a push to the target branch arms this trigger."
+
+  # --- Mirrored repo annotation (ContainsResourceReference, structural) ------
+  # CSR repos with mirrorConfig (GitHub/Bitbucket mirrors) are read-only
+  # from GCP's perspective: pushes go to the upstream, not CSR. This record
+  # links the CSR mirror node back to its upstream via ContainsResourceReference
+  # (the CSR repo "references" the upstream source), and sets is_mirror: true
+  # on the CSR node as a node property. Derived rules use this property to
+  # emit BLOCKED for CanModifyCode on mirrored repos (push is rejected by GCP).
+  - id: gcp-sr-mirror-config
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.sourcerepo.Repository"
+      field: "mirrorConfig.url"
+    where:
+      - "mirrorConfig.url is set (repo is a read-only mirror of an external source)"
+    emit:
+      source_type: ArtifactRepository
+      target_type: "*"
+      source: "<CSR mirror repository node>"
+      target: "<upstream external repository URL (ArtifactRepository or GenericStorage node)>"
+      api_source: "sourcerepo.projects.repos.get"
+      evidence_field: "mirrorConfig.url"
+      note: >-
+        A mirrored CSR repo receives content FROM the upstream (GitHub/Bitbucket).
+        Pushes to this CSR repo are BLOCKED by GCP (read-only mirror). Derived
+        rules (gcp-sr-push-is-code-modify) should emit BLOCKED for mirrored repos;
+        the attack surface is at the upstream, not here. This structural edge
+        records the mirror->upstream reference and the is_mirror: true property.
+      narrative: "CSR repository {repo.name} is a read-only mirror of {upstream.name}; push access to this CSR repo does not modify the upstream source."

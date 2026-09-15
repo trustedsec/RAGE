@@ -1,0 +1,169 @@
+# AWS MemoryDB — Explicit edge normalization rules
+# ---------------------------------------------------------------------------
+# Explicit normalization rules for Amazon MemoryDB. These rules translate direct
+# API observations (memorydb:DescribeClusters, memorydb:DescribeACLs,
+# memorydb:DescribeUsers, etc.) and IAM permission evaluations into explicit
+# edges consumed by derived rules in rules/derived/aws/memorydb.yaml.
+#
+# Emits ONLY explicit, schema-valid edges. All derived escalation logic lives
+# in the derived/ rules.
+# ---------------------------------------------------------------------------
+
+rules:
+
+  # --- ACL user creation via memorydb:CreateUser ---------------------------
+  # memorydb:CreateUser creates a new ACL user with a chosen password and
+  # access string. An attacker with memorydb:CreateUser can create a privileged
+  # user (access string 'on ~* &* +@all' for full access) and then update the
+  # cluster's ACL (via memorydb:UpdateAcl) to include that user. This is a
+  # direct IAM permission on the Credential (ACL user) resource — the ability
+  # to CREATE a credential.
+  - id: aws-memorydb-can-create-acl-user
+    emits: CanCreate
+    applies_to: [aws]
+    match_effective_permission:
+      action: "memorydb:CreateUser"
+      resource_type: "AWS::MemoryDB::User"
+    emit:
+      source_type: Identity
+      target_type: Credential
+      source: "<principal>"
+      target: "<MemoryDB ACL user Credential node (provider_type: memorydb_acl_user)>"
+      permissions: ["memorydb:CreateUser"]
+      narrative: >-
+        {principal.name} can create a new MemoryDB ACL user (memorydb:CreateUser)
+        with a chosen password and access string, then add that user to a cluster's
+        ACL via memorydb:UpdateACL. This allows the attacker to create a credential
+        for accessing the cluster's Redis data plane.
+
+  # --- ACL update via memorydb:UpdateAcl -----------------------------------
+  # memorydb:UpdateAcl modifies the user membership of an ACL. An attacker
+  # with this permission can add a user to an ACL (or remove a restrictive user,
+  # or modify which users are associated with a cluster via ACL swaps). This is
+  # a modification of the ACL (GenericPolicy) node.
+  - id: aws-memorydb-can-modify-acl
+    emits: CanModify
+    applies_to: [aws]
+    match_effective_permission:
+      action: "memorydb:UpdateAcl"
+      resource_type: "AWS::MemoryDB::ACL"
+    emit:
+      source_type: Identity
+      target_type: GenericPolicy
+      source: "<principal>"
+      target: "<MemoryDB ACL node (provider_type: AWS::MemoryDB::ACL)>"
+      permissions: ["memorydb:UpdateAcl"]
+      narrative: >-
+        {principal.name} can modify MemoryDB ACL {acl.name} (memorydb:UpdateAcl),
+        adding or removing users from the ACL. By adding a user to an ACL that
+        is attached to a cluster, the attacker can grant that user (and anyone
+        with knowledge of their password) access to the cluster's data plane.
+
+  # --- ACL user password reset via memorydb:UpdateUser ----------------------
+  # memorydb:UpdateUser can change an ACL user's password (up to two passwords
+  # per user). An attacker with memorydb:UpdateUser can set a known password
+  # and then authenticate to the MemoryDB data plane as that ACL user. This is
+  # a direct IAM permission on the Credential (ACL user) resource.
+  - id: aws-memorydb-can-modify-acl-user
+    emits: CanModify
+    applies_to: [aws]
+    match_effective_permission:
+      action: "memorydb:UpdateUser"
+      resource_type: "AWS::MemoryDB::User"
+    emit:
+      source_type: Identity
+      target_type: Credential
+      source: "<principal>"
+      target: "<MemoryDB ACL user Credential node (provider_type: memorydb_acl_user)>"
+      permissions: ["memorydb:UpdateUser"]
+      narrative: >-
+        {principal.name} can overwrite the authentication password of MemoryDB
+        ACL user {user.name} (memorydb:UpdateUser), setting an attacker-controlled
+        wire-protocol credential for the Redis cluster.
+
+  # --- Cluster's ACL contains user credentials (structural) --------
+  # A MemoryDB cluster is associated with an ACL, which defines a set of users.
+  # This explicit rule records the structural association: which cluster is bound
+  # to which ACL, and which user Credential nodes belong to that ACL. This
+  # information is captured as a provider_raw property; the actual ExposesCredential
+  # edge (indicating that the cluster LEAKS the credential to attackers) is derived
+  # in rules/derived/aws/memorydb.yaml by matching this raw association.
+  - id: aws-memorydb-cluster-associated-with-acl-users
+    emits: Contains
+    applies_to: [aws]
+    match_effective_permission:
+      action: "memorydb:DescribeClusters"
+      resource_type: "AWS::MemoryDB::Cluster"
+    where:
+      - "?cluster.properties.ACLName is present"
+    emit:
+      source_type: Cache
+      target_type: Credential
+      source: "<cluster node>"
+      target: "<ACL user Credential node(s) in the cluster's ACL>"
+      api_source: "memorydb:DescribeClusters + memorydb:DescribeACLs + memorydb:DescribeUsers"
+      evidence_field: "cluster.ACLName -> ACL.UserNames -> individual Credential nodes"
+      record_property:
+        node: "<cluster node>"
+        key: "associated_acl_users"
+        value: "<list of User names from DescribeACLs for this cluster's ACL>"
+      narrative: >-
+        {cluster.name} is associated with ACL {acl.name}, which contains the
+        ACL users ({user.name}) that can authenticate to the cluster. This is
+        a structural containment relationship; the ExposesCredential capability
+        is derived from this fact combined with the user's CredentialsFor link.
+
+  # --- ACL user credentials authenticate to cluster -------------------------
+  # An ACL user's password is a credential that authenticates to the cluster(s)
+  # that have the ACL containing that user attached. This edge documents which
+  # cluster(s) a given ACL user can authenticate to via the Redis wire protocol.
+  - id: aws-memorydb-acl-user-credentials-for-cluster
+    emits: CredentialsFor
+    applies_to: [aws]
+    match_effective_permission:
+      action: "memorydb:DescribeUsers"
+      resource_type: "AWS::MemoryDB::User"
+    where:
+      - "?user.properties.ACLNames is present and non-empty"
+    emit:
+      source_type: Credential
+      target_type: Cache
+      source: "<ACL user Credential node>"
+      target: "<MemoryDB cluster Cache node(s) associated with the ACL(s) containing this user>"
+      api_source: "memorydb:DescribeUsers + memorydb:DescribeACLs + memorydb:DescribeClusters"
+      evidence_field: "user.ACLNames -> ACLs[] -> Clusters[] on each ACL"
+      record_property:
+        node: "<user Credential node>"
+        key: "authenticates_to_clusters"
+        value: "<list of cluster ARNs / cluster names from ACL->Clusters[]>"
+      narrative: >-
+        ACL user {user.name} can authenticate to MemoryDB cluster {cluster.name}
+        via the Redis wire protocol using their password (username + password per
+        ACL configuration). The user's access string determines which commands and
+        keys they can read/write.
+
+  # --- Cluster ACL modification via memorydb:UpdateCluster --------------------
+  # memorydb:UpdateCluster accepts the --acl-name parameter, allowing an attacker
+  # to swap the cluster's ACL to a different one. The built-in "open-access" ACL
+  # has a "default" user with full permissions and no authentication requirement
+  # (on TLS-disabled clusters). Swapping to this ACL or another permissive ACL
+  # grants full data-plane access. This is a control-plane mutation of the cluster
+  # configuration.
+  - id: aws-memorydb-update-cluster-modifies-config
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "memorydb:UpdateCluster"
+      resource_type: "AWS::MemoryDB::Cluster"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: "<principal>"
+      target: "<MemoryDB cluster node>"
+      permissions: ["memorydb:UpdateCluster"]
+      narrative: >-
+        {principal.name} can call memorydb:UpdateCluster to modify {cluster.name},
+        including changing the cluster's ACL (--acl-name parameter). By swapping
+        to the "open-access" ACL (or another permissive ACL), the principal can
+        grant full or partial data-plane access to the cluster without changing
+        any passwords or authentication tokens.

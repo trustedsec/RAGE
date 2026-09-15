@@ -1,0 +1,296 @@
+# AWS ACM Private CA — Derived attack-path rules (Phase 5 — credential access)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (CanSignAs, CanRead, CanModifyPolicy, CanModifyConfiguration, CanAdminister,
+# CrossAccountTrust, HasPolicy) lives in /rules/explicit/aws-acmpca.yaml; these
+# rules combine those explicit edges with template/status facts and downstream
+# trust-consumer facts to derive the certificate-forging escalation chain.
+#
+# Core ACM PCA invariant: acm-pca:IssueCertificate signs a caller-controlled CSR
+# with the CA's private key for an ARBITRARY subject/SAN (any Subject name;
+# APIPassthrough templates allow arbitrary SANs/extensions; SubordinateCA
+# templates mint a new issuer). That is credential minting -> CanSignAs(CA). It
+# becomes CanImpersonate/CanEnterAccount only when a concrete downstream system
+# trusts the CA's certs. The CA private key is HSM-resident and NOT exportable ->
+# never emit CanExportKey for it.
+#
+# key_permission analogue: the "key" here is the CA's signing key. The gate is
+# NOT a separate KMS decrypt but the pair (IssueCertificate present) AND
+# (acm-pca:TemplateArn admits a forgeable template) AND (CA Status == ACTIVE) AND
+# (GetCertificate present to retrieve the PEM). An unmet gate -> CONDITIONAL.
+#
+# Permissions are the EFFECTIVE actions the permission evaluator must confirm on
+# the given CA scope. State defaults to ACTIVE; an unmet condition yields
+# CONDITIONAL/POTENTIAL; an explicit deny/SCP/boundary/resource-policy-Deny
+# yields BLOCKED.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 5-credential-access
+applies_to: [aws]
+
+rules:
+
+  # --- Issue + retrieve = sign as the CA ------------------------------------
+  - id: aws-acmpca-sign-as-via-issue
+    emits: CanSignAs
+    description: "Issue a certificate for an arbitrary subject/SAN signed by the CA's key."
+    match:
+      - [ ?principal, CanSignAs, ?ca ]
+    where:
+      - "node_type(?ca) == AWS::ACMPCA::CertificateAuthority"
+      - "?ca node_class == SigningKey"
+    optional:
+      - [ ?principal, CanRead, ?ca ]   # acm-pca:GetCertificate to retrieve the PEM
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?ca
+      permissions: ["acm-pca:IssueCertificate", "acm-pca:GetCertificate"]
+      conditions: [iam_permission, condition_expression, service_state]
+      state_logic: >-
+        if CA.Status != ACTIVE: CONDITIONAL(service_state);
+        elif not (matched(optional[0]) or principal has acm-pca:GetCertificate on ?ca): CONDITIONAL(iam_permission);
+        elif acm-pca:TemplateArn condition pins issuance to a template that cannot
+        express the forged subject/SAN: CONDITIONAL(condition_expression);
+        else ACTIVE
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanSignAs edge_id>", "<CanRead edge_id (optional GetCertificate)>" ]
+      false_positive_note: >-
+        IssueCertificate returns only an ARN; retrieving the usable PEM needs
+        acm-pca:GetCertificate -> without it, CONDITIONAL(iam_permission). A CA in
+        DISABLED/PENDING_CERTIFICATE/EXPIRED status cannot sign ->
+        CONDITIONAL(service_state). Honor the acm-pca:TemplateArn condition: a
+        policy pinning a narrow non-APIPassthrough EndEntity template limits the
+        forgeable fields -> CONDITIONAL(condition_expression) if the needed
+        subject/SAN is not expressible. This edge is the minting capability only;
+        downstream impersonation requires a trust consumer (separate rule).
+      narrative: >-
+        {principal.name} can issue a certificate for an arbitrary subject/SAN
+        signed by CA {ca.name} (acm-pca:IssueCertificate + acm-pca:GetCertificate),
+        effectively signing as the CA's private key.
+
+  # --- Self-grant issuance via resource policy ------------------------------
+  - id: aws-acmpca-sign-as-via-putpolicy
+    emits: CanSignAs
+    description: "Rewrite the CA resource policy to grant self issuance, then sign as the CA."
+    match:
+      - [ ?principal, CanModifyPolicy, ?ca ]
+    where:
+      - "node_type(?ca) == AWS::ACMPCA::CertificateAuthority"
+      - "?ca node_class == SigningKey"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?ca
+      permissions: ["acm-pca:PutPolicy", "acm-pca:IssueCertificate", "acm-pca:GetCertificate"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        if CA.Status != ACTIVE: CONDITIONAL(service_state);
+        else POTENTIAL(iam_permission) — this is a two-step self-grant the source can
+        CREATE but has not yet realized: PutPolicy must first write a statement granting
+        itself acm-pca:IssueCertificate, and the principal must then hold/obtain
+        acm-pca:GetCertificate to retrieve the signed PEM. Upgrade to
+        CONDITIONAL(iam_permission) once GetCertificate is confirmed, and to ACTIVE only
+        after the self-granting policy statement is actually written. Consistent with the
+        POTENTIAL definition (capability could be created by the source but is not yet
+        realized).
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<CanModifyPolicy edge_id>" ]
+      false_positive_note: >-
+        acm-pca:PutPolicy alone grants issuance only after the principal writes a
+        statement granting itself acm-pca:IssueCertificate (and GetCertificate).
+        This is a two-step self-grant; downgrade priors accordingly. An SCP
+        denying PutPolicy or IssueCertificate -> BLOCKED. Still gated by CA
+        Status == ACTIVE.
+      narrative: >-
+        {principal.name} can rewrite the resource policy of CA {ca.name}
+        (acm-pca:PutPolicy) to grant itself acm-pca:IssueCertificate, then sign
+        arbitrary certificates as the CA.
+
+  # --- Mint a subordinate CA (new issuer) -----------------------------------
+  - id: aws-acmpca-subca-mint
+    emits: CanSignAs
+    description: "Issue a SubordinateCACertificate to create a new issuer chaining to the trusted CA."
+    match:
+      - [ ?principal, CanSignAs, ?ca ]
+    where:
+      - "node_type(?ca) == AWS::ACMPCA::CertificateAuthority"
+      - "?ca node_class == SigningKey"
+      - "acm-pca:TemplateArn permits a SubordinateCACertificate* template (or is unconstrained)"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?ca
+      permissions: ["acm-pca:IssueCertificate", "acm-pca:GetCertificate"]
+      conditions: [condition_expression, service_state]
+      state_logic: >-
+        if acm-pca:TemplateArn is pinned to a non-SubordinateCA template: BLOCKED (denied_by=TemplateArn condition);
+        elif CA.Status != ACTIVE: CONDITIONAL(service_state);
+        else ACTIVE
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanSignAs edge_id>" ]
+      false_positive_note: >-
+        Only valid when the effective policy permits a SubordinateCACertificate
+        template (acm-pca:TemplateArn unconstrained or explicitly allowing it) and
+        the CA path length allows a subordinate. If TemplateArn pins EndEntity-only
+        templates, sub-CA minting is BLOCKED. Modeled as CanSignAs on the same CA
+        (the new issuer chains to it); a separate node for the minted sub-CA is
+        created by the collector on the next run.
+      narrative: >-
+        {principal.name} can issue a SubordinateCACertificate from CA {ca.name},
+        creating a new issuer that chains to it and enables unbounded downstream
+        certificate forging.
+
+  # --- Forged cert authenticates as a downstream identity -------------------
+  - id: aws-acmpca-forged-cert-credentials-for
+    emits: CredentialsFor
+    description: "A CA-issued certificate authenticates as the downstream identity a trust consumer maps it to."
+    match:
+      - [ ?principal, CanSignAs, ?ca ]
+      # The downstream trust-consumer edge: a concrete authenticator (?consumer)
+      # trusts ?ca-issued certs and authenticates the mapped principal ?identity.
+      # Modeled on the consumer node via AuthenticatesTo (Identity/Credential ->
+      # service), NOT on the SigningKey CA via TrustsExternalIdentity (whose source
+      # set is [Role, ServiceAccount, ApplicationIdentity, ResourcePolicy] and target
+      # is [ExternalIdentity, FederatedIdentity] — neither admits a SigningKey source
+      # nor an internal ?identity target).
+      - [ ?identity, AuthenticatesTo, ?consumer ]   # consumer maps a CA-issued cert subject/SAN to ?identity
+    where:
+      - "node_type(?ca) == AWS::ACMPCA::CertificateAuthority"
+      - "?consumer is a downstream authenticator (EKS client-cert auth, mTLS mesh, VPN, DB cert auth) that trusts ?ca-issued certs"
+      - "?consumer maps the forgeable cert subject/SAN to ?identity"
+    emit:
+      source: "<forged Certificate node issued by ?ca>"
+      target: ?identity
+      permissions: []
+      conditions: [trust_relationship, condition_expression]
+      state_logic: >-
+        if a concrete trust consumer maps the forgeable subject/SAN to ?identity
+        AND acm-pca:TemplateArn admits that subject/SAN: ACTIVE; else CONDITIONAL(trust_relationship)
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanSignAs edge_id>", "<AuthenticatesTo edge_id (downstream trust-consumer)>" ]
+      false_positive_note: >-
+        Emitted only when a modeled downstream system actually trusts this CA and
+        maps a certificate subject/SAN to ?identity. Without a concrete consumer,
+        do NOT emit — the capability stays at CanSignAs. Honor acm-pca:TemplateArn:
+        if the allowed template cannot express the subject/SAN the consumer keys
+        on, downgrade to CONDITIONAL(condition_expression).
+      narrative: >-
+        A certificate forged by {principal.name} from CA {ca.name} authenticates
+        as {identity.name} to a system that trusts the CA.
+
+  # --- Roll up to impersonation ---------------------------------------------
+  - id: aws-acmpca-impersonate-via-forged-cert
+    emits: CanImpersonate
+    description: "Forging a CA-trusted cert lets the principal act as the downstream identity."
+    match:
+      - [ ?principal, CanSignAs, ?ca ]
+      - [ "<forged Certificate node issued by ?ca>", CredentialsFor, ?identity ]
+    where:
+      - "node_type(?ca) == AWS::ACMPCA::CertificateAuthority"
+      - "node_type(?identity) in [ApplicationIdentity, ServiceAccount, MachineIdentity]"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: ["acm-pca:IssueCertificate", "acm-pca:GetCertificate"]
+      conditions: [trust_relationship, condition_expression, service_state]
+      state_logic: >-
+        inherit the weakest state of (CanSignAs, CredentialsFor); ACTIVE only when
+        both are ACTIVE (CA ACTIVE, retrievable PEM, template admits the subject,
+        concrete consumer maps it)
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanSignAs edge_id>", "<CredentialsFor edge_id>" ]
+      false_positive_note: >-
+        Requires BOTH the minting capability AND a concrete downstream consumer
+        that maps the forged cert to ?identity. Never emit from CanSignAs alone.
+        Only ApplicationIdentity/ServiceAccount/MachineIdentity targets are valid
+        for CanImpersonate per the edge schema.
+      narrative: >-
+        {principal.name} can impersonate {identity.name} by forging a certificate
+        from CA {ca.name} that {identity.name}'s authenticator trusts.
+
+  # --- Cross-account issuance -> account entry ------------------------------
+  - id: aws-acmpca-cross-account-issue
+    emits: CanEnterAccount
+    description: "Cross-account issuance on a CA whose certs are trusted in the owner account enters that account."
+    match:
+      - [ ?ca,     HasPolicy,          ?policy ]
+      - [ ?policy, CrossAccountTrust,  ?external ]
+      - [ ?external, CanSignAs,        ?ca ]
+    where:
+      - "node_type(?ca) == AWS::ACMPCA::CertificateAuthority"
+      - "node_type(?policy) == ResourcePolicy"
+      - "a downstream authenticator IN THE CA-OWNER ACCOUNT trusts ?ca-issued certs"
+      - "?external.account != ?ca.account"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?external
+      target: "<account of ?ca>"
+      permissions: ["acm-pca:IssueCertificate", "acm-pca:GetCertificate"]
+      conditions: [resource_policy, trust_relationship, condition_expression, service_state]
+      state_logic: >-
+        if resource_policy/RAM grants cross-account IssueCertificate AND a concrete
+        in-account trust consumer maps a forgeable cert to an in-account identity:
+        ACTIVE; else CONDITIONAL(trust_relationship)
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<HasPolicy edge_id>", "<CrossAccountTrust edge_id>", "<CanSignAs edge_id>" ]
+      false_positive_note: >-
+        Requires (1) the CA resource policy or RAM share to actually grant the
+        external principal acm-pca:IssueCertificate, AND (2) a concrete consumer in
+        the CA-owner account that trusts CA-issued certs for authentication.
+        Cross-account issuance without an in-account trust consumer is only
+        CrossAccountTrust + CanSignAs, NOT account entry. Honor acm-pca:TemplateArn
+        in the granting statement.
+      narrative: >-
+        {external.name} (account {external.account}) can issue certificates from
+        CA {ca.name} that a system in account {ca.account} trusts, gaining a
+        foothold in account {ca.account}.
+
+  # --- Roll up to escalation edge -------------------------------------------
+  - id: aws-acmpca-escalate-via-impersonate
+    emits: CanEscalateTo
+    description: "Forging a cert to act as a more-privileged identity is privilege escalation."
+    match:
+      - [ ?principal, CanImpersonate, ?identity ]
+    where:
+      - "the CanImpersonate was derived from an ACM PCA forged certificate"
+      - "?identity.privilege_level > ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: []
+      conditions: [trust_relationship, condition_expression, service_state]
+      state_logic: >-
+        inherit the state of the contributing CanImpersonate edge verbatim
+        (ACTIVE/CONDITIONAL/POTENTIAL/BLOCKED); this roll-up adds no new gate beyond the
+        strictly-greater-privilege check in the where-clause, so it never strengthens the
+        inherited state.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "<CanImpersonate edge_id>" ]
+      false_positive_note: >-
+        Only emit when the forged identity is strictly more privileged than the
+        caller; forging a lateral or lower-privilege identity is not escalation.
+        Inherits state from the contributing CanImpersonate edge.
+      narrative: >-
+        {principal.name} can escalate to {identity.name} by forging a certificate
+        from CA {ca.name} that {identity.name}'s authenticator trusts.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP/permission boundary denying acm-pca:IssueCertificate, acm-pca:PutPolicy,
+#    acm-pca:GetCertificate, or acm-pca:UpdateCertificateAuthority at the effective
+#    scope -> emit the edge with state: BLOCKED and denied_by=<SCP arn/statement>.
+#  - An acm-pca:TemplateArn condition pinning issuance to a benign template (e.g.
+#    a fixed non-APIPassthrough EndEntity template) BLOCKS aws-acmpca-subca-mint and
+#    downgrades aws-acmpca-*-impersonate when the forged subject/SAN is not expressible.
+#  - A resource-policy Deny statement, or a CA Status of DISABLED/PENDING/EXPIRED
+#    (without UpdateCertificateAuthority/ImportCertificateAuthorityCertificate to
+#    bring it online) -> CONDITIONAL(service_state) or BLOCKED.
+#  - The CA private key is HSM-resident and non-exportable: NEVER emit CanExportKey
+#    for a CA signing key.
+# ---------------------------------------------------------------------------

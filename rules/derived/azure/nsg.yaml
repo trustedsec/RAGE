@@ -1,0 +1,369 @@
+# Azure Network Security Groups — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# Covers Microsoft.Network/networkSecurityGroups (generic_type: Firewall).
+#
+# NSGs are the primary per-subnet and per-NIC stateful packet filter in Azure.
+# They contain ordered inbound/outbound security rules (priority 100–4096).
+# The effective NSG on a NIC is the union of the subnet-level and NIC-level
+# NSG rules; both must allow traffic for it to be effectively permitted.
+#
+# Phase 8 attack surface:
+#   (1) EXPOSURE: an inbound rule with source=Internet (or 0.0.0.0/0) and
+#       action=Allow on a port + the associated subnet/NIC has a public IP
+#       resource → ExposedToInternet. The open rule alone → CanReachPort
+#       (CONDITIONAL on network_reachability — public IP must also be present).
+#   (2) WEAKEN CONTROLS: Microsoft.Network/networkSecurityGroups/securityRules/write
+#       → add an Allow rule → CanModifyConfiguration on the NSG. Opens paths
+#       that were previously blocked (high-value NSG-specific escalation primitive).
+#       Microsoft.Network/networkSecurityGroups/write (replace the whole NSG object)
+#       is strictly stronger — also captured here.
+#   (3) ADMIN: Microsoft.Network/networkSecurityGroups/* → CanAdminister (full control
+#       including association with subnets/NICs, rule management, and deletion).
+#
+# IMPORTANT: transitive network reachability (NSG open rule + route + peering
+# composing into CanNetworkReach) is a FUTURE network-chains linchpin. Do NOT
+# invent it here; emit per-service FACTS and let that file compose them.
+#
+# All operation strings verified against:
+#   - Azure resource-provider operations reference (Microsoft.Network), 2026-09
+#   - https://learn.microsoft.com/azure/virtual-network/network-security-groups-overview
+#   - https://learn.microsoft.com/azure/virtual-network/manage-network-security-group
+#
+# CITE (not duplicate) can-control.yaml for CanControl / Controls derivations.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 8-networking
+applies_to: [azure]
+
+rules:
+
+  # =========================================================================
+  # WEAKEN CONTROLS: join/action → re-associate NSG (NSG-specific escalation)
+  # =========================================================================
+
+  - id: azure-nsg-join-action-escalation
+    emits: CanModifyConfiguration
+    description: >-
+      Principal with join/action on an NSG they control can re-associate
+      (replace) the NSG on a target subnet or NIC, bypassing the original
+      NSG's security rules. This is an NSG-specific escalation primitive
+      that does not decompose into generic can-control or credential chains.
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Network/networkSecurityGroups/join/action"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal>"
+      target: "<NSG node (Firewall)>"
+      permissions:
+        - "Microsoft.Network/networkSecurityGroups/join/action"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE if the principal's effective permission at the NSG scope includes
+        join/action and no deny assignment covers it; BLOCKED if a deny assignment
+        covers join/action at the NSG, RG, or subscription scope.
+        This capability is CONDITIONAL: it requires the principal to also control
+        a permissive NSG (CanModifyConfiguration on that NSG), which is the actual
+        foothold enabling subnet-level firewall bypass. The edge represents the
+        association capability; the blast radius materializes when combined with
+        NSG rule control.
+      confidence: 0.88
+      derived_from:
+        - "<RBAC effective permission: join/action at NSG scope>"
+      false_positive_note: >-
+        join/action alone is not a full compromise path; it represents the ability
+        to associate the NSG with subnets/NICs. The attacker must also control
+        (or have CanModifyConfiguration on) a permissive NSG to exploit this.
+        This rule emits a CanModifyConfiguration edge capturing the NSG-level
+        capability; downstream rules (attack-path linchpins) compose this with
+        attacker-controlled NSG facts to infer subnet-level compromise.
+        A deny assignment blocking join/action → BLOCKED.
+      narrative: >-
+        {principal.name} can associate/re-associate NSG {target.name} with
+        subnets and network interfaces (Microsoft.Network/networkSecurityGroups/join/action).
+        If the principal controls a permissive NSG, they can replace a production
+        subnet's NSG, effectively overriding all existing firewall protections on that subnet.
+
+  # =========================================================================
+  # WEAKEN CONTROLS: securityRules/write → add an Allow inbound rule
+  # =========================================================================
+
+  - id: azure-nsg-rule-write
+    emits: CanModifyConfiguration
+    description: >-
+      Principal with securityRules/write can add an inbound Allow rule for
+      Internet/0.0.0.0/0, opening previously blocked ports across all subnets
+      and NICs where this NSG is associated.
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Network/networkSecurityGroups/securityRules/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal>"
+      target: "<NSG node (Firewall)>"
+      permissions:
+        - "Microsoft.Network/networkSecurityGroups/securityRules/write"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE if the principal's effective permission at the NSG scope includes
+        securityRules/write and no deny assignment covers it; BLOCKED if a deny
+        assignment covers securityRules/write at the NSG, RG, or subscription scope.
+      confidence: 0.95
+      derived_from:
+        - "<RBAC effective permission: securityRules/write at NSG scope>"
+      false_positive_note: >-
+        Verify effective permissions (not just role assignments): a deny assignment
+        at the NSG, resource group, or subscription scope covering
+        securityRules/write blocks this capability → emit BLOCKED.
+        The Security Admin built-in role includes this action; custom roles may
+        grant it alone. Scope must reach the specific NSG (or its parent RG/sub).
+        This rule captures only the write-to-open-rules capability; it does NOT
+        directly create ExposedToInternet — that requires the NSG to be associated
+        with a subnet/NIC hosting a resource with a public IP (see azure-nsg-internet-exposed).
+      narrative: >-
+        {principal.name} can add an inbound Allow rule to NSG {target.name}
+        (Microsoft.Network/networkSecurityGroups/securityRules/write), opening
+        previously blocked ports across all associated subnets and NICs.
+
+  # =========================================================================
+  # WEAKEN CONTROLS: networkSecurityGroups/write → replace the full NSG object
+  # =========================================================================
+
+  - id: azure-nsg-object-write
+    emits: CanModifyConfiguration
+    description: >-
+      Principal with networkSecurityGroups/write can replace the full NSG rule
+      set, including deleting all existing Deny rules — strictly stronger than
+      securityRules/write alone.
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Network/networkSecurityGroups/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal>"
+      target: "<NSG node (Firewall)>"
+      permissions:
+        - "Microsoft.Network/networkSecurityGroups/write"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE if the principal's effective permission at the NSG scope includes
+        networkSecurityGroups/write and no deny assignment covers it; BLOCKED if
+        a deny assignment covers networkSecurityGroups/write at the NSG, RG, or
+        subscription scope.
+      confidence: 0.97
+      derived_from:
+        - "<RBAC effective permission: networkSecurityGroups/write at NSG scope>"
+      false_positive_note: >-
+        networkSecurityGroups/write allows creating or replacing the NSG object
+        and its complete rule set; it is a superset of securityRules/write. The
+        effective permission evaluator should emit only azure-nsg-object-write
+        when the principal holds networkSecurityGroups/write at the NSG scope,
+        since this action subsumes securityRules/write. If the collector reports
+        both action chains separately, deduplication is the responsibility of the
+        engine's effective-permission normalizer (match_effective_permission handler),
+        not this rule's where clause. Trust the engine to not emit duplicate
+        CanModifyConfiguration edges for the same (principal, NSG) pair when one
+        permission subsumes the other. A deny assignment blocking
+        networkSecurityGroups/write → BLOCKED.
+      narrative: >-
+        {principal.name} can replace the full rule set of NSG {target.name}
+        (Microsoft.Network/networkSecurityGroups/write), including removing existing
+        Deny rules and inserting broad Allow rules.
+
+  # =========================================================================
+  # ADMIN: networkSecurityGroups/* → CanAdminister
+  # =========================================================================
+
+  - id: azure-nsg-admin
+    emits: CanAdminister
+    description: >-
+      Principal with the networkSecurityGroups/* wildcard (Network Contributor,
+      Contributor, Owner) has full administrative control over the NSG.
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Network/networkSecurityGroups/*"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal>"
+      target: "<NSG node (Firewall)>"
+      permissions:
+        - "Microsoft.Network/networkSecurityGroups/*"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE if the principal's effective permission includes the
+        networkSecurityGroups/* wildcard and no deny assignment at NSG/RG/subscription
+        scope blocks networkSecurityGroups/write or higher.
+        BLOCKED if a deny assignment covers networkSecurityGroups/write or
+        networkSecurityGroups/* at the NSG, resource group, or subscription scope.
+        A deny assignment covering only a subset like securityRules/delete does NOT
+        block CanAdminister if networkSecurityGroups/write remains unblocked.
+      confidence: 0.97
+      derived_from:
+        - "<RBAC effective permission: networkSecurityGroups/* at NSG scope>"
+        - "can-control:control-via-admin  # derives Controls(principal → NSG)"
+      false_positive_note: >-
+        CanAdminister requires the Microsoft.Network/networkSecurityGroups/*
+        wildcard — Network Contributor, Contributor, or Owner at a scope that
+        covers the NSG. A custom role granting only securityRules/write does NOT
+        get CanAdminister; that is covered by azure-nsg-rule-write. CanAdminister
+        does NOT imply Microsoft.Authorization/*/write — assigning RBAC still
+        requires Owner or User Access Administrator. The can-control.yaml linchpin
+        rule (control-via-admin) automatically derives Controls(principal → NSG)
+        from this CanAdminister edge for objective-query composition.
+      narrative: >-
+        {principal.name} has full control of NSG {target.name}
+        (Microsoft.Network/networkSecurityGroups/*) and can add, replace, or delete
+        any security rule, or re-associate the NSG with any subnet or NIC.
+
+  # =========================================================================
+  # EXPOSURE: inbound Allow rule from Internet/0.0.0.0/0 → CanReachPort (FACT)
+  # =========================================================================
+
+  - id: azure-nsg-inbound-open
+    emits: CanReachPort
+    description: >-
+      An NSG effective inbound rule allows source=Internet (or 0.0.0.0/0) with
+      action=Allow on a specific port — the firewall is open to the public internet
+      for that port. CONDITIONAL(network_reachability): a public IP must also be
+      present on an attached resource for the port to be externally reachable.
+    applies_to: [azure]
+    match:
+      - [ ?nsg, LocatedIn, ?subnetOrNic ]
+      - [ ?resource, LocatedIn, ?subnetOrNic ]
+    where:
+      - "node_type(?nsg) == Firewall  # Microsoft.Network/networkSecurityGroups"
+      - "node_type(?resource) == Compute  # VM, App Service, Container, etc."
+      - "?nsg has an effective inbound security rule where:
+           properties.access == Allow
+           AND properties.direction == Inbound
+           AND properties.sourceAddressPrefix in {Internet, *, 0.0.0.0/0, ::/0}
+           AND rule priority < effective deny rule priority for the same port/proto"
+      - "?subnetOrNic is of type Subnet or NetworkInterface (LocatedIn target)"
+    emit:
+      source_type: Network
+      target_type: Compute
+      source: ?nsg
+      target: ?resource
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): the NSG rule is open but the resource
+        must also have a public IP or be fronted by an internet-facing load balancer
+        for the port to be externally reachable. Set ACTIVE only when collector
+        confirms a public IP is associated with the NIC or the subnet's resources.
+      confidence: 0.85
+      derived_from:
+        - "<NSG effective inbound rule: source=Internet/0.0.0.0/0, action=Allow, port={port}>"
+        - "<LocatedIn edge: NSG → Subnet/NIC>"
+        - "<LocatedIn edge: Compute → Subnet/NIC>"
+      false_positive_note: >-
+        CRITICAL: evaluate EFFECTIVE rules only (use effectiveNetworkSecurityGroups/action
+        on the NIC), not raw rule lists. A higher-priority Deny rule for the same port
+        blocks the Allow. For NICs with both a subnet NSG and a NIC NSG, the traffic
+        must be allowed by the subnet NSG first (inbound direction) and then by the NIC
+        NSG; an Allow in one but a Deny in the other means the port is NOT effectively
+        open.
+        Do NOT emit if:
+          - A higher-priority deny rule exists for the same port/source combination.
+          - The resource has no public IP and is not fronted by an internet-facing LB
+            (in that case the rule is a VNet-internal allow, not internet exposure).
+          - Only the default rules (priorities 65000/65001/65500) are present — the
+            default DenyAllInBound at 65500 blocks all internet traffic.
+        The `Internet` service tag excludes VNet private ranges; `0.0.0.0/0` covers
+        all IPv4 but Azure does not route arbitrary internet traffic to private IPs.
+        Treat both as equivalent internet-source for exposure analysis.
+        Note: source CIDRs covering all public IPv4 via multiple rules (e.g., split /1
+        ranges) should also trigger this rule; document coverage via CIDR composition
+        at collector/evaluation time.
+      narrative: >-
+        NSG {nsg.name} has an effective inbound Allow rule permitting traffic from
+        the public internet (source=Internet/0.0.0.0/0) on port {port}. {resource.name}
+        located in the NSG's associated subnet/NIC is reachable from the internet on
+        that port if a public IP is also present.
+
+  # =========================================================================
+  # EXPOSURE: NSG open inbound rule + public IP → ExposedToInternet (FACT)
+  # =========================================================================
+
+  - id: azure-nsg-internet-exposed
+    emits: ExposedToInternet
+    description: >-
+      An NSG effective inbound Allow rule from Internet/0.0.0.0/0 on a service
+      port, combined with a public IP (or internet-facing LB) on an attached
+      resource, makes that resource internet-reachable: ExposedToInternet.
+    applies_to: [azure]
+    match:
+      - [ ?nsg, LocatedIn, ?subnetOrNic ]
+      - [ ?resource, LocatedIn, ?subnetOrNic ]
+    where:
+      - "node_type(?nsg) == Firewall"
+      - "node_type(?resource) == Compute  # VM, App Service, Container, etc."
+      - "?nsg has an effective inbound security rule where:
+           properties.access == Allow
+           AND properties.direction == Inbound
+           AND properties.sourceAddressPrefix in {Internet, *, 0.0.0.0/0, ::/0}
+           AND rule priority < effective deny rule priority for the same port/proto"
+      - "?resource has a public IP address (properties.publicIPAddress on NIC,
+         or is fronted by an internet-facing LB)"
+    emit:
+      source_type: Compute
+      target_type: AnonymousIdentity
+      source: ?resource
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when: (1) effective NSG inbound rule allows Internet/0.0.0.0/0 on
+        a port AND (2) the resource has a public IP or internet-facing LB confirmed
+        by collector data.
+        CONDITIONAL(network_reachability) if the public IP association cannot be
+        confirmed from collected data (rule is open but public IP not yet verified).
+      confidence: 0.90
+      derived_from:
+        - "<NSG effective inbound rule: source=Internet/0.0.0.0/0, action=Allow, port={port}>"
+        - "<public IP association on NIC or LB frontend>"
+        - "<LocatedIn edge: NSG → Subnet/NIC>"
+        - "<LocatedIn edge: Compute → Subnet/NIC>"
+      false_positive_note: >-
+        Requires both: (1) effective NSG inbound Allow from Internet on the port (not
+        raw rule list — use effectiveNetworkSecurityGroups/action) AND (2) a public IP
+        directly on the NIC or an internet-facing load balancer in front of the resource.
+        An open NSG rule without a public IP is NOT ExposedToInternet — it is a broader
+        VNet-internal allow (emit CanReachPort CONDITIONAL instead).
+        An upstream Azure Firewall or Application Gateway may further filter traffic not
+        captured by the NSG; model those separately but do not suppress ExposedToInternet
+        solely because an upstream appliance exists unless confirmed to block the port.
+        Subnet NSG + NIC NSG: both must effectively allow the traffic (intersection rule).
+        Do not emit for resources protected by no-public-IP subnets (private-only VNets).
+        Note: source CIDRs covering all public IPv4 via multiple rules (e.g., split /1
+        ranges) should also trigger this rule; document coverage via CIDR composition
+        at collector/evaluation time.
+      narrative: >-
+        {source.name} is reachable from the public internet on port {port}: NSG
+        {nsg.name} has an effective inbound Allow rule for source=Internet/0.0.0.0/0,
+        and the resource has a public IP. Any internet host can attempt to connect.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - A deny assignment covering securityRules/write or networkSecurityGroups/write
+#     at the NSG, RG, or subscription scope → emit the CanModifyConfiguration edge
+#     with state: BLOCKED and denied_by=<deny assignment id>.
+#   - Azure Policy enforcing "deny networkSecurityGroups/securityRules/write" or
+#     enforcing specific rule constraints → may also block the capability (model
+#     via ConditionalPolicy node + deny_assignment condition type).
+#   - A deny assignment blocking networkSecurityGroups/* → emit CanAdminister as BLOCKED.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/azure-nsg.yaml (CanModifyConfiguration from RBAC effective
+# permission evaluation, LocatedIn subnet/NIC association facts). The derived rules
+# above depend on those explicit edges being present. Do NOT duplicate them here.

@@ -1,0 +1,304 @@
+# AWS Lake Formation — Explicit normalization rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# These rules translate raw Lake Formation API responses and effective-permission
+# evaluations into EXPLICIT graph edges consumed by the derived rules in
+# /rules/derived/aws/lakeformation.yaml.
+#
+# Naming convention: aws-lf-<short-purpose>
+#
+# Permissions reference: https://docs.aws.amazon.com/lake-formation/latest/dg/
+#   (Service Authorization Reference for Lake Formation)
+#
+# KEY ARCHITECTURE NOTE — dual gate:
+#   Every Lake Formation data-plane access requires BOTH:
+#   (a) an IAM permission to call the analytics service (Athena, Glue, EMR, …)
+#   (b) a Lake Formation data-lake permission (SELECT, INSERT, etc.) on the catalog
+#       resource, confirmed via lakeformation:ListPermissions or GetDataLakeSettings
+#   Do NOT emit CanReadData here; that two-gate derivation lives in lakeformation.yaml
+#   (rule aws-lf-get-data-access-read). These explicit rules emit the raw facts that
+#   the derived rules consume.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 11-data-analytics-ml
+applies_to: [aws]
+
+rules:
+
+  # =========================================================================
+  # STRUCTURAL / CONFIG FACTS
+  # =========================================================================
+
+  # Registered S3 location -> associated IAM role
+  # lakeformation:ListResources returns ResourceInfoList[].RoleArn per location.
+  # We model the registered location as a DataLake node; the role is the IAM role
+  # Lake Formation uses when calling lakeformation:GetDataAccess for that location.
+  - id: aws-lf-registered-location-role
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::LakeFormation::DataLake"
+      field: "ResourceInfoList[].RoleArn"
+    emit:
+      source_type: DataLake
+      source: "<DataLake node for the registered S3 location (ResourceArn)>"
+      target: "<IAM Role node at RoleArn>"
+      api_source: "lakeformation:ListResources"
+      evidence_field: "ResourceInfoList[].RoleArn"
+      narrative: >-
+        The Lake Formation registered location {location.arn} is associated with
+        {role.name}; when analytics services (Athena / Glue / EMR) access this
+        location, Lake Formation vends temporary credentials for {role.name} via
+        lakeformation:GetDataAccess.
+
+  # LF administrator list (from GetDataLakeSettings)
+  # DataLakeSettings.DataLakeAdmins[].DataLakePrincipalIdentifier lists every
+  # principal that has bypassed-all-LF-checks admin status. Modeled as
+  # HasPermission(principal -> DataLake) so derived rule aws-lf-put-datalake-settings-admin
+  # can detect admin status and downstream rules can condition on it.
+  - id: aws-lf-admin-list
+    emits: HasPermission
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::LakeFormation::DataLake"
+      field: "DataLakeSettings.DataLakeAdmins"
+    emit:
+      target_type: "*"
+      source_type: Identity
+      source: "<principal ARN in DataLakeAdmins list>"
+      target: "<DataLake node>"
+      api_source: "lakeformation:GetDataLakeSettings"
+      evidence_field: "DataLakeSettings.DataLakeAdmins[].DataLakePrincipalIdentifier"
+      narrative: >-
+        {principal.name} is listed as a Lake Formation DataLakeAdmin; ALL Lake
+        Formation permission checks are bypassed for this principal account-wide.
+
+  # Existing LF permission grants (from ListPermissions)
+  # PrincipalResourcePermissions maps each (principal, resource) pair to the set of
+  # LF permissions granted. Models as HasPermission(principal -> table/database/location).
+  # The derived rules then check for SELECT, INSERT, DATA_LOCATION_ACCESS, etc.
+  - id: aws-lf-existing-grants
+    emits: HasPermission
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::LakeFormation::Permission"
+      field: "PrincipalResourcePermissions"
+    emit:
+      target_type: "*"
+      source_type: Identity
+      source: "<principal ARN from PrincipalResourcePermissions[].Principal.DataLakePrincipalIdentifier>"
+      target: "<DataWarehouse node (Glue table or database) or DataLake node (location)>"
+      api_source: "lakeformation:ListPermissions"
+      evidence_field: "PrincipalResourcePermissions[].Principal.DataLakePrincipalIdentifier + .Permissions[]"
+      note: >-
+        Emit one HasPermission edge per (principal, resource) pair. Record
+        Permissions[] (SELECT, INSERT, DESCRIBE, CREATE_TABLE, DATA_LOCATION_ACCESS, etc.)
+        and PermissionsWithGrantOption[] as properties on the edge for downstream
+        GRANT OPTION gate evaluation.
+      narrative: >-
+        {principal.name} holds Lake Formation permission(s) {permissions} on
+        {resource.name}, confirmed by lakeformation:ListPermissions
+        (GrantOption: {grant_option}).
+
+  # Cross-account opt-in records (from ListLakeFormationOptIns)
+  # When a RAM share for a catalog resource is accepted, LakeFormationOptIns records
+  # the cross-account access. Emit CrossAccountTrust so the graph reflects the trust.
+  - id: aws-lf-cross-account-opt-in
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::LakeFormation::OptIn"
+      field: "LakeFormationOptInsInfoList"
+    emit:
+      source_type: ResourcePolicy
+      source: "<LakeFormation OptIn record (ResourceArn + Principal)>"
+      target: "<foreign Account parsed from Principal ARN>"
+      api_source: "lakeformation:ListLakeFormationOptIns"
+      evidence_field: "LakeFormationOptInsInfoList[].Principal.DataLakePrincipalIdentifier"
+      note: >-
+        Parse the account ID from the Principal ARN. Only emit when the Principal
+        ARN belongs to a different account than the data lake being collected.
+      narrative: >-
+        A Lake Formation OptIn record grants cross-account catalog access to principal
+        {foreign_principal} in account {foreign_account}, enabling that account to query
+        governed tables once the RAM share is accepted and the principal holds analytics
+        service IAM permissions.
+
+  # =========================================================================
+  # EFFECTIVE-PERMISSION EDGES (IAM evaluation required)
+  # =========================================================================
+
+  # lakeformation:GrantPermissions / BatchGrantPermissions -> CanGrantPermission
+  # The IAM action that lets a caller grant LF data-lake permissions to other
+  # principals (including themselves). The LF-side gate (admin or GRANT OPTION) is
+  # checked by derived rule aws-lf-grant-permissions-self; this record asserts the
+  # IAM-layer capability.
+  - id: aws-lf-can-grant-permission
+    emits: CanGrantPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action:
+        - "lakeformation:GrantPermissions"
+        - "lakeformation:BatchGrantPermissions"
+      resource_type: "AWS::LakeFormation::DataLake"
+    emit:
+      target_type: Identity
+      source_type: Identity
+      source: "<principal>"
+      target: "<any IAM principal (incl. the source principal itself)>"
+      permissions:
+        - "lakeformation:GrantPermissions"
+        - "lakeformation:BatchGrantPermissions"
+      note: >-
+        This edge asserts the IAM-layer grant capability. The LF-layer gate (LF
+        admin or GRANT OPTION on the specific resource) is evaluated by derived rule
+        aws-lf-grant-permissions-self before emitting a fully resolved CanGrantPermission.
+        Emit state CONDITIONAL(resource_policy) when GRANT OPTION status is unconfirmed.
+      narrative: >-
+        {principal.name} has effective lakeformation:GrantPermissions and can grant
+        Lake Formation data-lake permissions to any principal (subject to LF admin or
+        GRANT OPTION gate per derived rule).
+
+  # lakeformation:PutDataLakeSettings -> effective permission for admin escalation
+  # Emitting HasPermission for this action gates derived rule aws-lf-put-datalake-settings-admin.
+  - id: aws-lf-put-datalake-settings-permission
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "lakeformation:PutDataLakeSettings"
+      resource_type: "AWS::LakeFormation::DataLake"
+    emit:
+      target_type: "*"
+      source_type: Identity
+      source: "<principal>"
+      target: "<DataLake node>"
+      permissions:
+        - "lakeformation:PutDataLakeSettings"
+      note: >-
+        lakeformation:PutDataLakeSettings is only resource-scopeable to '*'; confirm
+        the IAM policy does not scope it to a non-wildcard resource (which would be
+        a mis-configuration — the action always operates account-wide).
+      narrative: >-
+        {principal.name} has effective lakeformation:PutDataLakeSettings on the data
+        lake; derived rule aws-lf-put-datalake-settings-admin produces CanAdminister.
+
+  # lakeformation:RegisterResource -> CanCreate (on DataLake)
+  # A principal with RegisterResource can register new S3 locations and supply a role.
+  # Combined with iam:PassRole (below), this is the classic PassRole privesc path.
+  - id: aws-lf-register-resource-permission
+    emits: CanCreate
+    applies_to: [aws]
+    match_effective_permission:
+      action: "lakeformation:RegisterResource"
+      resource_type: "AWS::LakeFormation::DataLake"
+    emit:
+      target_type: "*"
+      source_type: Identity
+      source: "<principal>"
+      target: "<DataLake node>"
+      permissions:
+        - "lakeformation:RegisterResource"
+      narrative: >-
+        {principal.name} has effective lakeformation:RegisterResource and can register
+        new S3 locations with Lake Formation, optionally specifying an IAM role via
+        iam:PassRole. Derived rule aws-lf-register-resource-passrole resolves the
+        full CanPassIdentity path.
+
+  # lakeformation:UpdateResource -> CanModifyConfiguration (on DataLake)
+  # Swaps the IAM role for a registered location; all subsequent GetDataAccess
+  # calls for that location use the new role's credentials.
+  - id: aws-lf-update-resource-permission
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "lakeformation:UpdateResource"
+      resource_type: "AWS::LakeFormation::DataLake"
+    emit:
+      target_type: "*"
+      source_type: Identity
+      source: "<principal>"
+      target: "<DataLake node>"
+      permissions:
+        - "lakeformation:UpdateResource"
+      note: >-
+        Full capability (CanModifyConfiguration + CanPassIdentity) requires both
+        lakeformation:UpdateResource AND iam:PassRole to lakeformation.amazonaws.com.
+        Derived rule aws-lf-update-resource-config checks both; this record asserts
+        the UpdateResource IAM-layer half.
+      narrative: >-
+        {principal.name} has effective lakeformation:UpdateResource and can update the
+        IAM role associated with a registered S3 location (see derived rule
+        aws-lf-update-resource-config for the full CanModifyConfiguration edge).
+
+  # iam:PassRole to lakeformation.amazonaws.com -> CanPassIdentity
+  # This is the Gate action for both RegisterResource and UpdateResource. Emit
+  # CanPassIdentity(principal -> role) when the principal can pass a role that
+  # trusts lakeformation.amazonaws.com.
+  - id: aws-lf-pass-role-to-lakeformation
+    emits: CanPassIdentity
+    applies_to: [aws]
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "PassedToService condition (if any) includes lakeformation.amazonaws.com (or condition is absent)"
+      - "?role trust policy includes Principal: {Service: lakeformation.amazonaws.com}"
+      - "principal also has at least one of: lakeformation:RegisterResource or lakeformation:UpdateResource"
+    emit:
+      target_type: Role
+      source_type: Identity
+      source: "<principal>"
+      target: "<IAM Role node>"
+      permissions:
+        - "iam:PassRole"
+      conditions: [iam_permission, role_compatibility]
+      note: >-
+        Downgrade to POTENTIAL(role_compatibility) when the role trust policy does not
+        explicitly include lakeformation.amazonaws.com — LF cannot use the role and
+        registration/update will fail. Honor iam:PassedToService: a role passable only
+        to glue.amazonaws.com or ec2.amazonaws.com does NOT satisfy this gate.
+      narrative: >-
+        {principal.name} can pass {role.name} to lakeformation.amazonaws.com
+        (iam:PassRole); combined with lakeformation:RegisterResource or
+        lakeformation:UpdateResource, this enables the Lake Formation PassRole
+        privilege escalation path (derived rules aws-lf-register-resource-passrole
+        and aws-lf-update-resource-config).
+
+  # lakeformation:ListPermissions -> CanRead (recon on data lake)
+  # Lower-value but important for enumeration; reveals all grant records.
+  - id: aws-lf-list-permissions-recon
+    emits: CanRead
+    applies_to: [aws]
+    match_effective_permission:
+      action: "lakeformation:ListPermissions"
+      resource_type: "AWS::LakeFormation::DataLake"
+    emit:
+      target_type: "*"
+      source_type: Identity
+      source: "<principal>"
+      target: "<DataLake node>"
+      permissions:
+        - "lakeformation:ListPermissions"
+      narrative: >-
+        {principal.name} has effective lakeformation:ListPermissions and can enumerate
+        all Lake Formation permission grants (principal ARNs, resources, permission types,
+        GRANT OPTION flags) — high-value recon for mapping who has data access.
+
+  # lakeformation:GetDataLakeSettings -> CanRead (admin list recon)
+  - id: aws-lf-get-datalake-settings-recon
+    emits: CanRead
+    applies_to: [aws]
+    match_effective_permission:
+      action: "lakeformation:GetDataLakeSettings"
+      resource_type: "AWS::LakeFormation::DataLake"
+    emit:
+      target_type: "*"
+      source_type: Identity
+      source: "<principal>"
+      target: "<DataLake node>"
+      permissions:
+        - "lakeformation:GetDataLakeSettings"
+      narrative: >-
+        {principal.name} has effective lakeformation:GetDataLakeSettings and can read
+        the Lake Formation admin list (DataLakeAdmins) and account-wide configuration —
+        useful for identifying privilege escalation targets.

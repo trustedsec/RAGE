@@ -1,0 +1,686 @@
+# AWS EC2 Image Builder — Derived attack-path rules (Phase 9 — CI/CD)
+# ---------------------------------------------------------------------------
+# Image Builder is a managed AMI/container-image factory that runs build and
+# test COMPONENTS (shell/PowerShell YAML documents) on ephemeral EC2 build
+# instances. Those instances carry an instance profile (IAM role). Whoever
+# controls what runs on the build instance controls what executes as that role.
+#
+# PHASE-9 PATTERN — the builder IS a CI/CD runner:
+#   Component doc  = buildspec
+#   Image recipe   = pipeline definition
+#   Image pipeline = the runner (BuildWorker)
+#   Instance profile = the runner's service identity (ExecutesAs)
+#
+# LINCHPIN DELEGATION — emit SERVICE FACTS; do NOT re-derive roll-ups:
+#   * cicd-chains.yaml (cicd-modify-buildspec-executes-as) — already collapses
+#     CanModifyCode(?runner) + ExecutesAs(?runner, ?identity) -> CanExecuteAs.
+#     Rules 1 and 2 here are the Image-Builder-specific framings of that
+#     collapse; they dedupe on (CanExecuteAs, ?principal, ?identity).
+#   * can-execute-as.yaml (execute-as-via-config-identity-swap) — collapses
+#     CanModifyConfiguration + CanPassIdentity -> CanExecuteAs (rule 3).
+#   * can-execute-as.yaml (execute-as-via-new-workload) — new pipeline with a
+#     passable role (rule 4, emits CanCreateWorkloadAs).
+#   * can-control.yaml (escalate-via-execute-as) — CanExecuteAs ->
+#     CanEscalateTo when identity is more privileged. NEVER re-derived here.
+#   * cicd-chains.yaml (cicd-trigger-runner-executes-as) — trigger-only path;
+#     rule 5 here is the Image-Builder framing (dedupes on same triple).
+#   * container-chains.yaml — container-recipe output is pushed to ECR;
+#     container-chains propagates CanModifyCode from that registry to all
+#     downstream consumers. Rule 6 emits the CanModifyCode(principal -> ECR)
+#     fact that container-chains consumes.
+#
+# STATE PROPAGATION (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. The Image-Builder-specific gates:
+#   * MODIFY path (rules 1-2): ACTIVE when the principal controls a definition
+#     the pipeline will execute AND a run path exists (trigger/schedule). If
+#     either gate is unmet, CONDITIONAL(run_path).
+#   * TRIGGER-only path (rule 5): CONDITIONAL(attacker_influenced_definition)
+#     unless the current definition already runs attacker-controllable code.
+#   * CONFIG-IDENTITY-SWAP (rule 3): ACTIVE when both CanModifyConfiguration
+#     AND CanPassIdentity contribute; CONDITIONAL(role_compatibility) when the
+#     role's trust policy allowing ec2.amazonaws.com is unknown.
+#
+# Permissions are the EFFECTIVE actions the permission evaluator must confirm.
+# Official docs:
+#   https://docs.aws.amazon.com/imagebuilder/latest/userguide/
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsec2imagebuilder.html
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-pipelines
+applies_to: [aws]
+
+rules:
+
+  # --- 1) Modify component + update pipeline + trigger => execute as build role
+  # THE headline Image Builder escalation path. A component is the "buildspec":
+  # a YAML document whose steps execute as shell/PowerShell on the build instance.
+  # Because components are versioned and immutable per version, the attacker must
+  # create a NEW component version and then update the recipe or pipeline to
+  # reference it. With StartImagePipelineExecution the build runs and the malicious
+  # steps execute as the instance-profile role (the pipeline's ExecutesAs identity).
+  #
+  # This is the CI/CD-specific framing of can-execute-as execute-as-via-code-modify
+  # and cicd-chains cicd-modify-buildspec-executes-as, specialized for Image Builder
+  # semantics (component versioning + recipe reference update). It dedupes with those
+  # linchpin rules on (CanExecuteAs, ?principal, ?identity).
+  - id: aws-imagebuilder-modify-component-executes-as
+    emits: CanExecuteAs
+    description: "Create a new malicious component version, update the pipeline to reference it, and trigger a build to execute shell commands as the build instance's IAM role."
+    match:
+      - [ ?principal, CanModifyCode,  ?pipeline ]
+      - [ ?pipeline,  ExecutesAs,     ?role ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "?pipeline.provider_type == 'AWS::ImageBuilder::ImagePipeline'"
+      # CanModifyCode here is normalized from effective permissions:
+      # imagebuilder:CreateComponent (new component version) +
+      # imagebuilder:UpdateImagePipeline (or CreateImageRecipe to reference it) +
+      # the pipeline schedule/trigger path exists OR principal has StartImagePipelineExecution.
+      # The explicit normalization rule aws-imagebuilder-can-modify-code (below) gates
+      # all three prerequisite actions before emitting CanModifyCode on the pipeline.
+    optional:
+      - [ ?principal, CanTrigger, ?pipeline ]
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions:
+        - "imagebuilder:CreateComponent"
+        - "imagebuilder:CreateContainerRecipe"
+        - "imagebuilder:UpdateImagePipeline"
+        - "imagebuilder:StartImagePipelineExecution?"
+      conditions: [run_path]
+      state_logic: >-
+        ACTIVE if a run path is established — the attacker can also trigger the pipeline
+        (matched(optional[0]): has imagebuilder:StartImagePipelineExecution) OR the pipeline
+        has a schedule that will fire after the recipe/component update (schedule present and
+        not disabled). Otherwise CONDITIONAL(run_path): the malicious component is planted but
+        the build will not run until a trigger or schedule fires.
+        Inherit weakest from CanModifyCode (which is itself CONDITIONAL(run_path) if no
+        trigger exists) and ExecutesAs (always ACTIVE for a running pipeline).
+        A branch-protection analog — e.g. an approval workflow gating pipeline execution —
+        caps the CanModifyCode to CONDITIONAL/BLOCKED and this edge inherits it.
+        BLOCKED when an SCP or permission boundary denies imagebuilder:CreateComponent,
+        imagebuilder:CreateContainerRecipe, imagebuilder:UpdateImagePipeline, or
+        imagebuilder:StartImagePipelineExecution on the effective scope.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal CanModifyCode ?pipeline (imagebuilder:CreateComponent/CreateContainerRecipe + UpdateImagePipeline)"
+        - "?pipeline ExecutesAs ?role (instanceProfileName -> IAM role)"
+        - "?principal CanTrigger ?pipeline? (imagebuilder:StartImagePipelineExecution)"
+        - "cicd-chains cicd-modify-buildspec-executes-as (cited, deduped)"
+        - "can-execute-as execute-as-via-code-modify (cited, deduped)"
+      false_positive_note: >-
+        Components are immutable per version: CreateComponent alone does NOT modify existing
+        builds — the attacker must ALSO update the recipe or pipeline to reference the new
+        component version AND trigger a build. For container recipes, CreateContainerRecipe
+        similarly requires UpdateImagePipeline to point the pipeline to the new recipe version.
+        Do not emit ACTIVE when the run path is absent (no schedule, no StartImagePipelineExecution
+        permission). A pipeline that references only AWS-managed components (owner 'Amazon') cannot
+        have its component mutated — only the UpdateImagePipeline path applies to swap in an
+        attacker-authored recipe. Verify that the CanModifyCode gate confirms BOTH
+        (CreateComponent OR CreateContainerRecipe) AND UpdateImagePipeline (or an equivalent recipe
+        swap) before emitting.
+      narrative: >-
+        {principal.name} can create a new Image Builder component version with malicious
+        shell steps (imagebuilder:CreateComponent), update {pipeline.name} to reference it
+        (imagebuilder:UpdateImagePipeline), and trigger a build
+        (imagebuilder:StartImagePipelineExecution or schedule). The build instance runs as
+        {role.name} via the SSM agent; the malicious steps execute as {role.name} and expose
+        its credentials to the attacker.
+
+  # --- 2) Update pipeline to reference attacker-authored recipe => execute as build role
+  # A simpler two-step: if the attacker already controls a recipe (including one with a
+  # malicious component they authored or one that references an S3-overwritable component
+  # URI), they can update the pipeline to reference it — no separate CreateComponent step
+  # required. This is UpdateImagePipeline as a pipeline-definition swap, the analog of
+  # changing which buildspec a CI runner uses.
+  - id: aws-imagebuilder-update-pipeline-executes-as
+    emits: CanExecuteAs
+    description: "Update an image pipeline to reference an attacker-controlled recipe (which may include malicious components or an S3-overwritable component URI), then trigger a build to execute as the build instance role."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?pipeline ]
+      - [ ?pipeline,  ExecutesAs,             ?role ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "?pipeline.provider_type == 'AWS::ImageBuilder::ImagePipeline'"
+    optional:
+      - [ ?principal, CanCreate, ?recipe ]
+      - [ ?principal, CanModifyCode, ?recipe ]
+      - [ ?principal, CanTrigger, ?pipeline ]
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions:
+        - "imagebuilder:UpdateImagePipeline"
+        - "imagebuilder:CreateImageRecipe"
+        - "imagebuilder:StartImagePipelineExecution?"
+      conditions: [run_path, attacker_controlled_recipe]
+      state_logic: >-
+        ACTIVE if the principal can point the pipeline to an attacker-controlled recipe
+        (matched optional[0] or optional[1]: has CanCreate or CanModifyCode on a recipe)
+        AND a run path exists (matched optional[2]: has CanTrigger or pipeline has schedule).
+        CONDITIONAL(attacker_controlled_recipe) when the attacker can update the pipeline but
+        at least one optional recipe-control clause is not matched — emit CONDITIONAL until
+        recipe control is confirmed. CONDITIONAL(run_path) when recipe is controllable but
+        optional[2] not matched and no schedule is known. Inherit weakest from
+        CanModifyConfiguration and ExecutesAs. BLOCKED when an SCP or permission boundary
+        denies imagebuilder:UpdateImagePipeline.
+      confidence: "min(contributing_confidences) * 0.88"
+      derived_from:
+        - "?principal CanModifyConfiguration ?pipeline (imagebuilder:UpdateImagePipeline)"
+        - "?pipeline ExecutesAs ?role (instanceProfileName -> IAM role)"
+        - "?principal CanCreate/CanModifyCode ?recipe (recipe control via optional[0] or [1])"
+        - "?principal CanTrigger ?pipeline? (imagebuilder:StartImagePipelineExecution, optional[2])"
+        - "cicd-chains cicd-modify-buildspec-executes-as (cited, deduped)"
+      false_positive_note: >-
+        UpdateImagePipeline alone only swaps the recipe/infra config reference — the attacker
+        must control the content of the recipe being pointed to. One of the optional clauses
+        (CanCreate or CanModifyCode on a recipe) must match to confirm recipe control;
+        if no optional clause matches, emit CONDITIONAL(attacker_controlled_recipe).
+        A pipeline that requires a human approval before execution keeps this CONDITIONAL(run_path).
+        Dedupes with rule 1 on (CanExecuteAs, ?principal, ?role) when both modification paths
+        apply — emit once.
+      narrative: >-
+        {principal.name} can update {pipeline.name} to reference an attacker-controlled image
+        recipe (imagebuilder:UpdateImagePipeline + imagebuilder:CreateImageRecipe), then trigger
+        a build (imagebuilder:StartImagePipelineExecution or schedule). The build instance runs
+        as {role.name} and executes the attacker-authored component steps as that role.
+
+  # --- 3) Swap instance profile => execute as a different (higher-privilege) role
+  # imagebuilder:UpdateInfrastructureConfiguration lets the attacker replace the
+  # instanceProfileName — the IAM role the build instance uses. With iam:PassRole on
+  # a privileged role that trusts ec2.amazonaws.com, the attacker reassigns the build
+  # runner to a different identity. This is the config-identity-swap pattern from
+  # can-execute-as execute-as-via-config-identity-swap.
+  - id: aws-imagebuilder-swap-instance-profile-executes-as
+    emits: CanExecuteAs
+    description: "Replace the infrastructure configuration's instance profile with a higher-privilege IAM role (UpdateInfrastructureConfiguration + iam:PassRole), then trigger a build to execute as that role."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?infra_config ]
+      - [ ?principal, CanPassIdentity,        ?role ]
+      - [ ?pipeline,  CanModifyConfiguration, ?infra_config ]
+    where:
+      - "node_type(?infra_config) == BuildWorker"
+      - "?infra_config.provider_type == 'AWS::ImageBuilder::InfrastructureConfiguration'"
+      # CanModifyConfiguration is from effective imagebuilder:UpdateInfrastructureConfiguration.
+      # CanPassIdentity is from effective iam:PassRole on ?role.
+      - "?role trust policy allows ec2.amazonaws.com (or trust is unknown)"
+    optional:
+      - [ ?principal, CanTrigger, ?pipeline ]
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions:
+        - "imagebuilder:UpdateInfrastructureConfiguration"
+        - "iam:PassRole"
+        - "imagebuilder:StartImagePipelineExecution?"
+      conditions: [role_compatibility, run_path]
+      state_logic: >-
+        ACTIVE when (a) the role trust policy permits ec2.amazonaws.com (iam:PassedToService
+        for ec2.amazonaws.com or no PassedToService condition, and trust allows it),
+        AND (b) a run path exists (attacker can trigger the pipeline or a schedule fires).
+        CONDITIONAL(role_compatibility) when the role trust policy does not explicitly allow
+        ec2.amazonaws.com or is unknown — the attach may fail at build time.
+        CONDITIONAL(run_path) when role_compatibility is satisfied but no trigger/schedule exists.
+        POTENTIAL when both conditions are unresolved.
+        BLOCKED when an SCP or permission boundary denies imagebuilder:UpdateInfrastructureConfiguration
+        or iam:PassRole on the role's ARN.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal CanModifyConfiguration ?infra_config (imagebuilder:UpdateInfrastructureConfiguration)"
+        - "?principal CanPassIdentity ?role (iam:PassRole)"
+        - "?principal CanTrigger ?pipeline? (imagebuilder:StartImagePipelineExecution)"
+        - "can-execute-as execute-as-via-config-identity-swap (cited, deduped)"
+      false_positive_note: >-
+        The swapped role MUST trust ec2.amazonaws.com for the instance profile assignment to
+        succeed — Image Builder launches an EC2 instance and the IAM service validates the
+        role's trust policy. A role trusting only lambda.amazonaws.com or ecs-tasks.amazonaws.com
+        cannot be used here -> POTENTIAL(role_compatibility) until trust is confirmed.
+        iam:PassedToService is not enforced by imagebuilder natively, but the role's trust
+        policy IS checked by IAM when EC2 calls AssumeRole for the instance profile. Also
+        confirm the attacker can reach a pipeline that uses this infra config (pipeline ref
+        check in where clause). Dedupes with can-execute-as execute-as-via-config-identity-swap
+        on (CanExecuteAs, ?principal, ?role) — emit once.
+      narrative: >-
+        {principal.name} can replace the instance profile in {infra_config.name}
+        (imagebuilder:UpdateInfrastructureConfiguration) with {role.name}
+        (iam:PassRole), then trigger a build on any pipeline using that infra config.
+        The build instance runs as {role.name}, exposing its credentials to attacker-injected
+        component steps.
+
+  # --- 4) Create a new pipeline with a passable role => CanCreateWorkloadAs
+  # A principal with imagebuilder:CreateImagePipeline + iam:PassRole on a target role
+  # (that trusts ec2.amazonaws.com) can create a new pipeline wired to a
+  # new infrastructure configuration using that role, then trigger it. This is the
+  # "create workload + attach identity" primitive from can-execute-as execute-as-via-new-workload.
+  # Emitting CanCreateWorkloadAs lets can-execute-as.yaml roll it up to CanExecuteAs.
+  - id: aws-imagebuilder-create-pipeline-with-role
+    emits: CanCreateWorkloadAs
+    description: "Create a new image pipeline with an infrastructure configuration that uses a passable IAM role as its instance profile, then trigger a build to execute as that role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has effective imagebuilder:CreateInfrastructureConfiguration (resource scope covers new configs)"
+      - "?principal has effective imagebuilder:CreateImagePipeline (resource scope covers new pipelines)"
+      - "?principal has effective imagebuilder:CreateComponent OR imagebuilder:CreateImageRecipe (to supply a definition)"
+      - "?principal has effective imagebuilder:StartImagePipelineExecution (to trigger the new pipeline)"
+      - "?role trust policy allows ec2.amazonaws.com (or trust is unknown)"
+      - "iam:PassedToService condition (if any) does not restrict to a service that excludes ec2.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions:
+        - "imagebuilder:CreateInfrastructureConfiguration"
+        - "imagebuilder:CreateImagePipeline"
+        - "imagebuilder:CreateComponent"
+        - "imagebuilder:CreateImageRecipe"
+        - "imagebuilder:StartImagePipelineExecution"
+        - "iam:PassRole"
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when all creation actions are available as effective permissions AND
+        ?role trusts ec2.amazonaws.com (role_compatibility satisfied).
+        CONDITIONAL(role_compatibility) when the role trust policy or PassedToService
+        condition does not clearly admit ec2.amazonaws.com — the pipeline creation
+        may succeed but the instance launch will fail at the IAM assume step.
+        POTENTIAL when the creation permissions or role compatibility are uncertain.
+        BLOCKED when an SCP or boundary denies any of the creation actions or iam:PassRole.
+        can-execute-as execute-as-via-new-workload rolls this up to CanExecuteAs(role) — cited, not re-derived here.
+      confidence: "min(contributing_confidences) * 0.88"
+      derived_from:
+        - "?principal CanPassIdentity ?role (iam:PassRole)"
+        - "effective_permission(?principal, imagebuilder:CreateInfrastructureConfiguration)"
+        - "effective_permission(?principal, imagebuilder:CreateImagePipeline)"
+        - "effective_permission(?principal, imagebuilder:StartImagePipelineExecution)"
+        - "can-execute-as execute-as-via-new-workload (cited)"
+      false_positive_note: >-
+        All five creation actions must be available; missing any of them means the pipeline
+        cannot be stood up. Verify resource scope — a principal whose CreateImagePipeline is
+        scoped to a specific ARN prefix that would not match the newly created pipeline ARN
+        must be treated as POTENTIAL. The role_compatibility check on ec2.amazonaws.com trust
+        is critical; without it the instance profile assignment fails at launch time. Do not
+        emit ACTIVE when the role trust is unknown — use CONDITIONAL(role_compatibility).
+      narrative: >-
+        {principal.name} can create a new Image Builder pipeline with an infrastructure
+        configuration that assigns {role.name} as the instance profile
+        (imagebuilder:CreateInfrastructureConfiguration + iam:PassRole), then trigger a build
+        (imagebuilder:StartImagePipelineExecution) to execute attacker-authored component steps
+        as {role.name}.
+
+  # --- 5) Trigger the pipeline => CONDITIONAL execute as build role (weaker path)
+  # Merely triggering a pipeline yields the build instance's identity ONLY if the
+  # pipeline's current definition already executes attacker-influenced code — e.g.,
+  # a component that references an S3 URI the attacker has already overwritten, or a
+  # recipe that already contains a malicious component version the attacker authored.
+  # Kept CONDITIONAL by default: triggering a clean, pinned definition is not RCE.
+  # This is the cicd-chains cicd-trigger-runner-executes-as framing for Image Builder.
+  - id: aws-imagebuilder-trigger-executes-as
+    emits: CanExecuteAs
+    description: "Trigger an Image Builder pipeline whose current definition already executes attacker-influenced code (e.g., an S3-overwritable component URI or an already-tampered component version), executing as the build instance role."
+    match:
+      - [ ?principal, CanTrigger, ?pipeline ]
+      - [ ?pipeline,  ExecutesAs, ?role ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "?pipeline.provider_type == 'AWS::ImageBuilder::ImagePipeline'"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions:
+        - "imagebuilder:StartImagePipelineExecution"
+      conditions: [attacker_influenced_definition]
+      state_logic: >-
+        CONDITIONAL(attacker_influenced_definition) by default. ACTIVE only when the current
+        pipeline definition already runs attacker-controllable code — specifically when a
+        component in the recipe references an S3 URI that the attacker can overwrite (confirmed
+        via ContainsResourceReference(component -> S3 bucket) + CanWrite(principal -> S3 bucket/key)),
+        or when an attacker-authored component version is already the active version referenced
+        by the recipe. Triggering a clean, customer-reviewed, pinned definition (no S3 URI
+        components, no attacker-authored versions) is NOT an active execute-as — keep CONDITIONAL.
+        Dedupes with rules 1-2 on (CanExecuteAs, ?principal, ?role) when the principal can also
+        modify the definition — rule 1/2's ACTIVE dominates. Inherit weakest from CanTrigger
+        and ExecutesAs. BLOCKED when an SCP denies imagebuilder:StartImagePipelineExecution.
+      confidence: "min(contributing_confidences) * 0.70"
+      derived_from:
+        - "?principal CanTrigger ?pipeline (imagebuilder:StartImagePipelineExecution)"
+        - "?pipeline ExecutesAs ?role (instanceProfileName -> IAM role)"
+        - "cicd-chains cicd-trigger-runner-executes-as (cited, deduped)"
+      false_positive_note: >-
+        Strictly weaker than rules 1-2 (0.70 prior): a trigger is not code control.
+        Do NOT emit ACTIVE merely because the principal can call StartImagePipelineExecution —
+        the current definition must already run attacker-influenced code. The classic ACTIVE
+        case is a component with a mutable S3 URI the attacker has already overwritten.
+        A locked-down definition (all components inline, no S3 URI, all AWS-managed) keeps
+        this CONDITIONAL and is NOT an active escalation. When rules 1-2 also apply, they
+        subsume this edge at ACTIVE — do not double-count weight.
+      narrative: >-
+        {principal.name} can trigger {pipeline.name} (imagebuilder:StartImagePipelineExecution),
+        which runs as {role.name}. If the pipeline's current definition already executes
+        attacker-influenced code (e.g., a component document at an S3 URI the attacker controls
+        or an already-tampered component version), the build executes that code as {role.name}.
+
+  # --- 6) S3-backed component URI — CanModifyCode via S3 write
+  # If a component document uses the `uri` field (referencing s3://bucket/key) instead
+  # of inline `data`, whoever can overwrite that S3 object controls what the component
+  # executes on the next build. This is a CanModifyCode path that bypasses all
+  # imagebuilder:* permissions — it only requires s3:PutObject on the S3 path.
+  # The emit is CanModifyCode(principal -> pipeline) to feed rules 1 and 5.
+  - id: aws-imagebuilder-s3-component-uri-can-modify-code
+    emits: CanModifyCode
+    description: "Overwrite a component's S3-backed document (s3:PutObject on the component URI bucket/key) to inject malicious steps that execute on the next build as the build instance role."
+    match:
+      - [ ?component, ContainsResourceReference, ?s3_object ]
+      - [ ?principal, CanWrite,                  ?s3_object ]
+      - [ ?recipe,    ContainsResourceReference, ?component ]
+      - [ ?pipeline,  ContainsResourceReference, ?recipe ]
+    where:
+      - "node_type(?component) == BuildWorker"
+      - "?component.provider_type == 'AWS::ImageBuilder::Component'"
+      - "?component.uri != null  # component uses S3-backed document, not inline data"
+      - "node_type(?s3_object) == ObjectStorage"
+      - "node_type(?recipe) == BuildWorker"
+      - "?recipe.provider_type in ['AWS::ImageBuilder::ImageRecipe', 'AWS::ImageBuilder::ContainerRecipe']"
+      - "node_type(?pipeline) == BuildWorker"
+      - "?pipeline.provider_type == 'AWS::ImageBuilder::ImagePipeline'"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: ?pipeline
+      permissions:
+        - "s3:PutObject"
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the principal has effective s3:PutObject on the exact S3 bucket/key
+        referenced in the component's uri field, and the component is referenced by an active
+        pipeline (the modification will be executed on the next build).
+        CONDITIONAL(resource_policy) when S3 write is granted only via a bucket policy that
+        may not remain in place. POTENTIAL when the component is present but it is unclear
+        whether any active pipeline references it (pipeline reference unresolved).
+        BLOCKED when an SCP or permission boundary denies s3:PutObject on the bucket.
+      confidence: "min(contributing_confidences) * 0.87"
+      derived_from:
+        - "?component ContainsResourceReference ?s3_object (component.uri -> S3 bucket/key)"
+        - "?principal CanWrite ?s3_object (s3:PutObject effective permission)"
+      false_positive_note: >-
+        Only applies when the component uses the `uri` field — an inline `data` component
+        cannot be overwritten via S3 (the document is stored in Image Builder's backing store,
+        not in the caller-accessible S3 path). Verify the S3 bucket and key match exactly the
+        component's `uri` value; a s3:PutObject on an unrelated bucket is not this path.
+        The component must be active in a referenced recipe in a running pipeline; a deprecated
+        or orphaned component is POTENTIAL. Do not conflate S3-backed component access with
+        imagebuilder:CreateComponent access — these are independent paths.
+      narrative: >-
+        {principal.name} can overwrite the S3 object at {s3_object.name} (s3:PutObject) that
+        backs the Image Builder component document for {component.name}. On the next build of
+        {pipeline.name}, the SSM agent will download and execute the attacker-modified document
+        as the build instance role {role.name}, without any imagebuilder:* API call by the attacker.
+
+  # --- 7) Container recipe output — CanModifyCode into target ECR repository
+  # When an image pipeline uses a container recipe, the output is an OCI image pushed
+  # to the ECR repository named in the recipe's `targetRepository`. The pipeline's build
+  # process is equivalent to ECR:PutImage (it pushes a new tag on each build). A
+  # principal who can modify the container recipe or the pipeline that uses it and trigger
+  # a build effectively controls what image is pushed to that ECR repository — equivalent
+  # to CanModifyCode on the ContainerRegistry. container-chains then fans out to all
+  # consumers of that ECR tag.
+  - id: aws-imagebuilder-container-recipe-poisons-ecr
+    emits: CanModifyCode
+    description: "Modify an Image Builder container recipe (or the pipeline referencing it) and trigger a build to push a poisoned container image to the target ECR repository, feeding the container-chains supply-chain fan-out to all downstream consumers."
+    match:
+      - [ ?principal, CanModifyCode, ?pipeline ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "?pipeline.provider_type == 'AWS::ImageBuilder::ImagePipeline'"
+      - "?pipeline.containerRecipeArn != null  # pipeline uses a container recipe, not an AMI recipe"
+      - "?ecr_repository is the targetRepository of the container recipe used by ?pipeline"
+      - "node_type(?ecr_repository) == ContainerRegistry"
+    emit:
+      source_type: Identity
+      target_type: ContainerRegistry
+      source: ?principal
+      target: ?ecr_repository
+      permissions:
+        - "imagebuilder:CreateComponent"
+        - "imagebuilder:CreateContainerRecipe"
+        - "imagebuilder:UpdateImagePipeline"
+        - "imagebuilder:StartImagePipelineExecution?"
+      conditions: [run_path]
+      state_logic: >-
+        Inherit state from the contributing CanModifyCode(principal -> pipeline): ACTIVE if that
+        edge is ACTIVE (run path exists + definition is modifiable); CONDITIONAL(run_path) if the
+        modification is planted but no run path fires the build; BLOCKED if the pipeline
+        CanModifyCode is BLOCKED. container-chains image-push-poisons-consumers (cited, not
+        re-derived) then propagates this CanModifyCode to each downstream consumer of the
+        ECR tag, and poisoned-image-executes-as (cited) produces CanExecuteAs the consumer's
+        identity. This rule only emits the ECR CanModifyCode fact that container-chains needs.
+      confidence: "min(contributing_confidences) * 0.92"
+      derived_from:
+        - "?principal CanModifyCode ?pipeline (imagebuilder rules 1-2, including container-recipe path)"
+        - "?pipeline ContainerRecipe.targetRepository -> ?ecr_repository"
+        - "container-chains image-push-poisons-consumers (cited — propagates to consumers)"
+        - "container-chains poisoned-image-executes-as (cited — produces CanExecuteAs consumer identity)"
+      false_positive_note: >-
+        Only emit when the pipeline uses a CONTAINER recipe (containerRecipeArn set), not
+        an AMI recipe. The build pushes to the targetRepository tag specified in the container
+        recipe; if the tag is immutable in the ECR repository, the push will fail — downgrade
+        the CanModifyCode to CONDITIONAL(image_tag_mutability). Verify the targetRepository ARN
+        resolves to a real ContainerRegistry node. container-chains handles the fan-out; do not
+        re-derive which downstream workloads are affected here. The CanModifyCode edge should come
+        from either aws-imagebuilder-modify-component-executes-as (rule 1, for component paths),
+        aws-imagebuilder-update-pipeline-executes-as (rule 2, for recipe swap paths), or
+        aws-imagebuilder-can-modify-code-container (explicit rule for CreateContainerRecipe path).
+      narrative: >-
+        {principal.name} can modify the container recipe of {pipeline.name} and trigger a build,
+        causing Image Builder to push a poisoned OCI image to {ecr_repository.name}. Every
+        workload (ECS task, EKS pod, Lambda container) that re-pulls the affected tag executes
+        attacker-controlled layers (container-chains image-push-poisons-consumers fans out;
+        poisoned-image-executes-as produces the CanExecuteAs each workload's identity).
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP or permission boundary denying imagebuilder:CreateComponent,
+#     imagebuilder:UpdateImagePipeline, or imagebuilder:StartImagePipelineExecution
+#     -> the contributing CanModifyCode or CanTrigger is BLOCKED; rules 1/2/5
+#     inherit BLOCKED state.
+#   - SCP denying imagebuilder:UpdateInfrastructureConfiguration -> rule 3
+#     CanModifyConfiguration is BLOCKED; the identity-swap path is BLOCKED.
+#   - SCP denying iam:PassRole at the effective scope -> CanPassIdentity BLOCKED;
+#     rules 3/4 are BLOCKED.
+#   - S3 bucket policy + SCP denying s3:PutObject on component URI bucket ->
+#     rule 6 CanWrite is BLOCKED; S3-component-URI path is BLOCKED.
+#   - ECR repository imageTagMutability == IMMUTABLE on the targetRepository ->
+#     rule 7 CanModifyCode is BLOCKED (or CONDITIONAL if the attacker also holds
+#     ecr:PutImageTagMutability — see aws-ecr-mutability-unblock in ecr.yaml).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# LINCHPIN CITATIONS (do NOT re-derive these here):
+#   cicd-chains.yaml:
+#     cicd-modify-buildspec-executes-as: CanModifyCode(?runner) + ExecutesAs ->
+#       CanExecuteAs. Rules 1-2 here are Image-Builder-specific framings; they
+#       dedupe on (CanExecuteAs, ?principal, ?role).
+#     cicd-trigger-runner-executes-as: CanTrigger(?runner) + ExecutesAs ->
+#       CanExecuteAs CONDITIONAL(attacker_influenced_definition). Rule 5 here
+#       is the IB framing; dedupes on same triple.
+#   can-execute-as.yaml:
+#     execute-as-via-code-modify: CanModifyCode + ExecutesAs -> CanExecuteAs.
+#       Rules 1-2 also dedupe against this.
+#     execute-as-via-config-identity-swap: CanModifyConfiguration +
+#       CanPassIdentity -> CanExecuteAs. Rule 3 dedupes against this.
+#     execute-as-via-new-workload: CanCreateWorkloadAs -> CanExecuteAs.
+#       Rule 4 emits CanCreateWorkloadAs; this linchpin produces CanExecuteAs.
+#   can-control.yaml:
+#     escalate-via-execute-as: CanExecuteAs -> CanEscalateTo (when target is
+#       more privileged than source). NEVER re-derived here.
+#   container-chains.yaml:
+#     image-push-poisons-consumers: CanModifyCode(principal -> ContainerRegistry)
+#       -> CanModifyCode(principal -> each consumer pulling that tag).
+#     poisoned-image-executes-as: CanModifyCode(principal -> consumer) +
+#       ExecutesAs(consumer -> identity) -> CanExecuteAs(principal -> identity).
+#   aws/identity-escalation.yaml:
+#     aws-pass-role: iam:PassRole effective permission -> CanPassIdentity.
+#       Rules 3/4 consume CanPassIdentity emitted by this linchpin.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION RECORDS
+# (analogous to /rules/explicit/aws-imagebuilder.yaml — inlined here per lambda.yaml
+# pattern; a separate explicit file is optional when the rules are straightforward)
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: aws-imagebuilder-executes-as
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::ImageBuilder::InfrastructureConfiguration"
+      field: "instanceProfileName"
+    emit:
+      source_type: BuildWorker
+      source: "<image pipeline node that references this InfrastructureConfiguration>"
+      target: "<IAM role from iam:GetInstanceProfile(instanceProfileName)>"
+      api_source: "imagebuilder:GetInfrastructureConfiguration + iam:GetInstanceProfile"
+      evidence_field: "InfrastructureConfiguration.instanceProfileName -> InstanceProfile.Roles[0].Arn"
+      narrative: "{pipeline.name} runs its build instance as {role.name} (via instance profile {instanceProfileName})."
+
+  - id: aws-imagebuilder-can-modify-code
+    emits: CanModifyCode
+    applies_to: [aws]
+    match_effective_permission:
+      action: "imagebuilder:CreateComponent"
+      resource_type: "AWS::ImageBuilder::Component"
+    where:
+      - "principal ALSO has effective imagebuilder:UpdateImagePipeline on at least one pipeline that can reference the new component version"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<image pipeline node>"
+      api_source: "iam:SimulatePrincipalPolicy"
+      permissions:
+        - "imagebuilder:CreateComponent"
+        - "imagebuilder:UpdateImagePipeline"
+      narrative: "{principal.name} can create a new component version and update {pipeline.name} to reference it (imagebuilder:CreateComponent + UpdateImagePipeline)."
+
+  - id: aws-imagebuilder-can-modify-code-container
+    emits: CanModifyCode
+    applies_to: [aws]
+    match_effective_permission:
+      action: "imagebuilder:CreateContainerRecipe"
+      resource_type: "AWS::ImageBuilder::ContainerRecipe"
+    where:
+      - "principal ALSO has effective imagebuilder:UpdateImagePipeline on at least one container pipeline that can reference the new container recipe"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<container image pipeline node>"
+      api_source: "iam:SimulatePrincipalPolicy"
+      permissions:
+        - "imagebuilder:CreateContainerRecipe"
+        - "imagebuilder:UpdateImagePipeline"
+      narrative: "{principal.name} can create a new container recipe and update {pipeline.name} to reference it (imagebuilder:CreateContainerRecipe + UpdateImagePipeline), then trigger a build to push a poisoned container image to ECR."
+
+  - id: aws-imagebuilder-can-modify-configuration
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "imagebuilder:UpdateImagePipeline"
+      resource_type: "AWS::ImageBuilder::ImagePipeline"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<image pipeline node>"
+      api_source: "iam:SimulatePrincipalPolicy"
+      permissions: ["imagebuilder:UpdateImagePipeline"]
+      narrative: "{principal.name} can modify the recipe, infra config, or schedule of {pipeline.name} (imagebuilder:UpdateImagePipeline)."
+
+  - id: aws-imagebuilder-infra-config-can-modify-configuration
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "imagebuilder:UpdateInfrastructureConfiguration"
+      resource_type: "AWS::ImageBuilder::InfrastructureConfiguration"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<InfrastructureConfiguration node (modeled as BuildWorker sub-node)>"
+      api_source: "iam:SimulatePrincipalPolicy"
+      permissions: ["imagebuilder:UpdateInfrastructureConfiguration"]
+      narrative: "{principal.name} can change the instance profile, subnet, or SGs of {infra_config.name} (imagebuilder:UpdateInfrastructureConfiguration)."
+
+  - id: aws-imagebuilder-can-trigger
+    emits: CanTrigger
+    applies_to: [aws]
+    match_effective_permission:
+      action: "imagebuilder:StartImagePipelineExecution"
+      resource_type: "AWS::ImageBuilder::ImagePipeline"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<image pipeline node>"
+      api_source: "iam:SimulatePrincipalPolicy"
+      permissions: ["imagebuilder:StartImagePipelineExecution"]
+      narrative: "{principal.name} can start a build of {pipeline.name} on demand (imagebuilder:StartImagePipelineExecution)."
+
+  - id: aws-imagebuilder-component-s3-uri-reference
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::ImageBuilder::Component"
+      field: "uri"
+    where:
+      - "value starts with 's3://'"
+    emit:
+      source_type: BuildWorker
+      source: "<component node>"
+      target: "<ObjectStorage node for the S3 bucket/key>"
+      api_source: "imagebuilder:GetComponent"
+      evidence_field: "Component.uri (S3 URI)"
+      properties:
+        reference_kind: "component_document_uri"
+      narrative: "{component.name} loads its document from S3 at {s3_object.name}; overwriting that object changes what the component executes."
+
+  - id: aws-imagebuilder-container-recipe-target-ecr
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::ImageBuilder::ContainerRecipe"
+      field: "targetRepository.repositoryName"
+    emit:
+      source_type: BuildWorker
+      source: "<container recipe node / pipeline node>"
+      target: "<ContainerRegistry node for targetRepository>"
+      api_source: "imagebuilder:GetContainerRecipe"
+      evidence_field: "ContainerRecipe.targetRepository.repositoryName"
+      properties:
+        reference_kind: "output_push_target"
+      narrative: "{pipeline.name} pushes its output container image to ECR repository {ecr_repository.name}."
+
+  - id: aws-imagebuilder-distribution-ami-share
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::ImageBuilder::DistributionConfiguration"
+      field: "distributions[*].launchPermissionConfiguration.userIds"
+    where:
+      - "userIds entry is an AWS account ID != the pipeline's account"
+    emit:
+      source_type: Account
+      target_type: Account
+      source: "<owning AWS account of the image pipeline>"
+      target: "<external account node>"
+      api_source: "imagebuilder:GetDistributionConfiguration"
+      evidence_field: "distributions[*].launchPermissionConfiguration.userIds"
+      narrative: "{pipeline.name}'s output AMI {ami.name} is shared to account {account.id} via the distribution configuration."

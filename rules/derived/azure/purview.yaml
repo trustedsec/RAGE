@@ -1,0 +1,183 @@
+# Azure — Microsoft Purview (Microsoft.Purview) derived attack-path rules (Phase 12)
+# ---------------------------------------------------------------------------
+# PHASE-12 SERVICE ADAPTER: Microsoft Purview is a data governance and catalog
+# service. Attack-path relevance is LOW. The primary security concern is RECON:
+# a principal with Purview Data Reader access can enumerate all registered data
+# sources and their classification results (PII, credentials, financial data),
+# learning WHERE sensitive data lives across the organization. This directs
+# subsequent attacks against those data services — but reading the catalog does
+# NOT grant access to the data it describes.
+#
+# KEY ATTACK SURFACE (verified against Microsoft.Purview resource-provider
+# operations reference and Purview documentation, 2026-09):
+#
+#   (1) RECON — catalog enumeration (primary risk):
+#       Purview Data Reader role (data-plane, NOT ARM RBAC) -> read all catalog
+#       assets, classification labels, scan results, data lineage, and registered
+#       data sources. The attacker learns which storage accounts, databases, and
+#       data lakes contain PII/credentials/financial records and can target them
+#       with separate data-plane permissions.
+#       -> CanRead(Identity -> ConfigurationService/Purview account)
+#
+#   (2) PRIVILEGE ESCALATION — within Purview (data-plane):
+#       Collection Admin role -> can assign Data Curator, Data Source Admin,
+#       or other Collection Admin roles to any principal (including themselves
+#       if they don't already have the role). This is an intra-Purview escalation.
+#       -> CanGrantPermission(Identity -> Identity) [scoped to Purview data-plane]
+#
+#   (3) CROSS-PLANE ESCALATION — ARM control-plane to Purview data-plane:
+#       ARM Contributor/Owner on the Microsoft.Purview/accounts resource
+#       automatically inherits Root Collection Admin role within Purview at
+#       account creation. This enables data-plane privilege escalation (self-assign
+#       Data Curator, manage collections, revoke others' access).
+#       -> ARM Owner -> (implicit) Root Collection Admin -> CanGrantPermission
+#
+# WHAT IS OUT OF SCOPE:
+#   - No CanModifyCode: Purview does not execute attacker-supplied code.
+#   - No ExecutesAs / CanExecuteAs: the scan MI runs server-side under Microsoft's
+#     managed infrastructure; callers cannot trigger arbitrary scans or inject code
+#     that runs as the MI via the Purview API.
+#   - No CanModifyConfiguration (defense evasion): disabling or deleting a Purview
+#     account removes a data governance tool, not a detective security control;
+#     this is low-relevance cover-tracks and not modeled.
+#   - No CanReadSecret: catalog scan results contain classification labels and
+#     column-level metadata, NOT raw data values or credentials.
+#   - No cross-subscription or cross-tenant escalation from Purview access alone.
+#
+# LINCHPINS CITED:
+#   - credential-chains: ARM Contributor → Root Collection Admin (control-plane to
+#     data-plane authority transfer)
+#
+# All operation strings from the official Microsoft.Purview resource-provider
+# operations reference and Purview data-plane API documentation. No hallucinated
+# permissions.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 12-security-logging
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # 1. Collection Admin privilege escalation — self-assign Data Curator role
+  # ===========================================================================
+
+  - id: azure-purview-collection-admin-grant
+    emits: CanGrantPermission
+    description: >-
+      A principal holding the Purview Collection Admin role can assign Purview RBAC
+      roles (including Data Curator, Data Source Administrator, Collection Admin) to
+      any other principal or to themselves via the Purview role assignment API. This
+      enables privilege escalation within the Purview account: a Collection Admin can
+      self-assign additional roles, elevate another compromised principal, or revoke
+      access from other admins.
+    match:
+      - "principal holds HasRole(Identity, Purview Collection Admin role)"
+      - "target is any Identity within the Purview account scope"
+    where:
+      - "source holds Collection Admin or Root Collection Admin on the Purview account"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal holding Collection Admin role>"
+      target: "<any principal in the Purview account (including self)>"
+      capabilities: ["assign Data Reader", "assign Data Curator", "assign Data Source Admin", "assign Collection Admin"]
+      conditions: []
+      state_logic: >-
+        ACTIVE when the source principal holds Collection Admin or Root Collection
+        Admin within the Purview account. The target can be any principal (including
+        a third-party identity or the source principal itself). BLOCKED if the source
+        loses the Collection Admin role or the account is deprovisioned.
+      confidence: 0.95
+      narrative: >-
+        {source.name} holds the Purview Collection Admin role on account {account.name},
+        enabling assignment of Purview RBAC roles to {target.name}. This includes
+        self-assignment (Collection Admin can self-assign Data Curator), enabling
+        privilege escalation within the Purview data-plane.
+      canonical_rule: >-
+        HasRole(X, Collection Admin) => CanGrantPermission(X, any Identity in account)
+      derived_from: ["azure-purview-collection-admin-role-assignment"]
+
+  # ===========================================================================
+  # 2. ARM control-plane to Purview data-plane escalation chain
+  # ===========================================================================
+
+  - id: azure-purview-arm-owner-grants-permission
+    emits: CanGrantPermission
+    description: >-
+      An identity with ARM Contributor or Owner permission on a Microsoft.Purview/accounts
+      resource holds the implicit Root Collection Admin role in Purview (assigned at
+      account creation). This cross-plane escalation enables data-plane privilege
+      escalation: the ARM admin can manage Purview role assignments, self-assign
+      Data Curator, and control access within the data-plane.
+    match:
+      - "principal has effective permission Microsoft.Purview/accounts/write (ARM Contributor/Owner)"
+      - "Purview account is provisioned (creationTime set)"
+    where:
+      - "source holds ARM Contributor or Owner on the Purview account resource"
+      - "Purview account provisioningState == Succeeded"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal with ARM Contributor/Owner on the Purview account>"
+      target: "<any principal in the Purview account (including self)>"
+      capabilities: ["assign Purview RBAC roles", "revoke roles", "create collections"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the source has effective ARM Contributor or Owner permission on
+        the Purview account resource AND the account is provisioned. The source
+        implicitly holds Root Collection Admin in Purview and can manage data-plane
+        role assignments. BLOCKED if the ARM permission is revoked or account is
+        deprovisioned.
+      confidence: 0.95
+      narrative: >-
+        {source.name} holds ARM Contributor/Owner on Purview account {account.name},
+        which implicitly grants Root Collection Admin role in the Purview data-plane.
+        This enables {source.name} to assign or revoke Purview RBAC roles, creating
+        a cross-plane escalation from ARM control authority to data-plane administrative
+        capability.
+      canonical_rule: >-
+        HasRole(X, Root Collection Admin [implicit from ARM Owner]) =>
+        CanGrantPermission(X, any Identity in Purview account)
+      linchpin: "credential-chains: ARM control-plane authority -> Purview data-plane authority"
+      derived_from: ["azure-purview-arm-owner-to-collection-admin"]
+
+  # ===========================================================================
+  # NOTE: Catalog read (CanRead) is emitted as an explicit normalization rule
+  # in rules/explicit/azure/purview.yaml (rule: azure-purview-catalog-read).
+  # It is matched directly from Purview RBAC role assignments collected via the
+  # policyElements API, normalized to HasRole, and then matched against effective
+  # permissions to emit CanRead. This explicit normalization (not derived from
+  # other edges) is appropriate because CanRead is declared nature: both in
+  # edges.yaml, permitting it in both /rules/explicit/ and /rules/derived/.
+  # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# THREAT MODEL SUMMARY:
+#
+# Purview is a low-risk resource for attack paths but high-value for
+# reconnaissance. The primary edge (CanRead on the account) enables discovery
+# of sensitive data locations; the cascading privilege-escalation edges
+# (Collection Admin -> CanGrantPermission, ARM Owner -> Root Collection Admin)
+# represent intra-Purview and cross-plane administrative risks.
+#
+# An attacker with Purview Data Reader can:
+#   - Enumerate all data sources and classifications (recon)
+#   - Learn where PII, credentials, financial data live
+#   - Pivot to those high-value resources with separate permissions
+#
+# An attacker with Collection Admin can:
+#   - Self-escalate to higher roles (Data Curator, Data Source Admin)
+#   - Restrict or revoke access for legitimate admins (persistence/coverage)
+#   - Manage collections and scan credentials
+#
+# An attacker with ARM Owner on the Purview account can:
+#   - Implicitly escalate to Purview Root Collection Admin (cross-plane)
+#   - Manage data-plane role assignments
+#   - Destroy the account (destructive, not escalation)
+#
+# The core recon path is: Identity --(HasRole(Data Reader))--> Data Reader role
+# --> (explicit CanRead match) --> CanRead(Purview account). This yields
+# high-confidence intelligence for downstream attacks on registered data sources.
+# ---------------------------------------------------------------------------

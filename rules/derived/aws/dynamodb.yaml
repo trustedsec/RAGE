@@ -1,0 +1,677 @@
+# AWS DynamoDB — Derived attack-path rules (Phase 6 — Storage & Databases)
+# ---------------------------------------------------------------------------
+# DynamoDB is a fully-managed NoSQL key-value and document store. Its Phase-6
+# attack surface centers on four primitives:
+#
+#   (1) DATA READ: GetItem / Query / Scan -> CanReadData (items often carry
+#       secrets -> ContainsSecret -> credential-chains roll-up).
+#
+#   (2) EXFILTRATION: ExportTableToPointInTime (requires PITR enabled) writes a
+#       full Parquet/DynamoDB-JSON snapshot to a caller-specified S3 bucket.
+#       If the target bucket is attacker-controlled or cross-account, this is
+#       complete table exfiltration -> CanExfiltrate.
+#
+#   (3) POLICY MUTATION: dynamodb:PutResourcePolicy on a table can write a new
+#       resource policy granting the attacker (or a third party) data-plane
+#       access without any further role assumption -> CanModifyPolicy.
+#       A resource policy naming a foreign-account principal -> CrossAccountTrust.
+#
+#   (4) DAX EXECUTION-IDENTITY: DAX clusters run AS an IAM role. iam:PassRole +
+#       dax:CreateCluster -> CanCreateWorkloadAs (cite can-execute-as linchpin).
+#       Analogous to the Glue / SageMaker / Redshift PassRole patterns.
+#
+#   STREAMS: dynamodb:GetShardIterator + dynamodb:GetRecords on a stream ->
+#   CanReadData (real-time change-data-capture). Streams also trigger Lambda
+#   (CanTrigger fact; Lambda rules own the escalation roll-up).
+#
+#   SSE-KMS GATE: tables encrypted with a CMK (SSEType: KMS, non-default key)
+#   require kms:Decrypt. Emit CanReadData as CONDITIONAL(key_permission) when
+#   the CMK is customer-managed. The credential-chains:decrypt-gates-secret-read
+#   linchpin upgrades this when the principal also holds CanDecrypt on the key.
+#
+# LINCHPIN CITATIONS (do not re-derive):
+#   * credential-chains.yaml — read-secret-yields-identity (ContainsSecret+
+#     CredentialsFor -> CanImpersonate), decrypt-gates-secret-read (SSE-KMS gate)
+#   * can-control.yaml     — escalate-via-execute-as, enter-account-via-assume
+#   * can-execute-as.yaml  — execute-as-via-new-workload (DAX PassRole path)
+#
+# PERMISSIONS: all from AWS Service Authorization Reference:
+#   Amazon DynamoDB  — https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazondynamodb.html
+#   Amazon DynamoDB Streams
+#   Amazon DAX       — https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazondynamodbaccelerator.html
+#
+# STATE CONVENTIONS (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. CONDITIONAL contributors cap the output at CONDITIONAL.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # (1) DATA READ
+  # ===========================================================================
+
+  # --- 1) GetItem / Query / Scan -> CanReadData ------------------------------
+  # The primary DynamoDB data-read path. A principal with any of GetItem,
+  # Query, or Scan on a table ARN can read item data. Scan is the broadest
+  # (full-table traversal). SSE-KMS with a CMK gates plaintext access — emit
+  # CONDITIONAL(key_permission) when the key is customer-managed.
+  - id: aws-dynamodb-read-data
+    emits: CanReadData
+    description: "dynamodb:GetItem / Query / Scan grants item-level read access to the table, including any secrets or sensitive data stored as item attributes."
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_type(?table) == NoSQLDatabase"
+      - "?table.provider_type in ['AWS::DynamoDB::Table', 'AWS::DynamoDB::GlobalTable']"
+      - "?principal has EFFECTIVE at least ONE of: dynamodb:GetItem, dynamodb:Query, dynamodb:Scan on ?table ARN"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan"]
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        ACTIVE when at least one of dynamodb:GetItem, dynamodb:Query, or dynamodb:Scan
+        is confirmed EFFECTIVE on the table ARN (identity-based policy + resource policy
+        evaluated + no SCP deny) AND the table's SSE uses the AWS-managed default key
+        (alias/aws/dynamodb) or no SSE. CONDITIONAL(key_permission) when the table uses
+        SSE with a customer-managed CMK (SSEDescription.KMSMasterKeyArn present and not
+        the default alias) — decrypt requires kms:Decrypt on that CMK; the
+        credential-chains:decrypt-gates-secret-read linchpin upgrades this when the
+        principal also holds CanDecrypt on the wrapping key. CONDITIONAL(resource_policy)
+        when a table resource policy exists but the evaluation of the principal's access
+        through it is unresolved. BLOCKED by an explicit SCP or permission-boundary deny
+        on all three read actions simultaneously. IAM condition keys dynamodb:LeadingKeys
+        and dynamodb:Attributes narrow access to specific items/attributes —
+        CONDITIONAL(condition_expression) when such conditions are present and the
+        accessible data scope is unclear.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?table (dynamodb:GetItem / Query / Scan effective permission)"
+      false_positive_note: >-
+        At least ONE of the three read actions must be effective; all three being denied
+        yields no read capability. IAM condition key dynamodb:LeadingKeys (partition-key
+        scoping) or dynamodb:Attributes (attribute-level projection) can restrict the
+        accessible item set significantly — downgrade confidence and note
+        CONDITIONAL(condition_expression) when these conditions are present with non-trivial
+        values. A table with SSE using a customer-managed CMK (not alias/aws/dynamodb) is
+        gated on kms:Decrypt — emit CONDITIONAL(key_permission) and cite
+        credential-chains:decrypt-gates-secret-read for upgrade. Scan on a large table is
+        operationally noisy (CloudTrail + high RCU consumption) but is not a false positive
+        — it is a real capability. dynamodb:Scan with ConsistentRead=true vs. eventual
+        consistency does not affect the existence of the read capability.
+      narrative: >-
+        {principal.name} can read items from DynamoDB table {table.name} via GetItem,
+        Query, or Scan (dynamodb:GetItem / Query / Scan), accessing all attribute data
+        the table contains — including any secrets, credentials, or application-sensitive
+        data stored as item attributes.
+
+  # --- 2) GetShardIterator + GetRecords -> CanReadData (Streams) -------------
+  # DynamoDB Streams expose a real-time change-data-capture feed. A principal
+  # with dynamodb:GetShardIterator AND dynamodb:GetRecords on the stream ARN
+  # can read all item mutations (INSERT/MODIFY/REMOVE) and, depending on the
+  # StreamViewType, the old and/or new item images. This yields CanReadData on
+  # the parent table (via its stream). Note: streams are modeled as Messaging nodes
+  # with provider_type AWS::DynamoDB::Stream (not the table's provider_type).
+  - id: aws-dynamodb-streams-read
+    emits: CanReadData
+    description: "dynamodb:GetShardIterator + dynamodb:GetRecords on a DynamoDB Stream yields real-time access to all item-level changes, including full item images depending on StreamViewType."
+    match:
+      - [ ?principal, HasPermission, ?stream ]
+      - [ ?stream, LocatedIn, ?table ]
+    where:
+      - "node_type(?stream) == Messaging"
+      - "node_type(?table) == NoSQLDatabase"
+      - "?stream.provider_type == 'AWS::DynamoDB::Stream' or arn_matches(?stream, ':table/*/stream/*')"
+      - "?principal has EFFECTIVE dynamodb:GetShardIterator on ?stream ARN"
+      - "?principal has EFFECTIVE dynamodb:GetRecords on ?stream ARN"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["dynamodb:GetShardIterator", "dynamodb:GetRecords"]
+      conditions: [iam_permission, resource_policy, service_state]
+      state_logic: >-
+        ACTIVE when BOTH dynamodb:GetShardIterator AND dynamodb:GetRecords are confirmed
+        EFFECTIVE on the stream ARN and the parent table has DynamoDB Streams enabled
+        (StreamSpecification.StreamEnabled == true). CONDITIONAL(service_state) when
+        Streams is not enabled on the parent table — GetShardIterator and GetRecords
+        succeed only for the 24-hour shard retention window; after 24 hours with no new
+        writes the stream is effectively empty. CONDITIONAL(resource_policy) when a
+        stream resource policy exists but its evaluation is unresolved. BLOCKED by an
+        explicit SCP or deny on either GetShardIterator or GetRecords. The stream
+        only captures CHANGES since stream enablement — it does NOT provide historical
+        data for items written before Streams was enabled.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?stream (dynamodb:GetShardIterator + GetRecords effective)"
+      false_positive_note: >-
+        BOTH GetShardIterator AND GetRecords are required; GetShardIterator alone cannot
+        retrieve item data. The StreamViewType determines data richness: KEYS_ONLY reveals
+        only partition/sort keys (lower sensitivity); NEW_IMAGE, OLD_IMAGE, and
+        NEW_AND_OLD_IMAGES reveal full item attribute values (higher sensitivity). Emit
+        with the parent table as target (CanReadData on the NoSQLDatabase); the stream
+        is the access mechanism, not the data target. Streams have a 24-hour shard
+        retention; old shards expire. SSE-KMS on the parent table does NOT additionally
+        encrypt the stream — stream records are always decryptable by a principal with
+        GetRecords, regardless of the table CMK. Do NOT emit CONDITIONAL(key_permission)
+        for stream access based on the parent table's SSE setting.
+      narrative: >-
+        {principal.name} can read the DynamoDB stream of {table.name}
+        (dynamodb:GetShardIterator + GetRecords), accessing a real-time feed of all
+        item mutations{if streamViewType != KEYS_ONLY: " including full item images"}.
+
+  # --- 2.5) PutItem / UpdateItem / DeleteItem / BatchWriteItem / TransactWriteItems -> CanWriteData ---
+  # A principal with any of the DynamoDB write actions can modify item data in a table.
+  # Write access is a lateral movement primitive when combined with Streams: data poisoning
+  # (inject malicious items into tables whose streams trigger Lambda/Glue) yields a code-
+  # execution or data-manipulation path. Additionally, write access enables TTL manipulation
+  # and deletion-based denial-of-service. This is CanWriteData on the NoSQLDatabase target.
+  - id: aws-dynamodb-write-data
+    emits: CanWriteData
+    description: "dynamodb:PutItem / UpdateItem / DeleteItem / BatchWriteItem / TransactWriteItems grant item-level write access, enabling data poisoning (stream injection), TTL manipulation, and denial-of-service."
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_type(?table) == NoSQLDatabase"
+      - "?table.provider_type in ['AWS::DynamoDB::Table', 'AWS::DynamoDB::GlobalTable']"
+      - "?principal has EFFECTIVE at least ONE of: dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:BatchWriteItem, dynamodb:TransactWriteItems on ?table ARN"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:BatchWriteItem", "dynamodb:TransactWriteItems"]
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        ACTIVE when at least one of the write actions is confirmed EFFECTIVE on the table
+        ARN (identity-based policy + resource policy evaluated + no SCP deny) AND the table's
+        SSE uses the AWS-managed default key (alias/aws/dynamodb) or no SSE. Writing to a table
+        does not require kms:Decrypt on an SSE CMK, but the DynamoDB service may need to
+        decrypt existing data during an update operation — CONDITIONAL(key_permission) if table
+        SSE uses a customer-managed CMK and the write path involves reading (UpdateItem with
+        conditions, or Transact writes with conditions). For pure PutItem/DeleteItem without
+        read-modify-write, SSE does not gate the write. CONDITIONAL(resource_policy) when a
+        table resource policy exists but evaluation is unresolved. BLOCKED by an explicit SCP
+        or permission-boundary deny on all write actions simultaneously. IAM condition keys
+        dynamodb:LeadingKeys narrow access to specific partition keys — CONDITIONAL(condition_expression)
+        when such conditions are present and the writable item scope is unclear.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?table (dynamodb:PutItem / UpdateItem / DeleteItem / BatchWriteItem / TransactWriteItems effective permission)"
+        - "messaging-chains:stream-injection-path (if table has stream → Lambda; data writes trigger Lambda execution)"
+      false_positive_note: >-
+        At least ONE of the five write actions must be effective; all being denied yields no write
+        capability. IAM condition key dynamodb:LeadingKeys (partition-key scoping) restricts write
+        access to items with specific partition keys — honor CONDITIONAL(condition_expression) when
+        such conditions are present with non-trivial values. PutItem, UpdateItem, and TransactWriteItems
+        have conditional-expression support (return values, etc.); these are application-layer controls,
+        not IAM gates. A principal with UpdateItem can modify TTL, read-modify-write, or poison item
+        data; all are write-capability realizations. If the table's stream feeds a Lambda (CanTrigger
+        relationship exists), data writes trigger the Lambda; combine CanWriteData with the existing
+        CanTrigger structural edge for the full stream-injection path (cite messaging-chains linchpin).
+        SSE-KMS on a table does NOT gate pure writes (PutItem is write-only); it gates read-modify-write
+        patterns (UpdateItem, TransactWriteItems with conditions). Do NOT emit CONDITIONAL(key_permission)
+        for table SSE on a pure PutItem or DeleteItem.
+      narrative: >-
+        {principal.name} can write items to DynamoDB table {table.name} via PutItem,
+        UpdateItem, DeleteItem, BatchWriteItem, or TransactWriteItems (dynamodb:PutItem / UpdateItem /
+        DeleteItem / BatchWriteItem / TransactWriteItems), enabling data poisoning, TTL manipulation,
+        and denial-of-service attacks.
+
+  # ===========================================================================
+  # (2) EXFILTRATION
+  # ===========================================================================
+
+  # --- 3) ExportTableToPointInTime -> CanExfiltrate --------------------------
+  # THE Phase-6 DynamoDB exfil primitive. A principal with
+  # dynamodb:ExportTableToPointInTime on a table can export a complete Parquet
+  # or DynamoDB JSON snapshot of the table to a caller-specified S3 bucket.
+  # If PITR is enabled on the table (required), the export can cover any point
+  # in time within the retention window (up to 35 days).
+  #
+  # The call specifies: S3Bucket + S3Prefix (can be in any account the bucket
+  # policy allows) and ExportFormat (DYNAMODB_JSON | ION). The DynamoDB service
+  # writes the data using a service role; the calling principal needs only the
+  # dynamodb:ExportTableToPointInTime IAM action — NOT s3:PutObject directly.
+  - id: aws-dynamodb-exfil-export
+    emits: CanExfiltrate
+    description: "dynamodb:ExportTableToPointInTime (requires PITR enabled) writes a complete table snapshot to a caller-specified S3 bucket — full table exfiltration in one API call."
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_type(?table) == NoSQLDatabase"
+      - "?table.provider_type in ['AWS::DynamoDB::Table', 'AWS::DynamoDB::GlobalTable']"
+      - "?principal has EFFECTIVE dynamodb:ExportTableToPointInTime on ?table ARN"
+      - "?table.properties.PointInTimeRecoveryStatus == 'ENABLED'  # ContinuousBackupsDescription.PointInTimeRecoveryDescription"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["dynamodb:ExportTableToPointInTime"]
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        ACTIVE when dynamodb:ExportTableToPointInTime is confirmed EFFECTIVE on the table
+        ARN AND the table has PITR enabled (PointInTimeRecoveryStatus == ENABLED). The
+        target S3 bucket need not be in the same account — the DynamoDB service uses its
+        own service role to write; the calling principal specifies only the S3 URI and does
+        not need s3:PutObject. CONDITIONAL(service_state) when PITR status is DISABLED or
+        unknown — dynamodb:ExportTableToPointInTime fails without PITR. CONDITIONAL(scp_or_org_policy)
+        when an SCP or permission boundary may restrict the action but isn't resolved
+        (do not use iam_permission label for unresolved SCPs; that label refers to the primary
+        action effectiveness). BLOCKED by an explicit SCP deny on dynamodb:ExportTableToPointInTime.
+        Note: the export is asynchronous (InProgress -> Completed); data lands in S3 when the export
+        completes (minutes to hours for large tables). SSE-KMS on the table does NOT
+        prevent export — the DynamoDB service decrypts using the table CMK during export
+        and the S3 bucket receives plaintext (or re-encrypted with the bucket's SSE).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?table (dynamodb:ExportTableToPointInTime effective permission)"
+        - "?table PointInTimeRecoveryStatus == ENABLED (dynamodb:DescribeContinuousBackups evidence)"
+      false_positive_note: >-
+        PITR MUST be enabled — ExportTableToPointInTime returns ExportConflictException if
+        PITR is disabled. Confirm PointInTimeRecoveryStatus == ENABLED before emitting ACTIVE;
+        otherwise CONDITIONAL(service_state). The target S3 bucket must allow the DynamoDB
+        service (dynamodb.amazonaws.com) to call s3:PutObject — typically done via the
+        bucket policy allowing the DynamoDB service principal. If the target bucket blocks
+        the DynamoDB service, the export fails (CONDITIONAL(resource_policy) for the target
+        S3 bucket, but this is typically transparent to the calling principal who controls
+        the destination). Table-level SSE with a CMK does NOT gate the export — the export
+        decrypts transparently. The export includes ALL items at the chosen point in time;
+        there is no per-attribute redaction. ExportTableToPointInTime requires no data-plane
+        GetItem/Scan permission — it is a control-plane export action. Emit even if the
+        principal lacks GetItem/Query/Scan.
+      narrative: >-
+        {principal.name} can export a complete snapshot of DynamoDB table {table.name} to
+        S3 (dynamodb:ExportTableToPointInTime), exfiltrating all item data at any point
+        within the PITR retention window. The DynamoDB service writes to the specified S3
+        bucket without requiring s3:PutObject from the calling principal.
+
+  # --- 4) RestoreTableToPointInTime -> CanReadData (data access via restore) ---
+  # A principal with dynamodb:RestoreTableToPointInTime can create a new DynamoDB
+  # table restored from any PITR point of the source table. The new table inherits
+  # all item data from the source at the chosen point. However, reading the restored
+  # table requires a separate EFFECTIVE IAM permission (GetItem/Scan/Query) on the
+  # NEW table's ARN — the restore action alone does not grant the principal automatic
+  # read access. This rule emits CONDITIONAL(iam_permission) to account for the
+  # gating read permission on the restored table ARN.
+  - id: aws-dynamodb-restore-pitr-read
+    emits: CanReadData
+    description: "dynamodb:RestoreTableToPointInTime creates a new table from PITR; reading it requires separate GetItem/Scan/Query permission on the restored table ARN (CONDITIONAL path)."
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_type(?table) == NoSQLDatabase"
+      - "?table.provider_type in ['AWS::DynamoDB::Table', 'AWS::DynamoDB::GlobalTable']"
+      - "?principal has EFFECTIVE dynamodb:RestoreTableToPointInTime on ?table ARN"
+      - "?table.properties.PointInTimeRecoveryStatus == 'ENABLED'"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["dynamodb:RestoreTableToPointInTime"]
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        CONDITIONAL(iam_permission) when dynamodb:RestoreTableToPointInTime is confirmed EFFECTIVE
+        on the source table ARN AND PITR is enabled. RestoreTableToPointInTime creates a NEW table
+        but does NOT automatically grant the restoring principal read access to the NEW table's ARN.
+        The principal must have a SEPARATE, confirmed EFFECTIVE permission (dynamodb:GetItem,
+        dynamodb:Query, or dynamodb:Scan) on the newly-restored table's ARN to read items. This
+        typically requires a wildcard permission (e.g., dynamodb:GetItem on
+        arn:aws:dynamodb:*:*:table/* or arn:aws:dynamodb:region:account:table/restored-*) or an
+        explicit grant on the new table. Emit as CONDITIONAL(iam_permission); upgrade to ACTIVE
+        only when an aws-dynamodb-read-data edge is confirmed on the restored table ARN.
+        CONDITIONAL(service_state) when PITR is disabled. BLOCKED by an SCP or permission-boundary
+        deny on RestoreTableToPointInTime.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal HasPermission ?table (dynamodb:RestoreTableToPointInTime effective permission)"
+        - "?table PointInTimeRecoveryStatus == ENABLED"
+        - "aws-dynamodb-read-data (separate edge required on restored table ARN)"
+      false_positive_note: >-
+        PITR must be enabled on the SOURCE table. RestoreTableToPointInTime is a single
+        action that creates the target table as part of its operation — no separate
+        dynamodb:CreateTable permission is required per AWS Service Authorization Reference.
+        The restored table is created in the SAME ACCOUNT as the calling principal —
+        DynamoDB does not support cross-account restore directly (unlike Redshift). CRITICAL:
+        the principal MUST HAVE a confirmed EFFECTIVE GetItem/Scan/Query permission on the
+        NEW restored table's ARN to read it; restore access alone does not grant read capability.
+        This is not a false positive IF the principal has a wildcard dynamodb:GetItem on
+        arn:aws:dynamodb:*:*:table/* or equivalent, but CONDITIONAL(iam_permission) otherwise.
+        The SSE key of the source table is inherited by the restored table — additional
+        CONDITIONAL(key_permission) applies if the source table uses a CMK the principal
+        cannot decrypt. Subsequent read access on the restored table is captured separately by
+        aws-dynamodb-read-data; do not treat restore access as implied read access.
+      narrative: >-
+        {principal.name} can restore a point-in-time copy of {table.name}
+        (dynamodb:RestoreTableToPointInTime), creating a new table with full historical
+        item data. Reading the new table requires a separate GetItem/Scan/Query permission
+        on the restored table ARN.
+
+  # --- 4.2) RestoreTableFromBackup (on-demand backup restore) -> CanReadData ---
+  # A principal with dynamodb:RestoreTableFromBackup can restore a table from any
+  # on-demand backup (AWS::DynamoDB::Backup). Unlike RestoreTableToPointInTime, this does
+  # NOT require PITR to be enabled — it uses on-demand backups which can be created at any
+  # time. The restored table contains the backup's historical data. Reading the restored
+  # table requires a separate EFFECTIVE IAM permission on the new table's ARN (same gate as PITR restore).
+  - id: aws-dynamodb-restore-backup-read
+    emits: CanReadData
+    description: "dynamodb:RestoreTableFromBackup restores a table from an on-demand backup; reading it requires separate GetItem/Scan/Query permission on the restored table ARN (CONDITIONAL path)."
+    match:
+      - [ ?principal, HasPermission, ?backup ]
+    where:
+      - "node_type(?backup) == Backup"
+      - "?backup.provider_type == 'AWS::DynamoDB::Backup'"
+      - "?principal has EFFECTIVE dynamodb:RestoreTableFromBackup on ?backup ARN"
+      - "?backup.properties.BackupStatus == 'AVAILABLE'"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: "<source table of the backup>"
+      permissions: ["dynamodb:RestoreTableFromBackup"]
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        CONDITIONAL(iam_permission) when dynamodb:RestoreTableFromBackup is confirmed EFFECTIVE
+        on the backup ARN AND the backup status is AVAILABLE. RestoreTableFromBackup creates a NEW
+        table but does NOT automatically grant the restoring principal read access to the NEW table's ARN.
+        The principal must have a SEPARATE, confirmed EFFECTIVE permission (dynamodb:GetItem,
+        dynamodb:Query, or dynamodb:Scan) on the newly-restored table's ARN. This typically requires
+        a wildcard permission (e.g., dynamodb:GetItem on arn:aws:dynamodb:*:*:table/*) or explicit grant.
+        Emit as CONDITIONAL(iam_permission); upgrade to ACTIVE only when an aws-dynamodb-read-data edge
+        is confirmed on the restored table ARN. CONDITIONAL(service_state) when backup status is not
+        AVAILABLE (e.g., DELETED, CREATING). BLOCKED by an SCP or permission-boundary deny on
+        RestoreTableFromBackup.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal HasPermission ?backup (dynamodb:RestoreTableFromBackup effective permission)"
+        - "?backup.properties.BackupStatus == AVAILABLE"
+        - "aws-dynamodb-read-data (separate edge required on restored table ARN)"
+      false_positive_note: >-
+        The backup must be in AVAILABLE status — RestoreTableFromBackup fails on DELETED or
+        CREATING backups. Unlike RestoreTableToPointInTime, this rule does NOT require PITR to
+        be enabled; on-demand backups are independent of PITR status. The restored table is
+        created in the SAME ACCOUNT as the calling principal. CRITICAL: the principal MUST HAVE
+        a confirmed EFFECTIVE GetItem/Scan/Query permission on the NEW restored table's ARN to read it;
+        restore access alone does not grant read capability. This is a peer-level escalation to
+        aws-dynamodb-restore-pitr-read but uses on-demand backups instead of PITR. The SSE key of
+        the source table is inherited by the restored table — additional CONDITIONAL(key_permission)
+        applies if the source table uses a CMK the principal cannot decrypt.
+      narrative: >-
+        {principal.name} can restore a copy of {table.name} from an on-demand backup
+        (dynamodb:RestoreTableFromBackup), creating a new table with historical item data. Reading
+        the new table requires a separate GetItem/Scan/Query permission on the restored table ARN.
+
+  # --- 4.5) UpdateContinuousBackups then ExportTableToPointInTime -> CanExfiltrate ---
+  # A principal with BOTH dynamodb:UpdateContinuousBackups AND
+  # dynamodb:ExportTableToPointInTime can enable PITR (if disabled) and then
+  # export the table — converting a CONDITIONAL(service_state) exfil path into ACTIVE.
+  # This rule explicitly models the enabling step; the exfil rule upgrades once PITR
+  # transitions to ENABLED state.
+  - id: aws-dynamodb-enable-pitr-then-exfil
+    emits: CanExfiltrate
+    description: "dynamodb:UpdateContinuousBackups (enable PITR) + dynamodb:ExportTableToPointInTime yields full-table exfiltration even if PITR is currently disabled — two-step escalation."
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_type(?table) == NoSQLDatabase"
+      - "?table.provider_type in ['AWS::DynamoDB::Table', 'AWS::DynamoDB::GlobalTable']"
+      - "?principal has EFFECTIVE dynamodb:UpdateContinuousBackups on ?table ARN"
+      - "?principal has EFFECTIVE dynamodb:ExportTableToPointInTime on ?table ARN"
+      - "?table.properties.PointInTimeRecoveryStatus == 'DISABLED' or unknown"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["dynamodb:UpdateContinuousBackups", "dynamodb:ExportTableToPointInTime"]
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        CONDITIONAL(service_state) when PITR is currently DISABLED on the table. The
+        principal first calls UpdateContinuousBackups(PointInTimeRecoveryEnabled=true),
+        which transitions PointInTimeRecoveryStatus to ENABLED (may take seconds to minutes).
+        Once ENABLED, ExportTableToPointInTime becomes callable (cf. aws-dynamodb-exfil-export).
+        ACTIVE if PITR is already ENABLED — in that case use aws-dynamodb-exfil-export instead.
+        BLOCKED by an SCP or permission-boundary deny on either UpdateContinuousBackups or
+        ExportTableToPointInTime.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?table (dynamodb:UpdateContinuousBackups + ExportTableToPointInTime effective)"
+        - "?table PointInTimeRecoveryStatus == DISABLED or unknown"
+      false_positive_note: >-
+        This rule fires only when PITR is DISABLED or unknown. When PITR is already ENABLED,
+        aws-dynamodb-exfil-export emits ACTIVE exfiltration without this gate. The
+        UpdateContinuousBackups call has a state transition cost (seconds to minutes); the
+        exfil path is real but requires an enabling step. Both permissions must be EFFECTIVE;
+        if either is missing or denied, no escalation. Note: UpdateContinuousBackups is
+        a PointInTimeRecoveryUpdate API call; SSE on the table is unaffected — the export
+        still decrypts and writes plaintext to S3 (or re-encrypts with S3 bucket SSE).
+      narrative: >-
+        {principal.name} can enable PITR on {table.name} (dynamodb:UpdateContinuousBackups)
+        and then export the full table to S3 (dynamodb:ExportTableToPointInTime), achieving
+        table exfiltration even if PITR was initially disabled.
+
+  # ===========================================================================
+  # (3) POLICY MUTATION
+  # ===========================================================================
+
+  # --- 5) PutResourcePolicy -> CanModifyPolicy (self-grant escalation) --------
+  # dynamodb:PutResourcePolicy on a table (or stream) lets a principal replace
+  # the entire resource-based policy document. This can grant the principal
+  # (or any third party) data-plane access (GetItem / Scan / PutItem etc.)
+  # without any existing IAM grants. This is the primary DynamoDB privilege-
+  # escalation primitive — analogous to s3:PutBucketPolicy or kms:PutKeyPolicy.
+  # Note: tables and streams are separate node types (NoSQLDatabase vs Messaging),
+  # so target_type is adjusted accordingly.
+  - id: aws-dynamodb-put-resource-policy
+    emits: CanModifyPolicy
+    description: "dynamodb:PutResourcePolicy allows rewriting the table/stream resource policy, enabling self-grant of data-plane access or cross-account grant — a direct privilege escalation primitive."
+    match:
+      - [ ?principal, HasPermission, ?resource ]
+    where:
+      - "node_type(?resource) in [NoSQLDatabase, Messaging]"
+      - "?resource.provider_type in ['AWS::DynamoDB::Table', 'AWS::DynamoDB::GlobalTable', 'AWS::DynamoDB::Stream']"
+      - "?principal has EFFECTIVE dynamodb:PutResourcePolicy on ?resource ARN"
+    emit:
+      source_type: Identity
+      target_type: "node_type(?resource)"
+      source: ?principal
+      target: ?resource
+      permissions: ["dynamodb:PutResourcePolicy"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when dynamodb:PutResourcePolicy is confirmed EFFECTIVE on the table (or
+        stream) ARN and no SCP deny exists. CONDITIONAL(scp_or_org_policy) when an SCP
+        may restrict PutResourcePolicy but hasn't been resolved. BLOCKED by an explicit
+        SCP or permission-boundary deny on dynamodb:PutResourcePolicy. Note: PutResourcePolicy
+        requires a resource policy block (cannot be an empty policy — the API requires a
+        syntactically valid policy document). The new policy takes effect immediately for
+        subsequent API calls. An SCP with aws:ResourceTag conditions may prevent policy
+        changes on specific tables — honor tag-based SCPs.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?resource (dynamodb:PutResourcePolicy effective permission)"
+      false_positive_note: >-
+        PutResourcePolicy is a control-plane action; it does NOT require data-plane
+        permissions (GetItem/Scan) to grant escalation. Even a principal with no existing
+        data-plane access who has PutResourcePolicy can escalate to full data access in one
+        call. The policy must be syntactically valid JSON and comply with IAM resource policy
+        limits (20 KB max). Cross-account grants via PutResourcePolicy require the principal
+        in the foreign account to ALSO have a matching identity-policy grant in their own
+        account (resource policy alone does not override the need for an identity-based
+        allow in cross-account scenarios — unlike same-account resource policies that can
+        grant access without identity policy). Model cross-account PutResourcePolicy escalation
+        as ACTIVE for the SAME-account self-grant. CrossAccountTrust edges are emitted by
+        the explicit normalization rule aws-dynamodb-cross-account-table-policy when the
+        resource policy is collected. Stream vs. table targeting: when the resource is a stream
+        (Messaging node_type), emit target_type: Messaging; when the resource is a table
+        (NoSQLDatabase node_type), emit target_type: NoSQLDatabase.
+      narrative: >-
+        {principal.name} can rewrite the resource policy of {resource.name}
+        (dynamodb:PutResourcePolicy), self-granting full data-plane access (GetItem, Scan,
+        PutItem) or granting access to an external account — a direct privilege escalation
+        without requiring an IAM role assumption.
+
+
+  # ===========================================================================
+  # (4) DAX EXECUTION-IDENTITY
+  # ===========================================================================
+
+  # --- 7) PassRole + dax:CreateCluster -> CanCreateWorkloadAs ----------------
+  # A principal with iam:PassRole for a DAX service role AND dax:CreateCluster
+  # can create a DAX cluster bound to that role. The DAX cluster then calls
+  # DynamoDB on behalf of DAX clients using that role's IAM permissions.
+  # This rule directly derives CanCreateWorkloadAs from iam:PassRole + dax:CreateCluster,
+  # collapsing the can-control linchpin's CanDeploy intermediate edge. This is pragmatically
+  # sound because dax:CreateCluster is the sole action that both deploys the DAX cluster
+  # AND passes the role in a single call (unlike Lambda/Glue which have separate actions).
+  # The linchpin's canonical CanDeploy -> CanCreateWorkloadAs chain does not apply here;
+  # this is a service-specific direct derivation.
+  - id: aws-dynamodb-dax-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "iam:PassRole for a DAX service role + dax:CreateCluster creates a DAX cluster executing DynamoDB requests as the passed role — AWS-specific single-action PassRole pattern."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE dax:CreateCluster"
+      - "?role trust policy allows dax.amazonaws.com as the service principal"
+      - "iam:PassRole for ?role permits iam:PassedToService including dax.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "dax:CreateCluster"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when iam:PassRole is confirmed EFFECTIVE for ?role with iam:PassedToService
+        admitting dax.amazonaws.com AND the principal has dax:CreateCluster effective. The
+        DAX cluster must be deployed into a VPC subnet group (dax:CreateSubnetGroup may be
+        required if no subnet group exists) — CONDITIONAL(iam_permission) when dax:CreateSubnetGroup
+        is also needed but its effectiveness is unresolved. CONDITIONAL(role_compatibility)
+        when the ?role trust policy or iam:PassedToService admission for dax.amazonaws.com
+        is unresolved — downgrade to POTENTIAL(role_compatibility) if trust is unknown.
+        BLOCKED when an SCP or permission-boundary denies iam:PassRole or dax:CreateCluster.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal CanPassIdentity ?role"
+        - "can-execute-as:execute-as-via-new-workload (canonical CanCreateWorkloadAs -> CanExecuteAs chain cited, not re-derived)"
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to ec2.amazonaws.com does NOT
+        become a DAX service role — downgrade to POTENTIAL(role_compatibility). The role
+        MUST trust dax.amazonaws.com or CreateCluster fails at the IAM service level.
+        DAX clusters require a VPC subnet group — if no subnet group exists, the principal
+        may also need dax:CreateSubnetGroup. This rule derives CanCreateWorkloadAs directly
+        from PassRole + dax:CreateCluster (bypassing the can-control linchpin's CanDeploy
+        intermediate step) because dax:CreateCluster is an AWS-specific single action that
+        performs both deployment and identity-passing. This is a pragmatic service-specific
+        exception to the linchpin canonical chain. A DAX cluster with iam:PassRole does NOT
+        give the calling principal direct DynamoDB access; it gives them a DAX cache that
+        calls DynamoDB as the passed role on behalf of DAX API clients. The escalation
+        path: principal creates DAX cluster -> DAX cluster calls DynamoDB as ?role ->
+        principal queries DAX (dax:GetItem / dax:Query via DAX SDK) -> reads DynamoDB
+        data as ?role. Cite can-execute-as:execute-as-via-new-workload for the final
+        CanExecuteAs roll-up from CanCreateWorkloadAs; do not re-derive it here.
+      narrative: >-
+        {principal.name} can create a DAX cluster bound to {role.name} (iam:PassRole +
+        dax:CreateCluster), then query DynamoDB through the DAX endpoint, exercising
+        {role.name}'s DynamoDB permissions — executing as {role.name} via the DAX
+        service principal.
+
+  # --- 8) Existing DAX cluster ExecutesAs -> CanReadData via DAX -------------
+  # A principal who can query a DAX cluster (via the DAX SDK, dax:GetItem,
+  # dax:Query, dax:Scan, dax:BatchGetItem) reads DynamoDB data through the DAX cache.
+  # The DAX cluster makes the underlying DynamoDB GetItem/Query/Scan calls as its
+  # attached IAM role. This yields CanReadData on the underlying DynamoDB table(s) the
+  # DAX cluster is configured to serve — the principal inherits the DAX role's
+  # DynamoDB read permissions via the cache layer.
+  - id: aws-dynamodb-dax-read-data
+    emits: CanReadData
+    description: "A principal with access to a DAX cluster (dax:GetItem / dax:Query / dax:Scan / dax:BatchGetItem) reads DynamoDB data through the cache, inheriting the DAX cluster's attached IAM role's DynamoDB permissions."
+    match:
+      - [ ?principal, HasPermission, ?dax_cluster ]
+      - [ ?dax_cluster, ExecutesAs, ?role ]
+      - [ ?role, HasPermission, ?table ]
+    where:
+      - "node_type(?dax_cluster) == Cache"
+      - "node_type(?table) == NoSQLDatabase"
+      - "?dax_cluster.provider_type == 'AWS::DAX::Cluster'"
+      - "?table.provider_type in ['AWS::DynamoDB::Table', 'AWS::DynamoDB::GlobalTable']"
+      - "?principal has EFFECTIVE at least ONE of: dax:GetItem, dax:Query, dax:Scan, dax:BatchGetItem on ?dax_cluster"
+      - "?role has EFFECTIVE at least ONE of: dynamodb:GetItem, dynamodb:Query, dynamodb:Scan on ?table ARN"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["dax:GetItem", "dax:Query", "dax:Scan", "dax:BatchGetItem"]
+      conditions: [iam_permission, network_reachability, service_state]
+      state_logic: >-
+        ACTIVE when the principal has at least one DAX read action (including dax:BatchGetItem)
+        effective on the DAX cluster AND the DAX cluster's attached role has the corresponding
+        DynamoDB read action effective on a target table AND the principal can reach the DAX
+        cluster endpoint (DAX is VPC-only — network_reachability condition). CONDITIONAL(network_reachability)
+        when the principal does not have a proven network path to the DAX cluster endpoint
+        (DAX clusters are VPC-internal; requires EC2 foothold or VPC peering in the same
+        subnet/VPC as the cluster). CONDITIONAL(service_state) when the DAX cluster is in
+        a non-AVAILABLE status. BLOCKED when an SCP or permission-boundary denies the DAX
+        read action. Note: DAX clusters are not accessible from outside the VPC without
+        explicit VPC connectivity — the network_reachability gate is almost always required
+        for external-attacker scenarios.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal HasPermission ?dax_cluster (dax:GetItem / dax:Query / dax:Scan / dax:BatchGetItem effective)"
+        - "?dax_cluster ExecutesAs ?role"
+      false_positive_note: >-
+        DAX is VPC-only. A principal without a VPC foothold (EC2 instance, Lambda in the
+        same VPC, or VPN/Transit Gateway connectivity) cannot reach the DAX cluster endpoint
+        — always CONDITIONAL(network_reachability) for principals that are not colocated.
+        The DAX cluster role determines WHICH DynamoDB tables are accessible; a role with
+        dynamodb:GetItem on arn:aws:dynamodb:*:*:table/SensitiveTable gives DAX-mediated
+        access to that table. dax:BatchGetItem is a bulk-read action (analogous to
+        dynamodb:BatchGetItem) that reads multiple items in a single call. The DAX cache
+        may serve stale data (cache hits bypass DynamoDB); the principal reads whatever
+        the cache has, which may be slightly behind the source of truth. DAX is not a data
+        exfiltration vector on its own — it is a read cache; exfiltration still requires
+        bulk operations (dax:Scan, dax:Query with filter expressions, or dax:BatchGetItem
+        with large batches) and iterating all partition keys.
+      narrative: >-
+        {principal.name} can query DynamoDB through the DAX cluster {dax_cluster.name}
+        (dax:GetItem / dax:Query / dax:Scan / dax:BatchGetItem), reading DynamoDB data via
+        the DAX role {role.name}'s permissions — network reach to the DAX VPC endpoint is required.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP denying dynamodb:GetItem, dynamodb:Query, dynamodb:Scan on all tables
+#     -> rule 1 BLOCKED.
+#   - SCP denying dynamodb:GetShardIterator or dynamodb:GetRecords on stream ARNs
+#     -> rule 2 BLOCKED.
+#   - SCP denying dynamodb:ExportTableToPointInTime -> rule 3 BLOCKED.
+#   - PITR disabled on source table -> rules 3 and 4 CONDITIONAL(service_state).
+#   - SCP denying dynamodb:RestoreTableToPointInTime or dynamodb:CreateTable
+#     -> rule 4 BLOCKED.
+#   - SCP denying dynamodb:PutResourcePolicy -> rule 5 BLOCKED.
+#   - Table SSE with CMK (alias/aws/dynamodb NOT present) -> rule 1 is
+#     CONDITIONAL(key_permission); cite credential-chains:decrypt-gates-secret-read.
+#   - iam:PassRole with iam:PassedToService NOT including dax.amazonaws.com
+#     -> rule 7 POTENTIAL(role_compatibility), not ACTIVE.
+#   - DAX cluster not in AVAILABLE state -> rule 8 CONDITIONAL(service_state).
+#   - DAX cluster VPC endpoint not reachable from principal network location
+#     -> rule 8 CONDITIONAL(network_reachability).
+#   - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/aws-dynamodb.yaml (ExecutesAs for DAX, ContainsSecret,
+# CrossAccountTrust from resource policy, CanTrigger from Lambda event source
+# mappings on DynamoDB streams). Per schema rules, edges with nature=explicit
+# must reside in /rules/explicit/ files, not in /rules/derived/ files.
+

@@ -1,0 +1,328 @@
+# AWS Config — Explicit normalization rules (nature: explicit only)
+# ---------------------------------------------------------------------------
+# Emits ONLY explicit edges from schema/edges.yaml:
+#   - CanDelete (resource_control, nature: explicit)
+#   - CanRead (resource_control, nature: both — allowed here)
+#   - CanTrigger (execution, nature: explicit)
+#   - CanModifyConfiguration (execution, nature: both — allowed here)
+#
+# Phase 12 (security & logging). These are the direct permission grants from
+# AWS Config IAM actions, not derived chains. The derived rules in
+# /rules/derived/aws/config.yaml cite these and combine them with linchpins
+# (can-execute-as, cicd-chains) to produce CanExecuteAs escalations.
+#
+# Official docs:
+#   https://docs.aws.amazon.com/config/latest/developerguide/
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsconfig.html
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 12-security-logging
+applies_to: [aws]
+
+explicit_rules:
+
+  # --- DeleteConfigurationRecorder => CanDelete on recorder ------------------
+  - id: aws-config-delete-recorder
+    emits: CanDelete
+    description: "config:DeleteConfigurationRecorder permanently removes the Config recorder, severing all Config-based compliance and configuration history for the region."
+    match:
+      - [ ?principal, HasPermission, ?recorder ]
+    where:
+      - "effective_action == 'config:DeleteConfigurationRecorder'"
+      - "node_type(?recorder) == ConfigurationService"
+      - "?recorder.provider_type == 'AWS::Config::ConfigurationRecorder'"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: ?principal
+      target: ?recorder
+      permissions: ["config:DeleteConfigurationRecorder"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when config:DeleteConfigurationRecorder is EFFECTIVE on the recorder
+        name (resource scope). BLOCKED when an SCP or permission boundary denies
+        config:DeleteConfigurationRecorder. Note: AWS requires the recorder to be
+        stopped (config:StopConfigurationRecorder) before it can be deleted; however,
+        if the caller holds both permissions, the delete is achievable as a two-step
+        sequence — model this edge as ACTIVE when both permissions are EFFECTIVE.
+        When only DeleteConfigurationRecorder is held but not Stop, the sequence fails
+        unless the recorder is already stopped — downgrade to CONDITIONAL(service_state).
+      confidence: 0.9
+      derived_from: ["effective config:DeleteConfigurationRecorder on ?recorder"]
+      false_positive_note: >-
+        Irreversible by itself — a deleted recorder must be re-created from scratch.
+        Defense evasion only; does NOT grant access to resources. Distinguish from
+        StopConfigurationRecorder (reversible); deletion has higher impact but also
+        requires a prior Stop call in practice. An SCP requiring Config recorder
+        presence (aws-config:StopConfigurationRecorder / DeleteConfigurationRecorder
+        deny) would BLOCK this. The recorder must already be stopped — if the caller
+        does not also hold config:StopConfigurationRecorder, the delete will fail
+        unless the recorder is already in a stopped state.
+      narrative: >-
+        {principal.name} can delete the Config recorder {recorder.name}
+        (config:DeleteConfigurationRecorder), permanently removing all Config-based
+        configuration recording for the region. Recovery requires re-creating the
+        recorder. Defense evasion only — no resource access is granted.
+
+  # --- DeleteDeliveryChannel => CanDelete on delivery channel ----------------
+  - id: aws-config-delete-delivery-channel
+    emits: CanDelete
+    description: "config:DeleteDeliveryChannel removes the Config delivery channel, stopping delivery of configuration snapshots and history to S3/SNS even if the recorder is running."
+    match:
+      - [ ?principal, HasPermission, ?channel ]
+    where:
+      - "effective_action == 'config:DeleteDeliveryChannel'"
+      - "node_type(?channel) == ConfigurationService"
+      - "?channel.provider_type == 'AWS::Config::DeliveryChannel'"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: ?principal
+      target: ?channel
+      permissions: ["config:DeleteDeliveryChannel"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when config:DeleteDeliveryChannel is EFFECTIVE and the recorder is
+        already stopped (AWS enforces recorder-must-be-stopped before channel
+        deletion). CONDITIONAL(service_state) when the caller does not also hold
+        config:StopConfigurationRecorder and the recorder is running (the delete
+        call will be rejected by the service). BLOCKED when an SCP denies
+        config:DeleteDeliveryChannel.
+      confidence: 0.85
+      derived_from: ["effective config:DeleteDeliveryChannel on ?channel"]
+      false_positive_note: >-
+        AWS enforces that the recorder must be stopped before the delivery channel
+        can be deleted. If the caller holds only config:DeleteDeliveryChannel but
+        not config:StopConfigurationRecorder (and the recorder is running), the
+        delete is rejected — downgrade to CONDITIONAL(service_state). When the
+        caller holds both Stop and Delete permissions, the sequence is achievable;
+        model as ACTIVE. Defense evasion only; existing S3 data persists but new
+        snapshots stop flowing.
+      narrative: >-
+        {principal.name} can delete the Config delivery channel {channel.name}
+        (config:DeleteDeliveryChannel), stopping delivery of configuration snapshots
+        and compliance history to the configured S3 bucket and SNS topic. No new
+        Config data flows after deletion. Defense evasion — no resource access granted.
+
+  # --- StartRemediationExecution => CanTrigger on remediation runner --------
+  # This is the explicit permission grant. The derived rule aws-config-remediation-trigger
+  # in /rules/derived/aws/config.yaml cites this to produce the CanTrigger edge
+  # that feeds cicd-chains for the execution roll-up.
+  - id: aws-config-remediation-trigger-explicit
+    emits: CanTrigger
+    description: "config:StartRemediationExecution triggers an existing Config remediation SSM Automation runner on demand, running it as the configured AutomationAssumeRole."
+    match:
+      - [ ?principal, HasPermission, ?rule ]
+    where:
+      - "effective_action == 'config:StartRemediationExecution'"
+      - "node_type(?rule) == ConfigurationService"
+      - "?rule.provider_type == 'AWS::Config::ConfigRule'"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: "<SSM Automation runner (BuildWorker) for this rule's remediation>"
+      permissions: ["config:StartRemediationExecution"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when config:StartRemediationExecution is EFFECTIVE on the rule ARN
+        and a remediation configuration with an AutomationAssumeRole exists on the
+        rule. CONDITIONAL(service_state) when no remediation configuration is
+        associated with the rule (the call would be rejected). BLOCKED when an SCP
+        denies config:StartRemediationExecution. Whether the trigger yields the
+        AutomationAssumeRole credentials depends on the SSM document definition
+        being attacker-influenceable — that judgment is cicd-chains:cicd-trigger-runner-executes-as
+        (CONDITIONAL(attacker_influenced_definition) by default).
+      confidence: 0.85
+      derived_from: ["effective config:StartRemediationExecution on ?rule"]
+      false_positive_note: >-
+        This is an explicit permission grant (CanTrigger). The execution consequence
+        (CanExecuteAs) is derived by cicd-chains:cicd-trigger-runner-executes-as using
+        this edge + the remediation runner's ExecutesAs. Do NOT emit CanExecuteAs here.
+        A caller who can both PutRemediationConfigurations (config modification +
+        iam:PassRole) AND trigger the runner: the modification path (CanCreateWorkloadAs)
+        dominates. Ensure the SSM Automation runner node exists and links to the
+        correct ConfigRule via remediation_rule_arn.
+      narrative: >-
+        {principal.name} can trigger on-demand remediation of Config rule {rule.name}
+        (config:StartRemediationExecution), invoking SSM Automation runner as the
+        configured AutomationAssumeRole; if the remediation document's steps already
+        execute attacker-influenceable code, cicd-chains derives execution as that role.
+
+  # --- PutRemediationConfigurations => CanModifyConfiguration on RemediationConfig
+  # This is the explicit permission grant. The derived rule aws-config-remediation-create-workload-as
+  # in /rules/derived/aws/config.yaml cites this + CanPassIdentity to produce
+  # CanCreateWorkloadAs.
+  - id: aws-config-put-remediation-config-modify
+    emits: CanModifyConfiguration
+    description: "config:PutRemediationConfigurations sets or updates a Config rule's remediation configuration, including the AutomationAssumeRole and SSM Document."
+    match:
+      - [ ?principal, HasPermission, ?rule ]
+    where:
+      - "effective_action == 'config:PutRemediationConfigurations'"
+      - "node_type(?rule) == ConfigurationService"
+      - "?rule.provider_type == 'AWS::Config::ConfigRule'"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: ?principal
+      target: "<RemediationConfiguration node for this rule>"
+      permissions: ["config:PutRemediationConfigurations"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when config:PutRemediationConfigurations is EFFECTIVE on the rule ARN
+        or '*'. BLOCKED when an SCP or permission boundary denies
+        config:PutRemediationConfigurations.
+      confidence: 0.9
+      derived_from: ["effective config:PutRemediationConfigurations on ?rule"]
+      false_positive_note: >-
+        This is an explicit permission grant (CanModifyConfiguration). For execution
+        via remediation, this must be combined with CanPassIdentity on the role
+        bound as AutomationAssumeRole. That combination is rolled up to
+        CanCreateWorkloadAs (and thence CanExecuteAs) by can-execute-as:execute-as-via-new-workload
+        and aws-config-remediation-create-workload-as in the derived rules. Do NOT
+        emit CanExecuteAs here.
+      narrative: >-
+        {principal.name} can update remediation configuration for Config rule
+        {rule.name} (config:PutRemediationConfigurations), setting or changing the
+        AutomationAssumeRole and SSM Document that will execute on remediation.
+
+  # --- ListAggregateDiscoveredResources / BatchGetAggregateResourceConfig ----
+  # Recon-only. Explicit permission grant (CanRead, nature: both).
+  - id: aws-config-aggregator-read-inventory
+    emits: CanRead
+    description: "config:ListAggregateDiscoveredResources or config:BatchGetAggregateResourceConfig on a Config Aggregator exposes cross-account resource inventory and configurations — recon primitive."
+    match:
+      - [ ?principal, HasPermission, ?aggregator ]
+    where:
+      - "effective_action in ['config:ListAggregateDiscoveredResources', 'config:BatchGetAggregateResourceConfig', 'config:GetAggregateConfigRuleComplianceSummary']"
+      - "node_type(?aggregator) == ConfigurationService"
+      - "?aggregator.provider_type == 'AWS::Config::ConfigurationAggregator'"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: ?principal
+      target: ?aggregator
+      permissions:
+        - "config:ListAggregateDiscoveredResources"
+        - "config:BatchGetAggregateResourceConfig"
+        - "config:GetAggregateConfigRuleComplianceSummary"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when any of the listed actions is EFFECTIVE on the aggregator ARN or
+        '*'. BLOCKED when an SCP denies all listed actions. The aggregator must be
+        populated (source accounts authorized) for the read to return data;
+        CONDITIONAL(service_state) when the aggregator exists but has no authorized
+        source accounts.
+      confidence: 0.8
+      derived_from: ["effective config:ListAggregateDiscoveredResources or similar on ?aggregator"]
+      false_positive_note: >-
+        Recon only — reading aggregator data does not grant access to the resources
+        it describes; it only reveals their configuration state. Downgrade significance
+        when the aggregator covers only the attacker's own account (no cross-account
+        value). High value when the aggregator covers the entire AWS Organization —
+        it exposes resource types, IDs, configurations, and compliance status across
+        all member accounts without requiring access to those accounts. This is a
+        1-rule conservative treatment per Phase 12 LOW-relevance guidance for recon
+        services. Do NOT chain this to CanEnter* or CanExecuteAs.
+      narrative: >-
+        {principal.name} can read cross-account resource inventory from Config
+        Aggregator {aggregator.name} (config:ListAggregateDiscoveredResources /
+        config:BatchGetAggregateResourceConfig), exposing configuration metadata for
+        resources across all aggregated accounts — enabling large-scale reconnaissance
+        without direct access to those accounts.
+
+  # --- PutDeliveryChannel => CanModifyConfiguration on DeliveryChannel ------
+  # New rule: redirecting Config delivery to attacker-controlled S3 for exfiltration.
+  # This is a lower-priority vector (data exfiltration rather than execution),
+  # but a real attack path.
+  - id: aws-config-put-delivery-channel-redirect
+    emits: CanModifyConfiguration
+    description: "config:PutDeliveryChannel allows an attacker to redirect Config snapshot delivery to an attacker-controlled S3 bucket, enabling exfiltration of configuration history (e.g., Lambda env vars, SSM parameters recorded by Config)."
+    match:
+      - [ ?principal, HasPermission, ?channel ]
+    where:
+      - "effective_action == 'config:PutDeliveryChannel'"
+      - "node_type(?channel) == ConfigurationService"
+      - "?channel.provider_type == 'AWS::Config::DeliveryChannel'"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: ?principal
+      target: ?channel
+      permissions: ["config:PutDeliveryChannel"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when config:PutDeliveryChannel is EFFECTIVE on the delivery channel
+        ARN or '*'. BLOCKED when an SCP or permission boundary denies
+        config:PutDeliveryChannel.
+      confidence: 0.8
+      derived_from: ["effective config:PutDeliveryChannel on ?channel"]
+      false_positive_note: >-
+        This enables data EXFILTRATION, not execution or privilege escalation. The
+        impact is conditional on the S3 destination bucket and whether Config
+        actually recorded sensitive data (e.g., Lambda environment variables, SSM
+        parameter values, RDS connection strings in resource configs). Downgrade
+        significance if the attacker already has S3 read access (they can already
+        read the original delivery bucket). The channel can deliver to an S3 bucket
+        in a different account if the bucket policy allows; attacker control means
+        either they own the destination bucket or can set its bucket policy. For
+        full exfiltration, the attacker must also be able to read from the
+        destination bucket they've specified — that is a separate CanReadData edge
+        (not modeled here). Detection: CloudTrail logs PutDeliveryChannel, and
+        Config generates notifications when it tries to deliver to the new location.
+      narrative: >-
+        {principal.name} can modify the delivery channel {channel.name}
+        (config:PutDeliveryChannel) to redirect Config snapshots to an attacker-controlled
+        S3 bucket. Future snapshots of resource configurations (including sensitive
+        data like Lambda env vars, SSM parameters, RDS connection strings) will be
+        delivered to the attacker's bucket, enabling exfiltration of this metadata.
+
+  # --- PutConfigurationRecorder => CanModifyConfiguration on Recorder -------
+  # New rule: narrowing the recording scope (evasion). Listed in provider doc but
+  # not previously modeled. Allows surgical suppression of recording for specific
+  # resource types, making evasion harder to detect than StopConfigurationRecorder.
+  - id: aws-config-put-recorder-narrow-scope
+    emits: CanModifyConfiguration
+    description: "config:PutConfigurationRecorder allows an attacker to narrow the recording scope (remove specific resource types from recording) as a more surgical evasion than StopConfigurationRecorder — targeted suppression of recording without halting recording entirely."
+    match:
+      - [ ?principal, HasPermission, ?recorder ]
+    where:
+      - "effective_action == 'config:PutConfigurationRecorder'"
+      - "node_type(?recorder) == ConfigurationService"
+      - "?recorder.provider_type == 'AWS::Config::ConfigurationRecorder'"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: ?principal
+      target: ?recorder
+      permissions: ["config:PutConfigurationRecorder"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when config:PutConfigurationRecorder is EFFECTIVE on the recorder
+        name (resource scope). BLOCKED when an SCP or permission boundary denies
+        config:PutConfigurationRecorder. Requires the recorder to be stopped before
+        changes take effect (AWS enforces this); if the caller also holds
+        config:StopConfigurationRecorder, the update is achievable as a two-step
+        sequence — model as ACTIVE. Otherwise, downgrade to CONDITIONAL(service_state)
+        if the recorder is running.
+      confidence: 0.85
+      derived_from: ["effective config:PutConfigurationRecorder on ?recorder"]
+      false_positive_note: >-
+        Defense evasion / cover tracks only — this does NOT grant access to any
+        resource. The attacker can remove specific resource types (e.g., Lambda,
+        EC2, IAM) from the scope, leaving other types still recorded. This is
+        narrower than StopConfigurationRecorder (which halts all recording) and may
+        evade detection better because the recorder is still "running" in a limited
+        mode. An SCP requiring Config recording to include certain resource types
+        would BLOCK this. The recorder must be stopped before the config update
+        takes effect — if the caller does not also hold StopConfigurationRecorder,
+        the update will fail unless the recorder is already stopped.
+      narrative: >-
+        {principal.name} can modify the Config recorder {recorder.name}
+        (config:PutConfigurationRecorder) to narrow its recording scope, removing
+        specific resource types from recording while leaving the recorder active for
+        others. This targeted evasion is harder to detect than a full recorder stop
+        but achieves the goal of blinding Config to attacker-created/modified
+        resources in the excluded types.

@@ -1,0 +1,469 @@
+# Provider-agnostic identity-federation chain rules (Phase 14 — multi-cloud federation)
+# ===========================================================================
+# THE PHASE-14 LINCHPIN. Written FIRST, before the per-service Phase-14
+# adapters (aws:rolesanywhere, gcp:wif / workload-identity-pool, azure
+# federated-credential / workload-identity, k8s OIDC, GitHub/GitLab OIDC),
+# exactly as hierarchy-chains.yaml was written first for Phase 3 and
+# credential-chains.yaml for Phase 5. It defines the traversable collapse those
+# adapters target so they only have to emit two NORMALIZED trust facts each and
+# get full path-finding for free.
+#
+# THE PHASE-14 IDEA (multi-cloud identity federation):
+#   An EXTERNAL identity — an OIDC/SAML workload (GitHub Actions, GitLab CI,
+#   a Kubernetes ServiceAccount projected token), another cloud's principal, or
+#   an X.509 certificate holder — becomes an INTERNAL cloud identity (a Role /
+#   ServiceAccount / MachineIdentity) WITHOUT any static, long-lived credential,
+#   purely by SATISFYING A TRUST CONDITION. There is no key to steal; the attack
+#   is to PRESENT an external identity the verifier will accept.
+#
+#   The attack value is almost always a WEAK trust condition:
+#     * an UNPINNED subject      (sub not constrained, or a broad prefix/wildcard)
+#     * a WILDCARD audience      (aud = *, or a shared/default audience)
+#     * an attacker-influenced ISSUER/CA (self-hostable OIDC issuer, a CA the
+#       attacker can issue from — see rule 4 / Phase-5 acmpca / gcp CAS)
+#     * a MISSING cert-subject condition on an X.509 trust anchor
+#   ...so that an identity the ATTACKER CONTROLS matches and is accepted.
+#
+# NORMALIZED TRUST MODEL (what the adapters emit; this file consumes it):
+#   Each provider's federation config is normalized to the SAME two explicit edges:
+#     TrustsExternalIdentity(?internal_trust_anchor -> ?ext)   the trust config:
+#         a Role/ServiceAccount/ApplicationIdentity/ResourcePolicy declares it will
+#         accept an ExternalIdentity/FederatedIdentity under some condition.
+#     ExternalIdentityMapsTo(?ext -> ?internal)                the realized mapping:
+#         a matching external identity becomes the internal Identity/Role/
+#         ServiceAccount (WIF attribute mapping, AWS OIDC/SAML/RolesAnywhere trust,
+#         Azure federated credential subject/issuer, k8s SA binding).
+#   The adapter records the trust CONDITION (sub/aud/issuer/cert-subject pinning)
+#   as properties on those edges; the rules below read those properties to decide
+#   ACTIVE vs CONDITIONAL(trust_condition).
+#
+# WHAT THIS FILE PRODUCES (the collapse):
+#   ExternalIdentityMapsTo + satisfiable-trust  => CanFederateAs(?ext -> ?internal)
+#   CanFederateAs (?internal in a boundary)      => CanEnter{Project|Account} foothold
+#   CanFederateAs (?internal is SA/Role)         => CanImpersonate(?p -> ?internal)
+#                                                    (inherit its outbound capabilities)
+#   CanSignAs(?ca) + CA is a federation anchor   => CanFederateAs (forge-cert path)
+#
+# STATE PROPAGATION (per RULE-FORMAT.md): a derived edge is never stronger than
+# its weakest contributor. The federation-specific gate is `trust_condition`:
+#   * BROAD / UNPINNED condition (attacker can present a matching external
+#     identity — unpinned sub, wildcard aud, self-hostable issuer): ACTIVE.
+#   * PINNED to a specific subject/issuer/cert the attacker does NOT control:
+#     CONDITIONAL(trust_condition) — real only if the attacker first obtains a
+#     matching external identity.
+#   A CONDITIONAL/POTENTIAL/BLOCKED contributor never yields a stronger output.
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE the other provider-agnostic files and the
+# Phase-2 identity rules:
+#   * credential-chains.yaml
+#       - read-secret-yields-identity / impersonate-is-escalation: this file
+#         reuses impersonate-is-escalation for the escalation roll-up off the
+#         CanImpersonate we emit (rule 3) — we do NOT re-derive escalation.
+#       - sign-as-yields-impersonation: the "signing needs a consuming trust"
+#         discipline is mirrored by rule 4 (a CA only matters if it anchors a
+#         real federation).
+#       - execute-then-read-secret: rule 3's capability-inheritance note is the
+#         federation analogue of that "inherit the acquired identity's outbound
+#         reach" collapse.
+#   * can-control.yaml
+#       - enter-account-via-assume already turns AWS cross-account CanAssume into
+#         CanEnterAccount; rule 2 here does the FEDERATION analogue (foothold from
+#         CanFederateAs) and defers the AWS-assume case to can-control.
+#       - control-via-admin / escalate-via-execute-as: consumed downstream, not
+#         re-derived.
+#   * hierarchy-chains.yaml
+#       - enter-boundary-rollups already materializes a foothold for a GENERIC
+#         acquisition edge (?acquire in {CanImpersonate, CanAssume, CanFederateAs,
+#         CanCreateCredentialFor}). Rule 2 below is the federation-SPECIFIC,
+#         first-class CanFederateAs -> CanEnter* keyed to ?internal's boundary; it
+#         dedupes with enter-boundary-rollups on (CanEnter*, principal, boundary)
+#         and exists so the federation narrative is explicit and fires even before
+#         that generic rule runs in the fixpoint.
+#   * Phase-2 identity-escalation (aws/identity-escalation.yaml,
+#     gcp/identity-escalation.yaml) — the per-provider PRIMITIVES this file builds on;
+#     CITED, not duplicated:
+#       - aws-assume-role-web-identity (AWS): emits CanFederateAs from an OIDC/SAML
+#         trust policy whose sub/aud is attacker-satisfiable. That is the
+#         AWS-specific realization of rule 1's collapse (the adapter may emit
+#         CanFederateAs directly OR the normalized TrustsExternalIdentity +
+#         ExternalIdentityMapsTo pair that rule 1 collapses).
+#       - gcp-workload-identity-federation (GCP): emits CanFederateAs from a WIF
+#         pool provider whose attribute mapping is attacker-satisfiable — same
+#         collapse, GCP-specific.
+#       - Azure federated-credential-write lives in the azure identity-escalation
+#         rules (a CanModifyTrust that ADDS a federated credential): that is the
+#         "attacker WRITES the trust to point at an identity it controls" primitive;
+#         this file consumes the resulting trust, it does not re-derive the write.
+#     Rules 1–4 are the PROVIDER-AGNOSTIC collapse over the normalized trust pair,
+#     so a new provider (k8s, GitLab, RolesAnywhere) needs only emit the two
+#     explicit edges and inherits every path here.
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml) — honored by every emit;
+# typed source_type/target_type declared per RULE-FORMAT.md, within these sets:
+#   CanFederateAs:          source [Identity, FederatedIdentity, WorkloadIdentity]
+#                           target [Role, ServiceAccount, MachineIdentity]
+#   FederatesTo:            source [Identity, ApplicationIdentity, WorkloadIdentity]
+#                           target [Identity, Role, ServiceAccount]
+#   TrustsExternalIdentity: source [Role, ServiceAccount, ApplicationIdentity, ResourcePolicy]
+#                           target [ExternalIdentity, FederatedIdentity]
+#   ExternalIdentityMapsTo: source [ExternalIdentity, FederatedIdentity]
+#                           target [Identity, Role, ServiceAccount]
+#   CanImpersonate:         source [Identity]
+#                           target [ServiceAccount, MachineIdentity, ManagedIdentity, WorkloadIdentity, ApplicationIdentity]
+#   CanEnterProject:        source [Identity]  target [Project]
+#   CanEnterAccount:        source [Identity]  target [Account]
+#   CanSignAs:              source [Identity]  target [SigningKey, ServiceAccount, ApplicationIdentity]
+# ===========================================================================
+
+applies_to: ["*"]
+phase: 14-identity-federation
+
+rules:
+
+  # --- 1) A realized external->internal mapping becomes a takeover edge -------
+  # THE collapse of the phase. The adapters normalize each provider's federation
+  # trust to TrustsExternalIdentity(anchor -> ?ext) + ExternalIdentityMapsTo(?ext
+  # -> ?internal). Neither is, on its own, an attacker capability: a trust config
+  # is only dangerous if an identity the ATTACKER controls satisfies its
+  # condition. This rule fires exactly when the trust is satisfiable by an
+  # attacker-controllable ?ext, emitting the traversable CanFederateAs takeover.
+  #
+  # The ACTIVE trigger is the WEAK-TRUST breadth: an unpinned subject, a wildcard
+  # or shared audience, or an attacker-influenceable issuer means the attacker can
+  # present a matching external identity right now. A subject PINNED to a specific
+  # principal the attacker does not control keeps it CONDITIONAL(trust_condition).
+  - id: federation-maps-to-identity
+    emits: CanFederateAs
+    description: "A realized external->internal identity mapping whose trust condition an attacker-controlled external identity can satisfy yields federation into the internal identity."
+    applies_to: ["*"]
+    match:
+      - [ ?ext, ExternalIdentityMapsTo, ?internal ]
+    where:
+      # ?ext is the external principal side (source set of ExternalIdentityMapsTo /
+      # target set of TrustsExternalIdentity); it is also a valid CanFederateAs source.
+      - "node_type(?ext) in [ExternalIdentity, FederatedIdentity]"
+      # ?internal must be an admissible CanFederateAs target (Role / ServiceAccount /
+      # MachineIdentity). ExternalIdentityMapsTo may also target a plain Identity; when
+      # ?internal is a plain User/Identity that is NOT one of those, prefer FederatesTo
+      # for the raw mapping and do not force CanFederateAs (see false_positive_note).
+      - "node_type(?internal) in [Role, ServiceAccount, MachineIdentity]"
+      # There is a backing trust config for this mapping (the anchor declares it
+      # accepts ?ext). Resolves via TrustsExternalIdentity(?anchor -> ?ext) with the
+      # trust CONDITION recorded on the trust/mapping edge properties.
+      - "exists TrustsExternalIdentity(?anchor -> ?ext) with condition C backing this mapping"
+    optional:
+      # Presence of a BROAD/UNPINNED condition (attacker-satisfiable) is what makes
+      # this ACTIVE. Model as an optional match on the trust-condition breadth flag
+      # the adapter set; absent/pinned => CONDITIONAL(trust_condition).
+      - [ ?ext, TrustsExternalIdentity, ?internal ]   # placeholder for "trust_condition is broad/unpinned" (attacker_controllable(?ext) == true)
+    emit:
+      source_type: FederatedIdentity
+      target_type: Role
+      source: ?ext
+      target: ?internal
+      permissions: []
+      conditions: [trust_condition]
+      state_logic: >-
+        if the trust condition is BROAD/UNPINNED so an attacker can present a
+        matching external identity (unpinned sub / wildcard or shared aud /
+        attacker-influenceable issuer / missing cert-subject constraint) OR the
+        attacker demonstrably controls a matching ?ext: ACTIVE. If the condition is
+        PINNED to a specific subject/issuer/cert the attacker does NOT control:
+        CONDITIONAL(trust_condition) — realizable only once the attacker obtains a
+        matching external identity. Inherit weakest with the backing
+        TrustsExternalIdentity / ExternalIdentityMapsTo: a BLOCKED trust (issuer
+        disabled, provider deleted, condition explicitly denies) => BLOCKED.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?ext ExternalIdentityMapsTo ?internal", "?anchor TrustsExternalIdentity ?ext (backing trust, condition C)" ]
+      false_positive_note: >-
+        The whole judgment is in the trust CONDITION — do not emit ACTIVE for a
+        well-pinned trust. UNPINNED/broad => ACTIVE: e.g. an AWS OIDC role trust with
+        no sub condition (or `sub` a wildcard), a shared/`sts.amazonaws.com` default
+        aud, a GitHub-Actions trust missing the repo/branch `sub` pin, a GCP WIF
+        provider whose attribute mapping accepts any `assertion.sub`, an Azure
+        federated credential with a broad issuer/subject, or an X.509 trust anchor
+        with no cert-subject condition. PINNED => CONDITIONAL(trust_condition): the
+        `sub` bound to a specific repo:owner/repo:ref, a specific SPIFFE ID, or a
+        specific cert CN the attacker cannot present. Do NOT treat mere existence of
+        a federation as compromise — a correctly pinned trust is a legitimate control.
+        If ?internal is a plain User (not Role/SA/MachineIdentity) the CanFederateAs
+        target set excludes it — keep it as FederatesTo and let identity-specific
+        rules handle it. A disabled/deleted OIDC provider or rotated issuer key =>
+        the adapter must not emit the trust => this rule does not fire.
+      narrative: >-
+        {ext.name} is mapped to the internal identity {internal.name} by
+        {anchor.name}'s federation trust; because that trust's condition is
+        {trust_condition_summary}, an identity the attacker controls satisfies it and
+        can federate in as {internal.name} with no static credential.
+
+  # --- 2) Federating into a Role/SA in a boundary is a foothold in it ---------
+  # A realized CanFederateAs whose target is homed in a project/account gives the
+  # federated principal a foothold in that boundary — the federation analogue of
+  # can-control's enter-account-via-assume (AWS CanAssume cross-account). We emit
+  # the CanEnter* keyed to ?internal's home boundary. Defers the AWS
+  # cross-account-ASSUME case to can-control; this is the FEDERATION path.
+  # Split per boundary subtype so each emit carries a precise typed target-ref
+  # (CanEnterAccount.target=[Account], CanEnterProject.target=[Project]); a single
+  # rule emitting both cannot carry one conformant target_type. Azure federated
+  # identities homed to a Subscription/Tenant surface via hierarchy-chains
+  # enter-boundary-rollups off the same CanFederateAs — not re-emitted here.
+  - id: federate-then-enter-account
+    emits: CanEnterAccount
+    description: "Federating into a Role homed in an AWS account gives the federated principal a foothold in that account."
+    applies_to: ["*"]
+    match:
+      - [ ?p, CanFederateAs, ?internal ]
+    where:
+      - "node_type(?internal) in [Role, ServiceAccount, MachineIdentity]"
+      - "node_class(?p) in [Identity]  # FederatedIdentity / WorkloadIdentity are Identity subtypes"
+      - "node_type(home_boundary(?internal)) == Account   # AWS"
+      - "home_boundary(?internal) is a boundary the federated principal is not already in"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?p
+      target: "home_boundary(?internal)  (Account)"
+      permissions: []
+      conditions: [trust_condition]
+      state_logic: >-
+        inherit from the CanFederateAs input: ACTIVE only when the federation is
+        ACTIVE (broad/unpinned trust the attacker satisfies); CONDITIONAL(trust_condition)
+        when the federation is CONDITIONAL (pinned trust); BLOCKED if the federation
+        is BLOCKED. The foothold is exactly as strong as the takeover that produces it.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?p CanFederateAs ?internal", "home_boundary(?internal) == Account" ]
+      false_positive_note: >-
+        The foothold is entry AS ?internal — it grants the federated principal
+        whatever ?internal itself can do inside the account, NOT the account's full
+        privilege (rule 1's trust breadth decides reachability; boundary control comes
+        only if ?internal is itself an admin there — see hierarchy-chains
+        enter-boundary-rollups for the Controls upgrade condition). Do NOT emit for a
+        federation whose target is homed in the principal's OWN account (no boundary
+        crossed). AWS cross-account role ASSUME (not federation) is already handled by
+        can-control's enter-account-via-assume — do not double-emit CanEnterAccount for
+        that case; this rule covers the CanFederateAs (web-identity / RolesAnywhere)
+        path. Respect the trust_condition gate — never upgrade a CONDITIONAL federation
+        to an ACTIVE foothold.
+      narrative: >-
+        {p.name} can federate in as {internal.name}, which is homed in account
+        {boundary.name}; the federation therefore lands the attacker inside
+        {boundary.name}, operating as {internal.name}.
+
+  - id: federate-then-enter-project
+    emits: CanEnterProject
+    description: "Federating into a ServiceAccount homed in a GCP project gives the federated principal a foothold in that project."
+    applies_to: ["*"]
+    match:
+      - [ ?p, CanFederateAs, ?internal ]
+    where:
+      - "node_type(?internal) in [Role, ServiceAccount, MachineIdentity]"
+      - "node_class(?p) in [Identity]"
+      - "node_type(home_boundary(?internal)) == Project   # GCP"
+      - "home_boundary(?internal) is a boundary the federated principal is not already in"
+    emit:
+      source_type: Identity
+      target_type: Project
+      source: ?p
+      target: "home_boundary(?internal)  (Project)"
+      permissions: []
+      conditions: [trust_condition]
+      state_logic: >-
+        inherit from the CanFederateAs input: ACTIVE only when the federation is
+        ACTIVE (broad/unpinned trust the attacker satisfies); CONDITIONAL(trust_condition)
+        when the federation is CONDITIONAL (pinned trust); BLOCKED if the federation is
+        BLOCKED. The foothold is exactly as strong as the takeover that produces it.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?p CanFederateAs ?internal", "home_boundary(?internal) == Project" ]
+      false_positive_note: >-
+        The foothold is entry AS ?internal — WIF-into-a-ServiceAccount grants the
+        federated principal whatever the SA can do in the project, NOT the project's
+        full privilege (boundary control only if the SA is itself a project admin — see
+        hierarchy-chains enter-boundary-rollups). Do NOT emit for a federation whose
+        target is homed in the principal's OWN project (no boundary crossed). Respect
+        the trust_condition gate — never upgrade a CONDITIONAL federation to an ACTIVE
+        foothold.
+      narrative: >-
+        {p.name} can federate in as {internal.name}, which is homed in project
+        {boundary.name}; the federation therefore lands the attacker inside
+        {boundary.name}, operating as {internal.name}.
+
+  # --- 3) Federation inherits the acquired identity's outbound capabilities ---
+  # Acting AS ?internal means the federated principal HAS ?internal's outbound
+  # reach — the federation analogue of credential-chains' execute-then-read-secret
+  # ("inherit the acquired identity's capabilities"). We express this two ways:
+  #   (a) a capability-inheritance NOTE so downstream rules (e.g.
+  #       execute-then-read-secret, admin-inherits-down-contains) traverse
+  #       ?internal's own outbound edges from ?p; and
+  #   (b) a CanImpersonate(?p -> ?internal) ROLL-UP when ?internal is a
+  #       ServiceAccount/Role/MachineIdentity, so the credential-centric queries and
+  #       the escalation roll-up fire. The escalation itself is NOT re-derived here:
+  #       it is credential-chains' impersonate-is-escalation, CITED below.
+  - id: federate-inherits-capabilities
+    emits: CanImpersonate
+    description: "Federating in as an internal Role/ServiceAccount lets the principal act AS it, inheriting its outbound capabilities; rolled up as CanImpersonate."
+    applies_to: ["*"]
+    match:
+      - [ ?p, CanFederateAs, ?internal ]
+    where:
+      # CanImpersonate target set is [ServiceAccount, MachineIdentity, ManagedIdentity,
+      # WorkloadIdentity, ApplicationIdentity]. A CanFederateAs whose target is a plain
+      # Role is federation-into-a-role, not identity impersonation — for a Role the
+      # inheritance is realized by normal traversal of the Role's outbound edges from
+      # ?p (the note below), NOT by a CanImpersonate whose target set excludes Role.
+      - "node_type(?internal) in [ServiceAccount, MachineIdentity]"
+      - "node_class(?p) in [Identity]"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: ?p
+      target: ?internal
+      permissions: []
+      conditions: [trust_condition]
+      state_logic: >-
+        inherit from CanFederateAs: ACTIVE when the federation is ACTIVE, else
+        CONDITIONAL(trust_condition); BLOCKED if the federation is BLOCKED. The
+        impersonation is never stronger than the federation that grants it.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?p CanFederateAs ?internal" ]
+      note: >-
+        CAPABILITY INHERITANCE (traversal-feeding): once CanFederateAs(?p -> ?internal)
+        holds, ?p effectively holds every OUTBOUND capability of ?internal — its
+        CanReadSecret, CanExecuteAs, CanAdminister, CanDeploy, etc. This is realized by
+        ordinary graph traversal (walk CanFederateAs, then ?internal's own outbound
+        edges), mirroring credential-chains execute-then-read-secret. This rule
+        additionally MATERIALIZES the CanImpersonate roll-up (for SA/MachineIdentity
+        targets) so credential-centric reverse queries and the escalation roll-up
+        surface ?p directly. For a Role target, no CanImpersonate is emitted (target set
+        excludes Role) — the inheritance is traversal-only.
+      false_positive_note: >-
+        Only emit the CanImpersonate roll-up when ?internal is a ServiceAccount/
+        MachineIdentity (the CanImpersonate target set) — never for a plain Role or User.
+        The escalation consequence (when ?internal is more privileged than ?p) is NOT
+        re-derived here: it is produced by credential-chains.yaml's
+        impersonate-is-escalation off this CanImpersonate — cite, do not duplicate. Do
+        not double-count weight where both this CanImpersonate and the two-hop
+        (CanFederateAs then ?internal's outbound) path appear on the same route. Inherits
+        the federation's trust_condition state — a CONDITIONAL federation yields only a
+        CONDITIONAL impersonation, never an ACTIVE one.
+      narrative: >-
+        {p.name} can federate in as {internal.name} ({perm:CanFederateAs}) and thereby
+        act as it — inheriting {internal.name}'s outbound capabilities; modeled as
+        {p.name} CanImpersonate {internal.name}.
+
+  # --- 4) Forge a cert from a CA that anchors a federation => federate in ------
+  # CROSS-PHASE, conservative. A federation can be anchored on an X.509 CA
+  # (AWS IAM Roles Anywhere trust anchor; a private CA whose certs a trust
+  # accepts) instead of an OIDC/SAML issuer. If the attacker can ISSUE from that
+  # CA (Phase-5 CanSignAs on the CA — aws acmpca / gcp CAS), it can mint a client
+  # certificate whose subject satisfies the trust, i.e. produce a matching
+  # external identity itself — then federate in. Kept tight: only fires when the
+  # CA is the ACTUAL trust anchor of a modeled federation, mirroring
+  # credential-chains sign-as-yields-impersonation ("signing needs a consuming trust").
+  - id: forge-cert-yields-federation
+    emits: CanFederateAs
+    description: "Issuing a certificate from a CA that is the trust anchor of a federation lets the issuer mint a matching external identity and federate in."
+    applies_to: ["*"]
+    match:
+      # (a) The attacker can issue/sign from the CA (Phase-5 acmpca / gcp CAS).
+      - [ ?p, CanSignAs, ?ca ]
+      # (b) That same CA is the trust anchor for a federation: the trust accepts
+      #     external identities presenting a cert chaining to ?ca.
+      - [ ?anchor, TrustsExternalIdentity, ?ext ]
+      # (c) The realized mapping the forged external identity would land on.
+      - [ ?ext, ExternalIdentityMapsTo, ?internal ]
+    where:
+      - "node_type(?ca) == SigningKey  # a certificate-authority signer (acmpca CA / gcp CAS pool)"
+      - "trust_anchor_of(?anchor -> ?ext) == ?ca   # the trust validates certs issued by THIS CA, not merely present in the account"
+      - "node_type(?ext) in [ExternalIdentity, FederatedIdentity]"
+      - "node_type(?internal) in [Role, ServiceAccount, MachineIdentity]"
+    emit:
+      source_type: FederatedIdentity
+      target_type: Role
+      source: ?ext
+      target: ?internal
+      permissions: ["<CA issue/sign action, e.g. acm-pca:IssueCertificate | privateca certificates.create>"]
+      conditions: [trust_condition, cert_subject_condition]
+      state_logic: >-
+        CONDITIONAL(trust_condition) by default: even with CA-issuance, the trust's
+        profile/role condition on the certificate SUBJECT/SAN (RolesAnywhere profile
+        `x509Subject`/SAN mapping, or the role trust `sub` derived from cert fields)
+        must admit a subject the attacker can put in the forged cert. ACTIVE only when
+        that cert-subject condition is ABSENT or BROAD (no subject pin / attacker can
+        choose the SAN) so a freshly-minted cert matches — the X.509 analogue of the
+        unpinned-subject case in rule 1. Inherit weakest with CanSignAs: if the CA
+        issuance is CONDITIONAL (acm-pca TemplateArn restriction, key-policy gate) or
+        BLOCKED, the federation carries that state. Never ACTIVE when the profile pins
+        the cert subject/SAN to a value the attacker cannot present.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "?p CanSignAs ?ca", "?anchor TrustsExternalIdentity ?ext (anchored on ?ca)", "?ext ExternalIdentityMapsTo ?internal" ]
+      false_positive_note: >-
+        Conservative and tight, mirroring credential-chains sign-as-yields-impersonation:
+        CA-issuance yields federation ONLY when ?ca is the ACTUAL trust anchor of the
+        federation (trust_anchor_of == ?ca), not merely a CA that exists in the account.
+        Honor the certificate-subject condition: AWS IAM Roles Anywhere profiles and
+        role trust policies constrain on cert Subject/CN/SAN and issuer — if the
+        profile/role pins a subject the attacker cannot mint (a specific CN, an
+        acm-pca:TemplateArn restricting the issued cert), keep CONDITIONAL(trust_condition,
+        cert_subject_condition). Respect the CA-issuance gate from Phase-5 acmpca
+        (acm-pca:IssueCertificate scoped by TemplateArn) / gcp CAS
+        (privateca.certificates.create on the CA pool with a permitted certificate
+        template) — a CanSignAs that is itself CONDITIONAL/BLOCKED does not yield an
+        ACTIVE federation. This does NOT model generic cert issuance as compromise —
+        without a federation consuming the cert it stays at CanSignAs (cite
+        credential-chains: signing needs a consuming trust).
+      narrative: >-
+        {p.name} can issue certificates from {ca.name}, which is the trust anchor for
+        {anchor.name}'s federation; it can mint a client certificate whose subject
+        satisfies the trust, presenting an external identity it controls to federate in
+        as {internal.name}.
+
+# ===========================================================================
+# WORKED EXAMPLES
+#
+# UNPINNED OIDC TRUST (rule 1 -> 2/3):
+#   adapter normalizes a GitHub-Actions AWS role trust with NO `sub` pin:
+#     [gha-oidc(ExternalIdentity) ExternalIdentityMapsTo ci-deploy-role(Role)]
+#     backed by [ci-deploy-role TrustsExternalIdentity gha-oidc], condition: aud only
+#       => federation-maps-to-identity: [gha-oidc CanFederateAs ci-deploy-role] ACTIVE
+#          (unpinned sub — any repo's workflow token matches)
+#   + home_boundary(ci-deploy-role) = Account 111122223333
+#       => federate-then-enter-account: [gha-oidc CanEnterAccount 111122223333] ACTIVE
+#   ci-deploy-role's own [ci-deploy-role CanReadSecret prod-secret] (traversal)
+#       => attacker reads prod-secret as ci-deploy-role (capability inheritance).
+#
+# PINNED TRUST (rule 1, stays CONDITIONAL):
+#   same as above but `sub == repo:acme/app:ref:refs/heads/main`
+#     => federation-maps-to-identity: [gha-oidc CanFederateAs ci-deploy-role]
+#        CONDITIONAL(trust_condition) — realizable only if the attacker can run a
+#        workflow on acme/app@main (e.g. via a poisoned PR / fork with pwn-request).
+#
+# WIF SA IMPERSONATION (rule 1 -> 3 -> credential-chains escalation):
+#   [ext(FederatedIdentity) ExternalIdentityMapsTo deployer-sa(ServiceAccount)]
+#   broad attribute mapping (any assertion.sub accepted)
+#     => federation-maps-to-identity: [ext CanFederateAs deployer-sa] ACTIVE
+#     => federate-inherits-capabilities: [ext CanImpersonate deployer-sa] ACTIVE
+#   + privilege(deployer-sa) > privilege(ext)
+#     => credential-chains impersonate-is-escalation: [ext CanEscalateTo deployer-sa]
+#        (CITED, not re-derived here).
+#
+# FORGE-CERT -> FEDERATION (rule 4, cross-phase Phase-5):
+#   [p CanSignAs corp-ca(SigningKey)]              (aws acmpca / gcp CAS issuance)
+#   + [ra-profile TrustsExternalIdentity x509-ext] anchored on corp-ca
+#   + [x509-ext ExternalIdentityMapsTo workload-role(Role)]
+#   profile has NO cert-subject pin
+#     => forge-cert-yields-federation: [x509-ext CanFederateAs workload-role] ACTIVE
+#        (mint a cert with an arbitrary SAN that the RolesAnywhere profile accepts).
+#   If the profile pins the cert CN => CONDITIONAL(trust_condition, cert_subject_condition).
+#
+# BLOCKED-edge guidance:
+#  - A disabled/deleted OIDC provider, a rotated issuer signing key, or a trust
+#    condition that explicitly denies => adapter emits no trust => rules do not fire.
+#  - A correctly PINNED subject/audience/cert-subject the attacker cannot present =>
+#    CONDITIONAL(trust_condition), never ACTIVE — a legitimate, well-configured
+#    federation is NOT an attack path.
+#  - A CanSignAs that is BLOCKED (acm-pca:IssueCertificate denied by SCP/key policy,
+#    TemplateArn excludes the needed template) => forge-cert-yields-federation BLOCKED.
+#  - State never exceeds the weakest contributor (RULE-FORMAT.md): a CONDITIONAL
+#    trust or a CONDITIONAL CanSignAs caps every downstream federation/foothold/
+#    impersonation edge at CONDITIONAL.
+# ===========================================================================

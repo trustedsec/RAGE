@@ -1,0 +1,271 @@
+# Azure Managed Disks — Explicit normalization rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Resource provider: Microsoft.Compute/disks + Microsoft.Compute/snapshots
+# Reference: https://learn.microsoft.com/azure/virtual-machines/managed-disks-overview
+#
+# Explicit rules normalize raw Azure configuration into explicit edges that represent
+# observed facts (RBAC permissions, resource containment, secret classification).
+# These edges feed the derived rules in /rules/derived/azure/disks.yaml.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 6-storage-databases
+applies_to: [azure]
+
+rules:
+
+  # =========================================================================
+  # SECTION 1 — Administrative control (explicit permissions)
+  # =========================================================================
+
+  - id: azure-disk-admin
+    emits: CanAdminister
+    description: "Wildcard permission on disks grants full control of the disk resource."
+    match_effective_permission:
+      action: "Microsoft.Compute/disks/*"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: BlockStorage
+      source: "<principal>"
+      target: "<managed disk in scope>"
+      permissions: ["Microsoft.Compute/disks/*"]
+      false_positive_note: >-
+        CanAdminister requires the Microsoft.Compute/disks/* wildcard (Virtual Machine
+        Contributor, Contributor, or Owner). A custom role granting only
+        disks/read or disks/beginGetAccess/action without the wildcard does NOT
+        qualify; those narrower grants produce CanExfiltrate or CanRead only.
+        This does not include Microsoft.Authorization/roleAssignments/write.
+      narrative: >-
+        {principal.name} has full control of managed disk {target.name}
+        (Microsoft.Compute/disks/*), including create, write, delete, SAS export,
+        and policy modification.
+
+  - id: azure-snapshot-admin
+    emits: CanAdminister
+    description: "Wildcard permission on snapshots grants full control of the snapshot resource."
+    match_effective_permission:
+      action: "Microsoft.Compute/snapshots/*"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: "<principal>"
+      target: "<disk snapshot in scope>"
+      permissions: ["Microsoft.Compute/snapshots/*"]
+      false_positive_note: >-
+        Requires the Microsoft.Compute/snapshots/* wildcard. Roles granting only
+        snapshots/beginGetAccess/action (e.g. Disk Backup Reader) produce
+        CanExfiltrate, not CanAdminister.
+      narrative: >-
+        {principal.name} has full control of snapshot {target.name}
+        (Microsoft.Compute/snapshots/*).
+
+  # =========================================================================
+  # SECTION 2 — Configuration modification (explicit permissions)
+  # =========================================================================
+
+  - id: azure-disk-write-network-policy
+    emits: CanModify
+    description: >-
+      disks/write allows changing networkAccessPolicy (e.g. from AllowPrivate to AllowAll),
+      which upgrades CONDITIONAL(network_reachability) SAS-export edges to ACTIVE.
+    match_effective_permission:
+      action: "Microsoft.Compute/disks/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: BlockStorage
+      source: "<principal>"
+      target: "<managed disk>"
+      permissions: ["Microsoft.Compute/disks/write"]
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal holds disks/write. The security value is that this
+        enables escalation of CONDITIONAL(network_reachability) SAS edges: by setting
+        networkAccessPolicy to AllowAll the attacker removes the private-endpoint
+        restriction on beginGetAccess.
+      false_positive_note: >-
+        disks/write alone does not directly read data; its security value is indirect:
+        it enables networkAccessPolicy downgrade (from AllowPrivate to AllowAll), which
+        then enables CanExfiltrate. A path-finder query should chain:
+        CanModify(disk) + azure-disk-sas-export (with the downgraded policy) -> CanExfiltrate.
+        Do NOT emit CanExfiltrate directly from CanModify; the policy-change step must be
+        modeled separately or noted as a POTENTIAL state upgrade.
+      narrative: >-
+        {principal.name} can write the networkAccessPolicy of disk {target.name}
+        (disks/write), potentially removing the private-endpoint SAS restriction and
+        enabling internet-routable SAS export.
+
+  - id: azure-snapshot-write-policy
+    emits: CanModify
+    description: >-
+      snapshots/write allows setting publicNetworkAccess and networkAccessPolicy on
+      a snapshot, enabling cross-subscription SAS download.
+    match_effective_permission:
+      action: "Microsoft.Compute/snapshots/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: "<principal>"
+      target: "<disk snapshot>"
+      permissions: ["Microsoft.Compute/snapshots/write"]
+      state_logic: "ACTIVE"
+      false_positive_note: >-
+        snapshots/write enables publicNetworkAccess: Enabled on an existing snapshot,
+        which is the precursor to azure-snapshot-cross-sub-public. The CanModify edge
+        here chains to CrossAccountTrust only after the policy is actually changed
+        (or can be changed) — model as a two-step: CanModify -> [policy update] ->
+        CrossAccountTrust(snapshot -> external sub). Emit CanModify as ACTIVE;
+        the downstream CrossAccountTrust edge is POTENTIAL until the policy is confirmed
+        changed.
+      narrative: >-
+        {principal.name} can modify snapshot {target.name} (snapshots/write), including
+        enabling public network access to facilitate cross-subscription SAS download.
+
+  - id: azure-diskencryptionset-write
+    emits: CanModifyConfiguration
+    description: >-
+      diskEncryptionSets/write allows changing the Key Vault key reference in a DES,
+      enabling attacker-controlled key wrapping for re-encryption at next attachment.
+    match_effective_permission:
+      action: "Microsoft.Compute/diskEncryptionSets/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: EncryptionKey
+      source: "<principal>"
+      target: "<disk encryption set>"
+      permissions: ["Microsoft.Compute/diskEncryptionSets/write"]
+      conditions: [service_state]
+      state_logic: >-
+        CONDITIONAL(service_state): The attacker can point the DES at a Key Vault key
+        they control, but the re-encryption of disks linked to this DES requires
+        the disk to be reattached/detached on a running VM. When a VM is stopped or
+        detached, this edge is BLOCKED (no re-wrap happens). When the VM is running
+        and a lifecycle operation (attach/detach/VM deallocate) occurs, the edge
+        becomes ACTIVE and the DEK is re-wrapped under the attacker key.
+      false_positive_note: >-
+        1) The DES must have at least one disk linked to it (via diskEncryptionSetId).
+        2) Re-encryption happens only on VM lifecycle events (attach, detach, VM stop/start).
+        3) If the VM is permanently stopped and offline, the re-encryption does not occur
+           and the DEK remains encrypted under the original key -> BLOCKED.
+        4) This is a distinct path from CanReadData (decrypt-on-download); this is
+           decrypt-via-rekey (re-encryption in Azure's data plane).
+      narrative: >-
+        {principal.name} can update the Key Vault key reference in DES {target.name}
+        (diskEncryptionSets/write), allowing re-encryption of attached disks under an
+        attacker-controlled key on the next VM lifecycle event (e.g. reboot or attach).
+
+  # =========================================================================
+  # SECTION 3 — Secret containment (explicit classification)
+  # =========================================================================
+
+  - id: azure-disk-contains-secret
+    emits: ContainsSecret
+    description: >-
+      An OS-type managed disk (Windows or Linux) is heuristically classified as
+      containing credential material: SAM/NTDS hive, /etc/shadow, SSH private keys,
+      or application credential files.
+    match:
+      - resource_type: "Microsoft.Compute/disks"
+        where:
+          - "disk.osType in [Windows, Linux]"
+          - "disk.managedBy != null"
+    emit:
+      source_type: BlockStorage
+      target_type: Secret
+      source: "<managed disk>"
+      target: "<embedded credential material (SAM/NTDS.dit on Windows; /etc/shadow, SSH keys on Linux; app config secrets)>"
+      permissions: []
+      state_logic: >-
+        ACTIVE: Raw-config fact (osType attribute observed directly from ARM).
+        No conditions; this is metadata, not a capability gate.
+      confidence: "0.75 for Windows (SAM/NTDS); 0.70 for Linux (shadow/SSH); 0.60 if unattached"
+      false_positive_note: >-
+        Heuristic: an OS disk is highly likely to contain credential material, but the
+        specific secrets are not enumerable without offline forensic analysis. Emit with
+        confidence 0.75 for Windows (SAM/NTDS present on domain-joined VMs; lower if
+        standalone workgroup VM) and 0.70 for Linux (shadow/SSH keys vary). Unattached
+        OS disks (managedBy absent) retain the classification but confidence should be
+        reduced to 0.60 (stale image may have rotated or no active secrets). Data disks
+        (osType absent) may contain application secrets but at lower confidence (0.50);
+        require additional evidence (disk name pattern, tags) before emitting. Do NOT
+        emit for empty or unformatted disks.
+      narrative: >-
+        Disk {source.name} is an OS disk ({disk.osType}); it is expected to contain
+        credential material (SAM/NTDS.dit hive for Windows, /etc/shadow and SSH private
+        keys for Linux, and application config secrets). An attacker with SAS export
+        access can harvest these credentials offline.
+
+  # =========================================================================
+  # SECTION 4 — Cross-subscription snapshot access (explicit config)
+  # =========================================================================
+
+explicit_rules:
+
+  - id: azure-snapshot-cross-sub-public
+    emits: CrossAccountTrust
+    description: >-
+      A snapshot configured for public network access (publicNetworkAccess: Enabled +
+      networkAccessPolicy: AllowAll) can be SAS-exported from any subscription,
+      establishing a cross-subscription trust / data exfil boundary crossing.
+    source_config:
+      resource_type: "Microsoft.Compute/snapshots"
+      field: "publicNetworkAccess"
+    where:
+      - "snapshot.publicNetworkAccess == Enabled"
+      - "snapshot.networkAccessPolicy in [AllowAll, null/unset]"
+    emit:
+      source: "<snapshot>"
+      target: "<any external subscription (ExternalIdentity in another sub)>"
+      api_source: "Microsoft.Compute/snapshots/read (publicNetworkAccess and networkAccessPolicy fields)"
+      evidence_field: "publicNetworkAccess, networkAccessPolicy"
+      state_logic: >-
+        ACTIVE when snapshot.publicNetworkAccess is Enabled and networkAccessPolicy is
+        AllowAll/unset; the SAS URL is internet-routable and any entity with the URL can
+        download the snapshot from any subscription.
+      confidence: 0.90
+      false_positive_note: >-
+        Only emit when BOTH publicNetworkAccess: Enabled AND networkAccessPolicy: AllowAll
+        (or equivalent) are set on the snapshot. A snapshot with AllowPrivate is not
+        cross-sub accessible from the public internet even if publicNetworkAccess is
+        Enabled. Note: Subscription == Account in Azure for this edge type.
+      narrative: >-
+        Snapshot {source.name} has public network access enabled; any external entity with
+        the SAS URL can download the full snapshot from outside the source subscription,
+        establishing a cross-subscription data exposure boundary.
+
+  - id: azure-disk-attached-to-vm
+    emits: AttachedTo
+    source_config:
+      resource_type: "Microsoft.Compute/disks"
+      field: "managedBy"
+    emit:
+      source: "<managed disk>"
+      target: "<virtual machine (managedBy resource URI)>"
+      api_source: "Microsoft.Compute/disks/read (managedBy field)"
+      evidence_field: "managedBy"
+      narrative: "Disk {disk.name} is attached to VM {vm.name} (managedBy)."
+
+  # NOTE: azure-disk-encryption-set-link and azure-des-kv-key-link are NOT emitted as edges.
+  # They are documented as configuration properties that feed property-based matching in
+  # derived rules (e.g., ?disk.encryption.diskEncryptionSetId == ?des.id). Graph traversal
+  # via AttachedTo is not applicable here because AttachedTo schema restricts
+  # source/target types to [NetworkInterface|BlockStorage|ManagedIdentity|IAMPolicy] ->
+  # [Compute|VirtualNetwork|Identity], and EncryptionKey/KV keys fall outside these sets.
+  # The DES-disk and DES-key relationships are modeled via property inspection in
+  # derived rules rather than graph edges.
+
+  - id: azure-snapshot-source-disk
+    emits: AttachedTo
+    source_config:
+      resource_type: "Microsoft.Compute/snapshots"
+      field: "creationData.sourceUri"
+    emit:
+      source: "<snapshot>"
+      target: "<source disk (resolved from creationData.sourceUri)>"
+      api_source: "Microsoft.Compute/snapshots/read (creationData.sourceUri)"
+      evidence_field: "creationData.sourceUri"
+      narrative: "Snapshot {snapshot.name} was created from disk {source_disk.name}."

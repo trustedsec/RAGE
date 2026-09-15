@@ -1,0 +1,267 @@
+# GCP Dataproc — Explicit normalization rules (Phase 11 — Data / Analytics / ML)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:dataproc
+# Official docs: https://cloud.google.com/dataproc/docs/concepts/iam/iam
+#                https://cloud.google.com/dataproc/docs/reference/rest/v1/projects.regions.clusters
+#
+# This file contains explicit_rules that ground derived rules in raw GCP API
+# fields. These rules emit edges with nature: explicit, sourced directly from
+# resource configuration and IAM policy, not re-derived.
+#
+# SCOPE:
+#   1. ExecutesAs — cluster resource config (config.gceClusterConfig.serviceAccount)
+#   2. CanPassIdentity — iam.serviceAccounts.actAs on a SA (gated by dataproc.clusters.create
+#      or dataproc.batches.create in the target project/location)
+#   3. CanModifyPolicy — dataproc.clusters.setIamPolicy, dataproc.jobs.setIamPolicy,
+#      dataproc.workflowTemplates.setIamPolicy
+#   4. CrossProjectTrust — cluster SA's home project != cluster project
+#   5. CanTrigger — Cloud Scheduler / other schedulers triggering Dataproc operations
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 11-data-analytics-ml
+service: dataproc
+applies_to: [gcp]
+
+explicit_rules:
+
+  # --------------------------------------------------------------------------
+  # 1. ExecutesAs — cluster VMs run as the cluster service account
+  # --------------------------------------------------------------------------
+  # Zero-cost structural fact. Feeds all downstream CanExecuteAs derivations
+  # via can-execute-as linchpins. Not an attack step by itself.
+  - id: gcp-dataproc-explicit-executes-as
+    emits: ExecutesAs
+    applies_to: [gcp]
+    source_record:
+      api: "dataproc.projects.regions.clusters.get"
+      field: "config.gceClusterConfig.serviceAccount"
+    default: "Compute Engine default SA PROJECT_NUMBER-compute@developer.gserviceaccount.com when unset"
+    emit:
+      source_type: AnalyticsService
+      target_type: ServiceAccount
+      source: "<cluster node>"
+      target: "<cluster SA>"
+      permissions: []
+      note: >-
+        Zero-cost fact sourced directly from cluster configuration. Default Compute
+        Engine SA typically holds roles/editor on the project. All jobs submitted to
+        the cluster run on these VMs and can read the cluster SA token from the GCE
+        metadata server (http://metadata.google.internal/computeMetadata/v1/instance/
+        service-accounts/default/token, header Metadata-Flavor: Google).
+      false_positive_note: >-
+        Not an escalation edge by itself; value comes from CanExecuteCommand or
+        CanModifyCode + this ExecutesAs. If the cluster SA is the Compute Engine default
+        SA with no meaningful roles (best practice: disable editor binding), CanExecuteAs
+        is low-value.
+      narrative: >-
+        {cluster.name} executes as service account {sa.name} on all master and worker
+        VMs; any code running in a submitted job can obtain {sa.name}'s OAuth token
+        via the GCE metadata server.
+
+  # --------------------------------------------------------------------------
+  # 2. CanPassIdentity — iam.serviceAccounts.actAs + dataproc cluster/batch create
+  # --------------------------------------------------------------------------
+  # iam.serviceAccounts.actAs on a target SA is the gate for either creating a
+  # cluster (dataproc.clusters.create) or a serverless batch (dataproc.batches.create)
+  # that runs as that SA. This rule enforces the compound match: both the actAs
+  # permission AND at least one of clusters.create or batches.create in the target
+  # project/location must be confirmed for CanPassIdentity to be emitted ACTIVE.
+  - id: gcp-dataproc-explicit-can-pass-identity
+    emits: CanPassIdentity
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "iam.serviceAccounts.actAs"
+      resource_type: "google.iam.ServiceAccount"
+    where:
+      - "?principal has EITHER dataproc.clusters.create OR dataproc.batches.create in the target project/location"
+      - "AND iam.serviceAccounts.actAs on the target SA is confirmed in the effective IAM policy"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["iam.serviceAccounts.actAs", "dataproc.clusters.create OR dataproc.batches.create"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when both iam.serviceAccounts.actAs on the target SA AND at least one of
+        dataproc.clusters.create or dataproc.batches.create are confirmed in the effective
+        IAM policy. POTENTIAL(iam_permission) if actAs is unconfirmed or if the attacker
+        has actAs but no cluster/batch create permission. BLOCKED if org policy
+        dataproc.clusterProjectScopeServiceAccountUsage restricts cross-project SA usage
+        or if an IAM deny blocks actAs or cluster/batch creation.
+      false_positive_note: >-
+        actAs is per-SA; actAs on SA-A does NOT grant cluster creation with SA-B. The
+        default Compute Engine SA also requires actAs. Do NOT emit without confirming
+        that at least one of clusters.create or batches.create is present — otherwise
+        the SA cannot be passed to a cluster or batch. Org policy
+        dataproc.clusterProjectScopeServiceAccountUsage restricts cluster SAs to SAs in
+        the same project as the cluster; cross-project SA usage will be BLOCKED when active.
+      narrative: >-
+        {principal.name} can pass {sa.name} as a Dataproc cluster or serverless batch
+        runtime SA (iam.serviceAccounts.actAs) and has dataproc.clusters.create or
+        dataproc.batches.create permission, enabling code execution as {sa.name}.
+
+  # --------------------------------------------------------------------------
+  # 3. CanModifyPolicy — cluster-level IAM policy modification
+  # --------------------------------------------------------------------------
+  # dataproc.clusters.setIamPolicy lets a principal rewrite the cluster's resource-level
+  # IAM policy, self-granting dataproc.jobs.create and thus bypassing needing pre-existing
+  # job-submit rights.
+  - id: gcp-dataproc-explicit-can-modify-policy-cluster
+    emits: CanModifyPolicy
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "dataproc.clusters.setIamPolicy"
+      resource_type: "google.dataproc.Cluster"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<cluster>"
+      permissions: ["dataproc.clusters.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed (project- or cluster-level).
+        BLOCKED if an IAM deny or org policy denies setIamPolicy. The principal can
+        grant dataproc.jobs.create to itself on the cluster (cluster-scoped IAM), then
+        proceed to submit a job.
+      false_positive_note: >-
+        setIamPolicy on a cluster grants CLUSTER-LEVEL IAM only; it cannot grant
+        project-level roles (resourcemanager.projects.setIamPolicy is a separate
+        permission). The granted jobs.create is cluster-scoped, so the principal can
+        submit jobs to this specific cluster only.
+      narrative: >-
+        {principal.name} can rewrite {cluster.name}'s IAM policy
+        (dataproc.clusters.setIamPolicy), self-granting dataproc.jobs.create to
+        execute arbitrary code as the cluster SA.
+
+  # --------------------------------------------------------------------------
+  # 4. CanModifyPolicy — job-level IAM policy modification (dataproc.jobs.setIamPolicy)
+  # --------------------------------------------------------------------------
+  # dataproc.jobs.setIamPolicy lets a principal rewrite the IAM policy on a specific
+  # Dataproc Job resource. A principal with this permission can grant themselves
+  # jobs.cancel or jobs.get, enabling job log inspection and potential credential theft
+  # from job output.
+  - id: gcp-dataproc-explicit-can-modify-policy-job
+    emits: CanModifyPolicy
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "dataproc.jobs.setIamPolicy"
+      resource_type: "google.dataproc.Job"
+    emit:
+      source_type: Identity
+      target_type: BatchJob
+      source: "<principal>"
+      target: "<job>"
+      permissions: ["dataproc.jobs.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed on a specific job.
+        BLOCKED if an IAM deny denies the action. The principal can grant jobs.get
+        to themselves, reading job output including logs and stdout/stderr.
+      false_positive_note: >-
+        jobs.setIamPolicy on a job is resource-scoped; it applies to the specific job
+        resource, not all jobs in the cluster. However, an attacker who also has
+        jobs.list can discover all jobs and modify their policies.
+      narrative: >-
+        {principal.name} can rewrite the IAM policy on {job.name}
+        (dataproc.jobs.setIamPolicy), self-granting jobs.get to read job output and logs.
+
+  # --------------------------------------------------------------------------
+  # 5. CanModifyPolicy — workflow template-level IAM policy modification
+  # --------------------------------------------------------------------------
+  # dataproc.workflowTemplates.setIamPolicy lets a principal rewrite the IAM policy
+  # on a Dataproc Workflow Template resource, enabling self-grant of other permissions
+  # on the template (e.g., update, instantiate).
+  - id: gcp-dataproc-explicit-can-modify-policy-workflow-template
+    emits: CanModifyPolicy
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "dataproc.workflowTemplates.setIamPolicy"
+      resource_type: "google.dataproc.WorkflowTemplate"
+    emit:
+      source_type: Identity
+      target_type: BatchJob
+      source: "<principal>"
+      target: "<workflow template>"
+      permissions: ["dataproc.workflowTemplates.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed on a specific template.
+        BLOCKED if an IAM deny denies the action. The principal can grant themselves
+        workflowTemplates.update and workflowTemplates.instantiate.
+      narrative: >-
+        {principal.name} can rewrite the IAM policy on workflow template {template.name}
+        (dataproc.workflowTemplates.setIamPolicy), self-granting permission to modify
+        and instantiate the template.
+
+  # --------------------------------------------------------------------------
+  # 6. CrossProjectTrust — cluster in project A with SA from project B
+  # --------------------------------------------------------------------------
+  # When a cluster's SA email domain differs from the cluster's project, the cluster
+  # represents a cross-project SA usage. This creates a trust relationship between
+  # the cluster's project and the SA's home project.
+  - id: gcp-dataproc-explicit-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    source_record:
+      api: "dataproc.projects.regions.clusters.get"
+      field: "config.gceClusterConfig.serviceAccount"
+    where:
+      - "SA email domain (PROJECT_ID.iam.gserviceaccount.com) != cluster project ID"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<cluster project>"
+      target: "<SA home project>"
+      permissions: []
+      conditions: [role_compatibility]
+      state_logic: >-
+        ACTIVE when the cross-project SA usage is confirmed (SA email domain != cluster
+        project). BLOCKED when org policy dataproc.clusterProjectScopeServiceAccountUsage
+        is active (it restricts cluster SAs to the same project as the cluster).
+      false_positive_note: >-
+        Parse the SA email to determine the SA's home project. User-managed SAs follow
+        NAME@PROJECT.iam.gserviceaccount.com; verify the PROJECT part differs from the
+        cluster project. Default Compute Engine SAs are always same-project (format:
+        PROJECT_NUMBER-compute@developer.gserviceaccount.com). Org policy
+        dataproc.clusterProjectScopeServiceAccountUsage -> BLOCKED.
+      narrative: >-
+        {cluster.name} (project {cluster_project}) runs as {sa.name} from project
+        {sa_project}; jobs executed on the cluster operate under a cross-project SA,
+        linking the two projects in the attack graph.
+
+  # --------------------------------------------------------------------------
+  # 7. CanTrigger — Cloud Scheduler triggering Dataproc operations
+  # --------------------------------------------------------------------------
+  # Cloud Scheduler jobs can be configured to trigger Dataproc job submissions or
+  # batch creation. The scheduler fires on a cron schedule, making the Dataproc
+  # operation subject to trigger_exists conditions.
+  - id: gcp-dataproc-explicit-can-trigger-scheduler
+    emits: CanTrigger
+    applies_to: [gcp]
+    source_record:
+      api: "cloudscheduler.projects.locations.jobs.get"
+      field: "httpTarget.uri + httpTarget.body (dataproc.jobs.create or batches.create endpoint)"
+    where:
+      - "the Cloud Scheduler job has an HTTP or GCP resource target that invokes a Dataproc API"
+    emit:
+      source_type: Scheduler
+      target_type: BatchJob
+      source: "<Cloud Scheduler job>"
+      target: "<Dataproc Job or Batch scope>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when the scheduler job is enabled and the target Dataproc API endpoint
+        is reachable. The scheduled execution fires the Dataproc job or batch on the
+        configured cron schedule. BLOCKED when the scheduler is disabled or paused.
+      false_positive_note: >-
+        Verify that the scheduler job is ENABLED (scheduler jobs can be paused). The
+        httpTarget must point to a Dataproc API endpoint (dataproc.jobs.submit or
+        dataproc.batches.create). Confirm that the scheduler's service account has the
+        necessary Dataproc permissions to submit the job or create the batch.
+      narrative: >-
+        Cloud Scheduler job {scheduler.name} triggers a Dataproc job submission or batch
+        creation on the configured schedule, feeding cicd-chains CanTrigger primitives.

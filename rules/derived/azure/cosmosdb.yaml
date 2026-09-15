@@ -1,0 +1,753 @@
+# Azure Cosmos DB — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Covers Microsoft.DocumentDB/databaseAccounts (NoSQL API and all API variants
+# sharing the same control-plane key surface). Research doc: /providers/azure/cosmosdb.md.
+#
+# ATTACK SURFACE SUMMARY (Phase 6 theme):
+#   (1) CREDENTIAL GRAB (headline): listKeys/action + listConnectionStrings/action are
+#       ARM control-plane calls that return the primary and secondary master keys —
+#       bypassing ALL Azure RBAC data-plane role assignments and network controls.
+#       ExposesCredential (the key IS the credential) + CanExfiltrate (data consequence).
+#   (2) DATA READ + EXFIL: Cosmos DB native RBAC (sqlRoleAssignment) grants the
+#       executeQuery + items/read dataActions -> CanReadData. Items may ContainsSecret
+#       (cite credential-chains for the ContainsSecret->CredentialsFor->CanImpersonate
+#       roll-up). CanReadData on a CMK account via data-plane RBAC is ACTIVE — the
+#       Cosmos DB service MI decrypts transparently; the attacker's key permission is
+#       irrelevant for RBAC-based reads. The key_permission gate applies only when
+#       the CMK key is revoked/disabled (account inaccessible).
+#   (3) PUBLIC EXPOSURE: default Cosmos DB accounts have NO IP firewall — data-plane
+#       endpoint is internet-reachable with any valid token (key or Entra).
+#       ExposedToInternet when publicNetworkAccess != Disabled AND ipRules is empty.
+#   (4) POLICY MODIFY: sqlRoleAssignments/write is an ARM action allowing a caller
+#       to modify Cosmos DB's native RBAC policy via role assignment creation/updates,
+#       assigning any data-plane role (including Built-in Data Contributor) to itself
+#       -> CanModifyPolicy leading to CanReadData/CanWriteData without listKeys.
+#
+# KEY ARM/DATA-PLANE SPLIT — critical for false-positive avoidance:
+#   listKeys, listConnectionStrings, readonlyKeys, sqlRoleAssignments/write are ARM
+#   control-plane calls (management.azure.com). They are NOT gated by the Cosmos DB
+#   IP firewall (ipRules/publicNetworkAccess). Apply network_reachability conditions
+#   ONLY to data-plane rules (CanReadData, CanWriteData), never to credential-grab rules.
+#
+# disableLocalAuth=true: the ARM listKeys call still succeeds and the key is still
+#   retrievable, but the data-plane endpoint rejects key-based auth with 401.
+#   ExposesCredential still emits (key is readable), but CanExfiltrate is BLOCKED/
+#   CONDITIONAL when disableLocalAuth=true is confirmed.
+#
+# COSMOS DB OPERATOR ROLE (230815da-be43-4aae-9cb4-875f7bd000aa):
+#   This role explicitly has listKeys/*, listConnectionStrings/*, readonlyKeys/*,
+#   and regenerateKey/* in its notActions. Do NOT emit key-grab rules for Cosmos DB
+#   Operator assignment; it intentionally prevents key access.
+#
+# Verified permissions (Microsoft.DocumentDB resource provider, 2026):
+#   listKeys:              Microsoft.DocumentDB/databaseAccounts/listKeys/action
+#   listConnectionStrings: Microsoft.DocumentDB/databaseAccounts/listConnectionStrings/action
+#   readonlykeys:          Microsoft.DocumentDB/databaseAccounts/readonlykeys/action
+#   data-plane read:       Cosmos DB Built-in Data Reader (00000000-0000-0000-0000-000000000001)
+#                            dataActions: readMetadata, containers/items/read,
+#                                         containers/executeQuery, containers/readChangeFeed
+#   data-plane write:      Cosmos DB Built-in Data Contributor (00000000-0000-0000-0000-000000000002)
+#                            dataActions: readMetadata, containers/*, containers/items/*
+#   self-grant:            Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/write
+#
+# Linchpin citations (CITE, DO NOT DUPLICATE):
+#   credential-chains.yaml — ExposesCredential + CredentialsFor -> CanImpersonate
+#     (the master key ExposesCredential -> CredentialsFor the Cosmos account ->
+#      read-secret-yields-identity if the key is registered for an external identity).
+#     Also execute-then-read-secret for workloads with CanReadData on containers
+#     that ContainsSecret. decrypt-gates-secret-read applies to CMK account scenarios
+#     where the principal must hold CanDecrypt on the Key Vault key — but this applies
+#     only to key-based auth (listKeys path), not to data-plane RBAC reads (where the
+#     service's MI decrypts transparently). For data-plane RBAC on CMK accounts, the
+#     key_permission gate is only relevant when the CMK key is revoked/disabled.
+#   can-control.yaml  — CanAdminister + CanModifyPolicy -> Controls / CanEscalateTo
+#     (Contributor/Owner at account scope -> Controls via can-control.yaml rules).
+#   can-execute-as.yaml — CanModifyCode + ExecutesAs -> CanExecuteAs for compute
+#     services that read from this Cosmos DB account and whose code is attacker-controlled.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 6-storage-databases
+applies_to: [azure]
+
+rules:
+
+  # --- (1) CREDENTIAL GRAB: listKeys -> ExposesCredential --------------------
+  # Microsoft.DocumentDB/databaseAccounts/listKeys/action returns the primary and
+  # secondary master keys. These keys:
+  #   - Bypass ALL Azure RBAC data-plane sqlRoleAssignments
+  #   - Authenticate to the Cosmos DB data-plane endpoint without any Entra token
+  #   - Grant full read/write/delete access to ALL databases and containers
+  #   - Allow minting resource tokens for scoped delegation to external callers
+  #   - Are callable over ARM (management.azure.com) regardless of ipRules /
+  #     publicNetworkAccess / private endpoint configuration
+  # This is the single highest-impact vector on a Cosmos DB account.
+  - id: azure-cosmosdb-listkeys-exposes-credential
+    emits: ExposesCredential
+    description: "listKeys/action returns Cosmos DB master keys, bypassing all data-plane RBAC and network controls."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == NoSQLDatabase"
+      - "node_type(?account) matched provider_type == 'Microsoft.DocumentDB/databaseAccounts'"
+      - "?principal has EFFECTIVE Microsoft.DocumentDB/databaseAccounts/listKeys/action at ?account scope"
+      - "NOTE: Cosmos DB Operator (230815da) has listKeys/* in notActions — verify effective permission excludes notActions; do NOT emit for Cosmos DB Operator assignments"
+    emit:
+      source_type: NoSQLDatabase
+      target_type: AccessKey
+      source: ?account
+      target: "<primary/secondary AccessKey node(s) of ?account>"
+      permissions: ["Microsoft.DocumentDB/databaseAccounts/listKeys/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy explicitly covers listKeys/action at
+        the effective scope: BLOCKED;
+        elif ?account.properties.disableLocalAuth == true: CONDITIONAL(service_state) —
+        the key is retrievable via ARM but cannot authenticate to the data endpoint;
+        else ACTIVE.
+        CRITICAL: the Cosmos DB IP firewall (ipRules/publicNetworkAccess) gates the
+        DATA-PLANE endpoint, NOT the ARM listKeys call. listKeys succeeds over
+        management.azure.com from any network regardless of ipRules. Do NOT apply
+        network_reachability here.
+      confidence: "0.97"
+      derived_from: [ "<HasPermission edge_id (listKeys/action)>" ]
+      false_positive_note: >-
+        listKeys is an ARM control-plane call not gated by the Cosmos DB IP firewall or
+        publicNetworkAccess setting. Do NOT apply network_reachability. Verify the
+        effective permission excludes Cosmos DB Operator's notActions — that role
+        explicitly blocks listKeys. When disableLocalAuth=true, the key material is
+        still readable over ARM but the data endpoint rejects key-based auth; emit with
+        CONDITIONAL(service_state) for the full-exfiltrate path, but ExposesCredential
+        itself is ACTIVE (the key is accessible). ContainsCredential(account -> AccessKey)
+        is the structural fact; this rule derives the ExposesCredential capability edge.
+      narrative: >-
+        {principal.name} can call listKeys on {account.name}
+        (Microsoft.DocumentDB/databaseAccounts/listKeys/action), retrieving the primary
+        and secondary master keys. These keys bypass all Azure RBAC data-plane role
+        assignments and authenticate directly to every database and container in the
+        account, granting full read, write, and delete access regardless of IP firewall
+        configuration.
+
+  # --- listConnectionStrings -> ExposesCredential ----------------------------
+  # Microsoft.DocumentDB/databaseAccounts/listConnectionStrings/action returns
+  # connection strings that embed the primary and secondary master keys. Impact is
+  # identical to listKeys — the keys are present in the response, just formatted
+  # as an endpoint+key URI. Modeled separately because the permission name differs
+  # and some custom roles include one but not the other.
+  - id: azure-cosmosdb-listconnectionstrings-exposes-credential
+    emits: ExposesCredential
+    description: "listConnectionStrings/action returns connection strings embedding the Cosmos DB master keys — equivalent credential exposure to listKeys."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == NoSQLDatabase"
+      - "node_type(?account) matched provider_type == 'Microsoft.DocumentDB/databaseAccounts'"
+      - "?principal has EFFECTIVE Microsoft.DocumentDB/databaseAccounts/listConnectionStrings/action at ?account scope"
+    emit:
+      source_type: NoSQLDatabase
+      target_type: ConnectionString
+      source: ?account
+      target: "<ConnectionString node(s) of ?account (embed primary/secondary master keys)>"
+      permissions: ["Microsoft.DocumentDB/databaseAccounts/listConnectionStrings/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if deny assignment covers listConnectionStrings/action: BLOCKED;
+        elif ?account.properties.disableLocalAuth == true: CONDITIONAL(service_state) —
+        connection string is retrievable but key-based auth is rejected at data endpoint;
+        else ACTIVE. ARM-plane call — not gated by ipRules or publicNetworkAccess.
+      confidence: "0.95"
+      derived_from: [ "<HasPermission edge_id (listConnectionStrings/action)>" ]
+      false_positive_note: >-
+        listConnectionStrings is equivalent to listKeys for attack impact; the connection
+        string embeds the master key with the endpoint URI. ARM-plane call — no network
+        gate applies. Cosmos DB Operator's notActions include listConnectionStrings/* —
+        verify notActions before emitting. disableLocalAuth=true: same treatment as
+        listKeys — key is retrievable, data endpoint rejects key-based auth.
+      narrative: >-
+        {principal.name} can call listConnectionStrings on {account.name}
+        (Microsoft.DocumentDB/databaseAccounts/listConnectionStrings/action), retrieving
+        connection strings that embed the primary and secondary master keys. This
+        provides identical data access as listKeys — full bypass of Azure RBAC data-plane
+        role assignments.
+
+
+  # --- (2) DATA READ: Cosmos DB data-plane RBAC -> CanReadData ---------------
+  # A principal holding a native Cosmos DB sqlRoleAssignment with Cosmos DB Built-in
+  # Data Reader (00000000-0000-0000-0000-000000000001) or a custom role including
+  # containers/items/read + executeQuery has data-plane read access. This path IS
+  # gated by the Cosmos DB IP firewall (unlike listKeys).
+  # NOTE: CMK gate (key_permission) is handled separately by azure-cosmosdb-cmk-data-read-conditional
+  # when the CMK key is revoked/disabled. For normal reads, the service manages CMK transparently.
+  - id: azure-cosmosdb-data-reader
+    emits: CanReadData
+    description: "Cosmos DB Built-in Data Reader (or custom role with items/read + executeQuery) grants effective data-plane read of items and query execution."
+    match:
+      - [ ?principal, HasPermission, ?scope ]
+    where:
+      - "node_class(?scope) == Data and node_type(?scope) == NoSQLDatabase"
+      - "node_type(?scope) matched provider_type in ['Microsoft.DocumentDB/databaseAccounts', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers']"
+      - "?principal has EFFECTIVE dataActions Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/read AND Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/executeQuery via sqlRoleAssignment at ?scope (Cosmos DB Built-in Data Reader 00000000-0000-0000-0000-000000000001 or custom role)"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?scope
+      permissions:
+        - "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/read"
+        - "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/executeQuery"
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if ?scope.properties.publicNetworkAccess == 'Disabled' AND no private endpoint
+        provides a path from ?principal to ?scope: CONDITIONAL(network_reachability);
+        elif ?scope.properties.ipRules is non-empty AND ?principal is not within
+        the allowed IP/CIDR ranges AND no VNet service endpoint allows the source:
+        CONDITIONAL(network_reachability);
+        elif deny assignment covers the sqlRoleAssignment at effective scope: BLOCKED;
+        else ACTIVE.
+        NOTE on CMK: Cosmos DB's CMK is account-level and managed by the service's MI.
+        An attacker reading via data-plane RBAC gets plaintext items (the service decrypts
+        transparently). When the CMK key is revoked/disabled in Key Vault, the account
+        becomes inaccessible — this gate is handled by azure-cosmosdb-cmk-data-read-conditional.
+      confidence: "0.88"
+      derived_from: [ "<HasPermission edge_id (sqlRoleAssignment dataActions)>" ]
+      false_positive_note: >-
+        This is a data-plane action gated by the Cosmos DB IP firewall (ipRules) and
+        publicNetworkAccess, unlike the ARM-plane listKeys. Apply CONDITIONAL(network_reachability)
+        when the account has IP rules or publicNetworkAccess=Disabled and no private endpoint
+        path exists. Native data-plane RBAC is separate from ARM RBAC — Subscription Owner cannot
+        execute queries without a sqlRoleAssignment (unless using listKeys). Scope matters:
+        a Built-in Data Reader assignment on a specific container targets that container only.
+        For CMK-revoked accounts, see azure-cosmosdb-cmk-data-read-conditional.
+      narrative: >-
+        {principal.name} holds a native Cosmos DB data-plane role assignment granting
+        items/read + executeQuery on {scope.name}. They can execute NoSQL queries and
+        perform point reads on items within the assigned scope. Items may contain
+        embedded credentials, connection strings, or API keys — see credential-chains.yaml
+        for ContainsSecret -> CredentialsFor -> CanImpersonate roll-up when containers
+        store credential material.
+
+  # --- DATA WRITE: Cosmos DB Built-in Data Contributor -> CanWriteData -------
+  # A principal with the Cosmos DB Built-in Data Contributor role (or a custom role
+  # including containers/items/* and containers/*) can create, replace, upsert, and
+  # delete items. This is CanWriteData — useful for data poisoning of items consumed
+  # by downstream application logic (config stored in Cosmos, ML feature stores, etc.).
+  - id: azure-cosmosdb-data-contributor-write
+    emits: CanWriteData
+    description: "Cosmos DB Built-in Data Contributor (or custom role with items/*) grants data-plane write — enabling item creation, replacement, upsert, and deletion."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == NoSQLDatabase"
+      - "node_type(?account) matched provider_type in ['Microsoft.DocumentDB/databaseAccounts', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers']"
+      - "?principal has EFFECTIVE dataActions Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/create OR items/replace OR items/upsert via sqlRoleAssignment at ?account or database or container scope (Cosmos DB Built-in Data Contributor 00000000-0000-0000-0000-000000000002 or custom role)"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?account
+      permissions:
+        - "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/create"
+        - "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/replace"
+        - "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/upsert"
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if network controls block the principal: CONDITIONAL(network_reachability);
+        elif deny assignment covers the sqlRoleAssignment: BLOCKED;
+        else ACTIVE.
+      confidence: "0.85"
+      derived_from: [ "<HasPermission edge_id (sqlRoleAssignment dataActions write)>" ]
+      false_positive_note: >-
+        CanWriteData alone has limited escalation value; its attack utility is realized
+        when the target Cosmos DB items are consumed by downstream application logic
+        (e.g., config records, ML feature store entries, session data) — poisoning
+        those items can influence application behavior or privilege decisions. Apply
+        network_reachability gate as with CanReadData. Cosmos DB does not support
+        write-immutability policies analogous to blob WORM — CanWriteData is always
+        structurally possible if the data-plane permission exists.
+      narrative: >-
+        {principal.name} can write to containers in {account.name}
+        (Cosmos DB Built-in Data Contributor or custom role with write dataActions),
+        enabling creation, replacement, or upsert of items. Items consumed by downstream
+        application logic (config, ML features, session state) may be poisoned to
+        influence application behavior.
+
+  # --- (3) PUBLIC EXPOSURE: no firewall -> ExposedToInternet -----------------
+  # When publicNetworkAccess is not Disabled AND the ipRules list is empty, the
+  # Cosmos DB data-plane endpoint is accessible from ANY internet client with a
+  # valid authorization token (master key or Entra token from a valid sqlRoleAssignment).
+  # This is the DEFAULT state for newly created Cosmos DB accounts.
+  # ExposedToInternet captures that the endpoint is internet-reachable — credential/RBAC
+  # requirements still apply, but network is no barrier.
+  - id: azure-cosmosdb-public-endpoint
+    emits: ExposedToInternet
+    description: "Cosmos DB account with no IP firewall and public network access enabled exposes its data-plane endpoint to the internet — any caller with a valid token can reach it."
+    match:
+      - [ ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == NoSQLDatabase"
+      - "node_type(?account) matched provider_type == 'Microsoft.DocumentDB/databaseAccounts'"
+      - "?account.properties.publicNetworkAccess != 'Disabled'"
+      - "?account.properties.ipRules is empty or null"
+      - "?account.properties.virtualNetworkRules is empty or null"
+    emit:
+      source_type: NoSQLDatabase
+      target_type: AnonymousIdentity
+      source: ?account
+      target: "azure:anonymous-identity"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        if ?account.properties.publicNetworkAccess == 'Disabled': DO NOT EMIT
+        (public endpoint is blocked; private endpoints are the only data path);
+        elif ?account.properties.ipRules is non-empty: DO NOT EMIT
+        (firewall restricts to listed IPs — not open to all internet);
+        elif ?account.properties.virtualNetworkRules is non-empty AND
+        ?account.properties.ipRules is empty: CONDITIONAL(network_reachability) —
+        VNet rules restrict access to specific subnets; internet callers blocked;
+        elif ?account.properties.ipRules contains ONLY '0.0.0.0' (Azure datacenter IPs):
+        DO NOT EMIT ExposedToInternet — emit ExposedToTenant (all Azure-hosted principals
+        can reach it, but arbitrary internet IPs cannot);
+        else ACTIVE (no firewall, public network accessible).
+      confidence: "0.92"
+      derived_from: [ "<publicNetworkAccess property record>", "<ipRules property record>" ]
+      false_positive_note: >-
+        ExposedToInternet does NOT mean unauthenticated access — a valid authorization
+        token (master key or Entra + sqlRoleAssignment) is always required by Cosmos DB.
+        This edge means the NETWORK is not a barrier; an attacker with any valid credential
+        can reach the endpoint from the public internet. Firewall with non-empty ipRules
+        restricts access — do not emit when ipRules is non-empty (even if the rules seem
+        broad). The '0.0.0.0' sentinel allows Azure datacenter IPs only — emit
+        ExposedToTenant rather than ExposedToInternet for that case (it's a broad but
+        Azure-bounded blast radius). publicNetworkAccess=Disabled is a hard block —
+        never emit ExposedToInternet when that property is set. This only covers the
+        data-plane endpoint; the ARM listKeys plane is always internet-accessible for
+        callers with ARM RBAC permissions (handled by note in listkeys rule, not a
+        separate ExposedToInternet — ARM is always public).
+      narrative: >-
+        {account.name} has no IP firewall and public network access is enabled. The
+        Cosmos DB data-plane endpoint is reachable from the public internet. Any attacker
+        who obtains a valid master key (via listKeys) or a data-plane Entra token can
+        reach the database without any network-layer barrier.
+
+  # --- (3b) AZURE-ONLY EXPOSURE: 0.0.0.0 ipRules -> ExposedToTenant -------
+  # When ipRules contains ONLY '0.0.0.0', the firewall allows all Azure datacenter IPs
+  # (any Azure-hosted workload in any subscription). This is ExposedToTenant — broad Azure
+  # blast radius, but not true internet exposure. The 0.0.0.0 sentinel is a material
+  # attack surface that was being silently dropped when only ExposedToInternet rules fired.
+  - id: azure-cosmosdb-azure-only-firewall
+    emits: ExposedToTenant
+    description: "Cosmos DB account with firewall restricted to 0.0.0.0 (all Azure IPs) — accessible from any Azure-hosted workload but not the open internet."
+    match:
+      - [ ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == NoSQLDatabase"
+      - "node_type(?account) matched provider_type == 'Microsoft.DocumentDB/databaseAccounts'"
+      - "?account.properties.publicNetworkAccess != 'Disabled'"
+      - "?account.properties.ipRules contains ONLY '0.0.0.0'"
+      - "?account.properties.virtualNetworkRules is empty or null"
+    emit:
+      source_type: NoSQLDatabase
+      target_type: Tenant
+      source: ?account
+      target: "<azure tenant hosting the account>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        if ?account.properties.ipRules is confirmed to contain only '0.0.0.0': ACTIVE
+        (all Azure-hosted principals can reach the endpoint).
+      confidence: "0.90"
+      derived_from: [ "<ipRules property record containing 0.0.0.0>" ]
+      false_positive_note: >-
+        The '0.0.0.0' firewall rule in Cosmos DB means "all Azure datacenter IPs" —
+        it allows any Azure-hosted workload to reach the endpoint, but external internet
+        traffic is blocked. This is broader than a VNet-scoped rule but narrower than
+        true internet exposure. Emit ExposedToTenant to model the broad but Azure-bounded
+        blast radius. Do not emit ExposedToInternet for this case. An attacker still needs
+        a valid credential (key or Entra token), but the network path is open from any
+        Azure-hosted principal in the tenant.
+      narrative: >-
+        {account.name} has a firewall rule allowing all Azure datacenter IPs (0.0.0.0).
+        Any workload running in Azure — whether in the same subscription or a different one —
+        can reach the Cosmos DB data-plane endpoint. With a valid credential (master key or
+        Entra token), any Azure-hosted attacker can access the database.
+
+  # --- (4) POLICY MODIFY: sqlRoleAssignments/write -> CanModifyPolicy -----------
+  # Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/write is an ARM
+  # control-plane action that allows creating or modifying Cosmos DB's native data-plane
+  # role assignment policy (sqlRoleAssignments). A principal with this permission mutates
+  # the service's internal RBAC policy object, which is semantically captured by CanModifyPolicy
+  # (Identity → NoSQLDatabase). The principal can assign any Cosmos DB data-plane role
+  # (including Built-in Data Contributor) to itself or others, leading to escalated data access.
+  # This differs from standard Azure RBAC CanGrantPermission because it operates on Cosmos DB's
+  # native (not ARM) RBAC system.
+  # NOTE: this requires the principal to also hold sqlRoleDefinitions/read to enumerate
+  # available roles; in practice, Contributor/Owner at the subscription level provides
+  # both (and also listKeys — so sqlRoleAssignments/write is most relevant for custom
+  # roles with restricted permissions that include write but not listKeys).
+  - id: azure-cosmosdb-sqlrole-self-grant
+    emits: CanModifyPolicy
+    description: "sqlRoleAssignments/write allows modifying Cosmos DB's native data-plane RBAC policy via role assignment creation/updates — enabling privilege escalation by assigning high-privilege roles to oneself."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == NoSQLDatabase"
+      - "node_type(?account) matched provider_type == 'Microsoft.DocumentDB/databaseAccounts'"
+      - "?principal has EFFECTIVE Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/write at ?account scope"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?account
+      permissions: ["Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/write"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if deny assignment covers sqlRoleAssignments/write at effective scope: BLOCKED;
+        else ACTIVE. ARM-plane call — not gated by Cosmos DB IP firewall.
+        The downstream capability (CanReadData or CanWriteData) that results from the
+        role assignment mutation IS gated by network_reachability when the role
+        is exercised at the data plane.
+      confidence: "0.88"
+      derived_from: [ "<HasPermission edge_id (sqlRoleAssignments/write)>" ]
+      false_positive_note: >-
+        CanModifyPolicy is emitted for the ARM sqlRoleAssignments/write action; the principal
+        can modify Cosmos DB's native data-plane RBAC policy by creating/updating role
+        assignments. This is distinct from Azure's standard CanGrantPermission
+        (Microsoft.Authorization/roleAssignments/write), which operates on ARM RBAC.
+        The actual data-plane access (CanReadData/CanWriteData) follows from the assigned role
+        and is gated by network_reachability when exercised. This is an ARM-plane call not
+        gated by the Cosmos DB IP firewall. Cosmos DB Operator (230815da-be43-4aae-9cb4-875f7bd000aa)
+        is documented to have sqlRoleAssignments/write in its notActions list — verify this
+        against the official Microsoft RBAC permissions reference
+        (https://learn.microsoft.com/azure/role-based-access-control/built-in-roles) before
+        accepting the suppression on Cosmos DB Operator assignments. A self-grant of Cosmos DB
+        Built-in Data Contributor enables items/read + items/* (full CRUD), which chains into
+        azure-cosmosdb-data-reader and azure-cosmosdb-data-contributor-write after assignment
+        creation. The sqlRoleAssignment/write itself requires sqlRoleDefinitions/read to identify
+        available role IDs — verify that permission is also present, but do not block the
+        CanModifyPolicy emit on its absence since Contributor/Owner implies both.
+      narrative: >-
+        {principal.name} has Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments/write
+        on {account.name}, allowing it to create or update Cosmos DB native data-plane role
+        assignments. By modifying the account's RBAC policy, it can grant itself the Cosmos DB
+        Built-in Data Contributor role, gaining full data-plane read/write access without
+        calling listKeys — a privilege escalation via policy modification.
+
+  # --- (5) ACCOUNT WRITE: databaseAccounts/write -> CanModifyConfiguration -----
+  # Microsoft.DocumentDB/databaseAccounts/write allows modifying account properties:
+  # disableLocalAuth (enable/disable key auth), ipRules, publicNetworkAccess (firewall),
+  # and keyVaultKeyUri (CMK swap). A principal with this permission can unlock blocked
+  # paths: if disableLocalAuth was true (blocking key-based auth), setting it false
+  # re-enables the listKeys->key-auth data path. This is CanModifyConfiguration.
+  - id: azure-cosmosdb-account-write-modifies-config
+    emits: CanModifyConfiguration
+    description: "databaseAccounts/write allows modifying account properties (disableLocalAuth, firewall, CMK) — enabling configuration attacks such as re-enabling key auth or firewall bypass."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == NoSQLDatabase"
+      - "node_type(?account) matched provider_type == 'Microsoft.DocumentDB/databaseAccounts'"
+      - "?principal has EFFECTIVE Microsoft.DocumentDB/databaseAccounts/write at ?account scope"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?account
+      permissions: ["Microsoft.DocumentDB/databaseAccounts/write"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if deny assignment covers databaseAccounts/write at effective scope: BLOCKED;
+        else ACTIVE. ARM-plane call — not gated by Cosmos DB IP firewall.
+        Downstream consequences include: re-enabling disableLocalAuth (unlocks listKeys
+        data-plane path if previously blocked), firewall policy changes (ExposedToInternet),
+        and CMK key swap (CanAttachIdentity-like escalation for CMK decryption).
+      confidence: "0.89"
+      derived_from: [ "<HasPermission edge_id (databaseAccounts/write)>" ]
+      false_positive_note: >-
+        This is an ARM-plane action not gated by IP firewall. databaseAccounts/write
+        creates CanModifyConfiguration on the account resource itself. Key downstream
+        effects: (1) disableLocalAuth=false re-enables key-based auth and unlocks listKeys
+        data paths, (2) firewall changes enable/disable ExposedToInternet, (3) keyVaultKeyUri
+        changes can swap the account's CMK to a key attacker-controlled. This is high-value
+        for escalation chaining but typically requires already holding write permission.
+        Do NOT apply network_reachability — this is an ARM call.
+      narrative: >-
+        {principal.name} has Microsoft.DocumentDB/databaseAccounts/write on {account.name},
+        allowing modification of account properties. This permits re-enabling key-based
+        authentication (if disabled), changing firewall rules to expose the account to
+        the internet, and swapping the Customer-Managed Key to one they control — unlocking
+        multiple escalation paths to full data access.
+
+  # --- listKeys -> full data exfiltration (CanExfiltrate) ----------------------
+  # The master keys returned by listKeys/action enable complete read/write/delete access
+  # to all databases and containers across the account. This is the highest-value
+  # data exfiltration path on Cosmos DB. Modeled as CanExfiltrate(Identity → NoSQLDatabase).
+  # This rule is BLOCKED when disableLocalAuth=true (key retrieved but data endpoint
+  # rejects key-based auth); ACTIVE otherwise. ARM-plane call — not gated by ipRules.
+  - id: azure-cosmosdb-listkeys-full-exfiltrate
+    emits: CanExfiltrate
+    description: "listKeys/action returns full master keys enabling complete data exfiltration (read/write/delete all items across all databases and containers)."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == NoSQLDatabase"
+      - "node_type(?account) matched provider_type == 'Microsoft.DocumentDB/databaseAccounts'"
+      - "?principal has EFFECTIVE Microsoft.DocumentDB/databaseAccounts/listKeys/action at ?account scope"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?account
+      permissions: ["Microsoft.DocumentDB/databaseAccounts/listKeys/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if deny assignment covers listKeys/action: BLOCKED;
+        elif ?account.properties.disableLocalAuth == true: BLOCKED (data-plane endpoint
+        rejects key-based auth with 401; the key is retrievable via ARM but cannot
+        authenticate to the data plane);
+        else ACTIVE. ARM-plane call — not gated by Cosmos DB IP firewall (ipRules/
+        publicNetworkAccess). The key returned by listKeys grants full read/write/delete
+        on all databases, containers, and items — this is the complete data exfiltration path.
+      confidence: "0.95"
+      derived_from: [ "<HasPermission edge_id (listKeys/action)>" ]
+      false_positive_note: >-
+        This is an ARM-plane call not gated by IP firewall. The key provides unrestricted
+        data-plane access — full exfiltration capability. Do NOT apply network_reachability.
+        Cosmos DB Operator (230815da) explicitly excludes listKeys/* from its permissions —
+        verify notActions. When disableLocalAuth=true, the key material exists but the
+        data endpoint rejects key-based authentication — emit BLOCKED state, not ACTIVE.
+      narrative: >-
+        {principal.name} can call listKeys on {account.name}
+        (Microsoft.DocumentDB/databaseAccounts/listKeys/action), retrieving the primary
+        and secondary master keys. These keys grant full read, write, and delete access to
+        every database and container in the account, enabling complete data exfiltration
+        regardless of Azure RBAC data-plane role assignments or IP firewall configuration.
+
+  # --- listConnectionStrings -> full data exfiltration (CanExfiltrate) ---------
+  # The connection strings returned by listConnectionStrings/action embed the primary and
+  # secondary master keys. These provide identical data-plane access to listKeys (full
+  # read/write/delete on all databases/containers). Same disableLocalAuth gate applies.
+  - id: azure-cosmosdb-listconnectionstrings-full-exfiltrate
+    emits: CanExfiltrate
+    description: "listConnectionStrings/action returns connection strings embedding full master keys — equivalent complete data exfiltration as listKeys."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == NoSQLDatabase"
+      - "node_type(?account) matched provider_type == 'Microsoft.DocumentDB/databaseAccounts'"
+      - "?principal has EFFECTIVE Microsoft.DocumentDB/databaseAccounts/listConnectionStrings/action at ?account scope"
+      - "NOT ?principal has EFFECTIVE Microsoft.DocumentDB/databaseAccounts/listKeys/action at ?account scope  # avoid double-emit; listKeys subsumes this"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?account
+      permissions: ["Microsoft.DocumentDB/databaseAccounts/listConnectionStrings/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if deny assignment covers listConnectionStrings/action: BLOCKED;
+        elif ?account.properties.disableLocalAuth == true: BLOCKED (data-plane endpoint
+        rejects key-based auth with 401; the key in the connection string cannot authenticate);
+        else ACTIVE. ARM-plane call — not gated by Cosmos DB IP firewall.
+      confidence: "0.95"
+      derived_from: [ "<HasPermission edge_id (listConnectionStrings/action)>" ]
+      false_positive_note: >-
+        Emit only when listConnectionStrings is present but listKeys is not (listKeys
+        subsumes this via azure-cosmosdb-listkeys-full-exfiltrate). Connection string
+        contains the master key in URI format — equivalent data-plane access. ARM-plane
+        call, not gated by IP firewall. Cosmos DB Operator explicitly excludes
+        listConnectionStrings/* — verify notActions. disableLocalAuth=true: same treatment
+        as listKeys — connection string has the key but data endpoint rejects it.
+      narrative: >-
+        {principal.name} can call listConnectionStrings on {account.name}
+        (Microsoft.DocumentDB/databaseAccounts/listConnectionStrings/action), retrieving
+        connection strings that embed the primary and secondary master keys. These enable
+        the same complete data exfiltration as listKeys — full read, write, and delete access
+        to every database and container regardless of Azure RBAC or IP firewall configuration.
+
+  # --- readonlykeys -> ExposesCredential (lower impact variant) ---------------
+  # Microsoft.DocumentDB/databaseAccounts/readonlykeys/action returns the read-only
+  # primary and secondary keys. These grant data-plane READ access (no write/delete)
+  # across all databases and containers, bypassing RBAC. Lower impact than listKeys
+  # but still a direct data-plane credential bypass.
+  - id: azure-cosmosdb-readonlykeys-exposes-credential
+    emits: ExposesCredential
+    description: "readonlykeys/action returns Cosmos DB read-only master keys — bypasses data-plane RBAC for read operations across all databases and containers."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == NoSQLDatabase"
+      - "node_type(?account) matched provider_type == 'Microsoft.DocumentDB/databaseAccounts'"
+      - "?principal has EFFECTIVE Microsoft.DocumentDB/databaseAccounts/readonlykeys/action at ?account scope"
+      - "NOT ?principal has EFFECTIVE Microsoft.DocumentDB/databaseAccounts/listKeys/action at ?account scope  # avoid double-emit; listKeys subsumes readonlykeys"
+    emit:
+      source_type: NoSQLDatabase
+      target_type: AccessKey
+      source: ?account
+      target: "<read-only primary/secondary AccessKey node(s) of ?account>"
+      permissions: ["Microsoft.DocumentDB/databaseAccounts/readonlykeys/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if deny assignment covers readonlykeys/action: BLOCKED;
+        elif ?account.properties.disableLocalAuth == true: CONDITIONAL(service_state);
+        else ACTIVE. ARM-plane call — not gated by IP firewall.
+      confidence: "0.90"
+      derived_from: [ "<HasPermission edge_id (readonlykeys/action)>" ]
+      false_positive_note: >-
+        Emit only when the principal has readonlykeys but NOT listKeys — listKeys is a
+        superset and azure-cosmosdb-listkeys-exposes-credential already covers that case.
+        Read-only keys bypass RBAC for read but cannot write or delete items; CanExfiltrate
+        is still applicable (data can be exfiltrated via read-only key). ARM-plane call,
+        not gated by IP firewall. Cosmos DB Operator explicitly excludes readonlyKeys/* —
+        verify notActions. disableLocalAuth=true: same treatment as listKeys.
+      narrative: >-
+        {principal.name} can call readonlykeys on {account.name}
+        (Microsoft.DocumentDB/databaseAccounts/readonlykeys/action), retrieving the
+        read-only primary and secondary keys. These keys bypass all Azure RBAC data-plane
+        role assignments for read operations across all databases and containers, enabling
+        unauthorized data exfiltration.
+
+  # --- readonlykeys -> data exfiltration (read-only key path) -----------------
+  # Read-only keys returned by readonlykeys/action enable read-only data-plane access.
+  # While lower impact than full listKeys (no write/delete), the capability to read ALL
+  # data across all databases/containers is still CanExfiltrate. Model separately with
+  # lower confidence per research doc §22 #7.
+  - id: azure-cosmosdb-readonlykeys-exfiltrate
+    emits: CanExfiltrate
+    description: "Read-only keys (from readonlykeys/action) enable read-only data exfiltration across all databases and containers."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == NoSQLDatabase"
+      - "node_type(?account) matched provider_type == 'Microsoft.DocumentDB/databaseAccounts'"
+      - "?principal has EFFECTIVE Microsoft.DocumentDB/databaseAccounts/readonlykeys/action at ?account scope"
+      - "NOT ?principal has EFFECTIVE Microsoft.DocumentDB/databaseAccounts/listKeys/action at ?account scope  # avoid double-emit; listKeys CanExfiltrate subsumes this"
+      - "?account.properties.disableLocalAuth != true"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?account
+      permissions: ["Microsoft.DocumentDB/databaseAccounts/readonlykeys/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if deny assignment covers readonlykeys/action: BLOCKED;
+        elif ?account.properties.disableLocalAuth == true: BLOCKED (key-based auth
+        rejected at data endpoint);
+        else ACTIVE. ARM-plane call — not gated by IP firewall.
+      confidence: "0.85"
+      derived_from: [ "<HasPermission edge_id (readonlykeys/action)>" ]
+      false_positive_note: >-
+        Read-only keys cannot write or delete — impact is limited to read exfiltration.
+        Emit only when readonlykeys is present but listKeys is not (listKeys subsumes
+        this via azure-cosmosdb-listkeys-full-exfiltrate). Lower confidence (0.85) than
+        master-key path (0.95) due to read-only limitation. Cosmos DB Operator explicitly
+        excludes readonlykeys/* — verify notActions. disableLocalAuth=true blocks this path.
+      narrative: >-
+        {principal.name} can retrieve read-only master keys from {account.name}, enabling
+        read-only access to all data across all databases and containers. While this
+        principal cannot write or delete data, complete data exfiltration via queries and
+        point reads is possible.
+
+  # --- CMK-encrypted account with revoked key -> BLOCKED data read -----------
+  # When a Cosmos DB account has keyVaultKeyUri set (CMK encryption) and the Key Vault
+  # key is revoked/disabled, the account becomes inaccessible for all operations
+  # (including CanReadData). This is a separate BLOCKED-state edge from normal data reads.
+  # The rule azure-cosmosdb-data-reader models ACTIVE/CONDITIONAL(network) reads; this
+  # rule models the BLOCKED state when CMK is compromised.
+  - id: azure-cosmosdb-cmk-data-read-conditional
+    emits: CanReadData
+    description: "Data read on CMK-encrypted Cosmos DB account — BLOCKED state when the Key Vault key is revoked or disabled."
+    match:
+      - [ ?principal, HasPermission, ?scope ]
+    where:
+      - "node_class(?scope) == Data and node_type(?scope) == NoSQLDatabase"
+      - "node_type(?scope) matched provider_type in ['Microsoft.DocumentDB/databaseAccounts', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases', 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers']"
+      - "?principal has EFFECTIVE dataActions Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/read AND Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/executeQuery via sqlRoleAssignment at ?scope"
+      - "?scope.properties.keyVaultKeyUri is not null and not empty  # CMK-encrypted"
+      - "resolved Key Vault key at ?scope.properties.keyVaultKeyUri is disabled or revoked  # account is inaccessible"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?scope
+      permissions:
+        - "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/items/read"
+        - "Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/executeQuery"
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        if ?scope.properties.keyVaultKeyUri is set AND the Key Vault key is
+        confirmed-disabled/revoked: BLOCKED (account is inaccessible; the service's
+        MI cannot decrypt data);
+        else this rule does not emit (see azure-cosmosdb-data-reader for normal case).
+        This rule models CMK revocation as a separate capability gate.
+      confidence: "0.91"
+      derived_from: [ "<HasPermission edge_id (sqlRoleAssignment dataActions)>", "<HasPolicy edge_id (CMK keyVaultKeyUri)>" ]
+      false_positive_note: >-
+        This rule ONLY emits BLOCKED state — it handles the specific scenario where a
+        principal has valid data-plane RBAC but the account's CMK key has been revoked.
+        Normal data reads (CMK key is valid/present) are modeled by azure-cosmosdb-data-reader.
+        Key Vault key revocation/disabled state must be observable/confirmed — do not emit
+        POTENTIAL or guess. The gate resolves via key_permission condition linking to
+        credential-chains decrypt-gates-secret-read.
+      narrative: >-
+        {principal.name} holds valid data-plane RBAC on {scope.name}, but the account
+        is encrypted with a Customer-Managed Key (CMK) at {scope.properties.keyVaultKeyUri}
+        that is now revoked or disabled in Key Vault. The account is inaccessible — no
+        data can be read regardless of RBAC permissions, because the service's managed
+        identity cannot unwrap the encryption key.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - Azure deny assignment covering listKeys/action at effective scope ->
+#     azure-cosmosdb-listkeys-exposes-credential and azure-cosmosdb-listkeys-full-exfiltrate
+#     emit state BLOCKED.
+#   - ?account.properties.disableLocalAuth == true ->
+#     azure-cosmosdb-listkeys-full-exfiltrate: BLOCKED (data-plane rejects key-based auth);
+#     azure-cosmosdb-listkeys-exposes-credential: CONDITIONAL(service_state) (key is
+#     readable but cannot authenticate).
+#   - Cosmos DB Operator (230815da) assigned -> NO key-grab rules fire (listKeys in notActions).
+#   - ?account.properties.publicNetworkAccess == 'Disabled' ->
+#     azure-cosmosdb-public-endpoint: DO NOT EMIT.
+#   - ?account.properties.ipRules non-empty ->
+#     azure-cosmosdb-data-reader, azure-cosmosdb-data-contributor-write:
+#     CONDITIONAL(network_reachability) when caller has no allowed network path.
+#   - Deny assignment covering sqlRoleAssignments/write ->
+#     azure-cosmosdb-sqlrole-self-grant: BLOCKED.
+#
+# Explicit normalization (azure-cosmosdb.yaml in /rules/explicit/) must produce:
+#   - HasPermission records for listKeys/action, listConnectionStrings/action,
+#     readonlykeys/action from ARM RBAC role assignment resolution (match_effective_permission).
+#   - HasPermission records for sqlRoleAssignments/write from ARM RBAC resolution.
+#   - HasPermission records for Cosmos DB native data-plane dataActions from
+#     sqlRoleAssignment + sqlRoleDefinition resolution.
+#   - ContainsCredential(account -> AccessKey) structural records when disableLocalAuth != true.
+#   - Property records: publicNetworkAccess, ipRules, virtualNetworkRules,
+#     disableLocalAuth, keyVaultKeyUri (CMK flag).
+#   - Contains(account -> database -> container) structural records.
+#
+# Linchpin cross-references (DO NOT RE-DERIVE here):
+#   credential-chains.yaml:
+#     - ExposesCredential(?account -> AccessKey) + CredentialsFor(AccessKey -> identity)
+#       -> read-secret-yields-identity: CanImpersonate if the master key is registered as
+#       a credential for an external service principal (e.g., stored in Key Vault as a
+#       secret with CredentialsFor -> ApplicationIdentity).
+#     - execute-then-read-secret: a workload with CanReadData on Cosmos DB containers that
+#       ContainsSecret(-> secret) inherits CanReadSecret from its CanExecuteAs chain.
+#     - decrypt-gates-secret-read: for CMK accounts where CanReadData is
+#       CONDITIONAL(key_permission), upgrade to ACTIVE when the principal also holds
+#       CanDecrypt on the Key Vault key. NOTE: Cosmos DB CMK is managed by the service's
+#       own MI (the service decrypts transparently); the key_permission gate on CanReadData
+#       is only relevant when the CMK key is revoked/disabled (account inaccessible).
+#       For attacker-controlled decrypt paths: the account's MI is what holds decrypt;
+#       a principal that can modify the account's MI (CanModifyConfiguration + CanAttachIdentity)
+#       and points it at a Key Vault key they control -> escalation via CMK swap.
+#   can-control.yaml:
+#     - control-via-admin: Contributor/Owner at account scope -> Controls(?account) ->
+#       combined with listKeys access this represents full account control.
+#     - escalate-via-execute-as: CanExecuteAs a higher-privileged MI attached to the account
+#       -> CanEscalateTo the MI identity.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in /rules/explicit/azure-cosmosdb.yaml.
+# The derived file contains ONLY derived attack-path rules.
+# Do NOT embed explicit_rules here — they run in the explicit/ rule engine phase.

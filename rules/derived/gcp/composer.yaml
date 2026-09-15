@@ -1,0 +1,540 @@
+# GCP Cloud Composer — Derived attack-path rules (Phase 11 — Data / Analytics / ML)
+# ---------------------------------------------------------------------------
+# Cloud Composer ESCALATION INVARIANT (Phase 11):
+#   A Composer environment runs DAG tasks AS a service account (ExecutesAs).
+#   DAG files are stored in a GCS bucket (gs://<env>/dags/). Whoever can WRITE
+#   a DAG file to that bucket (storage.objects.create on the dags/ prefix) injects
+#   arbitrary Python code that Airflow executes as the environment SA. This is the
+#   canonical Composer RCE primitive — a single GCS write yields code execution as
+#   the environment SA within seconds (DAG scan interval ~30s Composer 2 / ~5s
+#   Composer 1):
+#
+#     storage.objects.create on dags/
+#       + ExecutesAs(composerEnvironment, environmentSA)
+#       -> CanModifyCode(principal, composerEnvironment)
+#       -> [can-execute-as] CanExecuteAs(principal, environmentSA)
+#
+# SERVICE ACCOUNT MODEL:
+#   Environment SA: config.nodeConfig.serviceAccount; defaults to the Compute
+#     Engine default SA (PROJECT_NUMBER-compute@developer.gserviceaccount.com)
+#     which historically holds roles/editor. Requires iam.serviceAccounts.actAs
+#     at environment create/update when specifying a non-default SA.
+#   Composer Service Agent: service-PROJECT_NUMBER@cloudcomposer-accounts.iam.gserviceaccount.com
+#     — manages infrastructure; not typically an escalation target.
+#
+# LINCHPIN DELEGATION (CITE, DO NOT RE-DERIVE):
+#   can-execute-as.yaml   execute-as-via-code-modify: CanModifyCode(compute) +
+#                         ExecutesAs -> CanExecuteAs. This file emits the normalized
+#                         facts (CanModifyCode, ExecutesAs) and lets can-execute-as
+#                         produce the CanExecuteAs collapse.
+#   can-execute-as.yaml   execute-as-via-new-workload: CanCreateWorkloadAs ->
+#                         CanExecuteAs. This file emits CanCreateWorkloadAs.
+#   can-execute-as.yaml   execute-as-via-config-identity-swap: CanModifyConfiguration
+#                         + CanPassIdentity -> CanExecuteAs. Applies to SA swap via
+#                         environments.update.
+#   cicd-chains.yaml      cicd-modify-buildspec-executes-as: CanModifyCode(runner) +
+#                         ExecutesAs -> CanExecuteAs (CI/CD framing; dedupes with
+#                         can-execute-as on the same (CanExecuteAs, principal, envSA)).
+#   can-control.yaml      escalate-via-execute-as: CanExecuteAs -> CanEscalateTo.
+#   credential-chains.yaml: ExposesCredential + CanExecuteAs -> CanReadSecret chains.
+#
+# This file emits service FACTS + the Composer-specific derivations that require
+# Composer or GCS-specific framing:
+#   CanModifyCode     — dags/ GCS write = code injection into the execution env
+#   ExecutesAs        — structural: which SA the environment runs as
+#   ExposesCredential — structural: metadata token exposed to all DAG tasks
+#   CanPassIdentity   — actAs on env SA at create time
+#   CanCreateWorkloadAs — create env + actAs on chosen SA
+#   CanAttachIdentity — update env SA (environments.update + actAs on new SA)
+#   CanModifyConfiguration — update env config (pypiPackages, envVariables)
+#   CanModifyPolicy   — bucket setIamPolicy -> self-grant dags/ write
+#   CanTrigger        — executeAirflowCommand to trigger a DAG run
+#   CanEscalateTo     — roll-up when env SA is more privileged than attacker
+#
+# Permissions are exact identifiers from the Cloud Composer IAM reference, the
+# Cloud Storage IAM reference, and the Cloud IAM service accounts reference.
+# No permissions are hallucinated.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 11-data-analytics-ml
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1. DAG file write -> CanModifyCode (THE dominant Composer attack primitive)
+  # ---------------------------------------------------------------------------
+  # Writing a Python DAG file to the environment's GCS dags/ prefix is code
+  # injection into the Airflow execution environment. The Airflow scheduler scans
+  # for new/changed DAG files automatically (Composer 2: ~30s; Composer 1: ~5s via
+  # GCS FUSE mount) and begins executing tasks within that DAG as the environment SA.
+  # This requires ONLY storage.objects.create on the dags/ prefix — no Composer IAM
+  # permission is needed if the bucket name is already known. The bucket name is
+  # discoverable via composer.environments.get (dagGcsPrefix field).
+  - id: gcp-composer-dag-write-modify-code
+    emits: CanModifyCode
+    description: "storage.objects.create on the Composer environment's GCS dags/ prefix injects a Python DAG file that Airflow executes as the environment SA; cite can-execute-as for the CanExecuteAs roll-up."
+    match_effective_permission:
+      action: "storage.objects.create"
+      resource_type: "google.storage.Bucket"
+    where:
+      - "bucket is the environment's DAG bucket (dagGcsPrefix prefix — gs://<env-bucket>/dags/)"
+      - "object prefix matches dags/ OR plugins/ (plugins/ is equivalent: Airflow loads them at scheduler/worker startup)"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Composer Environment node (AnalyticsService)>"
+      permissions: ["storage.objects.create"]
+      conditions: []
+      state_logic: >-
+        ACTIVE: storage.objects.create on the dags/ prefix is a direct data-plane
+        write that the Airflow scheduler processes automatically (no manual trigger
+        required). Airflow picks up the new DAG file within the DAG scan interval
+        (~30s Composer 2, ~5s Composer 1); once parsed the tasks are scheduled and
+        executed as the environment SA. This is ACTIVE (not CONDITIONAL) because the
+        scan is automatic and requires no further action by the attacker. CONDITIONAL
+        only if a VPC Service Controls perimeter blocks the storage.googleapis.com API
+        for the principal's origin network. BLOCKED if an IAM deny policy or a VPC-SC
+        perimeter enforces a deny on storage.objects.create at this scope.
+      confidence: 0.97
+      derived_from: ["<storage.objects.create effective permission on dags/ bucket prefix>"]
+      false_positive_note: >-
+        Confirm the write is scoped to the dags/ or plugins/ prefix, not merely data/
+        or logs/ (data/ write is CanWriteData / ContainsSecret, not code execution).
+        Check for IAM Conditions on the storage.objects.create binding that restrict
+        by prefix (storage.googleapis.com/objectNamePrefix condition). A VPC Service
+        Controls perimeter covering storage.googleapis.com for the principal's
+        network makes this CONDITIONAL(scp_or_org_policy) for out-of-perimeter
+        principals — not ACTIVE. The DAG scan interval is a minor delay (~5-30s),
+        not a blocking control; emit ACTIVE. Do NOT emit if the bucket is a different
+        GCS bucket (not the env's dagGcsPrefix). Cite can-execute-as
+        execute-as-via-code-modify for the CanExecuteAs collapse — do not re-derive it.
+      narrative: >-
+        {principal.name} has storage.objects.create on the Cloud Composer environment
+        {env.name}'s GCS dags/ bucket prefix; uploading a Python DAG file causes the
+        Airflow scheduler to parse and execute it within ~30 seconds as the environment
+        service account {sa.name}. No Composer-level permission is required — a single
+        GCS write yields remote code execution as {sa.name}. Cite can-execute-as
+        execute-as-via-code-modify for the CanExecuteAs collapse (CanModifyCode +
+        ExecutesAs → CanExecuteAs).
+
+  # ---------------------------------------------------------------------------
+  # 2. Metadata credential exposure — structural fact
+  # ---------------------------------------------------------------------------
+  # The GKE/GCE metadata server injects the environment SA's OAuth token into every
+  # DAG task execution context. Any code running inside a DAG can call the metadata
+  # endpoint to obtain a short-lived OAuth token for the environment SA.
+  - id: gcp-composer-exposes-env-sa-cred
+    emits: ExposesCredential
+    description: "All Composer DAG task executions can mint OAuth tokens for the environment SA from the GKE metadata server; code execution in any DAG task yields the environment SA's credentials."
+    match:
+      - [ "?env", "ExecutesAs", "?sa" ]
+    where:
+      - "node_class(?env) in [AnalyticsService]  # Composer Environment"
+    emit:
+      source_type: AnalyticsService
+      target_type: Identity
+      source: "<Composer Environment node>"
+      target: "<environment service account>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE: structural fact — the GKE metadata server is always reachable from
+        Airflow worker pods. This edge only becomes an attack step when combined with
+        a CanModifyCode, CanTrigger, or CanExecuteAs edge on the environment. Cite
+        credential-chains.yaml for the ExposesCredential → CredentialsFor → CanImpersonate
+        collapse when relevant.
+      confidence: 1.0
+      derived_from: ["<ExecutesAs edge_id for ?env -> ?sa>"]
+      false_positive_note: >-
+        Not an escalation by itself — expresses the fact that code execution in any
+        DAG task equals credential access for the environment SA. Attack value is gated
+        by an upstream code-injection capability (CanModifyCode via dags/ write, or a
+        CanTrigger over an already-attacker-influenced DAG). Do not treat as a standalone
+        high-value finding.
+      narrative: >-
+        Code running in {env.name}'s DAG tasks can retrieve OAuth 2.0 access tokens for
+        environment service account {sa.name} from the GKE metadata server
+        (http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token),
+        granting all of {sa.name}'s IAM roles to any code in the environment.
+
+  # ---------------------------------------------------------------------------
+  # 3. Create workload as chosen SA (derived from CanPassIdentity + create cap)
+  # ---------------------------------------------------------------------------
+  - id: gcp-composer-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Holding CanPassIdentity on a target SA plus composer.environments.create gives the principal the ability to create a Composer environment running as that SA."
+    match:
+      - [ "?principal", "CanPassIdentity", "?sa" ]
+    where:
+      - "?principal has effective composer.environments.create on the project"
+      - "node_type(?sa) in [ServiceAccount, MachineIdentity]"
+      - "role_compatible(?sa, Composer Environment)  # SA must be valid for Composer env"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<target service account (?sa)>"
+      permissions: ["composer.environments.create", "iam.serviceAccounts.actAs"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when both composer.environments.create and iam.serviceAccounts.actAs
+        on ?sa are confirmed. CONDITIONAL(service_state) until the new environment
+        reaches RUNNING state (creation takes 5-20 minutes). CONDITIONAL(iam_permission)
+        if actAs is unresolved. BLOCKED if either permission is denied. Feeds
+        can-execute-as execute-as-via-new-workload directly.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["<CanPassIdentity edge_id for ?principal -> ?sa>", "<composer.environments.create effective permission>"]
+      false_positive_note: >-
+        Creating a Composer environment takes 5-20 minutes; CanExecuteAs derived from
+        this CanCreateWorkloadAs is CONDITIONAL(service_state) until RUNNING. The
+        environment creation also requires a GKE cluster and Cloud SQL instance to be
+        provisioned; org policies or quota limits may block creation.
+      narrative: >-
+        {principal.name} can create a Composer environment (composer.environments.create
+        + actAs on {sa.name}) bound to {sa.name}; once RUNNING, any DAG in the
+        environment executes as {sa.name}.
+
+  # ---------------------------------------------------------------------------
+  # 4. Update environment SA -> CanAttachIdentity
+  # ---------------------------------------------------------------------------
+  # composer.environments.update + iam.serviceAccounts.actAs on a NEW SA lets a
+  # principal change the environment's runtime SA. After the update, all future DAG
+  # task executions run as the new SA. This is CanAttachIdentity on the environment;
+  # cite can-execute-as execute-as-via-config-identity-swap for the CanExecuteAs
+  # collapse.
+  - id: gcp-composer-update-env-attach-sa
+    emits: CanAttachIdentity
+    description: "composer.environments.update + iam.serviceAccounts.actAs on a new SA: swap the Composer environment's runtime SA; future DAG tasks run as the new SA."
+    match:
+      - [ "?principal", "CanPassIdentity", "?new_sa" ]
+    where:
+      - "?principal has effective composer.environments.update on the project or the environment"
+      - "node_type(?new_sa) in [ServiceAccount, MachineIdentity]"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Composer Environment node>"
+      permissions: ["composer.environments.update", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE for the attach capability itself when both composer.environments.update
+        and iam.serviceAccounts.actAs on ?new_sa are confirmed. The SA swap takes
+        effect after the environment update completes (update propagation time: minutes).
+        Downstream CanExecuteAs (from can-execute-as execute-as-via-config-identity-swap:
+        CanModifyConfiguration + CanPassIdentity -> CanExecuteAs) is ACTIVE once the SA
+        swap propagates. CONDITIONAL(iam_permission) if actAs on ?new_sa is unresolved.
+        BLOCKED if either permission is denied by IAM deny or org policy.
+      confidence: 0.93
+      derived_from: ["<CanPassIdentity edge_id for ?principal -> ?new_sa>", "<composer.environments.update effective permission>"]
+      false_positive_note: >-
+        Requires actAs on the NEW SA — without it the API rejects the update. Do not
+        emit CanAttachIdentity unless actAs on the new SA is confirmed via the
+        CanPassIdentity edge match. The SA swap only affects future DAG executions
+        (not currently running tasks). Cite can-execute-as execute-as-via-config-identity-swap
+        for the CanExecuteAs roll-up.
+      narrative: >-
+        {principal.name} can update Composer environment {env.name}
+        (composer.environments.update) to change its runtime SA to {new_sa.name}
+        (iam.serviceAccounts.actAs confirmed); after the update, all future DAG task
+        executions run as {new_sa.name}.
+
+  # ---------------------------------------------------------------------------
+  # 5. PyPI package injection -> CanModifyConfiguration
+  # ---------------------------------------------------------------------------
+  # composer.environments.update allows modifying softwareConfig.pypiPackages to
+  # inject an attacker-controlled Python package. The package is installed on all
+  # worker pods and the scheduler pod, and code runs at Python import time — before
+  # any DAG task logic executes. Unlike DAG-write (rule 1) this does NOT require
+  # storage.objects.create but DOES require composer.environments.update. It also
+  # does NOT require iam.serviceAccounts.actAs (no SA swap), making it an independent
+  # code execution path.
+  - id: gcp-composer-update-env-inject-packages
+    emits: CanModifyConfiguration
+    description: "composer.environments.update with softwareConfig.pypiPackages injects an attacker-controlled Python package installed on all workers and the scheduler, executing code as the environment SA at import time."
+    match_effective_permission:
+      action: "composer.environments.update"
+      resource_type: "google.composer.Environment"
+    where:
+      - "update targets config.softwareConfig.pypiPackages OR config.softwareConfig.envVariables OR config.softwareConfig.airflowConfigOverrides"
+      - "no SA swap in this update path (separate rule gcp-composer-update-env-attach-sa covers SA swap)"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Composer Environment node>"
+      permissions: ["composer.environments.update"]
+      conditions: []
+      state_logic: >-
+        ACTIVE when composer.environments.update is confirmed in the effective grant
+        at project or environment scope. The package installation requires an environment
+        update cycle (minutes) and a worker restart — emit as ACTIVE for the code-injection
+        capability with a note that execution is delayed by the update propagation time.
+        The downstream CanExecuteAs (from can-execute-as execute-as-via-code-modify:
+        CanModifyConfiguration is treated as equivalent to CanModifyCode when it achieves
+        code injection) is ACTIVE once the update propagates. BLOCKED if an IAM deny
+        policy applies to composer.environments.update.
+      confidence: 0.90
+      derived_from: ["<composer.environments.update effective permission>"]
+      false_positive_note: >-
+        This requires specifying an attacker-controlled PyPI package (e.g., a typosquat
+        or a private package the attacker controls). Injecting a package that performs a
+        no-op is not code execution — the package must contain malicious import-time code.
+        The update takes minutes and workers are restarted; not an instant execution like
+        the dags/ write path. CanModifyConfiguration is ACTIVE for the configuration
+        capability, but the code-execution consequence (downstream CanExecuteAs) is
+        CONDITIONAL(external_resource) since the attacker must also control the external
+        PyPI package or have registered a typosquat. Also covers envVariables injection
+        (e.g., overriding AIRFLOW__CORE__EXECUTOR or pointing PYTHONPATH at an
+        attacker-controlled source) and airflowConfigOverrides (can alter scheduler
+        behavior). Cite can-execute-as execute-as-via-code-modify for the CanExecuteAs
+        collapse (treating this CanModifyConfiguration as equivalent in effect).
+      narrative: >-
+        {principal.name} can update Composer environment {env.name}
+        (composer.environments.update) to add an attacker-controlled Python package to
+        softwareConfig.pypiPackages; the package is installed on all worker pods and the
+        scheduler and executes at Python import time as the environment SA {sa.name}.
+        No actAs permission is required for this path (unlike SA-swap updates).
+
+  # ---------------------------------------------------------------------------
+  # 6. GCS bucket setIamPolicy -> CanGrantPermission (self-grant dags/ write)
+  # ---------------------------------------------------------------------------
+  # storage.buckets.setIamPolicy on the environment GCS bucket lets a principal grant
+  # itself storage.objects.create, enabling the DAG-write code-execution path without
+  # any Composer-level IAM. Semantically this is CanGrantPermission: granting a permission
+  # to an identity (self or others).
+  - id: gcp-composer-bucket-set-iam-policy
+    emits: CanGrantPermission
+    description: "storage.buckets.setIamPolicy on the Composer environment GCS bucket lets the principal grant storage.objects.create (dags/ write access) to itself or others, enabling the DAG-write code-execution path."
+    match_effective_permission:
+      action: "storage.buckets.setIamPolicy"
+      resource_type: "google.storage.Bucket"
+    where:
+      - "bucket is the environment's DAG bucket (dagGcsPrefix bucket)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<principal (self-grant)>"
+      permissions: ["storage.buckets.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when storage.buckets.setIamPolicy is confirmed in the effective grant
+        on the environment bucket. The principal can grant itself (or others) the
+        storage.objects.create permission on the dags/ prefix, enabling the DAG-write
+        code-execution path. BLOCKED if an IAM deny policy applies to storage.buckets.setIamPolicy.
+      confidence: 0.90
+      derived_from: ["<storage.buckets.setIamPolicy effective permission on environment bucket>"]
+      false_positive_note: >-
+        setIamPolicy on the bucket is a powerful primitive: it allows granting
+        storage.objects.create to arbitrary principals (including the attacker themselves),
+        which enables the DAG-write escalation. This is a two-step path (grant + write)
+        but both steps are under attacker control once setIamPolicy is held. Flag
+        alongside the CanModifyCode rule (gcp-composer-dag-write-modify-code) as a
+        chained escalation. Org policy constraints.storage.restrictAuthTypes may limit
+        IAM grant targets.
+      narrative: >-
+        {principal.name} holds storage.buckets.setIamPolicy on Composer environment
+        {env.name}'s GCS bucket and can grant itself storage.objects.create on the
+        dags/ prefix, enabling DAG-write remote code execution as environment SA
+        {sa.name}.
+
+  # ---------------------------------------------------------------------------
+  # 7. Trigger a DAG run -> CanTrigger (CONDITIONAL — weaker than modify)
+  # ---------------------------------------------------------------------------
+  # composer.environments.executeAirflowCommand lets a principal issue airflow CLI
+  # commands against the environment, including `airflow dags trigger`. This triggers
+  # execution of the CURRENT DAG definition as the environment SA. This is CONDITIONAL:
+  # it only yields CanExecuteAs if the current DAG already contains attacker-influenced
+  # code. Cite cicd-chains cicd-trigger-runner-executes-as for the CanExecuteAs collapse.
+  - id: gcp-composer-trigger-dag-run
+    emits: CanTrigger
+    description: "composer.environments.executeAirflowCommand lets the principal trigger an existing Airflow DAG run; CanExecuteAs is CONDITIONAL on the current DAG definition being attacker-influenced."
+    match_effective_permission:
+      action: "composer.environments.executeAirflowCommand"
+      resource_type: "google.composer.Environment"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<Composer Environment node>"
+      permissions: ["composer.environments.executeAirflowCommand"]
+      conditions: [attacker_influenced_definition]
+      state_logic: >-
+        CONDITIONAL(attacker_influenced_definition): executeAirflowCommand triggers
+        the CURRENT DAG definition. Code execution as the environment SA is only ACTIVE
+        if the triggered DAG already runs attacker-influenceable code (e.g., a DAG the
+        attacker has already modified via gcp-composer-dag-write-modify-code, a DAG with
+        a BashOperator running an unpinned script from GCS, or a DAG with a
+        PythonOperator calling an attacker-controlled function). A trigger over a clean,
+        pinned, reviewed DAG that does not run attacker-influenced code remains
+        CONDITIONAL. Cite cicd-chains cicd-trigger-runner-executes-as for the
+        CONDITIONAL CanExecuteAs collapse. BLOCKED if an IAM deny policy applies.
+      confidence: 0.70
+      derived_from: ["<composer.environments.executeAirflowCommand effective permission>"]
+      false_positive_note: >-
+        Strictly weaker than the DAG-write path (rule 1). Do NOT emit ACTIVE merely
+        because the principal can trigger a DAG run — the current DAG definition must
+        already contain attacker-controlled code for this to yield CanExecuteAs ACTIVE.
+        The classic ACTIVE case is: attacker has already written a malicious DAG (rule 1)
+        and can also trigger it. In that case rule 1's ACTIVE CanModifyCode + ExecutesAs
+        dominates; this rule provides the explicit trigger edge. For a clean DAG, keep
+        CONDITIONAL and do not elevate to high-value without confirming attacker influence
+        on the definition. Cite cicd-chains for the collapse; do not re-derive CanExecuteAs.
+      narrative: >-
+        {principal.name} can issue Airflow CLI commands against environment {env.name}
+        (composer.environments.executeAirflowCommand), including triggering a DAG run;
+        if the triggered DAG already runs attacker-influenced code, this executes as
+        environment SA {sa.name} (CONDITIONAL on definition being attacker-influenced).
+
+  # ---------------------------------------------------------------------------
+  # 8. Airflow Web Server Internet Exposure
+  # ---------------------------------------------------------------------------
+  # Composer 2 environments expose an Airflow web server UI for DAG browsing,
+  # triggering, and administration. By default the web server is internet-accessible
+  # (config.webServerNetworkAccessControl.allowedIpRanges may include 0.0.0.0/0).
+  # An internet-exposed web server is a high-value target for:
+  #   - Discovering DAG definitions (CanRead)
+  #   - Triggering DAG runs (CanTrigger → CanExecuteAs if DAGs are attacker-influenced)
+  #   - Exploiting Airflow web framework vulnerabilities
+  - id: gcp-composer-web-server-exposed-internet
+    emits: ExposedToInternet
+    description: "Airflow web server in Composer 2 environment is internet-accessible when config.webServerNetworkAccessControl.allowedIpRanges includes 0.0.0.0/0."
+    match_record:
+      resource_type: "google.composer.Environment"
+      field: "config.webServerNetworkAccessControl.allowedIpRanges"
+    where:
+      - "config.webServerNetworkAccessControl.allowedIpRanges includes '0.0.0.0/0' OR '::/0'"
+      - "config.webServerConfig.machineType is set (Composer 2 only; Composer 1 web server is internal)"
+    emit:
+      # ExposedToInternet is directed resource -> AnonymousIdentity (the exposed resource is the source).
+      source_type: Data  # Composer Environment is an AnalyticsService (Data class), admitted by ExposedToInternet.source
+      target_type: AnonymousIdentity
+      source: "<Composer Environment node (Airflow web server)>"
+      target: "<anonymous internet principal (0.0.0.0/0 ingress)>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE: the environment's Airflow web server is directly reachable from the
+        internet at https://<env-id>-<project>-web.<zone>.composer.googleusercontent.com.
+        This is a data-plane exposure, not requiring any IAM permission to observe or
+        interact with. BLOCKED only if a VPC Service Controls perimeter or a firewall
+        rule explicitly restricts internet ingress to the web server endpoint.
+      confidence: 1.0
+      derived_from: ["<config.webServerNetworkAccessControl.allowedIpRanges from google.composer.Environment>"]
+      false_positive_note: >-
+        Verify that allowedIpRanges is set at the environment level; if it is not set,
+        the default is to allow 0.0.0.0/0 (world accessible). Check if a VPC Service
+        Controls perimeter or an organization policy restricts Composer web access at
+        the org/folder/project level. Note: Composer 1 web servers are internal by
+        default; this rule applies to Composer 2 only. The web server URL is publicly
+        discoverable by querying the GCP project's public metadata.
+      narrative: >-
+        Composer environment {env.name}'s Airflow web server is accessible from the
+        internet at https://{env_id}-{project}-web.{zone}.composer.googleusercontent.com.
+        Any internet user can browse DAGs, view execution history, and trigger runs
+        (executeAirflowCommand perm not required for basic web UI access). Combined with
+        a CanModifyCode or CanTrigger capability on the environment, this is a critical
+        attack vector.
+
+# ---------------------------------------------------------------------------
+# Explicit normalization records for the collector. These translate raw Composer
+# environment resource fields into explicit graph edges for the explicit-edge layer.
+# Kept here as explicit_rules so the service is self-contained (explicitPath null).
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-composer-env-executes-as
+    emits: ExecutesAs
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.composer.Environment"
+      field: "config.nodeConfig.serviceAccount"
+    where:
+      - "if config.nodeConfig.serviceAccount is set: SA = that value"
+      - "else: SA = PROJECT_NUMBER-compute@developer.gserviceaccount.com"
+    emit:
+      source_type: AnalyticsService
+      target_type: Identity
+      source: "<Composer Environment node>"
+      target: "<service account>"
+      api_source: "composer.projects.locations.environments.get"
+      evidence_field: "config.nodeConfig.serviceAccount"
+      narrative: "Composer environment {env.name} executes DAG tasks as {sa.name}."
+
+  - id: gcp-composer-dag-bucket-link
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.composer.Environment"
+      field: "config.dagGcsPrefix"
+    where:
+      - "config.dagGcsPrefix is a non-empty GCS URI (gs://<bucket>/dags/)"
+      - "extract bucket name from the URI"
+    emit:
+      source_type: AnalyticsService
+      target_type: Storage
+      source: "<Composer Environment node>"
+      target: "<GCS bucket node (ObjectStorage)>"
+      api_source: "composer.projects.locations.environments.get"
+      evidence_field: "config.dagGcsPrefix"
+      narrative: "Composer environment {env.name} stores DAG files in GCS bucket {bucket.name} (dagGcsPrefix); used to resolve the CanModifyCode target bucket for the dags/ write attack path."
+
+  - id: gcp-composer-cross-project-sa
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.composer.Environment"
+      field: "config.nodeConfig.serviceAccount"
+    where:
+      - "service account email project ≠ environment's hosting project"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<environment hosting project>"
+      target: "<service account's project>"
+      api_source: "composer.projects.locations.environments.get"
+      evidence_field: "config.nodeConfig.serviceAccount"
+      narrative: "Composer environment {env.name} (project {env.project}) runs as SA {sa.name} from project {sa.project} — cross-project SA trust."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - IAM deny policy denying storage.objects.create on the dags/ prefix ->
+#    gcp-composer-dag-write-modify-code is BLOCKED.
+#  - IAM deny policy denying storage.buckets.setIamPolicy ->
+#    gcp-composer-bucket-set-iam-policy (CanGrantPermission) is BLOCKED.
+#  - IAM deny policy denying composer.environments.update ->
+#    gcp-composer-update-env-inject-packages and gcp-composer-update-env-attach-sa
+#    are BLOCKED.
+#  - IAM deny policy denying composer.environments.create ->
+#    gcp-composer-create-workload-as is BLOCKED.
+#  - IAM deny policy denying iam.serviceAccounts.actAs on a target SA ->
+#    gcp-composer-create-workload-as and gcp-composer-update-env-attach-sa are BLOCKED.
+#  - VPC Service Controls perimeter covering storage.googleapis.com for the principal's
+#    network -> gcp-composer-dag-write-modify-code is CONDITIONAL(scp_or_org_policy)
+#    for out-of-perimeter principals, not ACTIVE.
+#  - Org policy iam.automaticIamGrantsForDefaultServiceAccounts removes roles/editor
+#    from the Compute Engine default SA -> adjust privilege_level of the default SA;
+#    may make CanExecuteAs(principal, defaultSA) low-value.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# DEDUPLICATION NOTES:
+#  - can-execute-as.yaml execute-as-via-code-modify fires on ANY CanModifyCode +
+#    ExecutesAs for Compute or AnalyticsService nodes; this file's CanModifyCode(env) +
+#    ExecutesAs(env, sa) edges feed that rule. CanExecuteAs(principal, sa) is
+#    produced by can-execute-as — do not re-derive it here.
+#  - can-execute-as.yaml execute-as-via-new-workload fires on CanCreateWorkloadAs;
+#    gcp-composer-create-workload-as feeds it.
+#  - can-execute-as.yaml execute-as-via-config-identity-swap fires on
+#    CanModifyConfiguration + CanPassIdentity; gcp-composer-update-env-inject-packages
+#    (CanModifyConfiguration) + CanPassIdentity feed it for the PyPI+SA combo.
+#  - cicd-chains.yaml cicd-trigger-runner-executes-as fires on CanTrigger +
+#    ExecutesAs (CONDITIONAL); gcp-composer-trigger-dag-run (CanTrigger) feeds it.
+#  - credential-chains.yaml fires on ExposesCredential + downstream edges;
+#    gcp-composer-exposes-env-sa-cred feeds it.
+#  - can-control.yaml escalate-via-execute-as produces CanEscalateTo from CanExecuteAs.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,149 @@
+# GCP Cloud Armor — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:cloudarmor.
+# Cloud Armor attaches security policies (WAF / DDoS / IP / geo / rate-limit
+# rules) to HTTP(S) load balancer backend services. Its ENTIRE attack surface is
+# control-plane mutation of security policy rules: a principal with
+# compute.securityPolicies.update can remove or weaken DENY/THROTTLE rules,
+# lifting the edge-level access control protecting the backend application.
+#
+# There is NO execution role, NO code path, NO secret access, and NO peering.
+# Per Phase 8 scope: emit the WAF-weakening FACT only. Transitive end-to-end
+# network reachability (weakened policy + LB routes to backend + firewall allows)
+# is composed by the future network-chains linchpin — DO NOT invent it here.
+#
+# Key discipline:
+#   - CanModifyConfiguration is ACTIVE once the IAM grant is confirmed: the
+#     control-plane API capability to call compute.securityPolicies.update is
+#     immediately available. The attack's IMPACT (reaching a previously-blocked
+#     source) is CONDITIONAL on network reachability; see false_positive_note.
+#   - compute.securityPolicies.update ≠ attach permission. The update permission
+#     mutates existing rules only; attaching to a backend requires
+#     compute.backendServices.update + compute.securityPolicies.use (out of scope
+#     for a WAF weakening rule — would be a separate CanModifyConfiguration on
+#     the backend service, tracked in the LB / VPC files).
+#   - An unattached policy (no backend service referencing it) has no impact.
+#     Downgrade confidence when attachment status is unknown.
+#   - compute.securityPolicies.setIamPolicy is covered by identity-escalation.yaml:
+#     gcp-set-iam-policy-resource (CanModifyPolicy) which enables self-grant of
+#     compute.securityPolicies.update, feeding gcp-cloudarmor-weaken-policy
+#     transitively. That path is NOT duplicated here.
+#   - This file cites can-control.yaml; it does NOT duplicate its roll-up rules.
+#
+# Official permissions reference:
+#   https://cloud.google.com/iam/docs/permissions-reference
+#   (compute.securityPolicies.* section)
+# Cloud Armor concepts:
+#   https://cloud.google.com/armor/docs/security-policy-concepts
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 8-networking
+service: cloudarmor
+applies_to: [gcp]
+
+rules:
+
+  # --- Weaken security policy (remove/soften WAF/DDoS/access-control rules) --
+  - id: gcp-cloudarmor-weaken-policy
+    emits: CanModifyConfiguration
+    description: >-
+      compute.securityPolicies.update lets a principal modify rules in a Cloud
+      Armor security policy — deleting DENY rules, removing geo/IP blocks, disabling
+      adaptive protection, or inserting a catch-all ALLOW — weakening the WAF/DDoS
+      edge access control protecting the attached HTTP(S) LB backend.
+    match_effective_permission:
+      action: "compute.securityPolicies.update"
+      resource_type: "compute.googleapis.com/SecurityPolicy"
+    where:
+      - "the security policy is attached to at least one BackendService whose load-balancing-scheme is EXTERNAL or EXTERNAL_MANAGED (internal LBs do not use Cloud Armor)"
+      - "the security policy contains at least one rule with action DENY, THROTTLE, or REDIRECT (if all rules are ALLOW, weakening has no marginal effect)"
+    emit:
+      source_type: Identity
+      target_type: GenericNetwork
+      source: "<principal>"
+      target: "<Cloud Armor SecurityPolicy node>"
+      permissions: ["compute.securityPolicies.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE: the IAM permission compute.securityPolicies.update is sufficient to
+        invoke the control-plane API and mutate the security policy rules immediately.
+        The capability exists unconditionally once the effective permission is confirmed.
+        Downgrade to POTENTIAL when the policy's attachment to an external-LB backend
+        cannot be confirmed. BLOCKED if an IAM deny policy denies
+        compute.securityPolicies.update at the effective scope, or if an org policy
+        constraint prevents security policy mutation (denied_by=<deny policy or org constraint>).
+      confidence: "min(contributing_confidences) * 0.75"
+      derived_from:
+        - "<effective compute.securityPolicies.update IAM grant on the SecurityPolicy>"
+      false_positive_note: >-
+        (1) The policy MUST be attached to an internet-facing (EXTERNAL or
+        EXTERNAL_MANAGED) backend service — Cloud Armor does not apply to internal
+        LBs. (2) compute.securityPolicies.update does NOT grant the ability to
+        attach a policy to a backend service; that requires compute.backendServices.update
+        + compute.securityPolicies.use (a separate, broader privilege). (3) If the
+        policy only contains ALLOW rules (no DENY/THROTTLE/REDIRECT), there is no
+        access control to weaken — emit with very low confidence or suppress.
+        (4) IMPACT CONDITIONALITY: an attacker whose source traffic was already
+        allowed by the existing policy gains nothing from weakening it; impact is
+        realized only when the attacker's source was PREVIOUSLY BLOCKED by a rule
+        in this policy AND the backend LB is internet-reachable. This is an
+        impact/scoring concern, not a capability-state concern (emitted ACTIVE).
+        (5) roles/compute.securityAdmin, roles/compute.networkAdmin,
+        roles/compute.admin, roles/editor, and roles/owner all include this permission.
+        Confirm the effective permission (accounting for IAM deny policies and org
+        policy constraints) before emitting.
+      narrative: >-
+        {principal.name} holds compute.securityPolicies.update on {target.name}
+        and can remove or weaken DENY, THROTTLE, geo-block, IP allowlist, or
+        adaptive-protection rules in this Cloud Armor security policy. This lifts
+        the WAF/DDoS edge access control protecting the HTTP(S) load balancer
+        backend(s) that reference this policy, allowing previously-blocked traffic
+        to reach the backend application.
+
+# ---------------------------------------------------------------------------
+# ADDITIONAL PERMISSIONS NOT EMITTED AS SEPARATE RULES:
+#   - compute.securityPolicies.delete: included in roles/compute.securityAdmin.
+#     Deletes an unattached security policy outright. GCP enforces referential
+#     integrity: a policy attached to a backend service CANNOT be deleted until
+#     the attachment is removed (via compute.backendServices.setSecurityPolicy or
+#     compute.backendServices.update). An attacker can: (1) call setSecurityPolicy
+#     with null/permissive policy to detach, then (2) delete the original policy.
+#     This is a variant of gcp-cloudarmor-weaken-policy (both via mutation of
+#     security policy state), but delete is covered by the CanModifyConfiguration
+#     edge semantics — emit the update-permission path, which is more common and
+#     operationally silent. Delete adds noise (audit trail) and is uncommon in
+#     attack paths (usually used for cleanup). No separate rule is emitted.
+#
+# BLOCKED-edge guidance:
+#   - An IAM deny policy (iam.googleapis.com/deny) denying
+#     compute.securityPolicies.update at project/folder/org scope -> emit
+#     CanModifyConfiguration with state: BLOCKED and denied_by=<deny rule name>.
+#   - An org policy constraint that prevents security policy modification ->
+#     BLOCKED similarly.
+#   - If the compute.securityPolicies.update permission is present only at
+#     organization or folder scope but the targeted SecurityPolicy is in a
+#     specific project, confirm the effective scope matches before emitting.
+#
+# CITED, NOT DUPLICATED — can-control.yaml:
+#   If a principal reaches CanAdminister on the SecurityPolicy (e.g. via
+#   roles/compute.securityAdmin at project scope), can-control.yaml's
+#   control-via-admin rule emits Controls(Identity -> SecurityPolicy).
+#   This file does not re-derive that roll-up.
+#
+# CITED, NOT DUPLICATED — identity-escalation.yaml:
+#   If a principal holds compute.securityPolicies.setIamPolicy on a SecurityPolicy,
+#   identity-escalation.yaml:gcp-set-iam-policy-resource emits CanModifyPolicy
+#   (Identity -> SecurityPolicy). Via CanModifyPolicy, the principal can grant
+#   itself compute.securityPolicies.update on the same resource (self-binding on
+#   the SecurityPolicy resource), transitively feeding gcp-cloudarmor-weaken-policy.
+#   This file does not re-derive that privilege-escalation chain.
+#
+# NOT EMITTED (network-chains linchpin — FUTURE):
+#   The composed path "attacker weakens policy -> previously-blocked source
+#   can now reach the LB backend -> LB routes to compute -> attacker reaches
+#   workload" requires composing CanModifyConfiguration(policy) + RoutesTo(LB
+#   -> backend) + ExposedToInternet(LB) into CanNetworkReach or CanReachPort
+#   on the backend compute. That transitive derivation is the network-chains
+#   linchpin; it is NOT emitted here.
+# ---------------------------------------------------------------------------

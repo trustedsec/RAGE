@@ -1,0 +1,473 @@
+# AWS KMS — Derived attack-path rules (Phase 5 — Secrets / credentials / KMS)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (HasPolicy, CanDecrypt, CanSignAs, CanAdminister, CrossAccountTrust) lives in
+# /rules/explicit/aws-kms.yaml; these rules combine those explicit edges with the
+# key metadata (KeyUsage / Origin / KeyManager) and the consuming-store links to
+# derive credential-access and escalation capabilities.
+#
+# KMS is doubly-gated: a cryptographic capability requires the action in the
+# caller's effective IAM policy AND the key policy (or a grant) to permit the
+# principal. When the evaluator cannot confirm the key-policy side, state
+# downgrades to CONDITIONAL(resource_policy). kms:ViaService and
+# kms:EncryptionContext* scope the capability -> CONDITIONAL(condition_expression).
+#
+# Core KMS invariants:
+#   * CanDecrypt(P, K) gates CanReadData on any store encrypted by K and gates
+#     CanReadSecret on any KMS-encrypted secret (the key_permission gate),
+#     completing CanExecuteAs -> CanReadSecret -> CredentialsFor.
+#   * Administering a key (PutKeyPolicy / CreateGrant) => can USE the key
+#     (self-grant Decrypt/Sign) -> the KMS privilege-escalation primitive.
+#   * kms:Sign on a SIGN_VERIFY key => forge signatures => CanImpersonate /
+#     CanEscalateTo whatever the public key trust-anchors.
+#   * KMS key material is non-exportable; CanExportKey only for imported
+#     (Origin: EXTERNAL) material, and only ever POTENTIAL.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 5-secrets-credentials-kms
+applies_to: [aws]
+
+rules:
+
+  # --- Decrypt-adjacent: GenerateDataKey ------------------------------------
+  - id: aws-kms-decrypt-via-generate-datakey
+    emits: CanDecrypt
+    description: "GenerateDataKey* returns a usable plaintext data key -> envelope decryption of ciphertext under the key."
+    match:
+      - [ ?principal, CanRead, ?key ]
+    where:
+      - "node_type(?key) == EncryptionKey"
+      - "DescribeKey.KeyUsage == ENCRYPT_DECRYPT"
+      - "?principal has EFFECTIVE kms:GenerateDataKey OR kms:GenerateDataKeyWithoutPlaintext OR kms:GenerateDataKeyPair OR kms:GenerateDataKeyPairWithoutPlaintext on ?key, permitted by identity + key policy"
+    emit:
+      target_type: EncryptionKey
+      source: ?principal
+      target: ?key
+      permissions: ["kms:GenerateDataKey", "kms:GenerateDataKeyWithoutPlaintext", "kms:GenerateDataKeyPair", "kms:GenerateDataKeyPairWithoutPlaintext"]
+      conditions: [key_permission, resource_policy, condition_expression]
+      state_logic: "if key policy/grant permits AND no unmet kms:ViaService/EncryptionContext condition: ACTIVE; elif key-policy side unconfirmed: CONDITIONAL(resource_policy); elif ViaService/EncryptionContext gates it: CONDITIONAL(condition_expression)"
+      confidence: "min(contributing_confidences) * 0.75"
+      derived_from: [ "<effective kms:GenerateDataKey permission>" ]
+      false_positive_note: >-
+        GenerateDataKey alone yields plaintext for NEW ciphertext; decrypting an
+        EXISTING stored blob still needs the stored (wrapped) data key plus this call,
+        or direct kms:Decrypt. It is decrypt-ADJACENT, hence 0.75 prior. Honor
+        kms:ViaService (only usable through the named service) and
+        kms:EncryptionContext* (only the matching context). Never for SIGN_VERIFY keys.
+      narrative: >-
+        {principal.name} can call GenerateDataKey on {key.name}
+        (kms:GenerateDataKey), enabling envelope decryption of data protected by it.
+
+  # --- Decrypt-adjacent: ReEncrypt ------------------------------------------
+  - id: aws-kms-decrypt-via-reencrypt
+    emits: CanDecrypt
+    description: "ReEncryptFrom proves KMS can decrypt the source ciphertext; with an attacker-decryptable destination key, data is recoverable."
+    match:
+      - [ ?principal, CanRead, ?key ]
+    where:
+      - "node_type(?key) == EncryptionKey"
+      - "?principal has EFFECTIVE kms:ReEncryptFrom on ?key, permitted by identity + key policy"
+    optional:
+      - [ ?principal, CanDecrypt, ?destkey ]
+    emit:
+      target_type: EncryptionKey
+      source: ?principal
+      target: ?key
+      permissions: ["kms:ReEncryptFrom", "kms:ReEncryptTo"]
+      conditions: [key_permission, resource_policy, condition_expression]
+      state_logic: "if matched(optional[0]) (attacker controls a decryptable destination key) AND policies permit: ACTIVE; else CONDITIONAL(key_permission) — ReEncryptFrom alone never returns plaintext"
+      confidence: "min(contributing_confidences) * 0.6"
+      derived_from: [ "<effective kms:ReEncryptFrom permission>", "<CanDecrypt destkey?>" ]
+      false_positive_note: >-
+        kms:ReEncryptFrom NEVER returns plaintext — it only re-wraps ciphertext under
+        another key. Data is recovered only if the attacker can decrypt the DESTINATION
+        key (ReEncryptTo target). Without that, this is a data-movement/persistence
+        primitive, not exfil -> keep CONDITIONAL and low confidence (0.6).
+      narrative: >-
+        {principal.name} can ReEncrypt ciphertext from {key.name}
+        (kms:ReEncryptFrom); paired with a key it can decrypt, this recovers the data.
+
+  # --- Key admin -> self-grant Decrypt --------------------------------------
+  - id: aws-kms-decrypt-via-key-admin
+    emits: CanDecrypt
+    description: "Admin of a key (PutKeyPolicy/CreateGrant) can self-grant kms:Decrypt then use it."
+    match:
+      - [ ?principal, CanAdminister, ?key ]
+    where:
+      - "node_type(?key) == EncryptionKey"
+      - "DescribeKey.KeyUsage == ENCRYPT_DECRYPT"
+      - "DescribeKey.KeyManager == CUSTOMER (customer-managed; AWS-managed key policies are immutable)"
+    emit:
+      target_type: EncryptionKey
+      source: ?principal
+      target: ?key
+      permissions: ["kms:PutKeyPolicy", "kms:CreateGrant", "kms:Decrypt"]
+      conditions: [scp_or_org_policy, resource_policy, condition_expression]
+      state_logic: "if PutKeyPolicy is confirmed unconstrained (no residual key-policy Deny the admin cannot remove) AND CreateGrant is not narrowed by kms:GranteePrincipal/kms:GrantConstraintType/kms:GrantIsForAWSResource: ACTIVE (attacker rewrites policy/creates a grant to itself, then decrypts); elif the existing key policy keeps a Deny the admin cannot lift or CreateGrant is grant-constrained: CONDITIONAL(resource_policy); else BLOCKED(scp_or_org_policy) when an SCP/boundary denies PutKeyPolicy/CreateGrant"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanAdminister edge_id>" ]
+      false_positive_note: >-
+        Only for CUSTOMER-managed keys — AWS-managed (aws/*) key policies cannot be
+        edited and CreateGrant is service-restricted. Self-grant is doubly gated: even
+        with kms:PutKeyPolicy the default key-policy requirement that at least one
+        principal retain access can leave a residual Deny the admin cannot remove, and
+        kms:CreateGrant is constrained by kms:GranteePrincipal / kms:GrantConstraintType /
+        kms:GrantIsForAWSResource. Keep ACTIVE only when PutKeyPolicy is confirmed
+        unconstrained -> otherwise CONDITIONAL(resource_policy). An SCP or permission-
+        boundary denying kms:PutKeyPolicy/kms:CreateGrant, or a Deny the admin cannot
+        remove, makes this BLOCKED.
+      narrative: >-
+        {principal.name} administers {key.name} (kms:PutKeyPolicy / kms:CreateGrant)
+        and can self-grant kms:Decrypt, then decrypt any data protected by it.
+
+  # --- Key admin -> self-grant Sign -----------------------------------------
+  - id: aws-kms-sign-via-key-admin
+    emits: CanSignAs
+    description: "Admin of a SIGN_VERIFY key can self-grant kms:Sign and forge signatures."
+    match:
+      - [ ?principal, CanAdminister, ?key ]
+    where:
+      - "node_type(?key) == SigningKey (SIGN_VERIFY / HMAC keys carry the SigningKey subtype; required so the CanSignAs target conforms to edges.yaml target set [SigningKey, ServiceAccount, ApplicationIdentity])"
+      - "DescribeKey.KeyUsage == SIGN_VERIFY (asymmetric) OR GENERATE_VERIFY_MAC (HMAC)"
+      - "DescribeKey.KeyManager == CUSTOMER"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?key
+      permissions: ["kms:PutKeyPolicy", "kms:CreateGrant", "kms:Sign", "kms:GenerateMac"]
+      conditions: [scp_or_org_policy, resource_policy, condition_expression]
+      state_logic: "if PutKeyPolicy is confirmed unconstrained (the existing key policy contains no Deny the admin cannot remove) AND CreateGrant is not constrained by kms:GranteePrincipal/kms:GrantConstraintType/kms:GrantIsForAWSResource: ACTIVE; elif the key policy retains a Deny the admin cannot lift, or CreateGrant is grant-constrained: CONDITIONAL(resource_policy); else BLOCKED(scp_or_org_policy) when an SCP/boundary denies PutKeyPolicy/CreateGrant"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanAdminister edge_id>" ]
+      false_positive_note: >-
+        Only for SIGN_VERIFY / GENERATE_VERIFY_MAC customer-managed keys (both carry
+        the SigningKey subtype); an ENCRYPT_DECRYPT key cannot sign. Self-grant is
+        doubly gated: kms:PutKeyPolicy must not be blocked by an SCP/boundary AND the
+        default key-policy rule that at least one principal retains access can leave a
+        residual Deny the admin cannot remove; kms:CreateGrant is further constrained by
+        kms:GranteePrincipal / kms:GrantConstraintType / kms:GrantIsForAWSResource.
+        Keep ACTIVE only when PutKeyPolicy is confirmed unconstrained -> otherwise
+        CONDITIONAL(resource_policy). Blocked by SCP/boundary denying PutKeyPolicy/CreateGrant.
+      narrative: >-
+        {principal.name} administers signing key {key.name} and can self-grant
+        kms:Sign, forging signatures trusted by anything anchored on its public key.
+
+  # --- Decrypt unlocks a KMS-encrypted secret (key_permission gate) ----------
+  - id: aws-kms-decrypt-unlocks-secret
+    emits: CanReadSecret
+    description: "Decrypt on a CMK completes the key_permission gate for a secret encrypted under it."
+    match:
+      - [ ?principal, CanDecrypt,  ?key ]
+      - [ ?secret,    ContainsResourceReference, ?key ]
+    where:
+      - "node_class(?secret) == Secret"
+      - "structural link: the secret store entry references its encrypting CMK via ContainsResourceReference (the store->key 'encrypted-by' relation per providers/aws/kms.md §13); NOT LocatedIn, whose target set is [AdministrativeBoundary, Network] and cannot point at a key. NOTE: ContainsResourceReference source set is [Data, Storage, Compute] — a bare Secret-class source needs the schema owners to widen CRR's source to include Secret, or the consuming service emits the CRR from the Storage/Data store node that holds the secret; do not fall back to LocatedIn(secret->key), which is schema-invalid"
+      - "?secret is encrypted with CMK ?key (Secrets Manager KmsKeyId / SSM SecureString KeyId)"
+      - "?principal also holds the control-plane read action on ?secret (secretsmanager:GetSecretValue or ssm:GetParameter) — otherwise this only satisfies the KEY half of the gate"
+    emit:
+      source: ?principal
+      target: ?secret
+      permissions: ["kms:Decrypt", "secretsmanager:GetSecretValue", "ssm:GetParameter"]
+      conditions: [iam_permission, resource_policy, key_permission, condition_expression]
+      state_logic: "if ?principal has BOTH the secret-read action AND kms:Decrypt (this edge): ACTIVE; if only kms:Decrypt is confirmed: CONDITIONAL(iam_permission) — the secret-store read is still required; if the CanDecrypt input was CONDITIONAL(resource_policy/condition_expression): inherit that"
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanDecrypt edge_id>", "<ContainsResourceReference secret->key edge_id>" ]
+      false_positive_note: >-
+        This models the KEY half of the CanReadSecret gate. Reading a
+        Secrets Manager/SSM SecureString value needs BOTH the store read action AND
+        kms:Decrypt on the encrypting CMK. Do not emit ACTIVE from kms:Decrypt alone —
+        the store-read action (secretsmanager:GetSecretValue / ssm:GetParameter with
+        WithDecryption) is still required. If the CMK is the AWS-managed
+        aws/secretsmanager or aws/ssm key, kms:Decrypt is implicitly granted to
+        callers of the store action via kms:ViaService — do not double-count as a
+        separate gate. Honor kms:EncryptionContext (Secrets Manager binds SecretARN).
+      narrative: >-
+        {principal.name} can decrypt {key.name} (kms:Decrypt), satisfying the
+        encryption-key gate on {secret.name}; with the store-read action it reads the
+        secret value.
+
+  # --- Decrypt unlocks an encrypted data store ------------------------------
+  - id: aws-kms-decrypt-unlocks-data
+    emits: CanReadData
+    description: "Decrypt on the CMK protecting a store completes the key_permission gate for data reads."
+    match:
+      - [ ?principal, CanDecrypt, ?key ]
+      - [ ?store,     ContainsResourceReference, ?key ]
+    where:
+      - "node_class(?store) in [Storage, Data]"
+      - "structural 'encrypted-by' link: the store references its encrypting CMK via ContainsResourceReference (source [Data, Storage, Compute] — ?store conforms), per providers/aws/kms.md §13; NOT LocatedIn, whose target set is [AdministrativeBoundary, Network]"
+      - "?store is SSE-KMS/encrypted with ?key (S3 bucket default KMS key, EBS volume, RDS/Aurora, DynamoDB)"
+      - "?principal also holds the data-plane read action on ?store (e.g. s3:GetObject) and any network reachability"
+    emit:
+      source: ?principal
+      target: ?store
+      permissions: ["kms:Decrypt", "s3:GetObject"]
+      conditions: [iam_permission, resource_policy, network_reachability, key_permission, condition_expression]
+      state_logic: "if ?principal has the store-read action AND kms:Decrypt AND reachability: ACTIVE; if only kms:Decrypt confirmed: CONDITIONAL(iam_permission); inherit CONDITIONAL from a gated CanDecrypt input"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanDecrypt edge_id>", "<ContainsResourceReference store->key edge_id>" ]
+      false_positive_note: >-
+        kms:Decrypt is necessary but not sufficient — the store's own data-plane read
+        (s3:GetObject / etc.), resource policy, and network reachability still apply.
+        For S3 SSE-KMS the object read needs both s3:GetObject AND kms:Decrypt on the
+        bucket key; honor kms:ViaService==s3.amazonaws.com scoping. This rule only
+        supplies the key_permission half.
+      narrative: >-
+        {principal.name} can decrypt with {key.name}, satisfying the KMS gate on
+        {store.name}; with the data-plane read action it reads the encrypted data.
+
+  # --- Decrypted secret authenticates as an identity (CredentialsFor pivot) ---
+  - id: aws-kms-decrypt-exposes-credential
+    emits: ExposesCredential
+    description: "A KMS-decryptable secret exposes the credential of the identity it belongs to once the KMS gate is satisfied."
+    match:
+      - [ ?principal, CanReadSecret, ?secret ]
+      - [ ?secret,    CredentialsFor, ?identity ]
+    where:
+      - "node_class(?secret) == Secret"
+      - "the CanReadSecret was gated by a KMS CanDecrypt (rule aws-kms-decrypt-unlocks-secret)"
+    emit:
+      source: ?secret
+      target: ?identity
+      permissions: []
+      conditions: []
+      state_logic: "inherit state from the contributing CanReadSecret edge (ACTIVE only if the secret is actually readable — both the store-read and KMS-decrypt halves met)"
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "<CanReadSecret edge_id>", "<CredentialsFor secret->identity edge_id>" ]
+      note: >-
+        emitsConformance: this emits ExposesCredential (nature=derived, source set
+        includes Secret, target set includes Identity) rather than re-emitting the
+        already-explicit CredentialsFor(?secret->?identity) that the match itself binds.
+        It adds a NEW derived fact — 'reaching this secret through the KMS gate exposes
+        the identity's credential' — instead of duplicating an input edge, resolving the
+        derived-file explicit-nature concern.
+      false_positive_note: >-
+        Zero-cost pivot expressing that satisfying the KMS gate on the secret yields the
+        identity's credential. Do not emit if the secret cannot actually be read (KEY or
+        store-read half unmet). The underlying CredentialsFor(secret->identity) fact is
+        established by the secret store's own explicit rules (e.g. secretsmanager), not
+        invented here — this rule only surfaces the exposure once the gate is met.
+      narrative: >-
+        The secret {secret.name}, unlocked via KMS decrypt, exposes credentials for
+        {identity.name}; reading it authenticates as {identity.name}.
+
+  # --- Sign -> forge identity -> impersonate --------------------------------
+  - id: aws-kms-sign-forges-identity
+    emits: CanImpersonate
+    description: "Signing with a key that anchors an auth system forges the trusted identity."
+    match:
+      - [ ?principal, CanSignAs, ?key ]
+    where:
+      - "node_type(?key) == SigningKey and DescribeKey.KeyUsage == SIGN_VERIFY (asymmetric only; exclude GENERATE_VERIFY_MAC/HMAC keys — symmetric MACs do not forge public-key-verified identities)"
+      - "?key's public key trust-anchors a workload/application identity (?appidentity)"
+      - "node_class(?appidentity) == Identity AND node_type(?appidentity) in [ApplicationIdentity, ServiceAccount, MachineIdentity] (CanImpersonate.target = [ServiceAccount, MachineIdentity, ApplicationIdentity]; a FederatedIdentity, Role, or code-signing trust anchor is NOT a valid CanImpersonate target)"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?appidentity
+      permissions: ["kms:Sign"]
+      conditions: [trust_relationship]
+      state_logic: "if a concrete ApplicationIdentity/ServiceAccount/MachineIdentity anchored on ?key is known: ACTIVE; if the signing key's downstream trust is not resolved in the graph: POTENTIAL(trust_relationship)"
+      confidence: "min(contributing_confidences) * 0.7"
+      derived_from: [ "<CanSignAs edge_id>" ]
+      false_positive_note: >-
+        Only emit when a real trust anchor resolves to an ApplicationIdentity /
+        ServiceAccount / MachineIdentity (the public key verifies tokens/artifacts for
+        that specific identity). If the anchor is a SAML/OIDC issuer, a Role, or a
+        FederatedIdentity, do NOT emit CanImpersonate — reach that identity via
+        CanSignAs -> CanFederateAs/CanEscalateTo instead. Code-signing trust is not an
+        identity at all and yields no CanImpersonate. A SIGN_VERIFY key with no known
+        downstream verifier is CanSignAs only -> POTENTIAL, not a concrete
+        impersonation. HMAC (GENERATE_VERIFY_MAC) keys are excluded (symmetric MAC, not
+        public-key signing).
+      narrative: >-
+        {principal.name} can sign as {key.name} (kms:Sign) and forge signatures that
+        {appidentity.name}'s verifiers accept, impersonating it.
+
+  # --- Cross-account key use ------------------------------------------------
+  - id: aws-kms-cross-account-key-use
+    emits: CanDecrypt
+    description: "An external principal permitted by the key policy/grant can use the key cross-account."
+    match:
+      - [ ?key,       HasPolicy,         ?keypolicy ]
+      - [ ?keypolicy, CrossAccountTrust, ?external ]
+    where:
+      - "node_type(?key) == EncryptionKey (CanDecrypt target must be an EncryptionKey; HasPolicy binds the key to its key-policy ResourcePolicy node)"
+      - "node_class(?external) == Identity (CanDecrypt source is [Identity, Compute]; an ExternalIdentity is an Identity subtype and conforms. A CrossAccountTrust whose target is an Account node is NOT a valid CanDecrypt source — this guard suppresses those)"
+      - "the cross-account key-policy statement or grant permits kms:Decrypt (or Sign/GenerateDataKey) for ?external"
+      - "?external.account != ?key.account"
+    emit:
+      target_type: EncryptionKey
+      source: ?external
+      target: ?key
+      permissions: ["kms:Decrypt"]
+      conditions: [resource_policy, condition_expression]
+      state_logic: "if the key policy/grant grants the crypto op to ?external with no unmet condition: ACTIVE; if kms:ViaService/EncryptionContext/aws:SourceArn narrows it: CONDITIONAL(condition_expression)"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<HasPolicy key->keypolicy edge_id>", "<CrossAccountTrust edge_id>" ]
+      false_positive_note: >-
+        Cross-account KMS is key USE, not account entry. SourceArn/SourceAccount and
+        kms:ViaService scoping on the key-policy statement narrow WHO and HOW —
+        honor them. A cross-account statement granting only kms:DescribeKey is recon,
+        not CanDecrypt.
+      narrative: >-
+        {external.name} (account {external.account}) is permitted by {key.name}'s key
+        policy/grant to decrypt with it across accounts.
+
+  # --- Cross-account decrypt that yields this account's credentials ----------
+  - id: aws-kms-cross-account-credential-entry
+    emits: CanEnterAccount
+    description: "Cross-account decrypt that unlocks THIS account's credentials is an account foothold."
+    match:
+      - [ ?external, CanDecrypt, ?key ]
+      - [ ?acct,     Contains,   ?key ]
+      - [ ?secret,   ContainsResourceReference, ?key ]
+      - [ ?secret,   CredentialsFor, ?identity ]
+    where:
+      - "node_class(?external) == Identity (CanEnterAccount source is [Identity])"
+      - "node_class(?acct) == Account (Contains source is [AdministrativeBoundary]; binds the real Account node that owns ?key so the CanEnterAccount target is a bound Account, not a placeholder string)"
+      - "structural 'encrypted-by' link: ContainsResourceReference(secret->key), NOT LocatedIn (whose target set is [AdministrativeBoundary, Network]); see the source-class caveat in aws-kms-decrypt-unlocks-secret"
+      - "?external.account != ?acct.account"
+      - "?identity is a principal in ?acct (the ciphertext is a credential for THIS account)"
+      - "?external can also read the ciphertext store (the secret/blob), not just the key"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?external
+      target: ?acct
+      permissions: ["kms:Decrypt"]
+      conditions: [resource_policy, iam_permission, condition_expression]
+      state_logic: "if ?external can both read the ciphertext store AND decrypt it, and the plaintext is a valid credential for ?acct: ACTIVE; else CONDITIONAL(iam_permission)"
+      confidence: "min(contributing_confidences) * 0.8"
+      derived_from: [ "<CanDecrypt edge_id>", "<Contains account->key edge_id>", "<ContainsResourceReference secret->key edge_id>", "<CredentialsFor secret->identity edge_id>" ]
+      false_positive_note: >-
+        Bare cross-account kms:Decrypt is NOT account entry — only when the decrypted
+        material is itself a usable credential for the key's account AND the external
+        principal can also read the ciphertext store. Otherwise emit
+        aws-kms-cross-account-key-use (CanDecrypt) instead.
+      narrative: >-
+        {external.name} can decrypt {secret.name} in account {acct.name} and obtain
+        credentials for {identity.name}, gaining a foothold in that account.
+
+  # --- Imported key material export (rare) ----------------------------------
+  - id: aws-kms-export-imported-material
+    emits: CanExportKey
+    description: "Keys with imported material (Origin: EXTERNAL) may be controllable offline by the importer."
+    match:
+      - [ ?principal, CanAdminister, ?key ]
+    where:
+      - "node_type(?key) == EncryptionKey"
+      - "DescribeKey.Origin == EXTERNAL (imported key material)"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?key
+      permissions: []
+      conditions: [iam_permission]
+      state_logic: "POTENTIAL(iam_permission) — KMS never releases key material; this only reflects that imported material exists offline with the importer and could be re-imported/rotated by an admin. Never ACTIVE from KMS APIs alone."
+      confidence: "min(contributing_confidences) * 0.4"
+      derived_from: [ "<CanAdminister edge_id>" ]
+      note: >-
+        No permissions are listed because NO KMS API returns private key material. The
+        capability is derived from possession of the original offline material plus
+        CanAdminister on the key, not from any KMS action. kms:GetParametersForImport /
+        kms:ImportKeyMaterial are re-import/rotation primitives (they push material IN,
+        returning only a wrapping key + import token), NOT export — listing them as the
+        'permissions' would over-claim an export path that does not exist via any KMS API.
+      false_positive_note: >-
+        KMS key material is NON-exportable. Emit at most POTENTIAL and ONLY for
+        Origin: EXTERNAL keys, to flag that the plaintext material lives offline with
+        whoever imported it. NEVER emit CanExportKey for AWS_KMS-origin or
+        AWS_CLOUDHSM-origin keys, and never treat kms:GetParametersForImport/
+        kms:ImportKeyMaterial as an export grant.
+      narrative: >-
+        {key.name} uses imported (EXTERNAL) key material; its plaintext lives offline
+        with the importer and is not retrievable from KMS.
+
+  # --- Roll up to escalation (Decrypt/Sign yields stronger identity) ---------
+  - id: aws-kms-escalate-via-sign
+    emits: CanEscalateTo
+    description: "Forging a signature for a more-privileged identity is privilege escalation."
+    match:
+      - [ ?principal, CanImpersonate, ?identity ]
+    where:
+      - "?identity.privilege_level > ?principal.privilege_level"
+      - "the CanImpersonate was produced by aws-kms-sign-forges-identity"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: ["kms:Sign"]
+      conditions: []
+      state_logic: "inherit state from the contributing CanImpersonate edge"
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "<CanImpersonate edge_id>" ]
+      false_positive_note: >-
+        Only when the forged identity is strictly more privileged than the caller.
+        Lateral/same-privilege forgery is not escalation. Inherits state from
+        CanImpersonate (POTENTIAL if the trust anchor is unresolved).
+      narrative: >-
+        {principal.name} can escalate to {identity.name} by forging signatures with a
+        KMS signing key that {identity.name}'s verifiers trust.
+
+  # --- Roll up to escalation (Decrypt -> credential yields stronger identity) ---
+  - id: aws-kms-escalate-via-decrypt-credential
+    emits: CanEscalateTo
+    description: "Decrypting a KMS-encrypted secret whose credential is a more-privileged identity is privilege escalation."
+    match:
+      - [ ?principal, CanReadSecret,  ?secret ]
+      - [ ?secret,    CredentialsFor, ?identity ]
+    where:
+      - "node_class(?principal) == Identity AND node_class(?identity) == Identity (CanEscalateTo source/target are both Identity)"
+      - "?identity.privilege_level > ?principal.privilege_level"
+      - "the CanReadSecret was gated by a KMS CanDecrypt (rule aws-kms-decrypt-unlocks-secret) — i.e. the KMS key_permission gate is the enabling step (doc §14 decrypt->credential escalation)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: ["kms:Decrypt"]
+      conditions: []
+      state_logic: "inherit state from the contributing CanReadSecret edge (ACTIVE only if both the store-read and KMS-decrypt halves are met and the secret is a credential for a strictly-more-privileged identity)"
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "<CanReadSecret edge_id>", "<CredentialsFor secret->identity edge_id>" ]
+      false_positive_note: >-
+        Only when the identity the decrypted secret authenticates as is strictly more
+        privileged than the caller. Lateral/same-privilege credential access is not
+        escalation. Inherits state from CanReadSecret — do not emit if the secret is not
+        actually readable (KEY or store-read half unmet). This is the decrypt->credential
+        counterpart to aws-kms-escalate-via-sign, completing doc §14's two escalation
+        families (sign-forgery AND decrypt->credential) at the CanEscalateTo roll-up.
+      narrative: >-
+        {principal.name} can escalate to {identity.name} by decrypting a KMS-encrypted
+        secret (kms:Decrypt gate) that holds {identity.name}'s credentials.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP / permission boundary denying kms:Decrypt, kms:Sign,
+#    kms:GenerateDataKey*, kms:ReEncrypt*, kms:PutKeyPolicy or kms:CreateGrant at
+#    the effective scope -> emit the edge with state: BLOCKED, denied_by=<SCP arn>.
+#  - An explicit Deny statement in the KEY POLICY (which even a key admin without
+#    the power to remove it cannot bypass) blocks the crypto op -> BLOCKED.
+#  - A VPC endpoint policy on the KMS interface endpoint that excludes the caller/
+#    key blocks use from that network path -> BLOCKED(resource_policy).
+#  - kms:ViaService that does not include the path the attacker would use, or a
+#    kms:EncryptionContext* that the attacker cannot satisfy -> CONDITIONAL
+#    (condition_expression), not ACTIVE.
+#  - AWS-managed keys (KeyManager: AWS, alias aws/*): key policy is immutable and
+#    use is service-restricted -> no self-grant escalation; suppress the
+#    -via-key-admin rules.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/aws-kms.yaml (HasPolicy, CanDecrypt, CanSignAs, CanAdminister,
+# CrossAccountTrust). The consuming-store 'encrypted-by' links used by the gate rules
+# above are ContainsResourceReference(secret/store -> key) — NOT LocatedIn, whose
+# target set is [AdministrativeBoundary, Network] and cannot point at a key. They are
+# emitted by the consuming services' explicit rules (secretsmanager, ssm-params, s3,
+# ebs, rds) from their KmsKeyId fields. (Schema note: ContainsResourceReference source
+# is [Data, Storage, Compute]; for a bare Secret-class store node the schema owners
+# should widen CRR's source to include Secret, or the Storage/Data node that holds the
+# secret carries the CRR to the key.)

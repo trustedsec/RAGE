@@ -1,0 +1,839 @@
+# AWS Step Functions — Derived attack-path rules (Phase 10 — messaging & event systems)
+# ---------------------------------------------------------------------------
+# Step Functions is the canonical Phase-10 WORKFLOW node: a state machine
+# (Workflow class) that executes AS an IAM execution role and is driven by
+# event sources (EventBridge rules, EventBridge Scheduler, API calls, or
+# upstream compute). Whoever can TRIGGER the state machine (states:StartExecution)
+# or MODIFY its definition (states:UpdateStateMachine) gains the execution role's
+# identity — the core Phase-10 and CI/CD primitive applied to workflow
+# orchestration.
+#
+# PHASE-10 / CICD KEY FACTS:
+#   - State machine definition (ASL JSON) is the DEFINITION ARTIFACT — every
+#     Task state is a service call made with the execution role's credentials.
+#     states:UpdateStateMachine rewrites it -> CanModifyCode (ACTIVE with run path).
+#   - states:StartExecution triggers an execution with attacker-supplied input ->
+#     CanInvoke (B1a direct-invocation variant -> CanExecuteAs CONDITIONAL).
+#     NOTE: CanTrigger.target = [Compute] but Workflow is Messaging; this file
+#     supplies the direct-invoke path via B1a (CanInvoke + ExecutesAs => CanExecuteAs).
+#   - states:CreateStateMachine + iam:PassRole -> CanCreateWorkloadAs of the role.
+#   - Activities (GenericMessaging): GetActivityTask dequeues task payloads that
+#     may contain secrets from the state machine data context -> ContainsSecret.
+#   - Standard workflow execution history (GetExecutionHistory) records all state
+#     I/O including any sensitive data passed through the workflow.
+#
+# LINCHPIN CITATIONS (DO NOT RE-DERIVE):
+#   messaging-chains.yaml (Phase 10, this file's primary linchpin):
+#     messaging-trigger-executes-as   — CanTrigger + ExecutesAs => CanExecuteAs
+#       CONDITIONAL(trigger_exists). This covers event-source bindings; not the
+#       direct-invoke case (Workflow is Messaging, not Compute, so CanTrigger.target
+#       does not admit it). Rule B1a below handles direct invoke of state machines.
+#     messaging-schedule-persists-executes-as — CanSchedule + CanPassIdentity =>
+#       CanExecuteAs ACTIVE (persistence). Rule A5 emits CanSchedule; messaging-
+#       chains rule 3 collapses it.
+#   cicd-chains.yaml (Phase 9, also applies for definition-modify path):
+#     cicd-modify-buildspec-executes-as — CanModifyCode(Workflow) + ExecutesAs
+#       => CanExecuteAs. Rule A2 emits CanModifyCode; cicd-chains rule 1 collapses.
+#       NOTE: cicd-chains restricts ?runner to [BuildWorker, ContainerTask,
+#       ContainerService, ServerlessFunction, VirtualMachine, KubernetesWorkload].
+#       Workflow is NOT in that list — so this file supplies the Step Functions
+#       -specific CanExecuteAs collapse for the definition-modify path (rule B1).
+#   can-execute-as.yaml:
+#     execute-as-via-code-modify       — generic CanModifyCode + ExecutesAs =>
+#       CanExecuteAs for ANY Compute. Workflow class is Compute-adjacent but the
+#       schema models it under Messaging/Workflow. Rule B1 below is the explicit
+#       Step Functions bridge.
+#     execute-as-via-config-identity-swap — CanModifyConfiguration + CanPassIdentity
+#       => CanExecuteAs. Rule A4 emits CanModifyConfiguration; can-execute-as
+#       rolls up.
+#   credential-chains.yaml:
+#     read-secret-yields-identity — CanReadData(activity) + ContainsSecret +
+#       CredentialsFor => CanImpersonate (if payload has secrets).
+#     execute-then-read-secret — CanExecuteAs(role) + CanReadSecret => inherited
+#       CanReadSecret for querying.
+#   can-control.yaml:
+#     escalate-via-execute-as — CanExecuteAs => CanEscalateTo when role is
+#       more privileged. NOT re-derived here.
+#
+# THIS FILE EMITS service FACTS (sections A) and three Step Functions-specific
+# derived edges that the linchpins cannot cover without a Workflow-typed bridge
+# (section B).
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 10-messaging
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # SECTION A — EXPLICIT NORMALIZATION FACTS
+  # (configuration -> first-class graph edges consumed by linchpins)
+  # ===========================================================================
+
+  # --- A1) State machine executes as its execution role -----------------------
+  - id: aws-sf-executes-as
+    emits: ExecutesAs
+    description: "A Step Functions state machine runs every execution as its configured IAM execution role."
+    match_record:
+      resource_type: "AWS::StepFunctions::StateMachine"
+      field: "roleArn"
+    where:
+      - "stateMachine.roleArn is non-empty (all valid state machines have an execution role)"
+    emit:
+      source_type: GenericCompute
+      target_type: MachineIdentity
+      source: "<Step Functions State Machine (Workflow, modeled as GenericCompute)>"
+      target: "<IAM role from stateMachine.roleArn>"
+      state: ACTIVE
+      conditions: [service_state]
+      permissions: []
+      state_logic: >-
+        ACTIVE when the state machine exists and has a configured execution role
+        (all valid state machines have exactly one). CONDITIONAL(service_state)
+        when the state machine is being created but the role binding is not yet
+        confirmed. BLOCKED if the state machine is deleted or the role is deleted/disabled.
+      derived_from: ["AWS::StepFunctions::StateMachine.roleArn (DescribeStateMachine)"]
+      false_positive_note: >-
+        Every Step Functions state machine must have exactly one execution role.
+        The role is bound at CreateStateMachine and may be re-bound via
+        UpdateStateMachine. Emit this edge for every state machine regardless of
+        trigger configuration or workflow type (Standard vs. Express). State machines
+        are modeled as Workflow (Messaging subtype), but for ExecutesAs source constraint
+        we use GenericCompute (the closest valid Compute fallback) to satisfy the schema.
+      narrative: >-
+        Step Functions state machine {stateMachine.name} runs every execution as
+        IAM role {role.name} (stateMachine.roleArn). Any Task state in the
+        definition makes AWS service calls with {role.name}'s credentials.
+
+  # --- A2) CanModifyCode via UpdateStateMachine (definition rewrite) ----------
+  - id: aws-sf-can-modify-code-update
+    emits: CanModifyCode
+    description: "states:UpdateStateMachine allows replacing the ASL definition with arbitrary Task states that call AWS services as the execution role — equivalent to a buildspec rewrite."
+    match_effective_permission:
+      action: "states:UpdateStateMachine"
+      resource_type: "AWS::StepFunctions::StateMachine"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<Step Functions State Machine (Workflow, modeled as GenericCompute)>"
+      permissions: ["states:UpdateStateMachine"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective states:UpdateStateMachine on the
+        state machine scope. The API unconditionally replaces the definition with
+        any valid ASL JSON — Task states can call any AWS SDK action the execution
+        role permits. BLOCKED if an SCP or permission boundary denies
+        states:UpdateStateMachine.
+      derived_from: ["effective states:UpdateStateMachine on stateMachine scope"]
+      false_positive_note: >-
+        UpdateStateMachine always replaces the full definition; there is no IAM
+        control over which Task states can be added. Any principal with effective
+        states:UpdateStateMachine can inject arbitrary AWS SDK calls (e.g.,
+        arn:aws:states:::aws-sdk:iam:createUser) as Task states. Do NOT emit
+        CanTrigger instead — UpdateStateMachine is CanModifyCode because the
+        definition replacement is unconditional. Scope strictly: a Resource block
+        limiting to specific state machine ARNs restricts the target set. State machines
+        are modeled as Workflow (Messaging subtype), but for CanModifyCode target constraint
+        we use GenericCompute (the closest valid Compute fallback) to satisfy the schema.
+      narrative: >-
+        {principal.name} can replace the definition of state machine
+        {stateMachine.name} (states:UpdateStateMachine), injecting Task states
+        that call arbitrary AWS services as the execution role.
+
+  # --- A3) CanInvoke / CanTrigger via StartExecution --------------------------
+  - id: aws-sf-can-invoke-start-execution
+    emits: CanInvoke
+    description: "states:StartExecution or states:StartSyncExecution allows a principal to directly start a state machine execution with an attacker-supplied input payload."
+    match_effective_permission:
+      action: "states:StartExecution"
+      resource_type: "AWS::StepFunctions::StateMachine"
+    emit:
+      source_type: Identity
+      target_type: Workflow
+      source: "<principal>"
+      target: "<Step Functions State Machine (Workflow)>"
+      permissions: ["states:StartExecution"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective states:StartExecution (or
+        states:StartSyncExecution for Express workflows) on the state machine.
+        The API starts an execution immediately with the caller-supplied input
+        JSON — the attacker fully controls the execution's initial data context.
+        BLOCKED if an SCP or permission boundary denies states:StartExecution.
+      derived_from: ["effective states:StartExecution on stateMachine scope"]
+      false_positive_note: >-
+        StartExecution is CanInvoke (direct, synchronous trigger with the caller
+        in control of the input), NOT merely CanTrigger from a binding. The
+        attacker-supplied input propagates through every state's input/output
+        transformations and can influence downstream Task state parameters (e.g.,
+        DynamoDB key, Lambda function name in a dynamic ARN). For Express
+        workflows, states:StartSyncExecution provides synchronous execution with
+        the result returned directly.
+      narrative: >-
+        {principal.name} can start an execution of state machine
+        {stateMachine.name} (states:StartExecution), supplying the input payload
+        that drives the entire execution as {role.name}.
+
+  # --- A3b) CanInvoke via StartSyncExecution (Express workflows) ---------------
+  - id: aws-sf-can-invoke-start-sync-execution
+    emits: CanInvoke
+    description: "states:StartSyncExecution allows a principal to directly start a synchronous execution of an Express state machine with an attacker-supplied input payload."
+    match_effective_permission:
+      action: "states:StartSyncExecution"
+      resource_type: "AWS::StepFunctions::StateMachine"
+    where:
+      - "state machine type is EXPRESS (filtered during permission evaluation)"
+    emit:
+      source_type: Identity
+      target_type: Workflow
+      source: "<principal>"
+      target: "<Step Functions State Machine (Express Workflow)>"
+      permissions: ["states:StartSyncExecution"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective states:StartSyncExecution on an
+        Express state machine. StartSyncExecution starts an execution and waits
+        for the result, returning it directly to the caller — the attacker fully
+        controls the execution's initial input JSON. BLOCKED if an SCP or
+        permission boundary denies states:StartSyncExecution.
+      derived_from: ["effective states:StartSyncExecution on Express stateMachine scope"]
+      false_positive_note: >-
+        StartSyncExecution is Express-only; it is not valid for Standard workflows.
+        Treat as CanInvoke with synchronous completion. The permission
+        states:StartSyncExecution is distinct from states:StartExecution in IAM
+        policies — a principal with only states:StartExecution cannot call
+        StartSyncExecution and vice versa.
+      narrative: >-
+        {principal.name} can synchronously start an execution of Express state
+        machine {stateMachine.name} (states:StartSyncExecution), supplying the
+        input payload and receiving the result directly.
+
+  # --- A4) CanModifyConfiguration: execution role swap via UpdateStateMachine -
+  - id: aws-sf-can-modify-configuration-role-swap
+    emits: CanModifyConfiguration
+    description: "states:UpdateStateMachine combined with iam:PassRole on a new role allows swapping the execution role to a different IAM identity on an existing state machine."
+    match_effective_permission:
+      action: "states:UpdateStateMachine"
+      resource_type: "AWS::StepFunctions::StateMachine"
+    where:
+      - "principal also has effective iam:PassRole for at least one IAM role trusted by states.amazonaws.com (or with iam:PassedToService permitting states.amazonaws.com)"
+    emit:
+      source_type: Identity
+      target_type: Workflow
+      source: "<principal>"
+      target: "<Step Functions State Machine (Workflow)>"
+      permissions: ["states:UpdateStateMachine", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when the principal has effective states:UpdateStateMachine AND
+        iam:PassRole on a role whose trust policy allows states.amazonaws.com (or
+        iam:PassedToService includes states.amazonaws.com). POTENTIAL(role_compatibility)
+        when iam:PassRole is present but the role trust / PassedToService condition
+        is unknown or unresolved — downgrade until trust is confirmed.
+      derived_from: ["effective states:UpdateStateMachine on stateMachine scope", "effective iam:PassRole with states.amazonaws.com"]
+      false_positive_note: >-
+        The role-swap aspect of UpdateStateMachine is CanModifyConfiguration (not
+        CanModifyCode): it changes the execution identity, not the definition.
+        Honor iam:PassedToService: if PassRole is conditioned on
+        iam:PassedToService = ec2.amazonaws.com only, it does NOT permit passing
+        the role to Step Functions. The role's trust policy must include
+        states.amazonaws.com as a trusted service principal for the swap to
+        succeed. Downgrade to POTENTIAL(role_compatibility) when the trust is
+        uncertain. This feeds can-execute-as execute-as-via-config-identity-swap
+        which requires CanModifyConfiguration + CanPassIdentity.
+      narrative: >-
+        {principal.name} can re-bind state machine {stateMachine.name} to run
+        as a different IAM role (states:UpdateStateMachine + iam:PassRole to
+        states.amazonaws.com); the next execution runs as the new role.
+
+  # --- A5) CanSchedule via EventBridge rule ---------------------------------
+  - id: aws-sf-can-schedule-via-eventbridge-rule
+    emits: CanSchedule
+    description: "Creating or updating an EventBridge rule that targets a Step Functions state machine is persistence: it fires on a schedule/event pattern, starting executions without further attacker action."
+    match_effective_permission:
+      action: "events:PutRule"
+      resource_type: "AWS::Events::Rule"
+    where:
+      - "principal also has effective events:PutTargets to set the target to a Step Functions state machine ARN"
+      - "principal also has effective iam:PassRole for the EventBridge target role (or the rule uses the existing bound role)"
+    emit:
+      source_type: Identity
+      target_type: EventRule
+      source: "<principal>"
+      target: "<EventBridge Rule (EventRule)>"
+      permissions: ["events:PutRule", "events:PutTargets", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when the principal has effective events:PutRule AND events:PutTargets
+        AND iam:PassRole for the EventBridge target role (which must have
+        states:StartExecution). CONDITIONAL(role_compatibility) when the target
+        role or PassRole is uncertain. The rule fires on its configured schedule
+        or event pattern — a persistence primitive independent of further attacker action.
+      derived_from: ["effective events:PutRule + events:PutTargets + iam:PassRole (EventBridge)"]
+      false_positive_note: >-
+        CanSchedule here targets the EventRule node, not the state machine directly.
+        messaging-chains rule 3 (messaging-schedule-persists-executes-as) requires
+        both CanSchedule(?schedule) AND CanPassIdentity(?identity) where ?identity
+        is the execution role the rule invokes the state machine as. Honor the
+        PassRole scope: the EventBridge target role's trust must allow
+        events.amazonaws.com, and iam:PassedToService must include
+        events.amazonaws.com. A rule that targets a state machine in another
+        account requires a cross-account EventBridge bus target and appropriate
+        cross-account IAM grants. This is the EventBridge rule (events:PutRule)
+        path — EventBridge Scheduler uses a separate scheduler:CreateSchedule
+        path covered by aws-sf-can-schedule-via-scheduler.
+      narrative: >-
+        {principal.name} can create or update an EventBridge rule targeting
+        state machine {stateMachine.name} (events:PutRule + events:PutTargets +
+        iam:PassRole), establishing a scheduled or event-driven trigger that
+        fires executions without further attacker action.
+
+  # --- A5b) CanSchedule via EventBridge Scheduler ----------------------------
+  - id: aws-sf-can-schedule-via-scheduler
+    emits: CanSchedule
+    description: "Creating an EventBridge Scheduler schedule that targets a Step Functions state machine is persistence: it fires on a cadence with an optional execution role, running the state machine without further attacker action."
+    match_effective_permission:
+      action: "scheduler:CreateSchedule"
+      resource_type: "AWS::Scheduler::Schedule"
+    where:
+      - "schedule target is a Step Functions state machine ARN"
+      - "principal also has effective iam:PassRole for the Scheduler execution role (or uses an existing role)"
+    emit:
+      source_type: Identity
+      target_type: Scheduler
+      source: "<principal>"
+      target: "<EventBridge Scheduler (Scheduler)>"
+      permissions: ["scheduler:CreateSchedule", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when the principal has effective scheduler:CreateSchedule AND
+        iam:PassRole for the Scheduler execution role (which must allow the
+        scheduler service). CONDITIONAL(role_compatibility) when the role or
+        PassRole is uncertain. The schedule fires on its configured cadence — a
+        persistence primitive independent of further attacker action.
+      derived_from: ["effective scheduler:CreateSchedule + iam:PassRole (EventBridge Scheduler)"]
+      false_positive_note: >-
+        CanSchedule here targets the Scheduler node. messaging-chains rule 3
+        (messaging-schedule-persists-executes-as) requires both CanSchedule
+        (?schedule) AND CanPassIdentity(?identity) where ?identity is the
+        Scheduler execution role. The Scheduler execution role is passed via
+        iam:PassRole scoped to scheduler.amazonaws.com. Unlike EventBridge rules
+        (events:PutRule), Scheduler schedules always run with an explicitly-set
+        execution role; this path is the primary way to establish persistence
+        in Scheduler for Step Functions.
+      narrative: >-
+        {principal.name} can create an EventBridge Scheduler schedule targeting
+        state machine {stateMachine.name} (scheduler:CreateSchedule + iam:PassRole),
+        establishing a time-based trigger that fires executions on a cadence
+        without further attacker action.
+
+  # --- A6) EventBridge rule CanTrigger relationship ---------------------------
+  - id: aws-sf-eventbridge-rule-triggers-state-machine
+    emits: CanTrigger
+    description: "An EventBridge rule with a Step Functions state machine as its target can start an execution when the rule matches; the EventBridge source is the event source, the state machine is the consumer."
+    match_record:
+      resource_type: "AWS::Events::Rule"
+      field: "Targets[].Arn"
+    where:
+      - "target ARN matches an AWS::StepFunctions::StateMachine ARN"
+      - "rule State == ENABLED"
+      - "target IAM role has effective states:StartExecution on the target state machine"
+    emit:
+      source_type: EventRule
+      target_type: GenericCompute
+      source: "<EventBridge Rule (EventRule)>"
+      target: "<Step Functions State Machine (Workflow, modeled as GenericCompute for CanTrigger)>"
+      permissions: []
+      conditions: [service_state, trigger_exists]
+      state_logic: >-
+        ACTIVE when the rule is ENABLED and the target IAM role has effective
+        states:StartExecution on the state machine. CONDITIONAL(trigger_exists)
+        when the rule is DISABLED or the target role lacks the permission.
+        BLOCKED if the rule has been explicitly disabled/deleted or the target
+        role has a deny.
+      derived_from: ["AWS::Events::Rule.Targets[].Arn -> stateMachine (events:ListRules + events:ListTargetsByRule)"]
+      false_positive_note: >-
+        Only ACTIVE if the rule State is ENABLED. A rule with State = DISABLED
+        does not fire and is CONDITIONAL(trigger_exists). Also verify the
+        EventBridge target IAM role has states:StartExecution on the target
+        state machine — an incorrectly configured target role makes the trigger
+        non-functional. Event pattern / schedule expression filtering is a real
+        control: a rule that only fires on a specific source.detail-type may not
+        be triggerable by the attacker's publish path. NOTE: permissions field is
+        omitted (empty) because the required permission (states:StartExecution) is
+        the TARGET ROLE's permission, not the attacker's. The attacker's actions
+        are events:PutRule + events:PutTargets (from A5).
+      narrative: >-
+        EventBridge rule {rule.name} is configured to start an execution of
+        state machine {stateMachine.name} when its event pattern matches (or on
+        its schedule); an attacker who can publish matching events to the event
+        bus triggers the state machine.
+
+  # --- A7) Activity task payload may contain secrets --------------------------
+  - id: aws-sf-activity-task-contains-secret
+    emits: ContainsSecret
+    description: "A Step Functions activity task state embeds the current execution data context as the task payload returned by GetActivityTask; if upstream states processed sensitive data, the payload may contain secrets."
+    match_record:
+      resource_type: "AWS::StepFunctions::Activity"
+      field: "activityArn"
+    where:
+      - "the activity ARN is referenced as a Task state Resource in a state machine whose execution data context is analyst-flagged as containing secrets, OR the state machine's execution role has CanReadSecret permissions on secrets/SSM parameters"
+    emit:
+      source_type: GenericMessaging
+      target_type: Secret
+      source: "<Step Functions Activity (GenericMessaging)>"
+      target: "<secret or credential material in the task payload>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        CONDITIONAL(service_state): only emit when the state machine definition
+        and execution history evidence confirms sensitive data flows through the
+        activity task state's data context. ACTIVE when analyst or regex scan has
+        confirmed secrets in the task payload. This is a CONDITIONAL/analyst-gated
+        edge — not automatically derivable from IAM policy alone.
+      derived_from: ["AWS::StepFunctions::Activity + state machine definition analysis"]
+      false_positive_note: >-
+        Only emit when there is positive evidence (execution history scan, definition
+        analysis, or analyst flag) that the execution data context at the activity
+        task state contains credential material. The activity task payload is the
+        state machine's current data context at that step — upstream Lambda outputs,
+        parameter lookups, etc. may or may not contain secrets. Do not emit for every
+        activity without evidence; this will produce noise. credential-chains
+        read-secret-yields-identity handles the downstream consequence once
+        ContainsSecret + CredentialsFor are both present.
+      narrative: >-
+        Activity {activity.name} returns a task payload to GetActivityTask callers
+        that includes the state machine's current data context; if upstream states
+        have processed sensitive data (DB credentials, API keys, session tokens),
+        those are exposed in the payload to any IAM principal that calls
+        states:GetActivityTask on this activity ARN.
+
+  # --- A8) CanReadData via GetExecutionHistory --------------------------------
+  - id: aws-sf-can-read-execution-history
+    emits: CanReadData
+    description: "states:GetExecutionHistory returns the full event history of a Standard workflow execution including state input/output, which may contain sensitive data from the execution's data context."
+    match_effective_permission:
+      action: "states:GetExecutionHistory"
+      resource_type: "AWS::StepFunctions::Execution"
+    emit:
+      source_type: Identity
+      target_type: GenericData
+      source: "<principal>"
+      target: "<Step Functions Execution history (GenericData)>"
+      permissions: ["states:GetExecutionHistory"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective states:GetExecutionHistory on the
+        execution scope. The API returns all events including state I/O for
+        Standard workflows. BLOCKED if the workflow type is Express (Express
+        executions log to CloudWatch, not GetExecutionHistory — the principal
+        needs cloudwatch:GetLogEvents instead). A deny on
+        states:GetExecutionHistory blocks this edge.
+      derived_from: ["effective states:GetExecutionHistory on execution scope"]
+      false_positive_note: >-
+        Express workflow executions do NOT support GetExecutionHistory; the
+        execution history for Express workflows is available only through
+        CloudWatch Logs. Emit this edge only for Standard workflow executions.
+        The execution history record is modeled as GenericData (a data artifact),
+        not GenericCompute (a running resource). The data-plane consequence
+        (CanExfiltrate if the history contains secrets) is handled by
+        credential-chains — this edge only asserts the read capability. Honor
+        SCP/permission boundary denials on states:GetExecutionHistory.
+      narrative: >-
+        {principal.name} can read the full event history of execution
+        {execution.name} (states:GetExecutionHistory), including every state's
+        input and output data — which may contain sensitive parameters, API
+        responses, or credentials that flowed through the execution's data context.
+
+  # --- A9) CanReadData via GetActivityTask ------------------------------------
+  - id: aws-sf-can-read-activity-task
+    emits: CanReadData
+    description: "states:GetActivityTask returns the next queued task input from a Step Functions activity, exposing the execution data context to the poller — any IAM principal with this permission can dequeue tasks from the activity."
+    match_effective_permission:
+      action: "states:GetActivityTask"
+      resource_type: "AWS::StepFunctions::Activity"
+    emit:
+      source_type: Identity
+      target_type: GenericMessaging
+      source: "<principal>"
+      target: "<Step Functions Activity (GenericMessaging)>"
+      permissions: ["states:GetActivityTask"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective states:GetActivityTask on the
+        activity ARN. The API is unauthenticated to any specific execution — any
+        caller with the permission can receive the next available task input,
+        depriving the legitimate worker of the task and exposing the payload.
+        CONDITIONAL(service_state) when the activity has no pending tasks (no
+        running execution is currently at an Activity task state that references
+        this activity ARN). BLOCKED by SCP/permission boundary deny.
+      derived_from: ["effective states:GetActivityTask on activity scope"]
+      false_positive_note: >-
+        GetActivityTask long-polls (up to 60 seconds) for a task and returns when
+        a task becomes available. The action is scoped to the activity ARN — an
+        attacker must know (or discover) the ARN. The payload is the state
+        machine's current execution input at the activity task state, not a fixed
+        value — it varies per execution. The consequence (credential-chains) only
+        fires when the payload contains a secret (A7 ContainsSecret edge must be
+        present). A principal that calls GetActivityTask also receives the taskToken
+        which can be used with SendTaskSuccess/Failure to steer the execution.
+      narrative: >-
+        {principal.name} can call states:GetActivityTask on activity {activity.name},
+        dequeuing the next pending task's input payload (the execution's current
+        data context) and receiving a taskToken that can be used to steer the
+        running execution via SendTaskSuccess/Failure.
+
+  # --- A10) CanModifyConfiguration: SendTaskSuccess/Failure execution steering ---
+  - id: aws-sf-send-task-success-steers-execution
+    emits: CanModifyConfiguration
+    description: "states:SendTaskSuccess / states:SendTaskFailure with a valid taskToken allows steering an active execution through branching logic or injecting data into downstream Task states."
+    match_effective_permission:
+      action: ["states:SendTaskSuccess", "states:SendTaskFailure"]
+      resource_type: "AWS::StepFunctions::Activity"
+    where:
+      - "an execution is currently at an Activity task state that references this activity ARN (service_state condition)"
+      - "principal has a valid taskToken (obtained via states:GetActivityTask or disclosed externally)"
+    emit:
+      source_type: Identity
+      target_type: Workflow
+      source: "<principal>"
+      target: "<Step Functions State Machine (Workflow with active execution)>"
+      permissions: ["states:SendTaskSuccess", "states:SendTaskFailure"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        CONDITIONAL(service_state): only emit when an execution is actively waiting
+        at an Activity task state for this activity. The principal can inject a
+        crafted output (for SendTaskSuccess) or failure (for SendTaskFailure) to
+        steer the execution through conditional branching, skip approval steps,
+        or modify parameters for downstream Task states. BLOCKED if the activity
+        or execution is terminated.
+      derived_from: ["effective states:SendTaskSuccess / states:SendTaskFailure on activity scope"]
+      false_positive_note: >-
+        Requires a valid taskToken to call SendTaskSuccess/Failure — the principal
+        must either have called states:GetActivityTask (and hence obtained the token)
+        or the token must have been disclosed through another channel. The impact
+        depends on execution flow: a crafted output that matches a conditional
+        branch can skip authentication/approval logic. This is CanModifyConfiguration
+        (modifying execution flow/state) not CanModifyCode (modifying the definition).
+        Combines with CanPassIdentity for execute-as-via-config-identity-swap if the
+        injected output includes an identity selection.
+      narrative: >-
+        {principal.name} can inject a task result (states:SendTaskSuccess) or
+        failure (states:SendTaskFailure) into an active execution of
+        {state_machine.name} at {activity.name}, steering the execution through
+        conditional branches or bypassing approval steps.
+
+  # --- A11) CanModifyConfiguration: UpdateStateMachineAlias silent redirect ----
+  - id: aws-sf-alias-redirect
+    emits: CanModifyConfiguration
+    description: "states:UpdateStateMachineAlias / states:CreateStateMachineAlias allows redirecting an alias to a different definition version without triggering visible definition-update alerts."
+    match_effective_permission:
+      action: ["states:UpdateStateMachineAlias", "states:CreateStateMachineAlias"]
+      resource_type: "AWS::StepFunctions::StateMachine"
+    where:
+      - "alias currently routes traffic to the state machine (confirmed by listing aliases + their target versions)"
+    emit:
+      source_type: Identity
+      target_type: Workflow
+      source: "<principal>"
+      target: "<Step Functions State Machine (Workflow)>"
+      permissions: ["states:UpdateStateMachineAlias", "states:CreateStateMachineAlias"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective states:UpdateStateMachineAlias
+        (or CreateStateMachineAlias if creating a new alias) and an alias is
+        actively routing traffic to the state machine. Redirecting the alias to
+        a previously-modified definition version is a stealth variant of
+        CanModifyCode: the new version is already present, and the alias switch
+        is invisible to logs that only track UpdateStateMachine (which is not
+        called). BLOCKED if an SCP denies the alias action.
+      derived_from: ["effective states:UpdateStateMachineAlias or states:CreateStateMachineAlias on stateMachine scope"]
+      false_positive_note: >-
+        This is CanModifyConfiguration (redirecting execution targets) rather
+        than CanModifyCode (changing the definition itself) because the attacker
+        reuses a previously-injected version. It feeds can-execute-as
+        execute-as-via-config-identity-swap if combined with CanPassIdentity to
+        select a new execution role. The alias-redirect capability is weaker than
+        UpdateStateMachine (which creates code control directly) but valuable as
+        a stealth persistence mechanism. Step Functions does not produce
+        CloudWatch events for UpdateStateMachineAlias, making it harder to detect.
+      narrative: >-
+        {principal.name} can redirect an alias of state machine
+        {state_machine.name} (states:UpdateStateMachineAlias) to point to a
+        previously-modified definition version, silently changing the code
+        executed by that alias without triggering UpdateStateMachine events.
+
+  # ===========================================================================
+  # SECTION B — STEP FUNCTIONS-SPECIFIC DERIVED EDGES
+  # (bridges the Workflow node type into the linchpin collapse chain)
+  # ===========================================================================
+
+  # --- B1a) Direct invocation -> execute as execution role --------------------
+  # A principal with CanInvoke (states:StartExecution) on a state machine that
+  # ExecutesAs an identity gets CanExecuteAs for that identity. messaging-chains
+  # rule 2 (messaging-trigger-executes-as) covers CanTrigger + ExecutesAs, but
+  # Workflow is Messaging (not Compute), so CanTrigger.target does not admit it.
+  # This rule is the Step Functions-specific bridge for the direct-invoke case.
+  # Dedupes with messaging-trigger-executes-as and can-execute-as on
+  # (CanExecuteAs, ?principal, ?role) — emit once; prefer messaging chain.
+  - id: aws-sf-execute-as-via-direct-invoke
+    emits: CanExecuteAs
+    description: "Directly invoke a state machine (states:StartExecution) with an attacker-supplied input payload to execute as the machine's execution role."
+    match:
+      - [ ?principal, CanInvoke, ?state_machine ]
+      - [ ?state_machine, ExecutesAs, ?role ]
+    where:
+      - "node_type(?state_machine) == Workflow"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["states:StartExecution"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective states:StartExecution (or
+        states:StartSyncExecution for Express workflows) on the state machine.
+        The attacker directly invokes an execution with an attacker-controlled
+        input payload — the execution runs the entire workflow definition as
+        ?role, granting the attacker the role's identity for all Task state
+        calls. Inherit state from contributing CanInvoke (not gated on a trigger
+        existing — the principal supplies the trigger directly). BLOCKED if the
+        principal lacks CanInvoke or the role is deleted.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: ["<CanInvoke edge_id ?principal -> ?state_machine>", "<ExecutesAs edge_id ?state_machine -> ?role>"]
+      false_positive_note: >-
+        Only ACTIVE for direct invocation (CanInvoke matched); a trigger-based
+        execution without direct invocation capability is CONDITIONAL(trigger_exists)
+        and handled by the messaging-chains bridge. Dedupes with
+        messaging-trigger-executes-as on (CanExecuteAs, ?principal, ?role) — this
+        rule covers the CanInvoke path, messaging-chains covers the event-trigger
+        path (which targets Messaging sources, not the Workflow directly). Do not
+        double-count weight. The identity hierarchy consequence (escalation if
+        ?role is more privileged) is produced by can-control — cite, do not re-derive.
+      narrative: >-
+        {principal.name} can directly start an execution of state machine
+        {state_machine.name} (states:StartExecution), supplying the input payload
+        and causing the entire execution to run as {role.name}.
+
+  # --- B1) Definition modify -> execute as execution role ---------------------
+  # cicd-chains.yaml cicd-modify-buildspec-executes-as covers the generic
+  # CanModifyCode + ExecutesAs => CanExecuteAs for CI/CD runners typed as
+  # [BuildWorker, ContainerTask, ContainerService, ServerlessFunction,
+  # VirtualMachine, KubernetesWorkload]. Step Functions state machines are modeled
+  # as Workflow (a Messaging subtype), which is NOT in cicd's runner type list.
+  # This rule is the Step Functions-specific bridge for the definition-modify path.
+  # It dedupes with can-execute-as execute-as-via-code-modify on
+  # (CanExecuteAs, ?principal, ?role) — emit once; prefer ACTIVE over CONDITIONAL.
+  - id: aws-sf-execute-as-via-definition
+    emits: CanExecuteAs
+    description: "Modify a state machine's ASL definition (states:UpdateStateMachine), then trigger an execution to run arbitrary AWS SDK Task states as the execution role."
+    match:
+      - [ ?principal, CanModifyCode, ?state_machine ]
+      - [ ?state_machine, ExecutesAs, ?role ]
+    where:
+      - "node_type(?state_machine) == Workflow"
+    optional:
+      - [ ?principal, CanInvoke, ?state_machine ]
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["states:UpdateStateMachine", "states:StartExecution?"]
+      conditions: [trigger_exists]
+      state_logic: >-
+        ACTIVE when the principal can both modify the definition AND invoke/trigger
+        the state machine (matched(optional[0]) — states:StartExecution — OR an
+        existing EventBridge rule or Scheduler is already bound to the state machine
+        and is ENABLED). CONDITIONAL(trigger_exists) when the definition can be
+        modified but no run path is established (no StartExecution permission and
+        no existing active trigger). Never stronger than the contributing
+        CanModifyCode and ExecutesAs edges; BLOCKED if either is BLOCKED (SCP/
+        permission boundary denial of states:UpdateStateMachine or the execution
+        role is deleted/disabled).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["<CanModifyCode edge_id on ?state_machine>", "<ExecutesAs edge_id ?state_machine -> ?role>", "<CanInvoke edge_id?>" ]
+      false_positive_note: >-
+        Only ACTIVE when a run path exists: the attacker can StartExecution
+        (CanInvoke matched) OR a live EventBridge rule / Scheduler schedule is
+        already bound to the state machine (trigger_exists confirmed). A modified
+        definition with no trigger is CONDITIONAL(trigger_exists). Do NOT emit
+        ACTIVE for a state machine that has no active triggers and whose principal
+        lacks states:StartExecution. Dedupes with can-execute-as
+        execute-as-via-code-modify on (CanExecuteAs, ?principal, ?role): this
+        rule provides the Workflow-typed framing with Step Functions permissions;
+        do not double-count weight where both fire. The escalation consequence
+        (role more privileged than ?principal) is produced by can-control
+        escalate-via-execute-as — cite, do not re-derive.
+      narrative: >-
+        {principal.name} can replace the definition of state machine
+        {state_machine.name} (states:UpdateStateMachine) to include Task states
+        that call arbitrary AWS services as {role.name}; triggering an execution
+        (direct StartExecution or an existing EventBridge trigger) then runs those
+        Task states as {role.name}.
+
+  # --- B2) Create new state machine bound to a passable role ------------------
+  - id: aws-sf-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new Step Functions state machine bound to any role passable to states.amazonaws.com, then start an execution to run arbitrary Task states as that role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE states:CreateStateMachine (resource scope covers a new state machine)"
+      - "?role trust policy allows states.amazonaws.com as a trusted service principal"
+      - "iam:PassRole for ?role permits iam:PassedToService including states.amazonaws.com (or is unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "states:CreateStateMachine", "states:StartExecution?"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when the principal can create the state machine (states:CreateStateMachine),
+        pass ?role to it (iam:PassRole scoped to states.amazonaws.com), and start an
+        execution (states:StartExecution or states:StartSyncExecution on the new machine).
+        POTENTIAL(role_compatibility) when the role trust / PassedToService is unknown
+        or unresolved — downgrade until trust is confirmed. CONDITIONAL(trigger_exists)
+        when CreateStateMachine and PassRole are confirmed but StartExecution is not
+        yet established (the attacker can create and bind, but must still trigger).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["<CanPassIdentity edge_id ?principal -> ?role>"]
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to ec2.amazonaws.com or
+        lambda.amazonaws.com does NOT yield Step Functions execution — downgrade to
+        POTENTIAL(role_compatibility) when PassedToService excludes states.amazonaws.com.
+        The role MUST trust states.amazonaws.com in its trust policy or CreateStateMachine
+        will fail with an invalid role error. This rule folds states:CreateStateMachine
+        (confirmed in where-clause) as the CanDeploy-equivalent; no separate CanDeploy
+        edge is emitted for Step Functions. Dedupes with can-execute-as
+        execute-as-via-new-workload on (CanExecuteAs, ?principal, ?role) after the
+        CanCreateWorkloadAs -> CanExecuteAs collapse in can-execute-as.
+      narrative: >-
+        {principal.name} can create a new Step Functions state machine bound to
+        {role.name} (states:CreateStateMachine + iam:PassRole to states.amazonaws.com)
+        and start an execution, running arbitrary AWS SDK Task states as {role.name}.
+
+  # --- B3) Cross-account StartExecution -> direct invocation -------------------
+  - id: aws-sf-cross-account-execution
+    emits: CanInvoke
+    description: "A cross-account principal with states:StartExecution on a state machine in another account can directly trigger an execution in that account with an attacker-influenced payload."
+    match:
+      - [ ?external, CanInvoke, ?state_machine ]
+      - [ ?state_machine, ExecutesAs, ?role ]
+    where:
+      - "?external.account != ?state_machine.account"
+      - "?external has effective states:StartExecution on the state machine ARN in the remote account (cross-account IAM grant)"
+    emit:
+      source_type: Identity
+      target_type: Workflow
+      source: ?external
+      target: ?state_machine
+      permissions: ["states:StartExecution"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the cross-account IAM grant is unconditional (the external
+        principal's identity policy grants states:StartExecution on the remote
+        state machine ARN with no restricting conditions). CONDITIONAL(resource_policy)
+        when the grant requires conditions (aws:SourceAccount, aws:PrincipalOrgID,
+        aws:VpcSourceIp) the attacker must satisfy. Starting an execution in
+        account B runs the state machine's execution role in B — the caller
+        does not receive B's execution role credentials directly, but their
+        input payload influences the entire execution, including downstream Task
+        state parameters and any data the execution writes to S3/SQS/DynamoDB.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: ["<CanInvoke edge_id ?external -> ?state_machine>", "<ExecutesAs edge_id ?state_machine -> ?role>"]
+      false_positive_note: >-
+        Cross-account StartExecution requires the CALLER's identity policy to
+        allow states:StartExecution on the REMOTE ARN — Step Functions does not
+        support resource-based policies on state machines, so this is purely
+        IAM-identity-policy-driven. The caller triggers execution with an
+        attacker-controlled input payload; the execution runs the execution role
+        in the target account. The caller does not obtain that role's credentials
+        directly. This is CanInvoke (direct invocation from another account) —
+        cross-account entry only materializes if combined with CanModifyCode
+        (B1) for the definition-modify path or via messaging-chains for event
+        triggers. Do NOT downgrade to CanEnterAccount; that is reserved for
+        cases where the caller obtains credentials in the target account.
+      narrative: >-
+        {external.name} (account {external.account}) can start an execution of
+        state machine {state_machine.name} in account {state_machine.account}
+        (states:StartExecution cross-account), supplying the input payload that
+        drives the entire execution as {role.name}.
+
+  # --- B4) Execution role credentials exposed to Task state code --------------
+  - id: aws-sf-exposes-exec-role-cred
+    emits: ExposesCredential
+    description: "A state machine exposes its execution role's credentials to any code injected into a Task state (AWS SDK calls are made with the execution role's session)."
+    match:
+      - [ ?state_machine, ExecutesAs, ?role ]
+    where:
+      - "node_type(?state_machine) == Workflow"
+    emit:
+      source_type: Workflow
+      target_type: MachineIdentity
+      source: ?state_machine
+      target: ?role
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the state machine ExecutesAs edge is ACTIVE (state machine
+        exists and has a configured execution role). CONDITIONAL(service_state)
+        when the state machine is being created but the role binding is not yet
+        confirmed. BLOCKED if the ExecutesAs edge is BLOCKED (e.g., state machine
+        or role is deleted).
+      derived_from: ["<ExecutesAs edge_id ?state_machine -> ?role>"]
+      false_positive_note: >-
+        Not an escalation by itself. This edge expresses the fact that code
+        execution in any Task state (or a malicious definition injected via
+        UpdateStateMachine) runs with the execution role's AWS credentials —
+        the session token is used by the Step Functions service to make the
+        AWS SDK calls defined in Task states. The attack path value comes from
+        combining this with CanModifyCode (B1) or CanCreateWorkloadAs (B2).
+        Unlike Lambda, the execution role credentials are not directly accessible
+        to a worker's code — they are used by the Step Functions service on the
+        caller's behalf. An injected Task state calling
+        arn:aws:states:::aws-sdk:sts:getCallerIdentity can exfiltrate the
+        caller identity, confirming the role in use, but direct credential
+        retrieval requires an HTTP endpoint target.
+      narrative: >-
+        State machine {state_machine.name} makes all Task state AWS service calls
+        using {role.name}'s credentials; attacker code injected into the definition
+        (via states:UpdateStateMachine) runs as {role.name} for every Task state.
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION RECORDS (add to /rules/explicit/aws-stepfunctions.yaml)
+#
+# The following normalization records are needed for complete graph coverage.
+# They should live in /rules/explicit/aws-stepfunctions.yaml rather than here
+# because they match raw config records (not effective permissions):
+#
+#   aws-sf-explicit-executes-as:
+#     emits: ExecutesAs
+#     match_record: {resource_type: "AWS::StepFunctions::StateMachine", field: "roleArn"}
+#     (covered by A1 above as a hybrid explicit/derived emit)
+#
+#   aws-sf-explicit-eventbridge-rule-target:
+#     emits: CanTrigger
+#     match_record: {resource_type: "AWS::Events::Rule", field: "Targets[].Arn"}
+#     where: target ARN matches a StepFunctions state machine ARN
+#     (covered by A6 above)
+#
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP or permission boundary denying states:UpdateStateMachine ->
+#     CanModifyCode BLOCKED -> B1 aws-sf-execute-as-via-definition BLOCKED.
+#   - An SCP denying states:StartExecution -> CanInvoke BLOCKED -> B3 BLOCKED
+#     and B1 loses its optional run path (stays CONDITIONAL(trigger_exists)
+#     unless an EventBridge trigger exists).
+#   - iam:PassRole with iam:PassedToService NOT including states.amazonaws.com ->
+#     B2 aws-sf-create-workload-as BLOCKED (or POTENTIAL when unknown).
+#   - A disabled EventBridge rule (State = DISABLED) -> A6 CanTrigger
+#     CONDITIONAL(trigger_exists), never ACTIVE.
+#   - Express workflow executions -> A8 CanReadData(GetExecutionHistory) BLOCKED
+#     for Express (history is in CloudWatch, not Step Functions API).
+#   - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------

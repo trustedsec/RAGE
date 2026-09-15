@@ -1,0 +1,384 @@
+# Azure — Managed HSM (Microsoft.KeyVault/managedHSMs) credential-access rules (Phase 5)
+# ---------------------------------------------------------------------------
+# THE central invariant for this service: Managed HSM data-plane authorization is
+# a SEPARATE local RBAC system, NOT Azure RBAC. Management-plane roles
+# (Contributor / Owner / "Managed HSM Contributor") grant control of the ARM
+# object but ZERO key usage. Only a Managed HSM LOCAL role assignment carrying the
+# matching data action authorizes decrypt/sign/release. Every crypto edge below is
+# gated on a local-RBAC data action (condition: iam_permission = the local
+# assignment). Do NOT derive any crypto capability from Azure RBAC.
+#
+# Verified local data actions (learn.microsoft.com/azure/key-vault/managed-hsm/built-in-roles,
+# 2025-11 built-in-roles table). Role attribution is exact — match on the presence
+# of the DATA ACTION, never on a role name, because holders differ per action:
+#   Microsoft.KeyVault/managedHsm/keys/decrypt/action        (Crypto User only)
+#   Microsoft.KeyVault/managedHsm/keys/unwrap/action         (Crypto User only)
+#   Microsoft.KeyVault/managedHsm/keys/sign/action           (Crypto User only)
+#   Microsoft.KeyVault/managedHsm/keys/release/action        (Crypto User OR Crypto Service Release User)
+#   Microsoft.KeyVault/managedHsm/roleAssignments/write/action
+#         (Administrator OR Crypto Officer OR Policy Administrator — all can self-assign)
+# NOTE: Managed HSM Crypto Officer carries NO key cryptographic-operation data action
+# (no decrypt/sign/encrypt/wrap/unwrap); it holds only deletedKeys recover/delete,
+# roleAssignments read/write/delete, and roleDefinitions read/write/delete. It is a
+# role/deleted-key manager, NOT a crypto operator.
+#
+# State defaults: crypto edges are ACTIVE only with a resolvable local assignment
+# on the key scope; unresolved -> POTENTIAL(iam_permission). CanExportKey is
+# CONDITIONAL/POTENTIAL unless the key is exportable with a satisfiable release
+# policy. Local RBAC has no deny model, so data-plane BLOCKED means the assignment
+# is absent; management-plane edges can be BLOCKED by an Azure deny assignment.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 5-credential-access
+applies_to: [azure]
+
+rules:
+
+  # === Crypto User / Officer -> decrypt =====================================
+  - id: azure-mhsm-crypto-user-decrypt
+    emits: CanDecrypt
+    description: "A Managed HSM local Crypto User role can decrypt/unwrap with an HSM key."
+    match:
+      - [ ?principal, HasPolicy, ?assignment ]
+      - [ ?pool,      Contains,  ?key ]
+    where:
+      - "node_type(?key) == EncryptionKey"
+      - "?key.provider_type == 'Microsoft.KeyVault/managedHSMs/keys'"
+      - "?assignment is a Managed HSM LOCAL role assignment whose role definition dataActions include Microsoft.KeyVault/managedHsm/keys/decrypt/action OR .../keys/unwrap/action (carried by Crypto User; match on the DATA ACTION, not the role name)"
+      - "?assignment.scope covers ?key (scope '/' = the whole pool ?pool, or the specific key ?key)"
+    emit:
+      target_type: EncryptionKey
+      source: ?principal
+      target: ?key
+      permissions: ["Microsoft.KeyVault/managedHsm/keys/decrypt/action", "Microsoft.KeyVault/managedHsm/keys/unwrap/action"]
+      conditions: [iam_permission]
+      state_logic: "if a Managed HSM local assignment with keys/decrypt or keys/unwrap resolves at the key scope: ACTIVE; if the local assignment set is not collected/resolvable: POTENTIAL(iam_permission)"
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "?principal HasPolicy ?assignment (Managed HSM local role)", "?pool Contains ?key", "?assignment.scope covers ?key" ]
+      false_positive_note: >-
+        Do NOT emit from Azure RBAC. Contributor/Owner/"Managed HSM Contributor" are
+        management-plane and grant NO key usage. Match on the presence of the
+        keys/decrypt/action or keys/unwrap/action data action, NOT on a role name:
+        among the built-in roles ONLY Managed HSM Crypto User carries these crypto
+        data actions. Crypto Officer does NOT (it is role/deleted-key management
+        only), and Administrator does NOT have a decrypt data action either — neither
+        authorizes this edge on its own (Administrator/Crypto Officer reach decrypt
+        only by first self-granting Crypto User; see azure-mhsm-admin-self-grant). If
+        local role assignments were not collected (requires
+        Microsoft.KeyVault/managedHsm/roleAssignments/read), downgrade to
+        POTENTIAL(iam_permission) rather than asserting ACTIVE.
+      narrative: >-
+        {principal.name} holds a Managed HSM local Crypto User role granting
+        keys/decrypt on {key.name} and can decrypt any ciphertext or unwrap any
+        wrapped key protected by it.
+
+  # === Crypto User / Officer -> sign ========================================
+  - id: azure-mhsm-crypto-user-sign
+    emits: CanSignAs
+    description: "A Managed HSM local Crypto User role can sign with an HSM signing key."
+    match:
+      - [ ?principal, HasPolicy, ?assignment ]
+      - [ ?pool,      Contains,  ?key ]
+    where:
+      - "node_type(?key) == SigningKey"
+      - "?key.provider_type == 'Microsoft.KeyVault/managedHSMs/keys'"
+      - "?key.keyOps includes 'sign'"
+      - "?assignment is a Managed HSM LOCAL role assignment whose role definition dataActions include Microsoft.KeyVault/managedHsm/keys/sign/action (carried by Crypto User; match on the DATA ACTION, not the role name)"
+      - "?assignment.scope covers ?key (scope '/' = the whole pool ?pool, or the specific key ?key)"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?key
+      permissions: ["Microsoft.KeyVault/managedHsm/keys/sign/action"]
+      conditions: [iam_permission]
+      state_logic: "if a Managed HSM local assignment with keys/sign resolves at the key scope: ACTIVE; if not collected/resolvable: POTENTIAL(iam_permission)"
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "?principal HasPolicy ?assignment (Managed HSM local role)", "?pool Contains ?key", "?assignment.scope covers ?key" ]
+      false_positive_note: >-
+        Signing alone is escalation only when the key backs a token/cert issuer or
+        an application's client-assertion (see azure-mhsm-sign-as-issuer). A key
+        that only signs opaque data (e.g. code-signing unrelated to identity) is
+        CanSignAs but does not roll up to impersonation. Match on the presence of
+        the keys/sign/action data action, NOT on a role name: among the built-in
+        roles ONLY Managed HSM Crypto User carries keys/sign/action. Crypto Officer
+        does NOT (it is role/deleted-key management only) and Administrator does NOT;
+        neither can sign without first self-granting Crypto User. Never emit from
+        Azure RBAC.
+      narrative: >-
+        {principal.name} holds a Managed HSM local Crypto User role granting keys/sign
+        on {key.name} and can produce signatures as that key.
+
+  # === Decrypt a wrapped credential -> CredentialsFor pivot ==================
+  # Completes the Phase-5 chain: the decrypted plaintext IS a credential for some
+  # identity. Only fires when the ciphertext/wrapped node is evidenced as a
+  # credential (the wrapped node CredentialsFor an identity). The provider-agnostic
+  # credential-chains rules then roll CanDecrypt+CredentialsFor up to impersonation.
+  - id: azure-mhsm-decrypt-to-credential
+    emits: ExposesCredential
+    description: "A wrapped store whose wrapping key the principal can decrypt exposes the credential it holds."
+    match:
+      - [ ?principal, CanDecrypt,        ?key ]
+      - [ ?wrapped,   ContainsCredential, ?cred ]
+      - [ ?cred,      CredentialsFor,    ?identity ]
+    where:
+      - "?key.provider_type == 'Microsoft.KeyVault/managedHSMs/keys'"
+      - "wraps(?key, ?wrapped) — ?key is the wrapping/encryption key protecting ?wrapped (evidenced DEK/keyvault wrap reference)"
+      - "node_class(?wrapped) in [Compute, Storage, Data, Messaging, Secret] (ExposesCredential source set)"
+      - "node_class(?identity) == Identity (ExposesCredential target set)"
+    emit:
+      source: ?wrapped
+      target: ?identity
+      permissions: ["Microsoft.KeyVault/managedHsm/keys/decrypt/action", "Microsoft.KeyVault/managedHsm/keys/unwrap/action"]
+      conditions: [key_permission]
+      state_logic: "inherit_weakest(CanDecrypt): ACTIVE if the CanDecrypt input is ACTIVE and the wrap relationship is evidenced; if CanDecrypt is POTENTIAL/CONDITIONAL, so is this; BLOCKED if CanDecrypt is BLOCKED"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "?principal CanDecrypt ?key", "?wrapped ContainsCredential ?cred", "?cred CredentialsFor ?identity", "wraps(?key, ?wrapped)" ]
+      false_positive_note: >-
+        This is a genuinely new edge (the wrapped store -> the identity its wrapped
+        credential authenticates as); it does NOT re-emit the CredentialsFor input.
+        Only fires when the material the key wraps/encrypts is ITSELF a credential
+        (a wrapped DEK protecting a secret store, a wrapped SP key, an encrypted
+        connection string) evidenced by ContainsCredential + CredentialsFor. A key
+        used only for disk-block/CMK envelope encryption of non-credential data
+        does NOT yield an identity credential — keep the CanDecrypt edge and do not
+        emit this pivot. The decrypt-of-wrapped-credential value lives in the
+        contributing CanDecrypt edge; this edge only surfaces the exposure so
+        credential-centric queries and credential-chains.yaml can complete the
+        impersonation roll-up.
+      narrative: >-
+        {principal.name} can decrypt {key.name} that wraps {wrapped.name}, exposing
+        {cred.name} — a credential that authenticates as {identity.name}.
+
+  # === Sign as an issuer/app signing key -> impersonation input =============
+  # Roll-up hook: when the HSM signing key is the signer for a token issuer or an
+  # application's credential, CanSignAs(principal -> key) + CredentialsFor(key ->
+  # identity) feeds the provider-agnostic sign-as-yields-impersonation rule. This
+  # rule normalizes the key->issuer-identity link so that roll-up can fire.
+  - id: azure-mhsm-sign-as-issuer
+    emits: CanSignAs
+    description: "Signing with an HSM key that backs a token/cert issuer lets the caller sign as that identity."
+    match:
+      - [ ?principal, CanSignAs,      ?key ]
+      - [ ?key,       CredentialsFor, ?identity ]
+    where:
+      - "?key.provider_type == 'Microsoft.KeyVault/managedHSMs/keys'"
+      - "?key is the signing key of a token issuer / SAML IdP / application client-assertion (evidenced CredentialsFor link)"
+      - "node_class(?identity) in [ApplicationIdentity, ServiceAccount] (CanSignAs target set)"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: ["Microsoft.KeyVault/managedHsm/keys/sign/action"]
+      conditions: [iam_permission]
+      state_logic: "inherit_weakest(CanSignAs input): ACTIVE if the CanSignAs on ?key is ACTIVE and the key->issuer CredentialsFor is evidenced; else inherits the weaker state"
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "?principal CanSignAs ?key", "?key CredentialsFor ?identity" ]
+      false_positive_note: >-
+        Requires an EVIDENCED link that the key signs tokens/assertions for
+        ?identity (key CredentialsFor issuer). Do not assume every HSM signing key
+        is an identity issuer; many sign artifacts unrelated to authentication.
+        When the issuer binding is unknown, do not emit — leave the plain
+        CanSignAs(principal -> key) only.
+      narrative: >-
+        {principal.name} can sign as {identity.name} by using HSM key {key.name},
+        which backs that identity's token/certificate issuer.
+
+  # === Secure Key Release -> export raw key material ========================
+  - id: azure-mhsm-release-export-key
+    emits: CanExportKey
+    description: "A holder of keys/release/action (Crypto User or Crypto Service Release User) can export an exportable HSM key via Secure Key Release."
+    match:
+      - [ ?principal, HasPolicy, ?assignment ]
+      - [ ?pool,      Contains,  ?key ]
+    where:
+      - "?key.provider_type == 'Microsoft.KeyVault/managedHSMs/keys'"
+      - "?assignment is a Managed HSM LOCAL role assignment whose dataActions include Microsoft.KeyVault/managedHsm/keys/release/action (carried by Crypto User OR Crypto Service Release User; match on the DATA ACTION, not the role name)"
+      - "?assignment.scope covers ?key"
+      - "?key.attributes.exportable == true"
+      - "?key has a release policy"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?key
+      permissions: ["Microsoft.KeyVault/managedHsm/keys/release/action"]
+      conditions: [iam_permission, condition_expression]
+      state_logic: "POTENTIAL(condition_expression) by default: release requires the caller/enclave to present an attestation the release policy accepts. ACTIVE only if key.exportable==true AND a release policy is present AND a satisfiable attestation is available; if exportable is false or no release policy: do NOT emit"
+      confidence: "min(contributing_confidences) * 0.6"
+      derived_from: [ "?principal HasPolicy ?assignment (keys/release/action: Crypto User or Crypto Service Release User)", "?pool Contains ?key", "?assignment.scope covers ?key" ]
+      false_positive_note: >-
+        Gate on the keys/release/action data action, NOT a single role name:
+        keys/release/action is held by BOTH Managed HSM Crypto User AND Managed HSM
+        Crypto Service Release User, so a plain Crypto User can also request Secure
+        Key Release of an exportable key — attributing it solely to Crypto Service
+        Release User misses the Crypto-User export path. Keys are non-exportable by
+        default. Secure Key Release (SKR) still requires the key attribute
+        exportable==true, a configured release policy, AND a valid attestation from a
+        trusted enclave that satisfies that policy. Role/action membership alone is
+        NOT sufficient -> emit POTENTIAL(condition_expression), not ACTIVE. Never
+        emit for a key without exportable==true and a release policy. Do not derive
+        from Azure RBAC.
+      narrative: >-
+        {principal.name} holds a Managed HSM local role with keys/release/action
+        (Crypto User or Crypto Service Release User) on exportable key {key.name};
+        with a satisfiable release policy/attestation it could export the raw key
+        material for offline decrypt/sign.
+
+  # === Administrator self-grants a crypto role -> escalation ================
+  - id: azure-mhsm-admin-self-grant
+    emits: CanGrantPermission
+    description: "Any Managed HSM local role that carries roleAssignments/write can assign any local role, including to itself."
+    match:
+      - [ ?principal, HasPolicy, ?assignment ]
+    where:
+      - "?assignment is a Managed HSM LOCAL role assignment whose dataActions include Microsoft.KeyVault/managedHsm/roleAssignments/write/action (held by Managed HSM Administrator, Crypto Officer, OR Policy Administrator — match on the DATA ACTION, not a single role name)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?principal
+      permissions: ["Microsoft.KeyVault/managedHsm/roleAssignments/write/action"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE if a local assignment carrying roleAssignments/write/action resolves; POTENTIAL(iam_permission) if local assignments not collected"
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "?principal HasPolicy ?assignment (roleAssignments/write/action: Administrator, Crypto Officer, or Policy Administrator)" ]
+      false_positive_note: >-
+        Microsoft.KeyVault/managedHsm/roleAssignments/write/action is held by THREE
+        built-in local roles — Managed HSM Administrator, Managed HSM Crypto Officer,
+        AND Managed HSM Policy Administrator — so ALL THREE can self-assign Crypto
+        User (full key usage) exactly like Administrator; gating solely on the
+        Administrator role name silently drops the Crypto-Officer and
+        Policy-Administrator escalation paths. None of these three carries a crypto
+        data action by itself (Administrator holds securitydomain + roleAssignments;
+        Crypto Officer holds role/deleted-key management; Policy Administrator holds
+        role management), so each reaches decrypt/sign only by first granting itself
+        Crypto User — this edge models exactly that self-grant. Local RBAC has no
+        deny model, so the only block is loss of the assignment. Do not confuse with
+        Azure RBAC "Managed HSM Contributor" (management-plane, cannot touch local
+        roleAssignments).
+      narrative: >-
+        {principal.name} holds a Managed HSM local role with roleAssignments/write
+        (Administrator, Crypto Officer, or Policy Administrator) and can assign itself
+        (or any principal) Crypto User, self-granting full key usage.
+
+  - id: azure-mhsm-admin-escalate
+    emits: CanEscalateTo
+    description: "A self-grant of a crypto role (via roleAssignments/write) is privilege escalation to key usage."
+    match:
+      - [ ?principal, CanGrantPermission, ?principal ]
+    where:
+      - "the grantable local roles include Crypto User (keys/decrypt|sign|unwrap|release)"
+      - "those crypto data actions are strictly more privileged than what ?principal currently holds"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?principal
+      permissions: ["Microsoft.KeyVault/managedHsm/roleAssignments/write/action"]
+      conditions: [iam_permission]
+      state_logic: "inherit from CanGrantPermission: ACTIVE if the self-grant is ACTIVE"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "?principal CanGrantPermission ?principal (Administrator, Crypto Officer, or Policy Administrator)" ]
+      false_positive_note: >-
+        Only escalation if the crypto capability gained is strictly greater than the
+        principal already holds. Any of the three roleAssignments/write holders
+        (Administrator, Crypto Officer, Policy Administrator) can perform the
+        self-grant; none carries a crypto data action already, so each gains
+        keys/decrypt|sign|unwrap by assigning itself Crypto User. A principal that is
+        already Crypto User gains nothing new -> do not emit. Inherits state from the
+        self-grant edge.
+      narrative: >-
+        {principal.name} can escalate to full Managed HSM key usage by granting itself
+        Crypto User via its roleAssignments/write (Administrator, Crypto Officer, or
+        Policy Administrator) role.
+
+  # === Management-plane control (explicitly NOT data-plane) ==================
+  # NOTE: CanAdminister(principal -> pool) from Azure RBAC managedHSMs/write is
+  # emitted by the EXPLICIT rule azure-mhsm-mgmt-admin (rules/explicit/
+  # azure-managedhsm.yaml), which now carries the CRITICAL-GUARD false-positive
+  # note. No derived duplicate is emitted here — a derived rematch over the same
+  # ARM fact would double-emit the same edge. The security-domain-clone rule below
+  # binds ?pool via that explicit CanAdminister edge.
+
+  # === Security-domain custody -> clone all keys (offline, POTENTIAL) =======
+  - id: azure-mhsm-security-domain-clone
+    emits: CanExportKey
+    description: "Possession of the security domain + quorum keys can clone all HSM keys to a new pool."
+    match:
+      - [ ?principal, CanAdminister, ?pool ]
+      - [ ?pool,      Contains,      ?key ]
+    where:
+      - "node_type(?pool) == ManagementService and ?pool.provider_type == 'Microsoft.KeyVault/managedHSMs'"
+      - "node_type(?key) in [EncryptionKey, SigningKey] (CanExportKey target set)"
+      - "?principal (or an out-of-band actor) possesses the security-domain file AND the quorum of security-domain private keys"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?key
+      permissions: ["Microsoft.KeyVault/managedHsm/securitydomain/download/action", "Microsoft.KeyVault/managedHsm/securitydomain/upload/action"]
+      conditions: [condition_expression]
+      state_logic: "POTENTIAL(condition_expression) always: security-domain custody (file + quorum of SD private keys) is an offline possession fact we generally cannot observe from ARM. Never assert ACTIVE without evidence of custody; if custody is unknown emit POTENTIAL for analyst review"
+      confidence: "min(contributing_confidences) * 0.4"
+      derived_from: [ "?principal CanAdminister ?pool (explicit azure-mhsm-mgmt-admin, Azure RBAC managedHSMs/write)", "?pool Contains ?key", "security-domain custody (out-of-band)" ]
+      false_positive_note: >-
+        This is a possession-based, offline capability: cloning requires the SD
+        file plus the quorum of private keys that encrypted it — NOT observable
+        from ARM RBAC. Management-plane control can DOWNLOAD the SD blob but cannot
+        decrypt it without the quorum keys. Emit POTENTIAL only (one edge per HSM
+        key under the pool); never ACTIVE unless SD custody is independently
+        evidenced. Do not treat pool Contributor as key export.
+      narrative: >-
+        {principal.name}, if it possesses {pool.name}'s security domain file and the
+        quorum of security-domain private keys, could clone {key.name} (and every
+        key under {pool.name}) into a new pool — offline export of the key material.
+
+  # === Guest / multi-tenant principal with a local role -> cross-tenant =====
+  - id: azure-mhsm-guest-crosstenant
+    emits: CanEnterTenant
+    description: "A guest/foreign-tenant principal granted a Managed HSM local role gains cross-tenant crypto access."
+    match:
+      - [ ?external, CanDecrypt, ?key ]
+    where:
+      - "?key.provider_type == 'Microsoft.KeyVault/managedHSMs/keys'"
+      - "?external is a B2B guest or multi-tenant service principal whose home tenant != the HSM's home tenant"
+      - "the decrypted material yields a credential/token for an identity in the HSM's home tenant (evidenced)"
+    emit:
+      source_type: Identity
+      target_type: Tenant
+      source: ?external
+      target: "<home tenant of the HSM>"
+      permissions: ["Microsoft.KeyVault/managedHsm/keys/decrypt/action"]
+      conditions: [trust_relationship, key_permission]
+      state_logic: "CONDITIONAL(trust_relationship): ACTIVE only when the local assignment to the external principal resolves AND the decrypted material is evidenced to unlock a home-tenant identity credential; else CONDITIONAL"
+      confidence: "min(contributing_confidences) * 0.7"
+      derived_from: [ "?external CanDecrypt ?key", "external principal home tenant != HSM tenant" ]
+      false_positive_note: >-
+        Cross-tenant entry only follows if the crypto op actually yields a
+        credential/token usable in the HSM's tenant (e.g. decrypting a wrapped
+        home-tenant SP secret). A guest merely decrypting non-credential data does
+        NOT enter the tenant. Requires an evidenced local assignment to the external
+        oid; otherwise CONDITIONAL.
+      narrative: >-
+        {external.name} (foreign tenant) holds a Managed HSM local role and can
+        decrypt a wrapped home-tenant credential, gaining a foothold in the HSM's
+        tenant.
+
+# ---------------------------------------------------------------------------
+# BLOCKED / state guidance:
+#  - Data-plane (CanDecrypt/CanSignAs/CanExportKey): there is NO deny model in
+#    Managed HSM local RBAC. "BLOCKED" only means the local assignment is absent or
+#    was removed. Unresolved/uncollected local assignments -> POTENTIAL(iam_permission),
+#    not BLOCKED.
+#  - Management-plane (explicit azure-mhsm-mgmt-admin CanAdminister on the pool): an
+#    Azure DENY ASSIGNMENT on Microsoft.KeyVault/managedHSMs/write at the effective
+#    scope -> emit BLOCKED with denied_by=<deny assignment id>.
+#  - CanExportKey via release is POTENTIAL until exportable + release policy +
+#    satisfiable attestation are all confirmed.
+#  - NEVER derive any crypto edge from Azure RBAC (Contributor/Owner/Managed HSM
+#    Contributor). That is the #1 false positive for this service.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/azure-managedhsm.yaml (HasPolicy for local role assignments,
+# AttachedTo assignment->key, Contains pool->key, CanDecrypt/CanSignAs/CanExportKey
+# straight from local data actions, CanGrantPermission for Administrator).

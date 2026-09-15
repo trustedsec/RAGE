@@ -1,0 +1,737 @@
+# GCP Cloud Firestore / Cloud Datastore — Derived attack-path rules
+# (Phase 6 — Storage & Databases)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:firestore. Emits ONLY common edge types from schema/edges.yaml.
+# All permissions are taken verbatim from the Firestore / Datastore IAM reference:
+#   cloud.google.com/firestore/docs/security/iam
+#   cloud.google.com/datastore/docs/reference/admin/rest
+#   cloud.google.com/firestore/docs/manage-data/export-import
+#   firebase.google.com/docs/rules
+#
+# DUAL ACCESS-CONTROL MODEL — CRITICAL:
+#   Firestore has TWO completely independent access-control surfaces:
+#   (A) Cloud IAM: governs Admin SDK / server-side callers using OAuth2 service-
+#       account tokens. Permissions in the `datastore.*` namespace. VPC-SC applies.
+#   (B) Firebase Security Rules: governs Firebase client SDK callers using Firebase
+#       Auth JWTs. Security Rules source is deployed to the Firebase project.
+#       VPC-SC does NOT apply. Client SDK endpoints are internet-accessible by
+#       default. Admin SDK callers BYPASS Security Rules entirely.
+#   Both surfaces must be modeled independently. A Security Rules finding is NOT
+#   an IAM finding and vice versa.
+#
+# CENTRAL ATTACK-PATH THEMES (Phase 6 — storage & databases):
+#
+#   (1) DATA READ + EXFIL:
+#       datastore.entities.get -> CanReadData(Identity -> NoSQLDatabase).
+#       datastore.databases.export to GCS + storage.objects.create ->
+#       CanExfiltrate(Identity -> NoSQLDatabase). The exported data often contains
+#       application secrets (API keys, OAuth tokens, SA keys stored as documents).
+#       Cite credential-chains.yaml for the ContainsSecret->CredentialsFor->
+#       CanImpersonate roll-up; do NOT re-derive it here.
+#
+#   (2) PUBLIC EXPOSURE (Firebase Security Rules):
+#       Firebase Security Rules `allow read, write: if true` (or absent `request.auth`
+#       check) -> ExposedToInternet(NoSQLDatabase -> AnonymousIdentity).
+#       `allow read: if request.auth != null` without domain/claim scoping ->
+#       ExposedToTenant (any Firebase Auth user, which is broader than org).
+#       This is EXTREMELY common in Firebase apps configured in "test mode."
+#       firebase.rules.rulesets.create + firebase.rules.releases.update ->
+#       CanModifyPolicy (replace Security Rules -> open to internet).
+#
+#   (3) IAM POLICY MUTATION:
+#       datastore.databases.setIamPolicy -> CanModifyPolicy; self-grant of
+#       roles/datastore.owner -> CanGrantPermission -> CanReadData -> CanExfiltrate.
+#
+#   (4) CROSS-BOUNDARY SHARING:
+#       IAM binding naming a cross-project SA -> CrossProjectTrust.
+#       Export to a GCS bucket in another project -> CanExfiltrate across projects.
+#       Encrypted data (CMEK Firestore) -> CanReadData is CONDITIONAL(key_permission)
+#       gated on the Firestore Service Agent's KMS grant (NOT the caller).
+#
+# CMEK NOTE:
+#   For CMEK Firestore databases (`cmekConfig.kmsKeyName` set), the Firestore
+#   Service Agent (service-PROJECT_NUMBER@gcp-sa-firestore.iam.gserviceaccount.com)
+#   performs KMS decrypt, NOT the accessing principal. Callers with
+#   datastore.entities.get can read CMEK data while the service agent holds
+#   cloudkms.cryptoKeyVersions.useToDecrypt. Do NOT require caller cloudkms.*
+#   for Firestore reads. Emit CanReadData as CONDITIONAL(key_permission) gated
+#   on the SERVICE AGENT's grant state.
+#
+# LINCHPIN CITATIONS (do NOT re-derive the roll-ups listed here):
+#   * /rules/derived/credential-chains.yaml — read-secret-yields-identity:
+#     ContainsSecret + CanReadData => CredentialsFor => CanImpersonate / CanEscalateTo.
+#     Also decrypt-gates-secret-read for CMEK service-agent gate.
+#   * /rules/derived/can-control.yaml — control-via-admin / escalate-via-execute-as.
+#   * /rules/derived/can-execute-as.yaml — execute-as-via-code-modify (when
+#     Firestore triggers Cloud Functions via Eventarc; modeled in gcf.yaml / eventarc.yaml).
+#
+# PERMISSIONS ARE EFFECTIVE: the permission evaluator has already resolved IAM
+# bindings (project/database-level, predefined roles) before these rules fire.
+# State defaults to ACTIVE; an unmet condition yields CONDITIONAL/POTENTIAL;
+# an explicit deny / VPC-SC perimeter / org policy yields BLOCKED.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 6-storage-databases
+service: firestore
+applies_to: [gcp]
+
+rules:
+
+  # =====================================================================
+  # SECTION 1 — DATA READ ACCESS (IAM surface)
+  # =====================================================================
+
+  # --- CanReadData: datastore.entities.get effective ------------------------
+  - id: gcp-firestore-read-data
+    emits: CanReadData
+    description: "datastore.entities.get constitutes effective data-plane read access to Firestore/Datastore documents."
+    match_effective_permission:
+      action: "datastore.entities.get"
+      resource_type: "google.firestore.Database"
+    where:
+      - "database is NOT CMEK-encrypted (cmekConfig.kmsKeyName unset) — for CMEK see gcp-firestore-read-data-cmek"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Firestore Database / NoSQLDatabase node>"
+      permissions: ["datastore.entities.get"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when datastore.entities.get is confirmed effective at the project or
+        database scope (Firestore uses project-level IAM; multi-database configurations
+        also support database-level IAM) and no VPC-SC perimeter blocks the
+        Firestore API for the caller's context; CONDITIONAL(resource_policy) when
+        the IAM scope is uncertain or namespace-level restrictions exist;
+        BLOCKED when a VPC-SC perimeter, IAM deny policy, or org policy explicitly
+        denies datastore.entities.get for this caller.
+      confidence: "min(contributing_confidences) * 0.96"
+      derived_from: ["datastore.entities.get effective permission on Firestore Database"]
+      false_positive_note: >-
+        datastore.entities.list (without get) provides only key metadata (document IDs,
+        collection names) — NOT document content. Do NOT emit CanReadData from
+        entities.list alone. Firestore has two modes — native mode and Datastore mode —
+        both use `datastore.*` IAM permissions; do not invent `firestore.*` data-plane
+        permissions for IAM callers (those permissions do not exist; the correct IAM
+        actions are all in the `datastore.*` namespace as of GA). In multi-database
+        Firestore projects, IAM is scoped per database; confirm the effective permission
+        applies to the database node being targeted. VPC-SC perimeters that include
+        the Firestore API block callers outside the perimeter -> BLOCKED.
+        Firebase Security Rules do NOT govern IAM callers (Admin SDK bypasses them).
+      narrative: >-
+        {principal.name} holds datastore.entities.get on {database.name} and can read
+        the content of any document in the Firestore database. Firestore data commonly
+        contains application secrets, user PII, and embedded credentials.
+
+  # --- CanReadData (CMEK): service-agent key_permission gate ----------------
+  - id: gcp-firestore-read-data-cmek
+    emits: CanReadData
+    description: "datastore.entities.get on a CMEK Firestore database; the Firestore Service Agent (not the caller) decrypts using its KMS grant. CanReadData state is ACTIVE if the service agent's KMS grant is confirmed, CONDITIONAL(key_permission) if the grant state is unknown, and BLOCKED if the grant is denied or the key is disabled."
+    match_effective_permission:
+      action: "datastore.entities.get"
+      resource_type: "google.firestore.Database"
+    where:
+      - "database IS CMEK-encrypted (cmekConfig.kmsKeyName is set)"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<CMEK Firestore Database / NoSQLDatabase node>"
+      permissions: ["datastore.entities.get"]
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        ACTIVE if the Firestore Service Agent
+        (service-PROJECT_NUMBER@gcp-sa-firestore.iam.gserviceaccount.com) holds
+        cloudkms.cryptoKeyVersions.useToDecrypt (roles/cloudkms.cryptoKeyEncrypterDecrypter)
+        on the cmekConfig.kmsKeyName AND the key version is ENABLED;
+        CONDITIONAL(key_permission) if the service-agent grant or key state is unknown;
+        BLOCKED if the service agent lacks the grant, OR the key is DISABLED/DESTROYED,
+        OR a KMS deny policy targets the service agent's decrypt (data operations
+        then return KMS errors).
+      confidence: "min(contributing_confidences) * 0.93"
+      derived_from: ["datastore.entities.get effective permission on CMEK Firestore Database", "Firestore Service Agent KMS binding on cmekConfig.kmsKeyName"]
+      false_positive_note: >-
+        GCP-SPECIFIC: the key_permission gate is on the FIRESTORE SERVICE AGENT, not
+        the caller. Do NOT require the accessing principal to hold cloudkms.* — a
+        caller with only datastore.entities.get reads CMEK documents while the service
+        agent keeps useToDecrypt (same pattern as GCS CMEK and Secret Manager CMEK).
+        Requiring caller KMS decrypt (AWS-style) produces false negatives. Downgrade
+        to CONDITIONAL/BLOCKED based solely on the service agent's grant state and
+        the key's enabled/disabled status. The KMS key is specified in
+        cmekConfig.kmsKeyName on the Database resource; verify via
+        firestore.projects.databases.get.
+      narrative: >-
+        {principal.name} holds datastore.entities.get on CMEK database {database.name}
+        (cmekConfig.kmsKeyName: {key.name}); the Firestore Service Agent — not the
+        caller — decrypts documents using cloudkms.cryptoKeyEncrypterDecrypter on
+        {key.name}. Access is ACTIVE while the service agent retains that grant and
+        the key is enabled.
+
+  # --- CanWriteData: effective data-plane write (BOTH create + update) ------
+  - id: gcp-firestore-write-data
+    emits: CanWriteData
+    description: "datastore.entities.create + datastore.entities.update together constitute effective full data-plane write access to Firestore/Datastore documents (overwrite capability)."
+    match_effective_permission:
+      action: "datastore.entities.create"
+      resource_type: "google.firestore.Database"
+    where:
+      - "?principal ALSO has EFFECTIVE datastore.entities.update at the same database scope"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Firestore Database / NoSQLDatabase node>"
+      permissions: ["datastore.entities.create", "datastore.entities.update"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when both datastore.entities.create and datastore.entities.update are
+        confirmed effective at the project or database scope; CONDITIONAL(iam_permission)
+        when one permission is uncertain; BLOCKED when VPC-SC or IAM deny blocks the
+        write operations. Note: CanWriteData alone grants the ability to poison
+        document content (e.g., inject malicious values or overwrite legitimate data),
+        but does NOT grant code execution; further escalation requires a downstream
+        trigger (Cloud Function reading Firestore) — modeled in gcf.yaml/eventarc.yaml.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["datastore.entities.create + datastore.entities.update effective permissions on Firestore Database"]
+      false_positive_note: >-
+        Write access to Firestore does not constitute code execution within Firestore
+        itself. Escalation via CanWriteData requires a secondary compute resource
+        (Cloud Function / Cloud Run) that reads the written data and is itself
+        attacker-influenceable. Only emit CanWriteData for the data-plane fact;
+        defer the escalation derivation to the function/compute service rules.
+        datastore.entities.delete is a separate permission not required for write
+        and is not included here (it enables data destruction, not escalation).
+        This rule requires BOTH permissions; for create-only injection capability,
+        see gcp-firestore-inject-data.
+      narrative: >-
+        {principal.name} holds datastore.entities.create and datastore.entities.update
+        on {database.name} and can write or overwrite any document in the Firestore
+        database (risk: data poisoning; downstream escalation if a compute resource
+        consumes Firestore documents without validation).
+
+  # --- CanWriteData: creation-only write (injection, not modification) ------
+  - id: gcp-firestore-inject-data
+    emits: CanWriteData
+    description: "datastore.entities.create alone enables document injection (creation of new documents); without entities.update, the attacker cannot modify existing data but can poison via new entries."
+    match_effective_permission:
+      action: "datastore.entities.create"
+      resource_type: "google.firestore.Database"
+    where:
+      - "?principal DOES NOT have EFFECTIVE datastore.entities.update at the database scope"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Firestore Database / NoSQLDatabase node>"
+      permissions: ["datastore.entities.create"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        CONDITIONAL(iam_permission) when datastore.entities.create is confirmed effective
+        but entities.update is not (or is denied). Interpretation: the attacker can
+        insert new documents (poison downstream processors) but cannot modify existing
+        ones. This is a narrower capability than full CanWriteData but still constitutes
+        write-plane access and risk of data injection. Escalation via CanWriteData(CONDITIONAL)
+        requires the downstream processor (Cloud Function, workflow) to consume the
+        injected documents without validation.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from: ["datastore.entities.create effective permission (without entities.update) on Firestore Database"]
+      false_positive_note: >-
+        Document insertion (create-only) does NOT grant modification of existing documents.
+        Applications that validate new document shape/content before processing may not
+        be vulnerable to injection via creation alone. However, applications that trust
+        the database as a source-of-truth and fail to re-validate on read ARE vulnerable.
+        Flag with CONDITIONAL state to indicate the narrower risk. Escalation still
+        depends on a downstream trigger (Cloud Function) that processes new documents
+        — model separately in gcf.yaml / eventarc.yaml.
+      narrative: >-
+        {principal.name} holds datastore.entities.create on {database.name} and can
+        inject new documents into the Firestore database. Without entities.update,
+        the attacker cannot modify existing documents but can add new entries designed
+        to poison downstream data processors.
+
+  # =====================================================================
+  # SECTION 2 — DATA EXFILTRATION
+  # =====================================================================
+
+  # --- CanExfiltrate: export database to GCS --------------------------------
+  - id: gcp-firestore-export-exfiltrate
+    emits: CanExfiltrate
+    description: "datastore.databases.export + storage.objects.create on a destination GCS bucket constitutes effective Firestore data exfiltration: the entire database is copied to an attacker-controlled or cross-project GCS bucket."
+    match_effective_permission:
+      action: "datastore.databases.export"
+      resource_type: "google.firestore.Database"
+    where:
+      - "?principal ALSO has EFFECTIVE storage.objects.create on a destination GCS bucket in a different project or attacker-controlled bucket"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Firestore Database / NoSQLDatabase node>"
+      permissions: ["datastore.databases.export", "storage.objects.create"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when datastore.databases.export is confirmed effective on the Firestore
+        Database AND storage.objects.create on a writable destination bucket (ideally
+        attacker-controlled or cross-project) is confirmed; CONDITIONAL(iam_permission)
+        when destination bucket write rights are uncertain or the only confirmed
+        destination is a project-internal bucket; POTENTIAL when no confirmed
+        destination write path is modeled. CMEK state inherits from the underlying
+        CanReadData: CONDITIONAL(key_permission) if the database is CMEK and service-
+        agent grant is unconfirmed.
+      confidence: "min(contributing_confidences) * 0.91"
+      derived_from: ["datastore.databases.export effective permission on Firestore Database", "storage.objects.create on destination GCS bucket"]
+      false_positive_note: >-
+        The exported data is in Firestore's proprietary export format (a collection of
+        LevelDB SST files with a metadata file). Raw SST files require re-import into
+        another Firestore instance or offline parsing tools to read; they are not
+        human-readable JSON. The exfiltration is still effective (data leaves the
+        project boundary and can be fully recovered by an attacker), but the parsing
+        step should be noted. Exporting to a bucket in the SAME project does NOT
+        constitute cross-boundary exfiltration — emit POTENTIAL(iam_permission) in
+        that case unless the bucket itself is attacker-controlled. VPC-SC perimeters
+        co-perimeterizing Firestore and the destination GCS bucket may block the
+        cross-project export -> BLOCKED(resource_policy). datastore.databases.export
+        is included in roles/datastore.importExportAdmin and roles/datastore.owner.
+        Verify that export targets the correct Database resource node, not just
+        the project.
+      narrative: >-
+        {principal.name} holds datastore.databases.export on {database.name} and
+        can export the entire Firestore database to a GCS bucket it controls
+        (storage.objects.create), exfiltrating all documents outside the project
+        boundary. The export format is Firestore-native SST files; full data recovery
+        is possible via Firestore import.
+
+  # --- CanWriteData: import-based data overwrite ----------------------------
+  - id: gcp-firestore-import-overwrite
+    emits: CanWriteData
+    description: "datastore.databases.import + control of a source GCS bucket enables importing a Firestore export, overwriting ALL existing data in the database (bypass document-level write controls)."
+    match_effective_permission:
+      action: "datastore.databases.import"
+      resource_type: "google.firestore.Database"
+    where:
+      - "?principal ALSO has EFFECTIVE storage.objects.get on a source GCS bucket (attacker-controlled or writable by the principal)"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Firestore Database / NoSQLDatabase node>"
+      permissions: ["datastore.databases.import", "storage.objects.get"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        CONDITIONAL(resource_policy) when datastore.databases.import is confirmed
+        effective on the Firestore Database AND the principal controls (or has read access
+        to) a GCS bucket containing a Firestore export file. The attacker must also have
+        created or gained control of the import source. ACTIVE if source bucket is
+        confirmed attacker-controlled; CONDITIONAL if the source bucket is internal
+        and the attacker must first populate it (e.g., via CanExfiltrate). This is
+        an extremely disruptive action (replaces ALL database content); real attackers
+        use it for data destruction or to inject a full attacker-controlled dataset.
+      confidence: "0.85"
+      derived_from: ["datastore.databases.import effective permission on Firestore Database", "storage.objects.get on source GCS bucket"]
+      false_positive_note: >-
+        Import is a bulk, destructive operation: it replaces the entire database.
+        Document-level IAM permissions (datastore.entities.* create/update) do NOT
+        gate import — a principal with datastore.databases.import can bypass all
+        document-level access controls. However, the attacker must control or
+        compromise the SOURCE bucket (which holds the export file to import).
+        Emit CONDITIONAL(resource_policy) to indicate the resource-policy gate on
+        the source bucket. Escalation assumes the attacker has (1) CanExfiltrate
+        to create a malicious export or (2) access to an existing export. Org policy
+        constraints on database mutations may block import. Note: import is included
+        in roles/datastore.importExportAdmin and roles/datastore.owner.
+      narrative: >-
+        {principal.name} holds datastore.databases.import on {database.name} and can
+        import a Firestore export from a GCS bucket it controls (storage.objects.get),
+        completely overwriting all existing data in the database. This bypasses all
+        document-level write restrictions and constitutes a full CanWriteData capability
+        (though extremely loud and destructive — suitable for data poisoning or erasure).
+
+  # --- CanWriteData: backup restore-based data overwrite --------------------
+  - id: gcp-firestore-backup-restore-overwrite
+    emits: CanWriteData
+    description: "datastore.backups.restoreDatabase on a Firestore database + access to a Firestore backup enables restoring the backup, completely overwriting all current database content. Identical attack impact to import but via backup rather than GCS export."
+    match_effective_permission:
+      action: "datastore.backups.restoreDatabase"
+      resource_type: "google.firestore.Database"
+    where:
+      - "?principal has access (datastore.backups.get or datastore.backups.list) to at least one Firestore Backup resource in the same project"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Firestore Database / NoSQLDatabase node>"
+      permissions: ["datastore.backups.restoreDatabase"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        CONDITIONAL(resource_policy) when datastore.backups.restoreDatabase is confirmed
+        effective on the Firestore Database AND the principal can enumerate or access a
+        Firestore Backup (via datastore.backups.get or datastore.backups.list). ACTIVE if
+        the principal controls a backup (created it or has full backup admin rights); the
+        attacker can restore it to overwrite the target database. CONDITIONAL if backup
+        access is uncertain. Restoring a backup completely replaces the current database
+        content with the backup's content at the time of snapshot.
+      confidence: "0.87"
+      derived_from: ["datastore.backups.restoreDatabase effective permission on Firestore Database", "datastore.backups.get / datastore.backups.list on Firestore Backup resource", "gcp-firestore-import-overwrite (analogous pattern)"]
+      false_positive_note: >-
+        Backup restore is a bulk, destructive operation equivalent to import: it replaces
+        the entire database with the backup snapshot. Document-level IAM permissions do NOT
+        gate restore — a principal with datastore.backups.restoreDatabase can bypass all
+        document-level access controls. The attacker must have access to (or be able to
+        enumerate) a Firestore Backup. Backups are scoped to a project; a principal with
+        datastore.backups.list at the project scope can enumerate all backups, then restore
+        any one to the target database (if they also hold restoreDatabase on that database).
+        Point-in-time recovery (PITR) creates automatic backups; a principal with access to
+        enumerate them can restore to any snapshot in the retention window. Org policy
+        constraints on database mutations may block restore. Note: datastore.backups.restoreDatabase
+        is included in roles/datastore.backupAdmin and roles/datastore.owner. Cite
+        gcp-firestore-import-overwrite as the identical risk pattern via alternative vector.
+      narrative: >-
+        {principal.name} holds datastore.backups.restoreDatabase on {database.name} and
+        can enumerate Firestore backups (datastore.backups.get / datastore.backups.list),
+        then restore one to {database.name}, completely overwriting all existing data.
+        This bypasses all document-level write restrictions and constitutes a full
+        CanWriteData capability with identical impact to import-based overwrite.
+
+  # =====================================================================
+  # SECTION 2B — CMEK CONFIGURATION MUTATION
+  # =====================================================================
+
+  # --- CanWrite: datastore.databases.update (CMEK key swap & configuration mutation) ---
+  - id: gcp-firestore-modify-configuration
+    emits: CanWrite
+    description: "datastore.databases.update allows changing cmekConfig.kmsKeyName on a Firestore database, swapping to an attacker-controlled KMS key. Future writes are then encrypted under the attacker's key, enabling offline decryption of all subsequently written data. This is a configuration mutation on a data resource, not code execution."
+    match_effective_permission:
+      action: "datastore.databases.update"
+      resource_type: "google.firestore.Database"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Firestore Database / NoSQLDatabase node>"
+      permissions: ["datastore.databases.update"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when datastore.databases.update is confirmed effective on the Firestore
+        Database and no VPC-SC perimeter or IAM deny policy blocks the action;
+        CONDITIONAL(iam_permission) when the permission scope is uncertain;
+        BLOCKED when denied. The attacker can use this edge to modify cmekConfig.kmsKeyName
+        to a key they control; only NEW/rewritten document blocks are encrypted under
+        the attacker's key. Existing blocks continue to use the old key (and service-agent
+        decryption) until data is re-written.
+      confidence: "0.90"
+      derived_from: ["datastore.databases.update effective permission on Firestore Database", "CMEK key-swap escalation primitive"]
+      false_positive_note: >-
+        datastore.databases.update grants broad configuration changes including region,
+        backup policy, and CMEK key. The CMEK key-swap sub-attack is only realized if
+        the attacker both (1) holds CanWrite and (2) controls a KMS key in the same project.
+        Downstream: new writes encrypted under the attacker's key allow offline decryption
+        if the attacker exfiltrates the database (export to GCS). Existing data remains
+        readable by the Firestore Service Agent (no immediate impact). Org policy
+        constraints/gcp.resourceTypes/locations may restrict database mutations.
+        This edge uses CanWrite (resource-control category) not CanModifyConfiguration
+        (execution category) because the target is a Data resource (NoSQLDatabase) with no
+        downstream ExecutesAs edges. can-execute-as.yaml chains MUST NOT traverse this edge
+        to derive CanExecuteAs. Note: datastore.databases.update is included in
+        roles/datastore.owner and roles/datastore.editor.
+      narrative: >-
+        {principal.name} holds datastore.databases.update on {database.name} and can
+        modify the database configuration, including cmekConfig.kmsKeyName. By swapping
+        to an attacker-controlled KMS key, the attacker ensures all future writes are
+        encrypted under their key, enabling offline decryption of subsequently written
+        data (risk: data exfiltration + offline decryption without key access).
+
+  # =====================================================================
+  # SECTION 3 — PUBLIC EXPOSURE (Firebase Security Rules surface)
+  # =====================================================================
+
+  # --- ExposedToInternet: Security Rules allow read/write without auth ------
+  - id: gcp-firestore-public-rules
+    emits: ExposedToInternet
+    description: "Firebase Security Rules containing 'allow read, write: if true' (or equivalent unauthenticated-access rule) make the Firestore database readable/writable by any unauthenticated internet user via the Firebase client SDK."
+    match_record:
+      resource_type: "firebase.rules.Ruleset"
+      field: "source.files[].content"
+    where:
+      - "Security Rules source contains a match block with 'allow read: if true', 'allow write: if true', 'allow read, write: if true', or equivalent (missing 'if' clause defaults to 'if true' in some Firebase Rules versions)"
+      - "the release named 'cloud.firestore' points to this ruleset (confirmed via firebase.rules.releases.get)"
+    emit:
+      source_type: Data
+      target_type: AnonymousIdentity
+      source: "<Firestore Database / NoSQLDatabase node>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the live ruleset (the release named 'cloud.firestore') contains a
+        permissive allow rule with no request.auth check covering at least read OR
+        write access for the matched path; CONDITIONAL(resource_policy) when the
+        ruleset source cannot be fully parsed or the matching rule scope is unclear
+        (e.g. rules apply only to a subset of collections); BLOCKED when a subsequent
+        rule or condition check confirms auth is required for all paths.
+      confidence: "0.96"
+      derived_from: ["firebase.rules.Ruleset source: allow read/write without request.auth check", "firebase.rules.Release 'cloud.firestore' points to this ruleset"]
+      false_positive_note: >-
+        CRITICAL DUAL-SURFACE DISTINCTION: Firebase Security Rules govern ONLY the
+        Firebase client SDK endpoint. Admin SDK callers (server-to-server with
+        service-account credentials) BYPASS Security Rules entirely and are governed
+        by Cloud IAM. A permissive Security Rules ruleset does NOT grant unrestricted
+        Cloud IAM access. Only emit ExposedToInternet for the Firebase client endpoint
+        surface. Security Rules are evaluated per-path: a permissive rule on
+        /databases/{database}/documents/{document=**} covers all documents, but a
+        rule on /databases/{database}/documents/public/{document} covers only the
+        'public' collection. Parse the match paths carefully and emit with
+        CONDITIONAL(resource_policy) when the coverage is partial. Firebase test-mode
+        rulesets (generated during project setup) contain 'allow read, write: if true'
+        and are the single most common misconfiguration in Firebase apps. Verify the
+        ruleset is the currently active release (not a historical or draft ruleset).
+        Firebase App Check (when enforced for Firestore) limits client SDK access to
+        attested app instances but does not replace auth requirements — it is a
+        separate control not currently modeled; note as a mitigating factor.
+      narrative: >-
+        Firestore database {database.name} is accessible to unauthenticated internet
+        users: the active Firebase Security Rules ruleset allows read/write without
+        requiring request.auth (no Firebase Auth token needed). Any internet client
+        with the Firebase SDK and project ID can read and/or write documents. This
+        is the "test mode" default and a critical misconfiguration for production data.
+
+  # --- ExposedToTenant: Security Rules require auth but no domain scoping ---
+  - id: gcp-firestore-authed-rules
+    emits: ExposedToTenant
+    description: "Firebase Security Rules requiring only 'request.auth != null' (authenticated but no domain/claim restriction) make the Firestore database accessible to any Firebase Auth user — including users outside the organization."
+    match_record:
+      resource_type: "firebase.rules.Ruleset"
+      field: "source.files[].content"
+    where:
+      - "Security Rules source contains 'allow read: if request.auth != null' (or write, or both) without further domain, email, or custom-claim restriction"
+      - "no additional condition scopes the auth check to a specific domain (e.g. no @company.com domain check, no custom claim check)"
+      - "the release named 'cloud.firestore' points to this ruleset"
+    emit:
+      source_type: Data
+      target_type: Organization
+      source: "<Firestore Database / NoSQLDatabase node>"
+      target: "<GCP Organization / Tenant node>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the live ruleset contains an auth-only check with no further
+        domain or claim restriction and the check covers at least read access for the
+        matched path; CONDITIONAL(resource_policy) when the ruleset coverage is partial
+        or the match path is a subset of collections.
+      confidence: "0.90"
+      derived_from: ["firebase.rules.Ruleset source: allow read/write if request.auth != null (no domain scoping)", "firebase.rules.Release 'cloud.firestore' points to this ruleset"]
+      false_positive_note: >-
+        'request.auth != null' is NOT organization-scoped: any Firebase Auth user from
+        any Firebase project can authenticate (depending on sign-in method configuration)
+        and access the data. If the app allows anonymous sign-in (auth/anon enabled
+        in Firebase Auth settings), then ANY internet user can obtain a Firebase Auth
+        token (even without an account) and satisfy the check — in that scenario emit
+        ExposedToInternet, not just ExposedToTenant. Check whether anonymous sign-in
+        is enabled in Firebase Auth. If the rule includes a domain check such as
+        'request.auth.token.email.matches(".*@company.com$")' or a custom claim
+        check, that is NOT a blanket exposure — do not emit this rule. Only emit
+        ExposedToTenant (not ExposedToInternet) for auth-required rules when anonymous
+        sign-in is confirmed DISABLED.
+      narrative: >-
+        Firestore database {database.name} is accessible to any Firebase Auth user
+        (request.auth != null with no domain restriction). Firebase Auth accounts are
+        freely creatable and not restricted to the organization. Any Firebase-
+        authenticated user (including from other apps or organizations) can read
+        and/or write documents matching the permissive rule paths.
+
+  # =====================================================================
+  # SECTION 4 — IAM POLICY MUTATION
+  # =====================================================================
+
+  # --- CanModifyPolicy: datastore.databases.setIamPolicy -------------------
+  - id: gcp-firestore-set-iam-policy
+    emits: CanModifyPolicy
+    description: "datastore.databases.setIamPolicy writes the Firestore database IAM allow policy; the caller can grant any principal (including itself) any role on the database."
+    match_effective_permission:
+      action: "datastore.databases.setIamPolicy"
+      resource_type: "google.firestore.Database"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<database ResourcePolicy node>"
+      permissions: ["datastore.databases.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when datastore.databases.setIamPolicy is confirmed effective on the
+        Firestore Database or at project scope (project-level role includes all
+        databases) and no IAM deny policy or org policy blocks the action; BLOCKED
+        under IAM deny policy denying setIamPolicy or VPC-SC perimeter denial.
+      confidence: "min(contributing_confidences) * 0.97"
+      derived_from: ["datastore.databases.setIamPolicy effective permission on Firestore Database"]
+      false_positive_note: >-
+        setIamPolicy allows full IAM policy replacement on the database resource.
+        The caller can bind any principal to roles/datastore.owner, roles/datastore.viewer,
+        or custom roles. In Firestore multi-database projects, setIamPolicy at the
+        database level covers that specific database; at the project level, it covers
+        all databases. Downstream exposure edges (CanGrantPermission, CrossProjectTrust)
+        are emitted by specific rules below. Note: setIamPolicy on the Firestore
+        DATABASE resource is distinct from the project-level resourcemanager.projects.setIamPolicy
+        — the former covers Firestore data access only; the latter covers the entire
+        project's IAM. Do not conflate them.
+      narrative: >-
+        {principal.name} holds datastore.databases.setIamPolicy on {database.name}
+        and can overwrite its IAM policy — granting itself or any principal read/write/
+        admin access to all Firestore documents.
+
+  # --- CanGrantPermission: setIamPolicy self-grant -------------------------
+  - id: gcp-firestore-set-iam-self-grant
+    emits: CanGrantPermission
+    description: "datastore.databases.setIamPolicy lets a principal grant itself roles/datastore.owner or roles/datastore.viewer on the database, then read or administer all documents."
+    match_effective_permission:
+      action: "datastore.databases.setIamPolicy"
+      resource_type: "google.firestore.Database"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<principal (self)>"
+      permissions: ["datastore.databases.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when setIamPolicy resolves on the database or project scope and no
+        IAM deny or org policy blocks it; BLOCKED when denied. Chains to CanReadData
+        via self-bound roles/datastore.viewer, then to ContainsSecret/CanExfiltrate
+        if the database holds sensitive data or the caller obtains export rights.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["datastore.databases.setIamPolicy effective permission on Firestore Database"]
+      false_positive_note: >-
+        Escalation primitive: a principal that can setIamPolicy on the Firestore
+        database can grant itself roles/datastore.viewer (read all documents) or
+        roles/datastore.owner (full control including export). The self-grant
+        produces a CanReadData edge via the derived CanGrantPermission -> can-control
+        linchpin. For CMEK databases, the service-agent key_permission gate still
+        applies to the resulting read. Confirm setIamPolicy scope: a project-level
+        grant covers all databases; a database-level grant covers only that database.
+        Org policy denying IAM mutations at the project level -> BLOCKED.
+      narrative: >-
+        {principal.name} can set the IAM policy of Firestore database {database.name}
+        (datastore.databases.setIamPolicy) and grant itself roles/datastore.viewer or
+        roles/datastore.owner, then read all documents in the database.
+
+  # --- CanModifyPolicy: Firebase Security Rules replacement -----------------
+  - id: gcp-firestore-modify-security-rules
+    emits: CanModifyPolicy
+    description: "firebase.rules.rulesets.create + firebase.rules.releases.update allows a principal to replace the active Firebase Security Rules with an attacker-controlled permissive ruleset, opening the Firestore database to internet access via the Firebase client SDK."
+    match_effective_permission:
+      action: "firebase.rules.rulesets.create"
+      resource_type: "firebase.rules.Ruleset"
+    where:
+      - "?principal ALSO has EFFECTIVE firebase.rules.releases.update (to promote the new ruleset to the live 'cloud.firestore' release)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Firestore Database ResourcePolicy / firebase.rules.Release node>"
+      permissions: ["firebase.rules.rulesets.create", "firebase.rules.releases.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when both firebase.rules.rulesets.create and firebase.rules.releases.update
+        are confirmed effective at the Firebase project scope and no IAM deny policy
+        blocks them; CONDITIONAL(iam_permission) when one permission is uncertain.
+        The resulting access change is IMMEDIATE — Firebase Security Rules updates
+        propagate globally within ~1 minute of release update. No additional
+        trigger is needed for the policy to take effect.
+      confidence: "min(contributing_confidences) * 0.94"
+      derived_from: ["firebase.rules.rulesets.create effective permission", "firebase.rules.releases.update effective permission"]
+      false_positive_note: >-
+        This CanModifyPolicy edge represents the ability to replace Security Rules,
+        which governs the FIREBASE CLIENT SDK surface only — not the Admin SDK / Cloud
+        IAM surface. The resulting exposure (after a permissive ruleset is deployed)
+        is emitted as ExposedToInternet by gcp-firestore-public-rules when the actual
+        ruleset content is analyzed. Do NOT emit ExposedToInternet directly from this
+        rule — that requires analyzing the DEPLOYED ruleset content. firebase.rules.rulesets.create
+        alone is not sufficient: the new ruleset must also be promoted via
+        firebase.rules.releases.update to become live. Without the release update
+        the new ruleset is a draft and does not affect active access control.
+        These permissions are included in roles/firebase.develop and roles/firebase.admin.
+      narrative: >-
+        {principal.name} holds firebase.rules.rulesets.create and firebase.rules.releases.update
+        on Firebase project {project.name} and can replace the active Firestore Security
+        Rules with a permissive ruleset (e.g. 'allow read, write: if true'), immediately
+        opening the Firestore database to unauthenticated internet access via the
+        Firebase client SDK.
+
+
+
+  # =====================================================================
+  # SECTION 7 — ESCALATION ROLL-UP
+  # =====================================================================
+
+  # --- CanGrantPermission: setIamPolicy self-grant is delegated to can-control.yaml ---
+  # Previously: gcp-firestore-escalate-via-grant emitted CanEscalateTo(?principal -> ?principal)
+  # This was REMOVED because self-referential CanEscalateTo violates the edge schema
+  # (which requires privilege(target) > privilege(source) — a reflexive edge is semantically
+  # invalid and produces zero-value loops in path traversal).
+  #
+  # RATIONALE:
+  #   - gcp-firestore-set-iam-self-grant (ABOVE, line ~532) correctly emits
+  #     CanGrantPermission(Identity -> Identity [self]) for the setIamPolicy capability.
+  #   - can-control.yaml / control-boundary-via-iam-admin ALREADY chains
+  #     CanGrantPermission at a boundary scope => Controls(boundary).
+  #   - The canonical escalation path is:
+  #       ?principal CanGrantPermission ?principal(self)
+  #       => self-grant of roles/datastore.owner or roles/datastore.importExportAdmin
+  #       => CanReadData + CanExfiltrate (via gcp-firestore-read-data + gcp-firestore-export-exfiltrate)
+  #   - Path-finders that compose CanGrantPermission + downstream permission checks will
+  #     correctly derive the escalation without this broken CanEscalateTo self-loop.
+  # NOTE: If distinct CanEscalateTo(principal -> roles/datastore.owner Role node) is desired
+  #   in future, emit it with target = the Firestore owner Role resource node, NOT the source principal.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-EDGE GUIDANCE:
+#   - A VPC-SC perimeter that includes the Firestore API (firestore.googleapis.com
+#     / datastore.googleapis.com) enforces source-IP / VPN / service-account
+#     membership checks; callers outside the perimeter receive PERMISSION_DENIED
+#     even with valid IAM -> emit CanReadData / CanWriteData / CanExfiltrate edges
+#     as BLOCKED(resource_policy) with denied_by=<perimeter resource name>.
+#     NOTE: Firebase client SDK access BYPASSES VPC-SC — it uses the Firebase
+#     endpoint and is not subject to VPC-SC perimeter enforcement. Model the two
+#     surfaces separately.
+#   - Firestore Service Agent lacking cloudkms.cryptoKeyVersions.useToDecrypt on
+#     cmekConfig.kmsKeyName, or the key being DISABLED/DESTROYED ->
+#     gcp-firestore-read-data-cmek BLOCKED(key_permission).
+#   - An IAM deny policy denying datastore.entities.get / datastore.databases.export
+#     / datastore.databases.setIamPolicy at the effective scope -> respective
+#     edges BLOCKED.
+#   - Org policy constraints/gcp.resourceLocations scoping Firestore to specific
+#     regions does not affect IAM, but may affect where exports can go.
+#   - Firebase App Check (when enforced for Cloud Firestore in Firebase console)
+#     restricts Firebase client SDK access to attested app instances. This is a
+#     mitigating control; model as CONDITIONAL(resource_policy) for the
+#     ExposedToInternet / ExposedToTenant edges when App Check enforcement is
+#     confirmed, not BLOCKED (App Check is bypassable by determined attackers who
+#     can obtain valid app attestations).
+#
+# LINCHPIN CROSS-REFERENCES:
+#   * gcp-firestore-contains-secret (ContainsSecret) + CanReadData (gcp-firestore-
+#     read-data) -> credential-chains.yaml read-secret-yields-identity =>
+#     CanImpersonate / CanEscalateTo for the contained credential's target identity.
+#   * gcp-firestore-set-iam-self-grant (CanGrantPermission) ->
+#     can-control.yaml control-boundary-via-iam-admin => Controls(database / project).
+#   * gcp-firestore-read-data-cmek (CanReadData CONDITIONAL key_permission) ->
+#     credential-chains.yaml decrypt-gates-secret-read (when caller holds CanDecrypt
+#     on the CMEK key — rare, as gate is on the service agent) => ACTIVE CanReadData.
+#   * gcp-firestore-export-exfiltrate (CanExfiltrate -> GCS) -> if destination
+#     bucket backs a Cloud Function source archive, gcp/gcf.yaml CanModifyCode
+#     -> can-execute-as.yaml execute-as-via-code-modify => CanExecuteAs(principal, SA).
+#   * gcp-firestore-modify-security-rules (CanModifyPolicy on Security Rules) ->
+#     deployed permissive ruleset -> gcp-firestore-public-rules (ExposedToInternet).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION RULES MOVED TO /rules/explicit/gcp-firestore.yaml
+# This file previously documented explicit rules; they are now implemented
+# in the explicit rules file. See that file for:
+#   - gcp-firestore-explicit-has-policy (HasPolicy)
+#   - gcp-firestore-explicit-cross-project-trust (CrossProjectTrust)
+#   - gcp-firestore-explicit-contains-secret (ContainsSecret)
+#   - gcp-firestore-iam-allusers-public (ExposedToInternet)
+#   - gcp-firestore-iam-allauthenticated-public (ExposedToTenant)
+#   - gcp-firestore-explicit-cmek-ref (Evidence)
+# ---------------------------------------------------------------------------

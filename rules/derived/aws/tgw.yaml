@@ -1,0 +1,309 @@
+# AWS Transit Gateway — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# TGW is a MANAGED ROUTING FABRIC, not a compute or credential service.
+# This file derives NETWORK FACTS from the TGW control plane and emits them
+# as typed edges conforming to schema/edges.yaml.
+#
+# WHAT THIS FILE DERIVES:
+#   (1) CanModifyConfiguration (route injection) — a principal with
+#       ec2:CreateTransitGatewayRoute / ec2:ReplaceTransitGatewayRoute can
+#       inject or overwrite routes, redirecting inter-VPC or on-prem traffic.
+#   (2) CanModifyConfiguration (route table re-association) — a principal
+#       with ec2:AssociateTransitGatewayRouteTable or
+#       ec2:EnableTransitGatewayRouteTablePropagation can silently open routing
+#       between otherwise-isolated VPCs (a quiet isolation bypass).
+#   (3) CanNetworkReach — a consumer VPC with a confirmed cross-account TGW
+#       attachment gains L3 network reachability to owner-account subnets
+#       (network-layer foothold, subject to security groups).
+#
+# NOTE: RoutesTo (TGW VPC attachment + TGW route table entries) are EXPLICIT
+# normalization facts, not derived — they are emitted by /rules/explicit/aws-tgw.yaml
+# and feed both the network-chains linchpin and this file's rules.
+#
+# WHAT THIS FILE DOES NOT DERIVE:
+#   * Transitive network reachability (SG-allows + route + TGW composing
+#     end-to-end reach across VPCs / accounts) is the FUTURE network-chains
+#     linchpin. Per Phase 8 mandate, do NOT derive it here. Emit per-service
+#     FACTS; the linchpin composes them.
+#   * CrossAccountTrust for RAM-shared TGWs: normalized in
+#     /rules/explicit/aws-ram.yaml and derived in /rules/derived/aws/ram.yaml
+#     (rules aws-ram-shared-tgw-network-reach and aws-ram-org-wide-share-
+#     exposed-to-tenant). DO NOT re-derive them here.
+#   * ExposesCredential / CanReadSecret / CanExecuteAs: TGW has no execution
+#     surface, no data plane, and no credential material.
+#
+# LINCHPINS CITED (NOT DUPLICATED):
+#   * rules/derived/can-control.yaml: the CanControl roll-up is not applicable
+#     here; CanModifyConfiguration is the leaf capability. If a principal gains
+#     CanModifyConfiguration over the TGW or its route tables AND the can-control
+#     linchpin later promotes it to Controls, that promotion happens in
+#     can-control.yaml, not here.
+#   * rules/derived/hierarchy-chains.yaml: no org-boundary traversal derives
+#     from TGW route mutation alone; CanEnterAccount here requires a confirmed
+#     network-layer attachment path, not an IAM boundary crossing.
+#
+# STATE defaults:
+#   ACTIVE   — the attachment is 'available' (both sides confirmed).
+#   CONDITIONAL(network_reachability) — attachment/route exists but route-table
+#     policy or security groups gate reachability further (always applies to
+#     RoutesTo/CanNetworkReach facts pending linchpin evaluation).
+#   CONDITIONAL(service_state) — attachment is 'pendingAcceptance'; no routing
+#     until the owner accepts.
+#   POTENTIAL — the principal has the right to create an attachment but has not
+#     yet done so (e.g. consumer with RAM share but no existing attachment).
+#   BLOCKED — SCP denies the relevant ec2 action.
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml), honored by every emit:
+#   CanModifyConfiguration: source [Identity]                      target [Compute, Messaging, Network, *]
+#   CanNetworkReach:        source [Compute, Network, Identity]   target [Compute, Data, Network, PrivateEndpoint, Storage]
+#   (see schema/edges.yaml; no other edge types emitted from this file)
+#
+# Official docs: https://docs.aws.amazon.com/vpc/latest/tgw/
+# IAM reference: https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonvpc.html
+#   (TGW actions are in the Amazon EC2 / Amazon VPC IAM namespace)
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 8-networking
+applies_to: [aws]
+
+rules:
+
+
+
+  # --- (3) Route injection / replacement -> CanModifyConfiguration -----------
+  # A principal with ec2:CreateTransitGatewayRoute or
+  # ec2:ReplaceTransitGatewayRoute on a TGW route table can inject or overwrite
+  # routes, effectively redirecting traffic from legitimate CIDR destinations to
+  # an attacker-controlled VPC attachment. This is a WEAKEN CONTROLS primitive
+  # per Phase 8 mandate. The edge is CanModifyConfiguration on the Route (TGW
+  # route table) node.
+  - id: aws-tgw-route-inject-modify-config
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with ec2:CreateTransitGatewayRoute or
+      ec2:ReplaceTransitGatewayRoute on a TGW route table can inject or
+      overwrite routes, redirecting inter-VPC or on-premises traffic to an
+      attacker-controlled attachment — man-in-the-middle at L3 or traffic
+      sinkhole. Modeled as CanModifyConfiguration on the Route (TGW route table)
+      node.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?route_table ]
+    where:
+      - "node_type(?principal) in [Identity]"
+      - "node_type(?route_table) == Route   # TGW Route Table node"
+      - "?principal has EFFECTIVE ec2:CreateTransitGatewayRoute OR ec2:ReplaceTransitGatewayRoute on ?route_table (or resource scope covers it)"
+    emit:
+      source_type: Identity
+      target_type: Route
+      source: ?principal
+      target: ?route_table
+      permissions:
+        - "ec2:CreateTransitGatewayRoute"
+        - "ec2:ReplaceTransitGatewayRoute"
+      conditions: [iam_permission, condition_expression]
+      state_logic: >-
+        ACTIVE when the principal has EFFECTIVE (post-evaluation)
+        ec2:CreateTransitGatewayRoute or ec2:ReplaceTransitGatewayRoute on the
+        route table ARN (or a wildcard resource scope covering it), and no SCP
+        or permission boundary denies it. BLOCKED if an SCP or boundary denies
+        the action at this resource scope.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from: [ "<HasPermission edge: ec2:CreateTransitGatewayRoute or ec2:ReplaceTransitGatewayRoute on route_table>" ]
+      false_positive_note: >-
+        Honor resource scope: ec2:CreateTransitGatewayRoute requires the route
+        table ARN (arn:aws:ec2:*:*:transit-gateway-route-table/*) in the
+        resource condition. A resource:"*" grant is wide and covers all TGW
+        route tables in the account. A narrowly-scoped grant covers only
+        specific route tables — do not expand the target set beyond confirmed
+        resource scope. ec2:DeleteTransitGatewayRoute (traffic black-hole) is
+        DESTRUCTIVE and excluded from this rule; it does not yield an attack path
+        by itself (it removes routing, does not redirect it). Emitting for
+        REPLACE vs. CREATE: both are equivalent from a route-injection standpoint
+        (REPLACE overwrites an existing route, CREATE adds a new one). The
+        CanModifyConfiguration edge covers both.
+      narrative: >-
+        {principal.name} has ec2:CreateTransitGatewayRoute or
+        ec2:ReplaceTransitGatewayRoute on TGW route table {route_table.name}.
+        An attacker can inject or overwrite a route to redirect traffic for any
+        CIDR to an attacker-controlled VPC attachment, enabling L3 traffic
+        interception or a man-in-the-middle path across VPCs or to on-premises.
+
+  # --- (4) Route table re-association / propagation enable -> CanModifyConfiguration
+  # A principal with ec2:AssociateTransitGatewayRouteTable can re-associate an
+  # attachment with a different route table — including a permissive one that
+  # propagates all attachments. Similarly, EnableTransitGatewayRouteTablePropagation
+  # causes an attachment's CIDR to be learned by a route table, opening routing
+  # to all other attachments in that table. Both are quiet isolation-bypass
+  # primitives. Emitted as CanModifyConfiguration on the TransitGateway node
+  # (since the modification affects the TGW's routing policy, not just one route).
+  - id: aws-tgw-assoc-modify-config
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with ec2:AssociateTransitGatewayRouteTable or
+      ec2:EnableTransitGatewayRouteTablePropagation can silently re-route an
+      attachment to a permissive route table or add a propagation that opens
+      routing between otherwise-isolated VPCs — a quiet network-isolation bypass.
+      Modeled as CanModifyConfiguration on the TransitGateway node.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?tgw ]
+    where:
+      - "node_type(?principal) in [Identity]"
+      - "node_type(?tgw) == TransitGateway"
+      - "?principal has EFFECTIVE ec2:AssociateTransitGatewayRouteTable OR ec2:EnableTransitGatewayRouteTablePropagation on ?tgw (or covering resource scope)"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: ?principal
+      target: ?tgw
+      permissions:
+        - "ec2:AssociateTransitGatewayRouteTable"
+        - "ec2:EnableTransitGatewayRouteTablePropagation"
+      conditions: [iam_permission, condition_expression]
+      state_logic: >-
+        ACTIVE when the principal has EFFECTIVE ec2:AssociateTransitGatewayRouteTable
+        or ec2:EnableTransitGatewayRouteTablePropagation on the TGW ARN and no SCP
+        or permission boundary denies it. BLOCKED if denied. Resource scope:
+        AssociateTransitGatewayRouteTable requires both the transit-gateway-attachment
+        and transit-gateway-route-table ARNs; EnableTransitGatewayRouteTablePropagation
+        similarly. Honor those constraints.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<HasPermission edge: ec2:AssociateTransitGatewayRouteTable or ec2:EnableTransitGatewayRouteTablePropagation on ?tgw>" ]
+      false_positive_note: >-
+        ec2:AssociateTransitGatewayRouteTable requires the ARNs for BOTH the
+        attachment AND the route table; a principal who cannot reach an existing
+        attachment cannot use this permission to re-associate. Do NOT assert this
+        capability if the only CIDR that would open is already routed or if the
+        destination route table has no permissive entries that open additional
+        paths. ec2:DisassociateTransitGatewayRouteTable and
+        ec2:DisableTransitGatewayRouteTablePropagation are DESTRUCTIVE (traffic
+        black-hole); excluded as they do not yield an escalation or reachability
+        path by themselves.
+      narrative: >-
+        {principal.name} can re-associate a TGW attachment to a different route
+        table (ec2:AssociateTransitGatewayRouteTable) or enable CIDR propagation
+        (ec2:EnableTransitGatewayRouteTablePropagation) on {tgw.name}, silently
+        opening routing paths between otherwise-isolated VPCs (network-isolation
+        bypass).
+
+  # --- (5) Confirmed cross-account TGW attachment -> CanNetworkReach -----------
+  # When a consumer-account identity has a CONFIRMED (state == 'available') VPC
+  # attachment to an owner-account TGW, the consumer VPC is on the owner's
+  # routing fabric. Combined with TGW route table entries routing to owner-account
+  # subnets (from rule 1 above), the consumer has network-layer reachability to
+  # owner-account resources. This is modeled as CanNetworkReach (L3 routing path),
+  # NOT CanEnterAccount (which implies control-plane IAM access).
+  #
+  # Important semantic distinction:
+  #   - CanEnterAccount = source can obtain a principal/session inside target account
+  #     (IAM-level, control-plane boundary crossing).
+  #   - CanNetworkReach = source can reach target over the network (L3 routing fact,
+  #     subject to security groups and other L4 gates).
+  # TGW cross-account attachment is a NETWORK foothold, not an IAM foothold.
+  # The network-chains linchpin will compose this routing fact with endpoint
+  # reachability to derive full-path CanNetworkReach to specific resources.
+  #
+  # Cross-account sharing via RAM: the CrossAccountTrust(share -> consumer Account)
+  # is emitted by /rules/explicit/aws-ram.yaml. The derived rule
+  # aws-ram-shared-tgw-network-reach in /rules/derived/aws/ram.yaml may derive
+  # CanNetworkReach(consumer VPC -> owner VPC) from that trust fact. THIS RULE
+  # derives CanNetworkReach from the more specific fact of a CONFIRMED attachment
+  # with active routing — a concrete routing topology fact, not an IAM pivot.
+  - id: aws-tgw-cross-account-enter
+    emits: CanNetworkReach
+    description: >-
+      A consumer-account VPC with a confirmed (state==available) attachment
+      to an owner-account Transit Gateway has L3 network reachability to subnets
+      in the owner account (subject to TGW route table routing and L4 security
+      group evaluation). This is a network-layer foothold (CanNetworkReach),
+      not control-plane account entry (CanEnterAccount).
+    applies_to: [aws]
+    match:
+      - [ ?share, CrossAccountTrust, ?consumer_account ]
+      - [ ?tgw, RoutesTo, ?subnet ]
+    where:
+      - "node_type(?share) == ResourcePolicy   # RAM ResourceShare sharing the TGW"
+      - "node_type(?consumer_account) == Account"
+      - "node_type(?tgw) == TransitGateway"
+      - "node_type(?subnet) == Subnet   # owner-account subnet reachable via TGW"
+      - "?tgw is the shared resource referenced in ?share.resourceArns"
+      - "?subnet.account != ?consumer_account.id   # owner-account subnet (cross-account target)"
+      - "consumer-account VPC attachment to ?tgw state == 'available' (ec2:DescribeTransitGatewayVpcAttachments confirmed)"
+      - "TGW route table has a route entry routing to ?subnet's CIDR from the consumer attachment"
+    emit:
+      source_type: Network
+      target_type: Subnet
+      source: "<consumer VPC (VirtualNetwork containing the attachment subnets)>"
+      target: "<owner-account Subnet reachable via TGW routes>"
+      permissions: []
+      conditions: [network_reachability, service_state]
+      state_logic: >-
+        CONDITIONAL(network_reachability) when the attachment is 'available',
+        a matching TGW route table entry exists routing the owner CIDR via the
+        consumer attachment, but security groups on owner-account ENIs still gate
+        L4 access. CONDITIONAL(service_state) when the attachment is
+        'pendingAcceptance' (owner must accept first). POTENTIAL when the RAM
+        share is ACTIVE and the consumer can create an attachment but has not yet
+        done so. BLOCKED if SCP denies ec2:CreateTransitGatewayVpcAttachment in
+        the consumer account or if AutoAcceptSharedAttachments==false AND the
+        owner has not yet accepted the attachment. Never ACTIVE without confirming
+        attachment state == 'available' AND a routed path in the TGW route tables.
+      confidence: "min(contributing_confidences) * 0.80"
+      derived_from:
+        - "<CrossAccountTrust edge_id (RAM share -> consumer_account)>"
+        - "<RoutesTo edge_id (tgw -> owner-account subnet)>"
+        - "<TGW VPC attachment state == available in consumer account>"
+        - "<TGW route table entry routing owner CIDR via consumer attachment>"
+      false_positive_note: >-
+        This edge represents L3 NETWORK reachability only, not IAM/control-plane
+        account entry. Source type is Network (consumer VPC), target is Subnet
+        (owner-account), per schema/edges.yaml CanNetworkReach constraints.
+        This edge requires BOTH the RAM share CrossAccountTrust AND a confirmed
+        'available' TGW attachment AND a matching TGW route table entry. Without
+        all three conditions, the edge is POTENTIAL or CONDITIONAL. Security
+        groups on owner-account ENIs gate L4 access; emit CONDITIONAL(network_
+        reachability) and note this for the analyst. Do NOT conflate with
+        CanEnterAccount or IAM cross-account access — TGW grants network-layer
+        routing access only. The source is the consumer VPC (Network class),
+        not an IAM principal, because this is a reachability fact, not an
+        authorization fact. Full exploitation requires reaching a listening
+        service inside the owner-account subnet.
+      narrative: >-
+        Consumer VPC {consumer_vpc.name} (account {consumer_account.name}) has
+        a confirmed attachment to Transit Gateway {tgw.name} (owner account
+        {owner_account.name}). The TGW route table routes owner-account subnet
+        {subnet.name} CIDR via the consumer attachment, creating L3 network
+        reachability from the consumer VPC to the owner account's subnets.
+        Full exploitation requires overcoming L4 security group rules at owner-
+        account ENIs (CONDITIONAL(network_reachability)).
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP denying ec2:CreateTransitGatewayRoute or ec2:ReplaceTransitGatewayRoute
+#     on transit-gateway-route-table/* -> aws-tgw-route-inject-modify-config
+#     emitted with state: BLOCKED.
+#   - SCP denying ec2:AssociateTransitGatewayRouteTable or
+#     ec2:EnableTransitGatewayRouteTablePropagation -> aws-tgw-assoc-modify-config
+#     emitted with state: BLOCKED.
+#   - SCP denying ec2:CreateTransitGatewayVpcAttachment in consumer account
+#     or attachment state != 'available' -> aws-tgw-cross-account-enter emitted
+#     with state: BLOCKED or CONDITIONAL(service_state).
+#   - AutoAcceptSharedAttachments == false AND owner has not accepted
+#     -> aws-tgw-cross-account-enter state: CONDITIONAL(service_state).
+#   - Attachment state != 'available' (pending, failed, rejected, deleted)
+#     -> aws-tgw-cross-account-enter: downgrade to CONDITIONAL(service_state) for
+#     'pendingAcceptance'; omit for terminal states (failed, deleted, rejected).
+#
+# EXPLICIT NORMALIZATION RULES (in /rules/explicit/aws-tgw.yaml):
+#   aws-tgw-attachment-routes-to-subnet    — RoutesTo(TransitGateway -> Subnet) [explicit]
+#   aws-tgw-route-table-routes-to-subnet   — RoutesTo(Route -> Subnet) [explicit from route entries]
+#   aws-tgw-modify-route-inject            — CanModifyConfiguration(Identity -> Route) [route injection]
+#   aws-tgw-assoc-route-table              — CanModifyConfiguration(Identity -> TransitGateway)
+#   aws-tgw-create-vpc-attachment          — CanModifyConfiguration(Identity -> TransitGateway)
+#   aws-tgw-modify-tgw                     — CanModifyConfiguration(Identity -> TransitGateway) [AutoAccept option]
+#   aws-tgw-accept-attachment              — CanModifyConfiguration(Identity -> TransitGateway) [attachment acceptance]
+#   aws-tgw-peering-routes-to-peer         — RoutesTo(TransitGateway -> Network) [peering attachment]
+#   (CrossAccountTrust for RAM-shared TGW is handled in /rules/explicit/aws-ram.yaml)
+# ---------------------------------------------------------------------------

@@ -1,0 +1,923 @@
+# AWS VPC — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# VPC is the foundational network layer in AWS. This file emits FACTS about
+# network exposure, control-weakening, and connectivity — it does NOT compose
+# multi-hop reachability (e.g., SG-open + IGW route + peering -> end-to-end
+# CanNetworkReach). That transitive composition is the network-chains linchpin
+# reserved for a future provider-agnostic file.
+#
+# THEME: networking primitives. Each rule captures one of four themes:
+#   (1) EXPOSURE: SG/NACL rules allowing 0.0.0.0/0, public IGW-routed resources.
+#   (2) CONTROL WEAKENING: permissions that open/modify security controls
+#       (AuthorizeSecurityGroupIngress, CreateRoute, AttachInternetGateway, etc.)
+#   (3) CONNECTIVITY PIVOTS: VPC peering, TGW attachments, PrivateLink endpoints
+#       (structural PeeredWith / RoutesTo / PrivateReachability facts).
+#   (4) DNS HIJACK: ChangeResourceRecordSets on Route 53 zones.
+#
+# State model:
+#   ACTIVE — all preconditions satisfied at collection time.
+#   CONDITIONAL(network_reachability) — reachability depends on further routing/SG
+#     facts not yet composed (standard for all network edges per the theme spec).
+#   POTENTIAL — capability could be exercised but no current evidence it is realized.
+#   BLOCKED — SCP / permission boundary / explicit deny prevents the action.
+#
+# Transitive network reachability (SG + route + peering composing into end-to-end
+# CanNetworkReach) is a FUTURE provider-agnostic linchpin — DO NOT invent it here.
+# This file emits per-service FACTS only.
+#
+# Permissions: exact action names from the AWS Service Authorization Reference.
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonvpc.html
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonroute53.html
+#
+# Cross-references:
+#   can-control.yaml — roll-up Controls / CanEscalateTo (cited, not duplicated).
+#   ec2.yaml         — EC2 instance execution / IMDS credential rules.
+#   s3.yaml          — S3 bucket policies governing gateway endpoint access.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 8-networking
+applies_to: [aws]
+
+rules:
+
+  # =========================================================================
+  # (2) CONTROL WEAKENING — Security Group rule manipulation
+  # =========================================================================
+
+  # --- Add inbound allow rule to a security group --------------------------
+  - id: aws-vpc-sg-authorize-ingress
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with ec2:AuthorizeSecurityGroupIngress or ec2:ModifySecurityGroupRules
+      can add an allow-from-0.0.0.0/0 (or any source) inbound rule to a security group,
+      potentially exposing protected resources to new network sources.
+    match:
+      - [ ?principal, HasPermission, ?sg ]
+    where:
+      - "node_type(?sg) == SecurityGroup"
+      - >-
+        effective_permission(?principal, ?sg) contains
+        'ec2:AuthorizeSecurityGroupIngress' OR 'ec2:ModifySecurityGroupRules'
+    emit:
+      source_type: Identity
+      target_type: SecurityGroup
+      source: ?principal
+      target: ?sg
+      permissions:
+        - "ec2:AuthorizeSecurityGroupIngress"
+        - "ec2:ModifySecurityGroupRules"
+      conditions: [iam_permission]
+      state_logic: >-
+        if effective_permission(?principal, ?sg) contains
+        'ec2:AuthorizeSecurityGroupIngress' OR 'ec2:ModifySecurityGroupRules'
+        AND NOT scp_denies those actions at ?principal scope:
+          ACTIVE
+        elif scp_denies:
+          BLOCKED
+        else:
+          CONDITIONAL(iam_permission)
+      confidence: 0.95
+      derived_from:
+        - "HasPermission(?principal, ?sg) [ec2:AuthorizeSecurityGroupIngress | ec2:ModifySecurityGroupRules]"
+      false_positive_note: >-
+        ec2:AuthorizeSecurityGroupIngress and ec2:ModifySecurityGroupRules are both
+        effective means to add inbound allow rules. This edge models the CAPABILITY
+        to weaken the SG — it does NOT assert that 0.0.0.0/0 is currently allowed.
+        Whether the resulting rule actually opens internet access depends on the resource
+        also having a public IP and a route to an IGW; that composition is the
+        network-chains linchpin (future work). Do not emit ExposedToInternet from this
+        rule alone — only from aws-vpc-sg-internet-exposed-compute when all three facts
+        are observed.
+
+        ec2:RevokeSecurityGroupIngress is a destructive action (removes allow rules),
+        modeled as CanModifyConfiguration of weaker security posture but primarily a
+        denial/persistence tool — not separately emitted here unless used offensively.
+
+        An SCP denying ec2:AuthorizeSecurityGroupIngress at the principal's scope should
+        set state: BLOCKED.
+      narrative: >-
+        {principal.name} can add inbound allow rules to security group {sg.name}
+        (ec2:AuthorizeSecurityGroupIngress / ec2:ModifySecurityGroupRules), opening
+        network access to any resource protected by this security group from any
+        source the attacker specifies, including 0.0.0.0/0.
+
+  # --- Create permissive security group + attach to resource ---------------
+  - id: aws-vpc-sg-create-permissive
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with ec2:CreateSecurityGroup can create a new permissive SG,
+      then attach it to a resource (requires ec2:ModifyNetworkInterfaceAttribute
+      or service-specific attach permission), effectively bypassing existing rules.
+    match:
+      - [ ?principal, HasPermission, ?vpc ]
+    where:
+      - "node_type(?vpc) == VirtualNetwork"
+      - >-
+        effective_permission(?principal, ?vpc) contains 'ec2:CreateSecurityGroup'
+        AND effective_permission(?principal, '*') contains
+        'ec2:ModifyNetworkInterfaceAttribute' OR 'ec2:ModifyInstanceAttribute'
+    emit:
+      source_type: Identity
+      target_type: VirtualNetwork
+      source: ?principal
+      target: ?vpc
+      permissions:
+        - "ec2:CreateSecurityGroup"
+        - "ec2:AuthorizeSecurityGroupIngress"
+        - "ec2:ModifyNetworkInterfaceAttribute"
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        if all three permissions are effective AND NOT scp_denies: ACTIVE
+        elif ec2:ModifyNetworkInterfaceAttribute is absent but service-specific
+        attach is present: CONDITIONAL(iam_permission)
+        else: POTENTIAL(iam_permission)
+      confidence: 0.80
+      derived_from:
+        - "HasPermission(?principal, ?vpc) [ec2:CreateSecurityGroup + ec2:ModifyNetworkInterfaceAttribute]"
+      false_positive_note: >-
+        The attach step requires a separate permission on the target resource's
+        network interface or the resource itself. Without ec2:ModifyNetworkInterfaceAttribute
+        (or an equivalent like ecs:UpdateService changing the SG), the attacker can
+        create a permissive SG but cannot attach it — downgrade to POTENTIAL.
+        This rule focuses on the VPC as the scope node (SGs live in a VPC); the actual
+        exposure depends on attaching to a compute resource modeled by ec2.yaml.
+      narrative: >-
+        {principal.name} can create a new security group with permissive inbound rules
+        in {vpc.name} (ec2:CreateSecurityGroup + ec2:AuthorizeSecurityGroupIngress) and
+        attach it to a resource (ec2:ModifyNetworkInterfaceAttribute), bypassing existing
+        security group controls for that resource.
+
+  # =========================================================================
+  # (2) CONTROL WEAKENING — Route table / IGW manipulation
+  # =========================================================================
+
+  # --- Inject internet route into route table / attach IGW ------------------
+  - id: aws-vpc-route-inject-internet
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with ec2:CreateRoute, ec2:ReplaceRoute, or ec2:AttachInternetGateway
+      can make a previously-private subnet internet-routable, exposing any resource
+      in that subnet that has a public IP.
+    match:
+      - [ ?principal, HasPermission, ?route_or_vpc ]
+    where:
+      - "node_type(?route_or_vpc) in [Route, VirtualNetwork]"
+      - >-
+        effective_permission(?principal, ?route_or_vpc) contains
+        'ec2:CreateRoute' OR 'ec2:ReplaceRoute' OR 'ec2:AttachInternetGateway'
+        OR 'ec2:AssociateRouteTable' OR 'ec2:ReplaceRouteTableAssociation'
+    emit:
+      source_type: Identity
+      target_type: Network  # matches Route (RouteTable subtype) and VirtualNetwork
+      source: ?principal
+      target: ?route_or_vpc
+      permissions:
+        - "ec2:CreateRoute"
+        - "ec2:ReplaceRoute"
+        - "ec2:AttachInternetGateway"
+        - "ec2:AssociateRouteTable"
+        - "ec2:ReplaceRouteTableAssociation"
+      conditions: [iam_permission]
+      state_logic: >-
+        if any of the effective route-manipulation permissions are present
+        AND NOT scp_denies: ACTIVE
+        elif scp_denies: BLOCKED
+        else: CONDITIONAL(iam_permission)
+      confidence: 0.90
+      derived_from:
+        - "HasPermission(?principal, ?route_or_vpc) [route manipulation permissions]"
+      false_positive_note: >-
+        Route injection only creates internet exposure if (a) an IGW is attached
+        (or the principal also has ec2:AttachInternetGateway + ec2:CreateInternetGateway),
+        AND (b) resources in the affected subnet have public IPs. If no IGW is attached
+        and the principal cannot attach one, the route creates a black-hole rather than
+        internet access — downgrade to CONDITIONAL(network_reachability). ec2:CreateRoute
+        can also inject routes to VPC peering connections, TGW, or VPN targets;
+        this rule focuses on the control-weakening capability generically.
+      narrative: >-
+        {principal.name} can inject or replace routes in {route_or_vpc.name}
+        (ec2:CreateRoute / ec2:ReplaceRoute / ec2:AttachInternetGateway), potentially
+        making a private subnet internet-routable and exposing resources with public
+        IPs to inbound internet traffic.
+
+  # =========================================================================
+  # (1) EXPOSURE — Security group allows internet inbound (observed fact)
+  # =========================================================================
+
+  # --- Resource with open-internet SG rule is internet-exposed (observed) --
+  - id: aws-vpc-sg-internet-exposed-compute
+    emits: ExposedToInternet
+    description: >-
+      A compute resource is internet-exposed when its security group has an inbound
+      rule allowing 0.0.0.0/0 (or ::/0) on a port, the resource has a public IP,
+      and the subnet has a route to an Internet Gateway. All three conditions must
+      be observed facts.
+    match:
+      - [ ?sg, AttachedTo, ?resource ]
+    where:
+      - "node_type(?sg) == SecurityGroup"
+      - "node_type(?resource) in [VirtualMachine, ContainerService, ApplicationPlatform, GenericCompute]"
+      - "sg_has_inbound_rule(?sg, cidr='0.0.0.0/0' OR cidr='::/0', any_port)"
+      - "resource_has_public_ip(?resource)"
+      - "subnet_routes_to_igw(?resource.subnet)"
+    emit:
+      source_type: Compute
+      target_type: AnonymousIdentity
+      source: ?resource
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if all three conditions (open SG inbound rule, public IP, IGW route) are
+        observed ACTIVE facts: ACTIVE
+        elif any condition is unverified (e.g., IGW attachment state unknown): CONDITIONAL(network_reachability)
+        else: do not emit
+      confidence: 0.92
+      derived_from:
+        - "AttachedTo(?sg, ?resource)"
+        - "sg_has_inbound_rule(?sg, 0.0.0.0/0)"
+        - "resource_has_public_ip(?resource)"
+        - "subnet_routes_to_igw(?resource.subnet)"
+      false_positive_note: >-
+        ALL THREE conditions are mandatory — missing any one eliminates internet exposure:
+        (1) SG inbound rule must allow from 0.0.0.0/0 or ::/0 (not just any source);
+            a rule scoped to a named CIDR or another SG is NOT internet-open.
+        (2) Resource must have a public IP (Elastic IP or auto-assigned public IPv4/IPv6
+            on the ENI); a private-only ENI is never inbound-reachable from the internet
+            regardless of the SG or route.
+        (3) The subnet's route table must have a default route (0.0.0.0/0) pointing to
+            an attached Internet Gateway; a route to a NAT Gateway is outbound-only and
+            does NOT create inbound exposure. Resources behind a NAT GW have a private
+            IP only — they do not appear here.
+        Network ACLs (stateless) may also block the traffic at the subnet level; if a
+        NACL deny rule exists for the relevant port/CIDR, downgrade to CONDITIONAL or
+        do not emit. However, since NACLs are subnet-wide and commonly more permissive
+        than SGs, treat NACL blocks as a false-positive check rather than a primary gate.
+      narrative: >-
+        {resource.name} is reachable from the public internet: security group {sg.name}
+        allows inbound traffic from 0.0.0.0/0, the resource has a public IP address, and
+        its subnet routes to an Internet Gateway — any unauthenticated internet host can
+        attempt to connect to the exposed service port.
+
+  # =========================================================================
+  # (3) CONNECTIVITY PIVOTS — VPC Peering
+  # =========================================================================
+
+  # --- VPC peering -> PeeredWith structural fact + cross-account trust ------
+  - id: aws-vpc-peering-lateral-fact
+    emits: PeeredWith
+    description: >-
+      An active VPC peering connection creates bidirectional connectivity between
+      two VPCs. Security groups in each VPC can reference the peer's CIDR as a
+      source/destination, expanding the effective reachability surface.
+    match:
+      - [ ?peering, AttachedTo, ?vpc_a ]
+    where:
+      - "node_type(?peering) == Peering"
+      - "?peering.status == 'active'"
+      - "?vpc_b == peer_vpc(?peering, opposite_of=?vpc_a)"
+    emit:
+      source_type: VirtualNetwork
+      target_type: VirtualNetwork
+      source: ?vpc_a
+      target: ?vpc_b
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if ?peering.status == 'active': ACTIVE (the peering fact itself is active);
+        lateral movement across the peering is CONDITIONAL(network_reachability) —
+        individual SG rules must allow the traffic.
+      confidence: 0.98
+      derived_from:
+        - "AttachedTo(?peering, ?vpc_a)"
+        - "peering_status == active"
+      false_positive_note: >-
+        PeeredWith is a STRUCTURAL FACT — it records that connectivity is possible, not
+        that it is currently being exploited. End-to-end CanNetworkReach across the peering
+        additionally requires route table entries pointing to the peering connection AND
+        security group rules allowing the specific traffic. The network-chains linchpin
+        (future work) will compose these facts. Do not emit CanNetworkReach from this rule.
+
+        VPC peering is NOT transitive: VPC-A peered with VPC-B and VPC-B peered with
+        VPC-C does NOT mean VPC-A can reach VPC-C. Do not chain PeeredWith edges.
+      narrative: >-
+        {vpc_a.name} is peered with {vpc_b.name} via active peering connection
+        {peering.name} — resources in both VPCs can route to each other subject to
+        their respective security group and route table configurations.
+
+  # --- Cross-account peering creates cross-account trust --------------------
+  - id: aws-vpc-cross-account-peering-trust
+    emits: CrossAccountTrust
+    description: >-
+      A VPC peering connection whose requester and accepter VPCs belong to different
+      AWS accounts represents cross-account network trust. The peering connection
+      record in the accepting account's AWS account constitutes the cross-account
+      authorization artifact, enabling principals in the peer account to reach
+      resources in this account if SG/routing permits.
+    match:
+      - [ ?peering, AttachedTo, ?vpc_a ]
+    where:
+      - "node_type(?peering) == Peering"
+      - "?peering.status == 'active'"
+      - "?peering.RequesterVpcInfo.OwnerId != ?peering.AccepterVpcInfo.OwnerId"
+      - "?peer_account == account_node(?peering.RequesterVpcInfo.OwnerId or AccepterVpcInfo.OwnerId, opposite_of=?vpc_a.account)"
+    emit:
+      source_type: Account
+      target_type: Account
+      source: "?vpc_a.account"
+      target: ?peer_account
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if peering is active and accounts differ: ACTIVE (the cross-account trust fact);
+        actual network reach is CONDITIONAL(network_reachability) on SG + routing.
+      confidence: 0.95
+      derived_from:
+        - "AttachedTo(?peering, ?vpc_a)"
+        - "cross-account requester/accepter"
+      false_positive_note: >-
+        This edge expresses that the peering was established between two accounts —
+        one account's owner accepted the peering request from the other. The edge does NOT
+        assert that any specific resource is reachable; that depends on SG rules allowing
+        traffic from the peer CIDR and route tables propagating the peer route. Emit only
+        when both accounts are confirmed distinct and peering status is 'active'. The
+        peering connection is the supporting evidence; the edge source is the account
+        that owns the accepting VPC (the recipient of the cross-account trust).
+      narrative: >-
+        VPC peering connection {peering.name} links accounts across an account boundary —
+        network traffic between {vpc_a.name} (account {source.name}) and the peer VPC
+        in account {peer_account.name} is possible where security groups and route
+        tables permit, creating a cross-account lateral movement surface.
+
+  # --- Permission to create/accept peering (POTENTIAL exposure) ------------
+  - id: aws-vpc-peering-create-accept
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with ec2:CreateVpcPeeringConnection can initiate a VPC peering
+      to any VPC (including cross-account). Accepting requires ec2:AcceptVpcPeeringConnection
+      on the accepter side. This permission enables establishing new cross-VPC connectivity.
+    match:
+      - [ ?principal, HasPermission, ?vpc ]
+    where:
+      - "node_type(?vpc) == VirtualNetwork"
+      - >-
+        effective_permission(?principal, ?vpc) contains
+        'ec2:CreateVpcPeeringConnection' OR 'ec2:AcceptVpcPeeringConnection'
+    emit:
+      source_type: Identity
+      target_type: VirtualNetwork
+      source: ?principal
+      target: ?vpc
+      permissions:
+        - "ec2:CreateVpcPeeringConnection"
+        - "ec2:AcceptVpcPeeringConnection"
+      conditions: [iam_permission]
+      state_logic: >-
+        if effective permissions present AND NOT scp_denies: ACTIVE
+        elif scp_denies: BLOCKED
+        else: CONDITIONAL(iam_permission)
+      confidence: 0.85
+      derived_from:
+        - "HasPermission(?principal, ?vpc) [ec2:CreateVpcPeeringConnection | ec2:AcceptVpcPeeringConnection]"
+      false_positive_note: >-
+        ec2:CreateVpcPeeringConnection alone lets the principal REQUEST a peering; the
+        peer account must accept with ec2:AcceptVpcPeeringConnection on its side (or the
+        same principal must have accept rights in the target account). Without acceptance,
+        the peering is in 'pending-acceptance' state and creates no connectivity — downgrade
+        to POTENTIAL(network_reachability) if the principal cannot accept. Cross-account
+        acceptance requires the peer account's cooperation unless the principal also has
+        access to the peer account.
+      narrative: >-
+        {principal.name} can initiate or accept VPC peering connections for {vpc.name}
+        (ec2:CreateVpcPeeringConnection / ec2:AcceptVpcPeeringConnection), enabling
+        bidirectional network connectivity to be established between {vpc.name} and any
+        peer VPC, including those in other AWS accounts.
+
+  # =========================================================================
+  # (3) CONNECTIVITY PIVOTS — Transit Gateway
+  # =========================================================================
+
+  # NOTE: TGW VPC attachment -> RoutesTo structural facts are derived in
+  # /rules/derived/aws/tgw.yaml. Do not duplicate here.
+
+  # NOTE: Cross-account TGW attachment (RAM shared) -> CrossAccountTrust is derived in
+  # /rules/derived/aws/ram.yaml (aws-ram-shared-tgw-network-reach, aws-tgw-cross-account-enter).
+  # RAM.yaml is the canonical source for cross-account resource-share derivations.
+  # Do not re-derive here.
+
+  # --- Permission to create TGW attachment (requester role) ----------------
+  - id: aws-vpc-tgw-create-attachment
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with ec2:CreateTransitGatewayVpcAttachment can initiate a VPC
+      attachment request to a Transit Gateway, expanding the VPC's routing domain
+      to the TGW network (if the attachment is accepted).
+    match:
+      - [ ?principal, HasPermission, ?tgw ]
+    where:
+      - "node_type(?tgw) == TransitGateway"
+      - >-
+        effective_permission(?principal, ?tgw) contains
+        'ec2:CreateTransitGatewayVpcAttachment'
+    emit:
+      source_type: Identity
+      target_type: TransitGateway
+      source: ?principal
+      target: ?tgw
+      permissions:
+        - "ec2:CreateTransitGatewayVpcAttachment"
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        if effective ec2:CreateTransitGatewayVpcAttachment present AND NOT scp_denies
+        AND TGW AutoAcceptSharedAttachments is enabled: ACTIVE
+        elif permission present but auto-accept is disabled: CONDITIONAL(service_state)
+        elif scp_denies: BLOCKED
+        else: POTENTIAL(iam_permission)
+      confidence: 0.85
+      derived_from:
+        - "HasPermission(?principal, ?tgw) [ec2:CreateTransitGatewayVpcAttachment]"
+      false_positive_note: >-
+        Creating a TGW attachment requires the TGW to auto-accept attachments
+        (AutoAcceptSharedAttachments enabled) OR the TGW owner must accept via
+        ec2:AcceptTransitGatewayVpcAttachment. Without auto-accept, the attachment
+        remains in 'pending-acceptance' and creates no routing — downgrade to
+        CONDITIONAL(service_state) if auto-accept is disabled.
+      narrative: >-
+        {principal.name} can create a VPC attachment to Transit Gateway {tgw.name}
+        (ec2:CreateTransitGatewayVpcAttachment). The attachment reaches ACTIVE routing
+        only if the TGW has auto-accept enabled or the TGW owner accepts separately.
+
+  # --- Permission to accept TGW attachment (accepter role) -----------------
+  - id: aws-vpc-tgw-accept-attachment
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with ec2:AcceptTransitGatewayVpcAttachment can accept a pending
+      attachment request, transitioning the VPC connection to active routing status.
+    match:
+      - [ ?principal, HasPermission, ?tgw ]
+    where:
+      - "node_type(?tgw) == TransitGateway"
+      - >-
+        effective_permission(?principal, ?tgw) contains
+        'ec2:AcceptTransitGatewayVpcAttachment'
+    emit:
+      source_type: Identity
+      target_type: TransitGateway
+      source: ?principal
+      target: ?tgw
+      permissions:
+        - "ec2:AcceptTransitGatewayVpcAttachment"
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        if effective ec2:AcceptTransitGatewayVpcAttachment present AND NOT scp_denies
+        AND a pending-acceptance attachment exists: ACTIVE
+        elif permission present but no pending attachment: CONDITIONAL(service_state)
+        elif scp_denies: BLOCKED
+        else: POTENTIAL(iam_permission)
+      confidence: 0.85
+      derived_from:
+        - "HasPermission(?principal, ?tgw) [ec2:AcceptTransitGatewayVpcAttachment]"
+      false_positive_note: >-
+        ec2:AcceptTransitGatewayVpcAttachment is the TGW owner's permission to accept
+        an inbound attachment request. The source principal (TGW owner or delegate)
+        must hold this permission at the TGW scope and respond to a pending-acceptance
+        attachment. This models the accepter role in cross-account TGW sharing (RAM).
+      narrative: >-
+        {principal.name} can accept pending VPC attachment requests to Transit Gateway
+        {tgw.name} (ec2:AcceptTransitGatewayVpcAttachment), transitioning them from
+        pending-acceptance to active routing.
+
+  # =========================================================================
+  # (3) CONNECTIVITY PIVOTS — VPC Endpoints (PrivateLink)
+  # =========================================================================
+
+  # --- Interface VPC endpoint -> PrivateReachability -----------------------
+  - id: aws-vpc-endpoint-private-reach
+    emits: PrivateReachability
+    description: >-
+      An available Interface VPC Endpoint (PrivateLink) makes the backing AWS or
+      third-party service reachable from compute within the VPC via private networking,
+      without traversing the public internet. Source is any Compute node in the VPC
+      that has network access to the endpoint ENI.
+    match:
+      - [ ?endpoint, LocatedIn, ?vpc ]
+      - [ ?compute, LocatedIn, ?vpc ]
+    where:
+      - "node_type(?endpoint) == PrivateEndpoint"
+      - "node_type(?compute) in [VirtualMachine, ContainerService, ServerlessFunction, GenericCompute]"
+      - "?endpoint.VpcEndpointType == 'Interface'"
+      - "?endpoint.State == 'available'"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: ?compute
+      target: ?endpoint
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if endpoint state == 'available' AND DNS name resolves within VPC AND
+        endpoint SG allows inbound from ?compute SG/CIDR:
+          ACTIVE (private reach fact)
+        elif endpoint state == 'available' but SG reachability unverified:
+          CONDITIONAL(network_reachability)
+        elif endpoint state != 'available': do not emit
+      confidence: 0.90
+      derived_from:
+        - "LocatedIn(?endpoint, ?vpc)"
+        - "LocatedIn(?compute, ?vpc)"
+        - "endpoint_type == Interface, state == available"
+      false_positive_note: >-
+        PrivateReachability here means a compute resource co-located in the VPC can
+        reach the backing service via the private endpoint DNS name without internet
+        routing. The endpoint's security group controls which resources in the VPC can
+        connect to the endpoint ENI — if the endpoint SG only allows specific source SGs,
+        emit as CONDITIONAL(network_reachability) unless the compute's SG is confirmed
+        as a permitted source. The endpoint policy additionally restricts which IAM
+        principals and actions are permitted through the endpoint; a deny-all endpoint
+        policy blocks data-plane access despite network reachability (not modeled here —
+        endpoint policy is a separate HasPolicy edge). Target is the PrivateEndpoint node
+        itself; downstream rules (endpoint -> backing service) can chain from here.
+        Source class is Compute (PrivateEndpoint is not in PrivateReachability's
+        declared source set in edges.yaml — Compute is the correct schema-compliant type).
+      narrative: >-
+        {compute.name} can reach the backing service of interface endpoint {endpoint.name}
+        from within {vpc.name} via private networking — the endpoint provides a private
+        IP within the VPC's address space without internet routing.
+
+  # --- VPC endpoint cross-account service access (permissive policy) --------
+  - id: aws-vpc-endpoint-cross-account-trust
+    emits: CrossAccountTrust
+    description: >-
+      A VPC endpoint policy (gateway or interface) granting access to principals in
+      another AWS account enables cross-account access to the backing PaaS service
+      via the endpoint path. The endpoint policy resource is the trust artifact
+      (modeled as ResourcePolicy source).
+    match:
+      - [ ?endpoint, LocatedIn, ?vpc ]
+    where:
+      - "node_type(?endpoint) == PrivateEndpoint"
+      - "?endpoint.State == 'available'"
+      - >-
+        endpoint_policy_allows_cross_account(?endpoint,
+          principal_condition='aws:PrincipalAccount != this_account'
+          OR principal='*' without aws:PrincipalOrgID restriction)
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<endpoint policy node attached to ?endpoint>"
+      target: "<external account granted in the endpoint policy>"
+      permissions: []
+      conditions: [network_reachability, resource_policy]
+      state_logic: >-
+        if endpoint policy explicitly names a foreign account principal: ACTIVE
+        elif policy is Principal:'*' without org-scoping condition: CONDITIONAL(resource_policy)
+        else: do not emit
+      confidence: 0.85
+      derived_from:
+        - "LocatedIn(?endpoint, ?vpc)"
+        - "endpoint_policy cross-account principal"
+      false_positive_note: >-
+        Gateway endpoint policies (S3, DynamoDB) default to allowing all principals;
+        the effective restriction comes from the IAM policies of the callers AND the
+        bucket/table resource policy. An open gateway endpoint policy alone does not
+        mean a foreign account can access resources through it — the S3 bucket or
+        DynamoDB table resource policy must also allow the foreign principal. Downgrade
+        to CONDITIONAL(resource_policy) when the endpoint policy is open but downstream
+        resource policies are not verified. Interface endpoint policies are more commonly
+        restrictive — emit only when the policy explicitly grants foreign principals.
+      narrative: >-
+        VPC endpoint {endpoint.name} has a policy allowing principals from a different
+        AWS account to access the backing service — cross-account data-plane access is
+        possible through this endpoint for accounts granted in the endpoint policy.
+
+  # --- Open internet SG rule -> CanReachPort (derived from explicit SG record) -
+  - id: aws-vpc-sg-open-inbound-reachability
+    emits: CanReachPort
+    description: >-
+      A security group with an inbound allow rule allowing 0.0.0.0/0 (any source)
+      on a specific port grants network reachability to that port from the internet.
+      This is derived from explicit SG record collection and represents the
+      network-layer capability to reach a listening port on a protected compute node.
+    match:
+      - [ ?sg, AttachedTo, ?resource ]
+    where:
+      - "node_type(?sg) == SecurityGroup"
+      - "node_type(?resource) in [Compute, Network]"
+      - "sg_has_inbound_rule(?sg, cidr='0.0.0.0/0' OR cidr='::/0', port=?port, action='allow')"
+    emit:
+      source_type: Network
+      target_type: Compute
+      source: ?sg
+      target: ?resource
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if SG inbound rule exists allowing 0.0.0.0/0 on the port: ACTIVE (capability fact)
+        else: do not emit
+      confidence: 0.90
+      derived_from:
+        - "AttachedTo(?sg, ?resource)"
+        - "sg_has_inbound_rule(?sg, 0.0.0.0/0)"
+      false_positive_note: >-
+        CanReachPort is the NETWORK-LAYER reachability capability. It does NOT assert
+        that a service is actually listening or that end-to-end exploitability is
+        possible — only that the network path (SG rule) allows the traffic. Actual
+        exploitation depends on: (a) a listening service on the target port (service
+        enumeration), (b) a public IP on the resource, and (c) a route to IGW. The
+        network-chains linchpin will compose these facts into end-to-end CanNetworkReach.
+        Do not emit if the SG source is restricted to a named CIDR, VPC CIDR, or
+        another SG — only emit for 0.0.0.0/0 or ::/0 (truly unrestricted).
+      narrative: >-
+        Security group {sg.name} allows inbound traffic from 0.0.0.0/0 on port {port}
+        to {resource.name} — any host on the public internet can attempt to connect to
+        a service listening on that port on the resource.
+
+  # --- Interface endpoint available -> PrivateReachability (derived from endpoint state)
+  - id: aws-vpc-endpoint-private-reach-compute
+    emits: PrivateReachability
+    description: >-
+      An available Interface VPC Endpoint (PrivateLink) makes the backing AWS or
+      third-party service reachable from compute within the VPC via private networking,
+      without traversing the public internet. Derived from the endpoint state and
+      VPC co-location facts.
+    match:
+      - [ ?endpoint, LocatedIn, ?vpc ]
+      - [ ?compute, LocatedIn, ?vpc ]
+    where:
+      - "node_type(?endpoint) == PrivateEndpoint"
+      - "node_type(?compute) in [VirtualMachine, ContainerService, ServerlessFunction, GenericCompute]"
+      - "?endpoint.VpcEndpointType == 'Interface'"
+      - "?endpoint.State == 'available'"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: ?compute
+      target: ?endpoint
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if endpoint state == 'available' AND endpoint DNS resolves within the VPC
+        AND endpoint SG allows inbound from ?compute SG or CIDR: ACTIVE
+        elif endpoint state == 'available' but SG reachability unverified:
+          CONDITIONAL(network_reachability)
+        elif endpoint state != 'available': do not emit
+      confidence: 0.90
+      derived_from:
+        - "LocatedIn(?endpoint, ?vpc)"
+        - "LocatedIn(?compute, ?vpc)"
+        - "endpoint_state == available"
+      false_positive_note: >-
+        PrivateReachability is a NETWORK-LAYER capability; it means the compute can
+        reach the endpoint via private IP without internet routing. The endpoint's
+        security group controls which compute resources can connect to the endpoint ENI.
+        If the endpoint SG only allows specific source SGs, emit as CONDITIONAL(network_reachability)
+        unless the compute's SG is confirmed as a permitted source. The endpoint policy
+        additionally restricts which IAM principals and actions are permitted through
+        the endpoint; that is a separate HasPolicy edge (not network reachability).
+        Only emit when co-location in the VPC and endpoint availability are confirmed.
+      narrative: >-
+        Compute resource {compute.name} can reach the backing service of interface
+        endpoint {endpoint.name} from within {vpc.name} via private networking — the
+        endpoint provides a private IP address without internet routing.
+
+  # =========================================================================
+  # (2) CONTROL WEAKENING — Network ACL modification
+  # =========================================================================
+
+  # --- Modify NACL rules (allow/deny injection) -> CanModifyConfiguration ----
+  - id: aws-vpc-nacl-modify-config
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with ec2:CreateNetworkAclEntry, ec2:ReplaceNetworkAclEntry, or
+      ec2:ReplaceNetworkAclAssociation can modify Network ACL rules, changing the
+      firewall posture at the subnet level. This is a weaken-controls primitive
+      for stateless packet filtering, complementary to security groups.
+    match:
+      - [ ?principal, HasPermission, ?nacl_or_vpc ]
+    where:
+      - "node_type(?nacl_or_vpc) in [Firewall, VirtualNetwork]"
+      - >-
+        effective_permission(?principal, ?nacl_or_vpc) contains
+        'ec2:CreateNetworkAclEntry' OR 'ec2:ReplaceNetworkAclEntry'
+        OR 'ec2:ReplaceNetworkAclAssociation'
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: ?principal
+      target: ?nacl_or_vpc
+      permissions:
+        - "ec2:CreateNetworkAclEntry"
+        - "ec2:ReplaceNetworkAclEntry"
+        - "ec2:ReplaceNetworkAclAssociation"
+      conditions: [iam_permission]
+      state_logic: >-
+        if any of the NACL modification permissions are effective AND NOT scp_denies: ACTIVE
+        elif scp_denies: BLOCKED
+        else: CONDITIONAL(iam_permission)
+      confidence: 0.90
+      derived_from:
+        - "HasPermission(?principal, ?nacl_or_vpc) [NACL modification permissions]"
+      false_positive_note: >-
+        NACLs are stateless: they enforce rules in BOTH directions (inbound and outbound).
+        ec2:CreateNetworkAclEntry adds a new rule; ec2:ReplaceNetworkAclEntry modifies
+        an existing rule (commonly flipping a deny to allow or vice versa).
+        ec2:ReplaceNetworkAclAssociation swaps out the entire NACL for a subnet,
+        instantly affecting all resources in the subnet. This rule models the CAPABILITY
+        to weaken NACL controls — actual network exposure depends on the resulting rule
+        set and security group rules. SGs may still block traffic even if a permissive
+        NACL allow rule is added. Emit as CONDITIONAL(network_reachability) if NACL
+        modification is possible but downstream SG filtering is unknown.
+      narrative: >-
+        {principal.name} can create, replace, or modify Network ACL rules on {nacl_or_vpc.name}
+        (ec2:CreateNetworkAclEntry / ec2:ReplaceNetworkAclEntry / ec2:ReplaceNetworkAclAssociation),
+        potentially opening ingress/egress traffic at the subnet level for stateless
+        packet filtering and bypassing SG controls at scale.
+
+  # =========================================================================
+  # (2) CONTROL WEAKENING — VPC Endpoint Service permissions
+  # =========================================================================
+
+  # --- Modify VPC Endpoint Service permissions -> CanModifyConfiguration -----
+  - id: aws-vpc-endpoint-service-perm-modify
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with ec2:ModifyVpcEndpointServicePermissions can grant or revoke
+      access to a PrivateLink producer endpoint, controlling which principals (including
+      foreign accounts) can consume the service.
+    match:
+      - [ ?principal, HasPermission, ?endpoint ]
+    where:
+      - "node_type(?endpoint) == PrivateEndpoint"
+      - >-
+        effective_permission(?principal, ?endpoint) contains
+        'ec2:ModifyVpcEndpointServicePermissions'
+    emit:
+      source_type: Identity
+      target_type: PrivateEndpoint
+      source: ?principal
+      target: ?endpoint
+      permissions:
+        - "ec2:ModifyVpcEndpointServicePermissions"
+      conditions: [iam_permission]
+      state_logic: >-
+        if effective permission present AND NOT scp_denies: ACTIVE
+        elif scp_denies: BLOCKED
+        else: CONDITIONAL(iam_permission)
+      confidence: 0.85
+      derived_from:
+        - "HasPermission(?principal, ?endpoint) [ec2:ModifyVpcEndpointServicePermissions]"
+      false_positive_note: >-
+        ec2:ModifyVpcEndpointServicePermissions controls the principal allowlist for
+        a PrivateLink service. By default, services are not accessible to any principals.
+        Adding permissions grants access. The principal can add Principal:"*" (allow all)
+        or specific accounts/role ARNs. Cross-account exposure is created when a foreign
+        account principal is added to the allowlist. The impact depends on whether data
+        flows through the endpoint (network-layer) and whether downstream resource
+        policies (S3 bucket policy, DynamoDB policy) permit the external principal.
+      narrative: >-
+        {principal.name} can modify the access permissions for VPC Endpoint Service
+        {endpoint.name} (ec2:ModifyVpcEndpointServicePermissions), controlling which
+        principals (including those in other AWS accounts) can consume this PrivateLink
+        service endpoint.
+
+  # --- VPC Endpoint Service has cross-account permission -> ExposedToAccount ----
+  - id: aws-vpc-endpoint-service-cross-account
+    emits: ExposedToAccount
+    description: >-
+      A PrivateLink producer endpoint with an explicit permission granting access to
+      a foreign account principal is exposed to cross-account consumption. This is a
+      structural fact representing the intended cross-account data-plane exposure.
+    match:
+      - [ ?endpoint, LocatedIn, ?vpc ]
+    where:
+      - "node_type(?endpoint) == PrivateEndpoint"
+      - "?endpoint.VpcEndpointType == 'Interface'"
+      - "?endpoint.ServiceName == <producer service>"
+      - "endpoint_service_has_permission(?endpoint, principal_account != this_account)"
+    emit:
+      source_type: PrivateEndpoint
+      target_type: Account
+      source: ?endpoint
+      target: "<foreign account in the endpoint service permissions>"
+      permissions: []
+      conditions: [resource_policy, network_reachability]
+      state_logic: >-
+        if endpoint service permissions explicitly list a foreign account: ACTIVE
+        elif permissions list Principal:"*": CONDITIONAL(resource_policy) — depends on downstream resource policy
+        else: do not emit
+      confidence: 0.85
+      derived_from:
+        - "LocatedIn(?endpoint, ?vpc)"
+        - "endpoint_service_permissions include foreign account"
+      false_positive_note: >-
+        An endpoint service permission granting access to a foreign account exposes
+        the endpoint at the network layer (PrivateReachability from the foreign account).
+        Actual data-plane access depends on the resource policy of the backing service
+        (S3 bucket policy, DynamoDB table policy, etc.). If the backing resource policy
+        does NOT allow the foreign account principal, data access is blocked despite
+        network exposure. Emit only when both the endpoint permission AND resource
+        policy are confirmed to allow the foreign account.
+      narrative: >-
+        VPC Endpoint Service {endpoint.name} has explicitly granted access permissions
+        to principals in account {target.name} — cross-account consumers can reach the
+        service endpoint via PrivateLink networking.
+
+  # =========================================================================
+  # (4) DNS HIJACK — Route 53 record manipulation
+  # =========================================================================
+
+  # NOTE: DNS hijack rules are defined in /rules/derived/aws/route53.yaml (authoritative source)
+  # - aws-route53-change-records-hijack: CanModifyConfiguration(Identity -> DNS)
+  # - aws-route53-dangling-alias-takeover: ExposedToInternet(DNS -> AnonymousIdentity)
+  # Route53 rules comprehensively cover public zones, private zones, NS delegation,
+  # and registrar NS swaps. Do not duplicate them here.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying ec2:AuthorizeSecurityGroupIngress or ec2:ModifySecurityGroupRules
+#     -> set state: BLOCKED on aws-vpc-sg-authorize-ingress.
+#   - An SCP denying ec2:CreateVpcPeeringConnection / ec2:AcceptVpcPeeringConnection
+#     -> set state: BLOCKED on aws-vpc-peering-create-accept.
+#   - An SCP denying ec2:CreateTransitGatewayVpcAttachment / ec2:AcceptTransitGatewayVpcAttachment
+#     -> set state: BLOCKED on aws-vpc-tgw-create-attachment / aws-vpc-tgw-accept-attachment.
+#   - An SCP denying ec2:CreateNetworkAclEntry / ec2:ReplaceNetworkAclEntry / ec2:ReplaceNetworkAclAssociation
+#     -> set state: BLOCKED on aws-vpc-nacl-modify-config.
+#   - An SCP denying ec2:ModifyVpcEndpointServicePermissions
+#     -> set state: BLOCKED on aws-vpc-endpoint-service-perm-modify.
+#   - A permission boundary capping the above actions at the principal level
+#     -> BLOCKED on affected rule.
+#
+# LINCHPIN NOTE — transitive network reachability:
+#   End-to-end CanNetworkReach (SG-open + IGW route + peering + TGW composing
+#   into reachability between two compute nodes) is the provider-agnostic
+#   network-chains linchpin. DO NOT implement it here. This file emits only:
+#     - CanModifyConfiguration on control resources (SG, Route, DNS, TGW)
+#     - ExposedToInternet on compute nodes where all three exposure facts are observed
+#     - PeeredWith / RoutesTo / PrivateReachability / CrossAccountTrust as structural
+#       connectivity facts
+#   The network-chains file will compose these facts into CanNetworkReach / CanReachPort
+#   attack paths. See /rules/derived/RULE-FORMAT.md for the CONDITIONAL(network_reachability)
+#   state model applied throughout this file.
+#
+# Cross-references (cited, not duplicated):
+#   /rules/derived/can-control.yaml     — Controls / CanEscalateTo roll-ups
+#   /rules/derived/aws/ec2.yaml         — EC2 instance execution / IMDS credential exposure
+#   /rules/derived/aws/s3.yaml          — S3 bucket policies + gateway endpoint interaction
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/aws-vpc.yaml (AttachedTo for SG/ENI, PeeredWith, RoutesTo
+# structural facts). CanReachPort and PrivateReachability are now derived rules
+# (aws-vpc-sg-open-inbound-reachability, aws-vpc-endpoint-private-reach-compute)
+# that compose explicit facts. Additional explicit records recommended:
+explicit_rules:
+
+  - id: aws-vpc-sg-attached
+    emits: AttachedTo
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::EC2::NetworkInterface"
+      field: "Groups[].GroupId"
+    emit:
+      source_type: NetworkInterface
+      source: "<NetworkInterface node for the ENI>"
+      target: "<VirtualMachine or ContainerService node owning the ENI>"
+      api_source: "ec2:DescribeNetworkInterfaces"
+      evidence_field: "Groups[].GroupId"
+      note: >-
+        AttachedTo source must be NetworkInterface per edges.yaml (NetworkInterface ->
+        Compute/VirtualNetwork). The association between the SecurityGroup and the
+        NetworkInterface is captured as a property on the NetworkInterface node
+        (Groups field) rather than a separate edge, consistent with the schema.
+      narrative: "Network interface {eni.name} (with security group {sg.name}) is attached to {resource.name}."
+
+  - id: aws-vpc-peering-active
+    emits: PeeredWith
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::EC2::VPCPeeringConnection"
+      field: "Status.Code"
+      value: "active"
+    emit:
+      source_type: VirtualNetwork
+      source: "<VPC node for RequesterVpcInfo.VpcId>"
+      target: "<VPC node for AccepterVpcInfo.VpcId>"
+      api_source: "ec2:DescribeVpcPeeringConnections"
+      evidence_field: "Status.Code"
+      narrative: "{vpc_a.name} is peered with {vpc_b.name} (active peering connection {peering_id})."
+
+  - id: aws-vpc-route-table-entry
+    emits: RoutesTo
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::EC2::RouteTable"
+      field: "Routes[].DestinationCidrBlock"
+    emit:
+      source_type: Route
+      source: "<RouteTable node>"
+      target: "<Subnet or VirtualNetwork node for DestinationCidrBlock>"
+      api_source: "ec2:DescribeRouteTables"
+      evidence_field: "Routes[].GatewayId | Routes[].TransitGatewayId | Routes[].VpcPeeringConnectionId"
+      narrative: "Route table {rt.name} routes {cidr} via {gateway}."
+

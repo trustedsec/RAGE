@@ -1,0 +1,198 @@
+# AWS Direct Connect — Explicit normalization rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# These rules normalize collector raw data into structural routing FACTS.
+# RoutesTo edges are declared nature: explicit in schema/edges.yaml and must
+# be emitted by rules in /rules/explicit/ only.
+#
+# NODE CLASS CONFORMANCE (schema/nodes.yaml + schema/edges.yaml):
+#   VirtualInterface -> Route (Network class)
+#   DirectConnectGateway -> TransitGateway (Network class)
+#   VGW (AWS::EC2::VPNGateway) -> VPN (Network class)
+#   TransitGateway (AWS::EC2::TransitGateway) -> TransitGateway (Network class)
+#   RoutesTo: source [Route, Subnet, TransitGateway], target [Network, Subnet]  ✓
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 8-networking
+applies_to: [aws]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1. VIF routes on-prem traffic into a VGW or DXGW
+  # ---------------------------------------------------------------------------
+  # A Direct Connect Virtual Interface in AVAILABLE state with type 'private'
+  # (attached to a VGW) or 'transit' (attached to a DXGW) creates a routed path
+  # from the on-premises network into AWS-private address space. This is a
+  # STRUCTURAL RoutesTo FACT normalized from DescribeVirtualInterfaces raw data.
+  - id: aws-directconnect-vif-routes-to-gateway
+    emits: RoutesTo
+    description: >-
+      A private or transit Direct Connect Virtual Interface in AVAILABLE state
+      routes the on-premises network into the attached VGW or DXGW, establishing
+      a non-internet routed path from on-prem into AWS private address space.
+    applies_to: [aws]
+    match:
+      - [ ?vif, AttachedTo, ?gateway ]
+    where:
+      - "node_type(?vif) == Route"
+      - "?vif.provider_type == 'AWS::DirectConnect::VirtualInterface'"
+      - "?vif.properties.virtualInterfaceType in ['private', 'transit']"
+      - "?vif.properties.virtualInterfaceState == 'available'"
+      - "node_type(?gateway) in [TransitGateway, VirtualNetwork]"
+      - "?gateway.provider_type in ['AWS::DirectConnect::DirectConnectGateway', 'AWS::EC2::VPNGateway', 'AWS::EC2::TransitGateway']"
+    emit:
+      source_type: Route
+      target_type: Network  # ?gateway is a VGW/DXGW/TGW (all Network-class); was an unresolved template placeholder
+      source: ?vif
+      target: ?gateway
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): the routing FACT exists when the VIF is
+        in AVAILABLE state and attached to the gateway (VGW or DXGW). Whether a
+        specific workload in the target VPC is actually reachable from on-prem
+        additionally requires (a) route propagation to subnets, (b) security group
+        rules, and (c) NACLs — these are evaluated by the network-chains linchpin.
+        Downgrade to UNKNOWN if VIF state cannot be confirmed from collected data.
+        Do NOT emit for public VIFs (virtualInterfaceType == 'public').
+      confidence: 0.9
+      derived_from:
+        - "DescribeVirtualInterfaces.virtualGatewayId or directConnectGatewayId"
+      false_positive_note: >-
+        (1) AVAILABLE-state gate: only VIFs with virtualInterfaceState == 'available'
+        provide active routing. Pending, confirming, deleting, or deleted VIFs do NOT
+        — do not emit for those states.
+        (2) Public VIF exclusion: a VIF of type 'public' routes to AWS public IP ranges,
+        not into a VPC — there is no lateral-movement path to private compute resources.
+        Do NOT emit RoutesTo for public VIFs.
+        (3) Hosted connections: on hosted DX (provisioned by an AWS partner), the
+        physical connection is in the partner account; only the VIF is visible to the
+        customer. The RoutesTo fact is still valid from the customer's graph perspective.
+        (4) Route propagation: even with a valid VIF→VGW RoutesTo, subnets only receive
+        the on-prem routes if VGW route propagation is enabled on the route table. This
+        onward reachability is handled by the network-chains linchpin — not here.
+        (5) DXGW transit VIFs: emit VIF→DXGW only; the DXGW→TGW RoutesTo is a
+        separate fact from DescribeDirectConnectGatewayAssociations.
+      narrative: >-
+        The Direct Connect Virtual Interface {vif.name} (type: {vif.properties.virtualInterfaceType},
+        state: available) routes the on-premises network ({vif.properties.amazonSideAsn}) into
+        {gateway.name}. Any system on the on-premises network that can route to the VIF's
+        peering addresses has a non-internet path into this AWS gateway and, transitively,
+        into the attached VPC(s) — subject to route propagation, security groups, and NACLs.
+
+  # ---------------------------------------------------------------------------
+  # 2. DXGW routes traffic to associated TransitGateway
+  # ---------------------------------------------------------------------------
+  # A Direct Connect Gateway with an ASSOCIATED gateway association propagates
+  # routes to the target TransitGateway, enabling traffic from on-prem (via a
+  # transit VIF) to reach the TGW's connected VPCs. This is the second structural
+  # RoutesTo hop in the on-prem → VIF → DXGW → TGW path.
+  - id: aws-directconnect-dxgw-routes-to-tgw
+    emits: RoutesTo
+    description: >-
+      A Direct Connect Gateway with an accepted association to a TransitGateway
+      routes on-premises traffic to the TGW and its attached VPCs.
+    applies_to: [aws]
+    match:
+      - [ ?dxgw ]
+    where:
+      - "node_type(?dxgw) == TransitGateway"
+      - "?dxgw.provider_type == 'AWS::DirectConnect::DirectConnectGateway'"
+      - "node_type(?tgw) == TransitGateway"
+      - "?tgw.provider_type == 'AWS::EC2::TransitGateway'"
+      - "?dxgw.properties.directConnectGatewayAssociations[?associationState == 'associated'].associatedGateway.id == ?tgw.native_id"
+    emit:
+      source_type: TransitGateway
+      target_type: TransitGateway
+      source: ?dxgw
+      target: ?tgw
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): the DXGW→TGW routing FACT exists when
+        the gateway association is in state 'associated'. Route propagation on the
+        TGW's route tables determines which VPCs are reachable onward.
+      confidence: 0.9
+      derived_from:
+        - "DescribeDirectConnectGatewayAssociations.associationState == 'associated'"
+      false_positive_note: >-
+        (1) Association state gate: only emit when associationState == 'associated'.
+        Associations in 'pending', 'disassociating', or 'disassociated' state do not
+        route traffic.
+        (2) Cross-account associations: if the target TGW is in a different account,
+        a separate CrossAccountTrust edge is emitted (see aws-directconnect-dxgw-cross-account-trust).
+      narrative: >-
+        The Direct Connect Gateway {dxgw.name} has an accepted association to
+        Transit Gateway {tgw.name}, enabling traffic from the on-premises network
+        (via a transit VIF) to reach the TGW's route tables and attached VPCs.
+
+  # ---------------------------------------------------------------------------
+  # 3. Cross-account DXGW association establishes network-layer trust
+  # ---------------------------------------------------------------------------
+  # When a Direct Connect Gateway-to-TransitGateway association spans account
+  # boundaries, the DXGW owner's on-prem network gains a routed path into the
+  # accepting account's VPCs. This is a high-value cross-boundary trust
+  # relationship modeled as CrossAccountTrust (even though the source is a
+  # network-layer resource, not an identity/policy).
+  #
+  # NOTE: CrossAccountTrust in edges.yaml currently restricts source to
+  # [Account, Role, ResourcePolicy, Data, Snapshot, DataLake]. TransitGateway
+  # (DirectConnectGateway's generic_type) is not in this set. This rule should
+  # trigger an enhancement to edges.yaml CrossAccountTrust source list to
+  # include TransitGateway, OR we emit a specialized edge type (e.g.,
+  # NetworkCrossBoundaryTrust). For now, we emit as CrossAccountTrust and flag
+  # for schema review.
+  - id: aws-directconnect-dxgw-cross-account-trust
+    emits: CrossAccountTrust
+    description: >-
+      A Direct Connect Gateway-to-TransitGateway association spanning account
+      boundaries establishes network-layer trust (on-prem has routed path into
+      remote account's VPCs).
+    applies_to: [aws]
+    match:
+      - [ ?dxgw ]
+    where:
+      - "node_type(?dxgw) == TransitGateway"
+      - "?dxgw.provider_type == 'AWS::DirectConnect::DirectConnectGateway'"
+      - "exists(?dxgw.properties.directConnectGatewayAssociations[?associationState == 'associated' AND associatedGateway.ownerAccount != ?dxgw.account])"
+    emit:
+      # CrossAccountTrust is an account<->account boundary edge (cf. azure-vnet-cross-sub-peering,
+      # whose source is the owner Subscription/Account, not the VNet device). The trust source is
+      # therefore the AWS Account that owns the DXGW, not the DXGW node itself.
+      source_type: Account
+      target_type: Account
+      source: "<AWS Account owning ?dxgw (?dxgw.account)>"
+      target: "extract_account_from_cross_assoc(?dxgw)"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): the cross-account trust exists when
+        the DXGW has at least one association in state 'associated' with a TGW
+        in a different account.
+      confidence: 0.9
+      derived_from:
+        - "DescribeDirectConnectGatewayAssociations[].associationState == 'associated' AND associatedGateway.ownerAccount != directConnectGatewayOwnerAccount"
+      false_positive_note: >-
+        (1) This edge models network-layer trust, not IAM trust. The target is the
+        AWS Account (boundary), not an Identity. The threat model is network-level
+        lateral movement, not IAM escalation.
+        (2) Even with this trust edge, the attacker-controlled on-prem endpoint must
+        still exploit a vulnerable service in the target account's VPCs to pivot.
+        (3) Multiple cross-account associations: if a DXGW has multiple associated
+        TGWs in different accounts, a separate CrossAccountTrust edge is emitted
+        for each target account.
+      narrative: >-
+        The Direct Connect Gateway {dxgw.name} (in account {dxgw.account}) has an
+        accepted association to a Transit Gateway in a different AWS account,
+        establishing a routed path from the on-premises network into that account's
+        VPCs. This is a network-layer cross-account trust relationship.
+
+# ---------------------------------------------------------------------------
+# NOTE ON SCHEMA ALIGNMENT:
+#   CrossAccountTrust source must be extended to include TransitGateway (or a
+#   new edge type NetworkCrossBoundaryTrust must be added) to correctly model
+#   DXGW cross-account associations. The DescribeDirectConnectGatewayAssociations
+#   API provides the ownerAccount field needed to detect these edges. See
+#   /schema/edges.yaml CrossAccountTrust definition for current constraints.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,430 @@
+# GCP Container Registry (GCR) — Derived attack-path rules (Phase 7 — containers & k8s)
+# ---------------------------------------------------------------------------
+# GCR (gcr.io / *.gcr.io) is a LEGACY container registry backed by a GCS bucket
+# named `artifacts.<PROJECT>.appspot.com`. There is no dedicated GCR IAM
+# resource type; all access control is enforced by GCS IAM on that bucket.
+# Push/pull = storage.objects.create / storage.objects.get on the artifacts bucket.
+#
+# ATTACK-SURFACE SUMMARY:
+#   storage.objects.create  on artifacts bucket  = push image = code control
+#     -> CanModifyCode(principal -> ContainerRegistry)
+#     -> container-chains image-push-poisons-consumers fans out to every consumer
+#        with a mutable-tag reference
+#     -> container-chains poisoned-image-executes-as yields CanExecuteAs(principal
+#        -> workload_SA) for each consumer
+#     -> can-control escalate-via-execute-as rolls up to CanEscalateTo
+#
+#   storage.buckets.setIamPolicy on artifacts bucket = rewrite registry ACL
+#     -> CanModifyPolicy(principal -> ResourcePolicy[artifacts-bucket])
+#     -> can grant cross-project push (supply-chain backdoor) or public pull
+#
+#   allUsers objectViewer on artifacts bucket = public pull
+#     -> ExposedToInternet(ContainerRegistry -> AnonymousIdentity)
+#
+#   Cross-project principal with objectCreator on artifacts bucket
+#     -> CrossProjectTrust(ResourcePolicy -> ExternalIdentity)
+#     -> hierarchy-chains / can-control produce CanEnterProject
+#
+# LINCHPINS CITED (DO NOT DUPLICATE):
+#   container-chains.yaml  rules: image-push-poisons-consumers, poisoned-image-executes-as
+#     — consume CanModifyCode(registry) + ContainsResourceReference(consumer->registry)
+#       + ExecutesAs(consumer->SA) and produce the CanExecuteAs fan-out.
+#   can-control.yaml       rule: escalate-via-execute-as
+#     — rolls up CanExecuteAs to CanEscalateTo when the SA is more privileged.
+#   gcp/identity-escalation.yaml  rule: gcp-set-iam-policy-resource
+#     — rolls up storage.buckets.setIamPolicy to CanModifyPolicy.
+#   hierarchy-chains.yaml  rule: enter-project-via-cross-project-trust
+#     — consumes CrossProjectTrust to produce CanEnterProject.
+#
+# FACT RULES (this file) vs LINCHPIN ROLL-UPS (cited files):
+#   This file emits NORMALIZED FACTS (CanModifyCode, CanModifyPolicy,
+#   ExposedToInternet, CrossProjectTrust, CanRead). The linchpins convert
+#   those facts into traversable escalation paths. Service-specific execution
+#   consequences (CanExecuteAs, CanEscalateTo, CanEnterProject) are NOT
+#   re-derived here.
+#
+# ARTIFACT-REGISTRY MIGRATION NOTE:
+#   Newly created GCP projects (2023+) route gcr.io requests to Artifact
+#   Registry. On migrated projects, push permission is expressed as
+#   artifactregistry.repositories.uploadArtifacts (covered by gcp:artifact-registry
+#   rules), NOT storage.objects.create. The collection adapter MUST detect which
+#   backend is active. These rules apply only when the legacy GCS-backed artifacts
+#   bucket is the active backend for the project's gcr.io endpoint.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 7-containers-k8s
+applies_to: [gcp]
+service: gcr
+docs: https://cloud.google.com/container-registry/docs
+
+rules:
+
+  # --- Push access = code control over the registry ---------------------------
+  # storage.objects.create on the artifacts.PROJECT.appspot.com bucket = push or
+  # overwrite any image/tag in the GCR registry. Overwriting a mutable tag (e.g.
+  # :latest) does NOT require storage.objects.delete; a GCS PUT of the manifest
+  # object with the same name replaces it. This is the primary supply-chain
+  # primitive: one write fans out to N consuming workloads via container-chains.
+  - id: gcp-gcr-push-can-modify-code
+    emits: CanModifyCode
+    description: "storage.objects.create on the GCR artifacts bucket = push/overwrite a container image — code control over the registry and supply-chain poisoning of every consumer that pulls a mutable tag."
+    match_effective_permission:
+      action: "storage.objects.create"
+      resource_type: "storage.googleapis.com/Bucket"
+    where:
+      - "resource.name matches 'artifacts.<PROJECT>.appspot.com' (the GCR artifacts backing bucket, not an arbitrary GCS bucket)"
+      - "The GCR endpoint (gcr.io/PROJECT) is GCS-backed (legacy GCR active, not yet migrated to Artifact Registry backend). Detect by checking artifacts bucket existence and non-empty state, or absence of an Artifact Registry gcr.io-mirror repo."
+    emit:
+      source_type: Identity
+      target_type: ContainerRegistry
+      source: "<principal with effective storage.objects.create on the artifacts bucket>"
+      target: "<ContainerRegistry node for gcr.io/PROJECT>"
+      permissions:
+        - "storage.objects.create"
+      conditions: [api_enabled]
+      state_logic: >-
+        ACTIVE when the principal holds effective storage.objects.create on
+        artifacts.PROJECT.appspot.com (via bucket-level IAM, project-level role
+        binding, or org-level inheritance) AND the gcr.io endpoint is GCS-backed
+        (legacy GCR active). CONDITIONAL(api_enabled) when the Container Registry
+        API is not confirmed enabled (gcr.io endpoint may not be initialised).
+        BLOCKED when a GCS IAM deny policy or VPC Service Controls perimeter denies
+        storage.objects.create to the principal for this bucket.
+      confidence: 0.95
+      derived_from:
+        - "effective storage.objects.create on artifacts.<PROJECT>.appspot.com (from storage.buckets.getIamPolicy + resourcemanager.projects.getIamPolicy + role expansion)"
+      false_positive_note: >-
+        (1) On projects that have migrated gcr.io to Artifact Registry backend, this
+        rule MUST NOT fire; storage.objects.create on the legacy bucket in those
+        projects does not yield push capability on the active gcr.io endpoint — the
+        push goes through Artifact Registry (artifactregistry.repositories.uploadArtifacts).
+        The collection adapter must check which backend is active.
+        (2) storage.objects.create scoped at PROJECT level (not bucket level) grants
+        write to ALL GCS buckets in the project, not just the artifacts bucket. Scope
+        the CanModifyCode to the ContainerRegistry node (artifacts bucket), not all
+        buckets. The linchpin (container-chains image-push-poisons-consumers) fans out
+        only to consumers of this registry.
+        (3) The supply-chain reach is CONDITIONAL(image_pulled) for each consumer: only
+        workloads referencing MUTABLE tags (:latest, moving tags, no @sha256 digest pin)
+        are poisoned on next pull/redeploy. Digest-pinned consumers are NOT poisoned —
+        container-chains enforces this gate; do not override it here.
+        (4) Overwriting a tag requires storage.objects.create but NOT storage.objects.delete
+        (GCS PUT semantics). A principal with only storage.objects.get or
+        storage.objects.list cannot push; only storage.objects.create is the push gate.
+      narrative: >-
+        {principal.name} can push or overwrite container images in the GCR registry
+        for project {project.name} (storage.objects.create on
+        artifacts.{project.name}.appspot.com). Overwriting a mutable image tag injects
+        attacker code into every workload (GKE pod, Cloud Run service, Cloud Build step,
+        or GCE container-mode instance) that pulls that tag — a supply-chain attack with
+        a blast radius equal to all consumers of mutable tags in this registry.
+        container-chains produces the CanExecuteAs edges to each consumer's runtime
+        service account.
+
+  # --- Bucket IAM rewrite = registry policy control --------------------------
+  # storage.buckets.setIamPolicy on the artifacts bucket lets the principal
+  # rewrite the entire registry access policy: grant push to external attackers,
+  # grant pull to allUsers, or revoke legitimate access. This is the registry-
+  # level CanModifyPolicy fact; gcp-set-iam-policy-resource (identity-escalation)
+  # produces CanModifyPolicy for all *.setIamPolicy — we emit separately here
+  # for GCR-specific context and to ensure the target is the ContainerRegistry
+  # ResourcePolicy node (not a generic project resource).
+  - id: gcp-gcr-policy-set
+    emits: CanModifyPolicy
+    description: "storage.buckets.setIamPolicy on the GCR artifacts bucket = rewrite the registry IAM policy, enabling cross-project push grants, public pull, or access revocation."
+    match_effective_permission:
+      action: "storage.buckets.setIamPolicy"
+      resource_type: "storage.googleapis.com/Bucket"
+    where:
+      - "resource.name matches 'artifacts.<PROJECT>.appspot.com' (the GCR artifacts backing bucket, not an arbitrary GCS bucket)"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: "<principal with effective storage.buckets.setIamPolicy on the artifacts bucket>"
+      target: "<ResourcePolicy node for the artifacts.PROJECT.appspot.com bucket IAM policy>"
+      permissions:
+        - "storage.buckets.setIamPolicy"
+      conditions:
+        - scp_or_org_policy
+      state_logic: >-
+        ACTIVE when the principal holds effective storage.buckets.setIamPolicy on
+        artifacts.PROJECT.appspot.com. BLOCKED when a GCS IAM deny policy or
+        org policy (constraints/iam.allowedPolicyMemberDomains) prevents the
+        rewrite. CONDITIONAL(scp_or_org_policy) when org policy constraints limit
+        which members can be granted roles on GCS resources in this project.
+      confidence: 0.95
+      derived_from:
+        - "effective storage.buckets.setIamPolicy on artifacts.<PROJECT>.appspot.com"
+      false_positive_note: >-
+        storage.buckets.setIamPolicy at project level (roles/storage.admin at project)
+        applies to ALL GCS buckets, not just the artifacts bucket. Scope the target of
+        this CanModifyPolicy to the artifacts bucket's ResourcePolicy node only.
+        Org policy constraints/iam.allowedPolicyMemberDomains can restrict the ability
+        to add external members even with setIamPolicy — emit CONDITIONAL(scp_or_org_policy)
+        when such a constraint is in effect. gcp/identity-escalation gcp-set-iam-policy-resource
+        also fires for this permission; deduplicate on (CanModifyPolicy, principal,
+        artifacts-bucket-policy) — emit once.
+      narrative: >-
+        {principal.name} can set the IAM policy of the GCR artifacts bucket
+        artifacts.{project.name}.appspot.com (storage.buckets.setIamPolicy). This
+        allows granting push access to an external attacker (supply-chain backdoor),
+        making images publicly pullable (credential exfil), or revoking access to
+        disrupt workloads. The policy change takes effect immediately.
+
+  # --- Public read access = images exposed to the internet -------------------
+  # If the artifacts bucket ACL grants allUsers storage.objects.get (or
+  # roles/storage.objectViewer which includes it), any internet user can pull
+  # images from this registry without authenticating. This is a misconfiguration
+  # that exposes image layers — which may contain embedded secrets — to the world.
+  - id: gcp-gcr-public-pull
+    emits: ExposedToInternet
+    description: "artifacts bucket ACL grants allUsers storage.objects.get — GCR registry is publicly pullable without authentication, exposing embedded secrets and proprietary code."
+    match_effective_permission:
+      action: "storage.objects.get"
+      resource_type: "storage.googleapis.com/Bucket"
+    where:
+      - "resource.name matches 'artifacts.<PROJECT>.appspot.com' (the GCR artifacts backing bucket, not an arbitrary GCS bucket)"
+      - "binding.member in ['allUsers', 'allAuthenticatedUsers'] (the effective permission storage.objects.get is granted to public principals on the artifacts bucket via a binding in the bucket IAM policy)"
+    emit:
+      source_type: ContainerRegistry
+      target_type: AnonymousIdentity
+      source: "<ContainerRegistry node for gcr.io/PROJECT>"
+      target: "<AnonymousIdentity>"
+      permissions:
+        - "storage.objects.get"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the bucket IAM grants allUsers storage.objects.get (any internet
+        user can pull). CONDITIONAL(resource_policy) when only allAuthenticatedUsers
+        (any Google-authenticated user worldwide) have pull — a real misconfiguration
+        but not anonymous public; emit with confidence: 0.8 and note the member scope.
+        BLOCKED when Uniform Bucket-Level Access is enabled AND org policy
+        constraints/storage.publicAccessPrevention is enforced at the bucket or project
+        — GCS rejects public ACLs in that configuration.
+      confidence: 0.9
+      derived_from:
+        - "allUsers or allAuthenticatedUsers storage.objects.get on artifacts.<PROJECT>.appspot.com (from storage.buckets.getIamPolicy)"
+      false_positive_note: >-
+        allUsers vs allAuthenticatedUsers is a material distinction: allUsers = truly
+        anonymous pull (confidence 0.9); allAuthenticatedUsers = any Google account
+        worldwide (confidence 0.8, note in analyst narrative). Neither equals project/org
+        members only. constraints/storage.publicAccessPrevention at bucket or project
+        level blocks this ACL from being set — if the constraint is enforced, this rule
+        should not fire (the bucket cannot have public ACLs). Verify the constraint
+        status before emitting ACTIVE.
+      narrative: >-
+        The GCR registry for project {project.name} is publicly pullable: the artifacts
+        bucket grants {allUsers|allAuthenticatedUsers} storage.objects.get. Any internet
+        user can pull container images and inspect their layers for embedded credentials,
+        secrets, configuration, or proprietary code — no project credentials required.
+
+  # --- Cross-project principal with push access = supply-chain trust ----------
+  # When the artifacts bucket IAM policy contains a binding for a principal whose
+  # home project is different from the registry's project (a cross-project SA or
+  # group), that principal can inject images from outside the project boundary.
+  # This is a CrossProjectTrust fact; hierarchy-chains rolls it up to CanEnterProject.
+  - id: gcp-gcr-cross-project-push
+    emits: CrossProjectTrust
+    description: "GCR artifacts bucket grants storage.objects.create to a principal from another project — cross-project supply-chain trust allows external actors to inject images into this project's registry."
+    match_effective_permission:
+      action: "storage.objects.create"
+      resource_type: "storage.googleapis.com/Bucket"
+    where:
+      - "resource.name matches 'artifacts.<PROJECT>.appspot.com' (the GCR artifacts backing bucket, not an arbitrary GCS bucket)"
+      - "principal.project_id != PROJECT (the external principal belongs to a different GCP project, e.g., a cross-project SA: X@OTHER-PROJECT.iam.gserviceaccount.com)"
+      - "The effective permission includes storage.objects.create on the artifacts bucket."
+    emit:
+      source_type: ResourcePolicy
+      target_type: ExternalIdentity
+      source: "<ResourcePolicy node for the artifacts.PROJECT.appspot.com bucket IAM>"
+      target: "<ExternalIdentity node for the cross-project principal>"
+      permissions:
+        - "storage.objects.create"
+      conditions:
+        - resource_policy
+      state_logic: >-
+        ACTIVE when the cross-project principal has effective storage.objects.create
+        on the artifacts bucket (binding confirmed in bucket IAM policy) AND the
+        external project is collected (the principal is a real SA, not a deleted member).
+        CONDITIONAL(resource_policy) when the binding exists but the external principal's
+        liveness or project status is unconfirmed. BLOCKED when org policy
+        constraints/iam.allowedPolicyMemberDomains restricts the bucket IAM to
+        project/org members only (the binding is org-policy-denied, not effective).
+      confidence: 0.90
+      derived_from:
+        - "cross-project member with storage.objects.create in artifacts.<PROJECT>.appspot.com bucket IAM"
+      false_positive_note: >-
+        Verify the external principal is live (the service account exists in the other
+        project, not a dangling reference to a deleted SA — a deleted SA with retained
+        IAM binding is a confused-deputy risk, not an active trust). Cross-organization
+        principals (from a different org) are higher severity than same-org, cross-project
+        ones. Hierarchy-chains enter-project-via-cross-project-trust rolls this up to
+        CanEnterProject for the consuming project; do not re-derive that here.
+      narrative: >-
+        The GCR artifacts bucket for project {project.name} grants storage.objects.create
+        to {external_principal.name} from another project ({external_project}). This
+        external principal can push or overwrite images in this registry, injecting code
+        into workloads that pull mutable tags — a cross-project supply-chain trust that
+        extends the attack surface to the external project.
+
+  # --- Pull access (read layers) = image exfil / embedded credential recon ----
+  # storage.objects.get on the artifacts bucket = pull image layers. For attackers,
+  # this enables reconnaissance of image contents (embedded secrets, config, code)
+  # without push capability. High value when images contain baked-in credentials.
+  # Emitted as CanRead (not CanModifyCode) — pull alone is not a code injection path.
+  - id: gcp-gcr-read-layers
+    emits: CanRead
+    description: "storage.objects.get on the GCR artifacts bucket = pull container image layers for inspection (embedded credential exfil / code recon) without push capability."
+    match_effective_permission:
+      action: "storage.objects.get"
+      resource_type: "storage.googleapis.com/Bucket"
+    where:
+      - "resource.name matches 'artifacts.<PROJECT>.appspot.com' (the GCR artifacts backing bucket, not an arbitrary GCS bucket)"
+      - "The principal has effective storage.objects.get but NOT storage.objects.create on the artifacts bucket (pure pull, not push)."
+      - "The GCR endpoint is GCS-backed (legacy GCR active)."
+    emit:
+      source_type: Identity
+      target_type: ContainerRegistry
+      source: "<principal with effective storage.objects.get on the artifacts bucket>"
+      target: "<ContainerRegistry node for gcr.io/PROJECT>"
+      permissions:
+        - "storage.objects.get"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal holds effective storage.objects.get on
+        artifacts.PROJECT.appspot.com. BLOCKED when VPC Service Controls denies
+        storage.googleapis.com access for the principal from outside the perimeter.
+      confidence: 0.85
+      derived_from:
+        - "effective storage.objects.get on artifacts.<PROJECT>.appspot.com"
+      false_positive_note: >-
+        Pull access (storage.objects.get) is not a code injection primitive; it enables
+        image layer inspection, which is relevant when images contain embedded secrets
+        (leading to a CanReadSecret / ExposesCredential path if confirmed by layer
+        scanning). Do not conflate storage.objects.get with storage.objects.create:
+        pull-only principals cannot push/overwrite images. The Compute Engine default SA
+        and most GCE/GKE workloads have this permission by default — this rule produces
+        a large number of CanRead edges in a typical project; filter by
+        is_external=true or high_value=true for path-finding relevance.
+      narrative: >-
+        {principal.name} can pull container images from the GCR registry for project
+        {project.name} (storage.objects.get on artifacts.{project.name}.appspot.com),
+        enabling inspection of image layers for embedded credentials, configuration,
+        or proprietary code. This is a read-only capability; it does not permit
+        image push or supply-chain poisoning.
+
+  # --- GCR push event → Cloud Build trigger (CI/CD supply-chain primitive) ----
+  # When a GCR push occurs, GCP emits an event to the project's default gcr Pub/Sub
+  # topic (gcr). Cloud Build can subscribe to this topic via a Cloud Build trigger.
+  # A principal with storage.objects.create (push capability) thus indirectly triggers
+  # any Cloud Build job subscribed to gcr topic events. If the build executes as a
+  # Cloud Build service account (the default), the principal gains a CanTrigger edge
+  # to the build worker. The build step scripts run as that SA, producing CanExecuteAs.
+  # This is a Phase-9 (CI/CD) supply-chain primitive: push → trigger → execute as SA.
+  - id: gcp-gcr-push-triggers-cloud-build
+    emits: CanTrigger
+    description: "GCR push event fires to the default gcr Pub/Sub topic, triggering any Cloud Build subscription — indirect trigger of build jobs running as the Cloud Build SA."
+    match:
+      - [ ?principal, CanModifyCode, ?registry ]
+      - [ ?registry, CanTrigger, ?pubsub_topic ]
+      - [ ?pubsub_topic, CanTrigger, ?build_job ]
+      - [ ?build_job, ExecutesAs, ?build_sa ]
+    where:
+      - "?registry is a ContainerRegistry node (GCR in the project)"
+      - "?pubsub_topic is the default gcr Pub/Sub topic for the project"
+      - "?build_job is a Cloud Build job subscribed to the gcr topic"
+      - "The principal has storage.objects.create on the registry (push capability) and can thus emit events to the gcr topic"
+    optional:
+      - [ ?principal, CanInvoke, ?build_job ]  # direct build invocation is stronger than event-driven
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?build_job
+      permissions:
+        - "storage.objects.create"
+        - "cloudbuild.builds.create (via Pub/Sub event subscription)"
+      conditions: [trigger_exists]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) when a Cloud Build trigger is subscribed to the gcr
+        topic and the principal holds storage.objects.create on the registry (push).
+        ACTIVE if the principal can also directly invoke the build (cloudbuild.builds.create).
+        The trigger is realized only when the push event fires and the Cloud Build
+        subscriber processes it. The build runs as the Cloud Build SA by default
+        (roles/cloudbuild.builds.editor on the project) — a principal with this
+        CanTrigger edge and the build SA's permissions produces CanExecuteAs(principal
+        -> build_SA) via cicd-chains and escalation rules.
+      confidence: 0.85
+      derived_from:
+        - "CanModifyCode(principal, registry)"
+        - "ContainerRegistry push events fire to default gcr Pub/Sub topic (GCP documented behavior)"
+        - "Cloud Build subscription to gcr topic (infrastructure-dependent; confirmed by scanning build triggers)"
+      false_positive_note: >-
+        This rule fires only when ALL of the following are confirmed: (1) the principal
+        holds storage.objects.create on the artifacts bucket (gcp-gcr-push-can-modify-code
+        base); (2) the project has a Cloud Build trigger subscribed to the gcr Pub/Sub
+        topic (must scan Cloud Build trigger configuration to confirm); (3) the build
+        job is stored in the project's Cloud Source Repositories or GitHub and is
+        in-scope. If the gcr Pub/Sub topic exists but no trigger subscribes to it, the
+        rule should not fire (no CanTrigger edge exists from the topic to any build job).
+        Not all projects have Cloud Build triggers; this rule only fires in projects
+        where the scanning adapter confirms at least one trigger subscription to gcr.
+      narrative: >-
+        {principal.name} can push container images to the GCR registry for project
+        {project.name} (storage.objects.create). GCR push events are published to the
+        default gcr Pub/Sub topic. If {project.name} has a Cloud Build trigger subscribed
+        to the gcr topic, pushing an image will fire that trigger and invoke the Cloud Build
+        job {build_job.name}, which executes as {build_sa.name}. This creates an
+        indirect supply-chain path: push → trigger → execute as Cloud Build SA. If the
+        build pipeline modifies infrastructure or deploys code, the attacker reaches
+        every deployment target the build can reach.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A GCS IAM deny policy denying storage.objects.create on the artifacts bucket
+#    to the principal -> emit gcp-gcr-push-can-modify-code with state: BLOCKED,
+#    denied_by=<deny policy>.
+#  - VPC Service Controls perimeter restricting storage.googleapis.com from outside
+#    the perimeter -> emit push/pull edges with state: BLOCKED for principals outside
+#    the perimeter.
+#  - constraints/storage.publicAccessPrevention enforced at bucket or project level ->
+#    gcp-gcr-public-pull does not fire (public ACLs cannot be set); emit BLOCKED if
+#    the ACL exists but the constraint prevents it from being effective.
+#  - constraints/iam.allowedPolicyMemberDomains restricting bucket IAM members ->
+#    gcp-gcr-cross-project-push CrossProjectTrust is BLOCKED if the binding is
+#    org-policy-denied.
+#  - Artifact Registry migration: if gcr.io is backed by Artifact Registry (not GCS),
+#    these rules do NOT apply; storage.objects.create on the legacy bucket does not
+#    yield push capability. Emit gcp-gcr-push-can-modify-code as BLOCKED or suppress
+#    it, and rely on gcp:artifact-registry rules for that project.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service (bucket IAM → CanModifyCode, CanRead,
+# CanModifyPolicy, ExposedToInternet, CrossProjectTrust) should be added to
+# /rules/explicit/gcp-gcr.yaml. Key normalizations:
+#
+#   - id: gcp-gcr-effective-push
+#     emits: CanModifyCode
+#     match_effective_permission: {action: "storage.objects.create", resource_filter: "artifacts.*.appspot.com"}
+#     emit: {source: "<principal>", target: "<ContainerRegistry>", permissions: ["storage.objects.create"]}
+#
+#   - id: gcp-gcr-effective-pull
+#     emits: CanRead
+#     match_effective_permission: {action: "storage.objects.get", resource_filter: "artifacts.*.appspot.com"}
+#     emit: {source: "<principal>", target: "<ContainerRegistry>", permissions: ["storage.objects.get"]}
+#
+#   - id: gcp-gcr-bucket-policy-set
+#     emits: CanModifyPolicy
+#     match_effective_permission: {action: "storage.buckets.setIamPolicy", resource_filter: "artifacts.*.appspot.com"}
+#     emit: {source: "<principal>", target: "<ResourcePolicy[artifacts-bucket]>", permissions: ["storage.buckets.setIamPolicy"]}
+#
+#   - id: gcp-gcr-consumer-reference
+#     emits: ContainsResourceReference
+#     match_record: {resource_type: "gcr.io/ContainerRegistry", field: "image"}
+#     emit: {source: "<consumer workload>", target: "<ContainerRegistry>", properties: {image_mutable: true|false}}
+#
+# The explicit file is NOT created here because ContainsResourceReference edges
+# are emitted by the consumer-service adapters (GKE, Cloud Run, Cloud Build, GCE),
+# not by the registry adapter. The registry adapter only emits permission-derived
+# edges (CanModifyCode, CanRead, CanModifyPolicy, ExposedToInternet, CrossProjectTrust).

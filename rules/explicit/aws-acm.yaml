@@ -1,0 +1,148 @@
+# Explicit normalization: AWS Certificate Manager (ACM) raw config -> explicit edges.
+# ---------------------------------------------------------------------------
+# ACM contributes a single node type (Certificate, Secret-class subtype Certificate).
+# The security-relevant explicit edges are the credential-access primitive
+# (CanExportKey, state-gated HERE by the per-cert exportable flag), certificate
+# overwrite (CanWrite), recon (CanRead), and consumer linkage
+# (ContainsResourceReference from InUseBy).
+#
+# GROUND RULES honored:
+#  - acm:GetCertificate returns the PUBLIC cert + chain only (NO private key) ->
+#    CanRead (recon), NEVER CanReadSecret/CanExportKey.
+#  - acm:ExportCertificate is the ONLY private-key retrieval action -> CanExportKey,
+#    state-gated on the PER-CERT exportable flag (Type==PRIVATE OR a public cert
+#    requested exportable on/after 2025-06-17), NOT on Type alone.
+#  - ACM has NO resource-based policy -> no CrossAccountTrust here.
+#  - CanExportKey / CanWrite / CanRead are produced by the permission evaluator
+#    matching EFFECTIVE acm: actions on a certificate ARN, not from raw config alone.
+#  - CanExportKey (nature: explicit), CanWrite (nature: explicit) live HERE, not in
+#    the derived file (ground rule 1: derived files emit only derived|both edges).
+#  - ContainsResourceReference source set is [Data, Storage, Compute]; a Certificate
+#    is Secret-class and CANNOT be its source. The InUseBy reference is therefore
+#    emitted FROM the CONSUMING resource TO the Certificate, and only for
+#    Compute/Storage-class consumers (Network-class ELB/CloudFront are emitted by
+#    their own service rules).
+# ---------------------------------------------------------------------------
+
+rules:
+
+  - id: aws-acm-contains-certificate
+    emits: Contains
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CertificateManager::Certificate", field: "CertificateArn"}
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: "*"
+      source: "<account/region administrative boundary>"
+      target: "<certificate node>"
+      api_source: "acm:ListCertificates"
+      evidence_field: "CertificateArn"
+      narrative: "Certificate {cert.name} exists in {account}/{region}."
+
+  - id: aws-acm-can-export-key
+    emits: CanExportKey
+    applies_to: [aws]
+    # source Identity, target Certificate (Secret-class) -> conformant with
+    # CanExportKey source: [Identity], target: [EncryptionKey, SigningKey, Certificate].
+    match_effective_permission:
+      action: "acm:ExportCertificate"
+      resource_type: "AWS::CertificateManager::Certificate"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<certificate node>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["acm:ExportCertificate"]
+      conditions: [condition_expression]
+      evidence_field: "DescribeCertificate exportable flag (Type==PRIVATE OR a public cert requested exportable)"
+      state_logic: >-
+        if ?cert.exportable == true: ACTIVE
+        elif ?cert.exportable == false: BLOCKED(non_exportable)
+        else: CONDITIONAL(condition_expression)  # exportability unresolved from collection
+      false_positive_note: >-
+        The gate is the PER-CERT exportable flag, NOT the certificate Type. As of
+        2025-06-17 AWS launched EXPORTABLE PUBLIC certificates: a public
+        (AMAZON_ISSUED) cert requested with the exportable option CAN have its
+        private key exported via acm:ExportCertificate. So do NOT hardcode
+        BLOCKED for Type in [AMAZON_ISSUED, IMPORTED] — that false-negatives on
+        exportable public certs. exportable==false (all public certs issued before
+        2025-06-17, and any cert not requested exportable) -> BLOCKED(non_exportable).
+        Do NOT confuse with acm:GetCertificate, which returns only the public cert
+        + chain (no private key) and must NOT produce this edge. The Passphrase
+        parameter is attacker-chosen and is NOT a gate; export does NOT require
+        kms:Decrypt on aws/acm, so do NOT add a key_permission condition. An
+        SCP/boundary denying acm:ExportCertificate -> BLOCKED(scp_or_org_policy).
+      narrative: "{principal.name} can export certificate {cert.name} (acm:ExportCertificate) — private key retrievable only if the cert's exportable flag is set (Type==PRIVATE, or a public cert requested exportable on/after 2025-06-17)."
+
+  - id: aws-acm-can-write-import
+    emits: CanWrite
+    applies_to: [aws]
+    # source Identity, target Certificate -> conformant with CanWrite source:
+    # [Identity], target: ["*"]. Overwriting an EXISTING cert ARN via
+    # acm:ImportCertificate swaps served TLS material; acm:UpdateCertificateOptions
+    # rewrites cert options. Both are config-write actions on the cert -> CanWrite.
+    # acm:ImportCertificate WITHOUT an existing ARN merely CREATES a new cert
+    # (persistence), not an overwrite.
+    match_effective_permission:
+      action: ["acm:ImportCertificate", "acm:UpdateCertificateOptions"]
+      resource_type: "AWS::CertificateManager::Certificate"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<certificate node>"
+      permissions: ["acm:ImportCertificate", "acm:UpdateCertificateOptions"]
+      note: >-
+        acm:ImportCertificate on an existing ARN overwrites the served cert+key
+        material (attacker TLS to consumers, requires them to pick it up; noisy).
+        acm:UpdateCertificateOptions toggles Certificate Transparency logging — a
+        weaker config write with no key-exportability or privilege impact. Neither
+        is an AWS IAM privilege escalation (no CanEscalateTo) nor a credential READ.
+      narrative: "{principal.name} can overwrite/modify certificate {cert.name} (acm:ImportCertificate / acm:UpdateCertificateOptions)."
+
+  - id: aws-acm-can-read-getcertificate
+    emits: CanRead
+    applies_to: [aws]
+    match_effective_permission:
+      action: "acm:GetCertificate"
+      resource_type: "AWS::CertificateManager::Certificate"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<certificate node>"
+      permissions: ["acm:GetCertificate"]
+      note: >-
+        acm:GetCertificate returns the PUBLIC certificate body + chain only, NOT the
+        private key. Emit CanRead (recon) ONLY — never CanReadSecret/CanExportKey.
+      narrative: "{principal.name} can read the public body + chain of certificate {cert.name} (acm:GetCertificate) — no private key."
+
+  - id: aws-acm-inuseby-reference
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    # DIRECTION FIX: ContainsResourceReference source set is [Data, Storage,
+    # Compute] and target is ["*"]. A Certificate is a Secret-class node, which is
+    # NOT a valid source for this edge — so the reference is emitted FROM the
+    # CONSUMING resource TO the Certificate. This is source-conformant ONLY when
+    # the consumer is Compute- or Storage-class (e.g. App Runner service = Compute).
+    # Network-class consumers (Classic/ALB LoadBalancer, CloudFront distribution =
+    # Network) are NOT in the ContainsResourceReference source set, so those
+    # references must be emitted by the CONSUMING SERVICE's own rules (elb/cloudfront/
+    # apigateway), not from ACM. ACM only emits the Compute/Storage-class subset.
+    match_record: {resource_type: "AWS::CertificateManager::Certificate", field: "InUseBy"}
+    where:
+      - "InUseBy array is non-empty"
+      - "node_class(consumer) in [Compute, Storage]  # e.g. App Runner service (Compute); skip Network-class consumers (ELB/CloudFront) here"
+    emit:
+      target_type: "*"
+      source: "<consuming resource node (Compute/Storage-class, e.g. App Runner service)>"
+      target: "<certificate node>"
+      api_source: "acm:DescribeCertificate"
+      evidence_field: "Certificate.InUseBy[]"
+      note: >-
+        Recon only (traversal: walkable=false). Reversed from the old
+        Certificate->consumer direction, which violated the ContainsResourceReference
+        source set (Certificate is Secret-class, not Data/Storage/Compute).
+        Network-class consumers (ELB/CloudFront) are intentionally NOT emitted here —
+        their own service rules own that reference edge.
+      narrative: "{consumer.name} references certificate {cert.name} (recon: an endpoint a stolen key would impersonate)."

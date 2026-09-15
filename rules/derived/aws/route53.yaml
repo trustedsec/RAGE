@@ -1,0 +1,630 @@
+# AWS Route 53 — Derived attack-path rules (Phase 8 — networking / DNS)
+# ---------------------------------------------------------------------------
+# Dominant theme: DNS as a REDIRECTION PRIMITIVE.
+#
+# Route 53 hosted zones are the authoritative source of truth for domain names.
+# Any capability that lets an identity change records in a zone (via IAM) or
+# claim an abandoned resource referenced by a dangling alias/CNAME (no IAM
+# required) enables DNS hijacking or subdomain takeover — redirecting internet
+# or VPC-internal traffic to attacker-controlled infrastructure.
+#
+# WHAT THESE RULES EMIT:
+#   - CanModifyConfiguration(Identity -> DNS)  for DNS record write actions
+#     (change-records, NS-delegation, registrar NS-swap, private-zone shadow).
+#   - ExposedToInternet(DNS -> AnonymousIdentity)  for dangling alias/CNAME
+#     (no-permission path; the zone is exposed to an unauthenticated attacker
+#     from the internet who can claim and exploit the dangling reference).
+#
+# WHAT THESE RULES DO NOT EMIT:
+#   - CanExecuteAs / CanEscalateTo / CanEnterAccount — DNS hijacking is a
+#     traffic-redirection primitive that enables out-of-band credential capture;
+#     the subsequent escalation is modeled in the receiving service's rules.
+#   - ExposedToInternet — public zone exposure is a property of the hosted zone
+#     itself, not of an identity. Emit the zone node with exposure=public.
+#   - CanNetworkReach / RoutesTo — transitive network reachability is a FUTURE
+#     provider-agnostic linchpin. These rules emit per-service FACTS (a record
+#     change, a dangling reference); the network-chains composer assembles them.
+#   - ExecutesAs — Route 53 has no execution identity.
+#
+# TRANSITIVE REACHABILITY NOTE:
+#   Network reachability is CONDITIONAL(network_reachability) by nature per
+#   Phase 8 ground rules. These rules emit the DNS-control FACT; downstream
+#   traversal to a victim workload requires a separate network_reachability
+#   condition. Mark private-zone rules CONDITIONAL(network_reachability).
+#
+# PERMISSIONS are exact IAM action names from the AWS Service Authorization
+# Reference (Route 53 + Route 53 Domains):
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonroute53.html
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonroute53domains.html
+#
+# NODE CLASS CONFORMANCE (schema/nodes.yaml + schema/edges.yaml):
+#   Route 53 Hosted Zones map to Network class, generic type DNS.
+#   CanModifyConfiguration: source [Identity] / target [Compute, Messaging, Network, "*"]
+#     -> DNS (Network class) is within the target set.
+#   Source Identity is within the declared source set for all emitted edges.
+#
+# CITE can-control.yaml: the roll-up to Controls / CanEscalateTo is handled by
+#   /rules/derived/can-control.yaml. These rules emit the per-service primitives
+#   (CanModifyConfiguration on the DNS zone); can-control handles the summary.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 8-networking
+applies_to: [aws]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1. DNS Record Mutation — route53:ChangeResourceRecordSets
+  # ---------------------------------------------------------------------------
+  # The core Route 53 attack primitive. An identity with
+  # route53:ChangeResourceRecordSets on a hosted zone can add, modify, or delete
+  # any record in that zone:
+  #   - A/AAAA records:  redirect hostname resolution to attacker IP.
+  #   - CNAME records:   redirect to attacker-controlled hostname.
+  #   - MX records:      redirect email delivery (phishing, credential interception).
+  #   - TXT records:     override SPF/DKIM (email spoofing facilitator).
+  #   - NS records:      delegate a subdomain to an attacker-controlled nameserver
+  #                      (see rule aws-route53-ns-delegation-hijack below for that
+  #                      higher-specificity variant).
+  #
+  # IAM scope discipline: honor the resource ARN in the policy statement.
+  #   "arn:aws:route53:::hostedzone/ABCDE12345" — one zone only.
+  #   "arn:aws:route53:::hostedzone/*" or "*"   — all zones in the account.
+  #
+  # STATE LOGIC:
+  #   ACTIVE when effective-permission evaluator confirms
+  #     route53:ChangeResourceRecordSets on the zone ARN (or wildcard).
+  #   BLOCKED if an SCP or permission boundary denies the action.
+  #   CONDITIONAL(network_reachability) for private hosted zones only — the DNS
+  #     manipulation affects only VPC-resident resolvers; an attacker on the
+  #     public internet cannot observe or exploit private zone changes.
+  - id: aws-route53-change-records-hijack
+    emits: CanModifyConfiguration
+    description: >-
+      route53:ChangeResourceRecordSets on a public hosted zone enables DNS record
+      mutation — traffic redirection, MX/SPF override, and subdomain NS delegation
+      (DNS hijacking primitive).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?zone ]
+    where:
+      - "node_type(?zone) == DNS"
+      - "?zone.provider_type == 'AWS::Route53::HostedZone'"
+      - "?zone.properties.type == 'Public'"
+      - "effective_action_on(?principal, ?zone) contains 'route53:ChangeResourceRecordSets'"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: ?principal
+      target: ?zone
+      permissions:
+        - "route53:ChangeResourceRecordSets"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when effective-permission evaluator confirms route53:ChangeResourceRecordSets
+        on the zone ARN (or a wildcard resource in the policy). BLOCKED if an SCP or
+        permission boundary denies route53:ChangeResourceRecordSets on this zone's ARN.
+        Do NOT emit for private hosted zones with this rule; use
+        aws-route53-change-records-private-zone for private-zone coverage where the
+        CONDITIONAL(network_reachability) condition applies.
+      confidence: 0.95
+      derived_from:
+        - "?principal HasPermission ?zone (route53:ChangeResourceRecordSets)"
+      false_positive_note: >-
+        Honor the resource ARN scope: a policy granting route53:ChangeResourceRecordSets
+        on a single zone ARN does NOT permit changes to other zones. A wildcard resource
+        covers all zones. An SCP or permission boundary denying this action yields BLOCKED.
+        This edge is a traffic-redirection primitive, NOT a direct access grant; the
+        subsequent credential capture or exploitation is out-of-band and modeled at the
+        receiving service (e.g. an HTTPS server the attacker stands up on the hijacked IP).
+        Do NOT chain this single edge directly to CanEnterAccount or CanEscalateTo — that
+        multi-step path includes out-of-band steps not represented in the graph.
+        Cite can-control.yaml for the Controls roll-up (not applicable here directly).
+      narrative: >-
+        {principal.name} can modify any DNS record in the public hosted zone {zone.name}
+        (route53:ChangeResourceRecordSets). An attacker can redirect A/AAAA records to
+        attacker infrastructure, override MX for email interception, insert attacker
+        CNAMEs, or modify TXT records to break SPF/DKIM — DNS hijacking for any name
+        delegated to this zone.
+
+  # ---------------------------------------------------------------------------
+  # 2. Private Hosted Zone Record Mutation
+  # ---------------------------------------------------------------------------
+  # Same IAM action as rule 1 but targeting a private hosted zone. The attack
+  # impact is limited to VPC-resident workloads consulting this zone for resolution.
+  # Does NOT expose traffic to the public internet; requires a foothold inside an
+  # associated VPC to be exploitable. Emitted CONDITIONAL(network_reachability).
+  #
+  # Attack scenario: an attacker with a VPC foothold and route53:ChangeResourceRecordSets
+  # changes an internal service name (e.g. db.internal) to point to an attacker-
+  # controlled host in the VPC, capturing DB credentials from connecting workloads.
+  - id: aws-route53-change-records-private-zone
+    emits: CanModifyConfiguration
+    description: >-
+      route53:ChangeResourceRecordSets on a private hosted zone enables internal DNS
+      hijacking within associated VPCs — traffic redirection for VPC-resident workloads only.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?zone ]
+    where:
+      - "node_type(?zone) == DNS"
+      - "?zone.provider_type == 'AWS::Route53::HostedZone'"
+      - "?zone.properties.type == 'Private'"
+      - "effective_action_on(?principal, ?zone) contains 'route53:ChangeResourceRecordSets'"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: ?principal
+      target: ?zone
+      permissions:
+        - "route53:ChangeResourceRecordSets"
+      conditions: [iam_permission, scp_or_org_policy, network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability) — private zone manipulation affects only
+        VPC-resident resolvers within associated VPCs. The edge is ACTIVE for the IAM
+        control-plane permission but CONDITIONAL for actual exploitation because the
+        attacker must have (or gain) a foothold inside an associated VPC to observe the
+        redirected traffic. BLOCKED if an SCP or permission boundary denies
+        route53:ChangeResourceRecordSets on this zone.
+      confidence: 0.85
+      derived_from:
+        - "?principal HasPermission ?zone (route53:ChangeResourceRecordSets, Private)"
+      false_positive_note: >-
+        Private zone hijacking is CONDITIONAL on the attacker having network reachability
+        inside an associated VPC — public-internet attackers cannot observe or benefit from
+        private zone changes. Do not emit ACTIVE. Honor zone VPC associations: a zone
+        associated only with VPC-A does not affect resolution in VPC-B even if the same
+        account owns both. An SCP denying the action yields BLOCKED.
+      narrative: >-
+        {principal.name} can modify DNS records in the private hosted zone {zone.name}
+        (route53:ChangeResourceRecordSets), redirecting internal name resolution for all
+        VPCs associated with this zone. Exploitation requires network reachability within
+        an associated VPC to capture redirected traffic (e.g. MITM of DB connections or
+        internal API calls that trust DNS names).
+
+  # ---------------------------------------------------------------------------
+  # 2b. Private Zone Shadow Attack (CreateHostedZone with VPC / AssociateVPCWithHostedZone)
+  # ---------------------------------------------------------------------------
+  # An attacker with route53:CreateHostedZone + the ability to specify a VPC
+  # (via --vpc parameter) can create a shadow private zone that overrides resolution
+  # for a specific domain inside the target VPC. Similarly, route53:AssociateVPCWithHostedZone
+  # allows an attacker to extend an existing private zone's resolution scope to a
+  # different VPC (potentially a cross-account VPC, if the zone owner permits).
+  #
+  # Attack impact: DNS MITM for all workloads inside the associated VPC consulting
+  # the zone, enabling credential capture from internal services that rely on DNS
+  # names for authentication (mTLS by hostname, SSH known_hosts, DB connection strings).
+  #
+  # Prerequisite: the attacker must have network reachability inside (or can gain it
+  # into) a VPC that will resolve via the shadowed/extended zone.
+  #
+  # STATE: CONDITIONAL(network_reachability) — the zone manipulation is ACTIVE
+  # (IAM permission confirmed) but exploitation depends on network access to an
+  # associated VPC to observe and exploit the redirected resolution.
+  - id: aws-route53-private-zone-shadow
+    emits: CanModifyConfiguration
+    description: >-
+      route53:CreateHostedZone with --vpc or route53:AssociateVPCWithHostedZone enables
+      creating a shadow private zone or extending an existing zone's resolution scope
+      across VPCs — DNS MITM for all workloads in the associated VPC.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?zone ]
+    where:
+      - "node_type(?zone) == DNS"
+      - "?zone.provider_type == 'AWS::Route53::HostedZone'"
+      - "?zone.properties.type == 'Private'"
+      - "effective_action_on(?principal, ?zone) contains 'route53:CreateHostedZone' OR effective_action_on(?principal, ?zone) contains 'route53:AssociateVPCWithHostedZone'"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: ?principal
+      target: ?zone
+      permissions:
+        - "route53:CreateHostedZone"
+        - "route53:AssociateVPCWithHostedZone"
+      conditions: [iam_permission, scp_or_org_policy, network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability) — the IAM permission to create or associate
+        a private zone is confirmed effective, but actual DNS hijacking within a VPC
+        requires the attacker to have network reachability inside that VPC to benefit
+        from the shadowed/extended resolution. An attacker outside all associated VPCs
+        cannot observe or exploit the zone changes. BLOCKED if an SCP denies
+        route53:CreateHostedZone or route53:AssociateVPCWithHostedZone.
+      confidence: 0.90
+      derived_from:
+        - "?principal HasPermission ?zone (route53:CreateHostedZone | route53:AssociateVPCWithHostedZone, Private)"
+      false_positive_note: >-
+        Private zone creation/association is CONDITIONAL on the attacker having network
+        reachability inside an associated VPC. Honor the zone's VPC associations — the
+        zone only affects resolution for workloads consulting it within those specific
+        VPCs. Cross-account VPC association requires authorization from the VPC owner
+        (AssociateVPCWithHostedZone is typically cross-account and needs permission from
+        both zone owner and VPC owner). An SCP denying the action yields BLOCKED.
+      narrative: >-
+        {principal.name} can create a private hosted zone with an associated VPC, or
+        extend an existing private zone to additional VPCs (route53:CreateHostedZone
+        with --vpc or route53:AssociateVPCWithHostedZone). An attacker with network
+        reachability inside an associated VPC can hijack DNS resolution for all
+        workloads in that VPC — enabling credential capture and MITM attacks on
+        internally-trusted services.
+
+  # ---------------------------------------------------------------------------
+  # 3. Dangling Alias / CNAME — Subdomain Takeover (no IAM required)
+  # ---------------------------------------------------------------------------
+  # A dangling record exists when a Route 53 record (alias or CNAME) points to
+  # an AWS resource that has been deprovisioned:
+  #   - Alias to a deleted ELB / ALB / NLB (ELB DNS name is unclaimed)
+  #   - Alias to a deleted CloudFront distribution (CNAME target is unclaimed)
+  #   - Alias to a deleted S3 static website endpoint (bucket is unclaimed)
+  #   - CNAME to a deleted API Gateway custom domain
+  #   - Alias to a released Elastic IP (EIP is claimable)
+  #
+  # An attacker who claims the target resource (creates a new S3 bucket with the
+  # same name, stands up an ELB on the unclaimed DNS name, etc.) begins serving
+  # content or capturing traffic under the hijacked subdomain — WITHOUT any AWS
+  # IAM permission on the Route 53 zone.
+  #
+  # EXPLOIT SELECTIVITY: not all dangling records are equally exploitable.
+  #   - S3 static website:  HIGH — bucket name is globally predictable; attacker
+  #                          creates a bucket with the same name in any account.
+  #   - API GW custom domain: HIGH — domain ownership verification via DNS is
+  #                          re-claimable by creating a new API in the same region.
+  #   - ELB/ALB DNS name:   MEDIUM — ELB DNS names contain random strings; a new
+  #                          ELB does not re-use the old DNS name. Downgrade to
+  #                          CONDITIONAL unless confirmed claimable.
+  #   - CloudFront:          HIGH — CloudFront alternate domains can be claimed by
+  #                          any distribution in any account if the target CNAME
+  #                          is not claimed.
+  #   - EIP:                 CONDITIONAL — only if the EIP has been released
+  #                          (confirmed via ec2:DescribeAddresses).
+  #
+  # This rule emits ExposedToInternet with source=?zone (the DNS zone node)
+  # and target="public-internet" (a synthetic AnonymousIdentity node), because the
+  # dangling record is reachable by any unauthenticated attacker from the internet
+  # (no IAM permission required). The attacker claims the deprovisioned target
+  # resource and begins serving content or capturing traffic under the hijacked name.
+  #
+  # DECISION: The zone is exposed to AnonymousIdentity (public internet) because
+  # any attacker can exploit the dangling record without AWS credentials. This is
+  # a network-exposure primitive (ExposedToInternet), not a configuration change
+  # by a privileged identity. The "public-internet" synthetic node represents the
+  # internet-wide threat surface.
+  #
+  # STATE: CONDITIONAL(service_state) — depends on whether the target resource
+  # is actually deprovisioned AND claimable by the attacker.
+  - id: aws-route53-dangling-alias-takeover
+    emits: ExposedToInternet
+    description: >-
+      A dangling alias or CNAME record pointing to a deprovisioned AWS resource enables
+      subdomain takeover — an attacker (unauthenticated, from the internet) claims the
+      deprovisioned resource and serves content on the hijacked name without any AWS
+      IAM permission required.
+    applies_to: [aws]
+    match:
+      - [ ?zone, ContainsResourceReference, ?target_resource ]
+    where:
+      - "node_type(?zone) == DNS"
+      - "?zone.provider_type == 'AWS::Route53::HostedZone'"
+      - "?zone.properties.has_dangling_alias == true"
+      - "?target_resource.state == 'deprovisioned' or ?target_resource is not found in inventory"
+      - "?zone.properties.dangling_record_types contains 'A (alias)' OR ?zone.properties.dangling_record_types contains 'AAAA (alias)' OR ?zone.properties.dangling_record_types contains 'CNAME'"
+    emit:
+      source_type: DNS
+      target_type: AnonymousIdentity
+      source: ?zone
+      target: "public-internet"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        CONDITIONAL(service_state) — the dangling record exists (confirmed by inventory
+        cross-reference showing the alias target is absent from collected resources) but
+        actual exploitability depends on whether the target resource type is claimable:
+        S3 static website bucket (same-name, same-region) -> ACTIVE if bucket is unclaimed;
+        CloudFront distribution CNAME -> ACTIVE if no current distribution claims the
+        alternate domain; API Gateway custom domain -> CONDITIONAL (requires ownership
+        verification via DNS TXT record as of 2022, which may not be present on the attacker's
+        domain); ELB/ALB DNS name -> CONDITIONAL (random suffix, hard to claim);
+        EIP -> CONDITIONAL until confirmed released. Never BLOCKED (no IAM permission
+        exists to prevent an external attacker from claiming an unclaimed resource).
+      confidence: 0.80
+      derived_from:
+        - "?zone ContainsResourceReference ?target_resource (dangling alias/CNAME)"
+      false_positive_note: >-
+        This edge requires CROSS-REFERENCING the alias/CNAME target against live
+        resource inventory (ELB, CloudFront, S3, API GW). Do NOT emit based solely on
+        a record existing — the target must be confirmed absent from the account's
+        collected resources. Claimability varies by resource type (see state_logic
+        above). ELB DNS names with random suffixes are generally NOT claimable by
+        re-creating an ELB — downgrade those to CONDITIONAL or POTENTIAL. No IAM
+        permission is required for this attack path, so BLOCKED state is not applicable.
+        This edge does not yield CanEnterAccount directly — it enables traffic capture
+        on the hijacked name, which is a pre-condition for out-of-band credential theft.
+        Cite can-control.yaml: Controls roll-up is NOT appropriate here.
+      narrative: >-
+        Hosted zone {zone.name} contains a dangling alias/CNAME record pointing to a
+        deprovisioned AWS resource. An attacker who claims that resource (e.g. creates a
+        new S3 bucket with the same name, or a new CloudFront distribution using the same
+        alternate domain) will serve content and/or capture traffic under the hijacked
+        subdomain — no Route 53 permission required.
+
+  # ---------------------------------------------------------------------------
+  # 4. NS Subdomain Delegation Hijack
+  # ---------------------------------------------------------------------------
+  # route53:ChangeResourceRecordSets includes the ability to add NS records for a
+  # subdomain within the zone. Adding NS records for sub.example.com pointing to
+  # an attacker-controlled nameserver delegates ALL record types for that subdomain
+  # to the attacker — a broader capability than a single A-record redirect.
+  #
+  # This is a higher-impact specialization of rule 1 (change-records-hijack).
+  # It is emitted in addition to rule 1 (not instead of it) when the zone contains
+  # existing NS record sets (indicating subdelegation is in operational use, making
+  # the NS mutation less anomalous) or when the attacker has confirmed NS-add intent.
+  #
+  # Practically the same IAM permission as rule 1; modeled separately because the
+  # IMPACT (full subdomain control vs. single record redirect) and analyst framing
+  # differ significantly.
+  - id: aws-route53-ns-delegation-hijack
+    emits: CanModifyConfiguration
+    description: >-
+      route53:ChangeResourceRecordSets enables adding NS records for a subdomain,
+      delegating full authority for that subtree to an attacker-controlled nameserver
+      (broader than a single A-record redirect).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?zone ]
+    where:
+      - "node_type(?zone) == DNS"
+      - "?zone.provider_type == 'AWS::Route53::HostedZone'"
+      - "?zone.properties.type == 'Public'"
+      - "effective_action_on(?principal, ?zone) contains 'route53:ChangeResourceRecordSets'"
+      - "?zone.properties.has_ns_delegation_records == true OR analyst_flag == 'ns-delegation-risk'"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: ?principal
+      target: ?zone
+      permissions:
+        - "route53:ChangeResourceRecordSets"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when route53:ChangeResourceRecordSets is confirmed effective on the zone
+        AND the zone contains existing NS delegation records (confirming the record type
+        is operational and would not trigger obvious anomaly detection). If no NS
+        delegation records currently exist, downgrade to CONDITIONAL — adding the first
+        NS delegation may trigger monitoring alerts, but the IAM capability remains.
+        BLOCKED if SCP or permission boundary denies the action.
+      confidence: 0.90
+      derived_from:
+        - "?principal HasPermission ?zone (route53:ChangeResourceRecordSets + NS-delegation context)"
+      false_positive_note: >-
+        This rule overlaps with aws-route53-change-records-hijack (same permission).
+        Emit BOTH when the zone has existing NS delegations (higher impact, different
+        analyst framing). Do not emit this rule for private hosted zones (NS delegation
+        within a private zone is unusual and the same CONDITIONAL(network_reachability)
+        concern from rule 2 applies). The IAM permission is identical to rule 1; this
+        rule adds the context that the attacker can delegate an ENTIRE subtree, not just
+        redirect a single record.
+      narrative: >-
+        {principal.name} can add NS records for any subdomain of {zone.name}
+        (route53:ChangeResourceRecordSets), delegating full authoritative control for
+        that subdomain tree to an attacker-controlled nameserver. Every record type
+        (A, MX, TXT, SRV, etc.) under the delegated subtree becomes attacker-controlled —
+        higher impact than a single-record redirect.
+
+  # ---------------------------------------------------------------------------
+  # 5. Registrar Nameserver Swap (route53domains:UpdateDomainNameservers)
+  # ---------------------------------------------------------------------------
+  # Route 53 Domains (registrar) operations are SEPARATE from Route 53 hosted zone
+  # operations. UpdateDomainNameservers replaces the NS servers registered at the
+  # domain registry (e.g. Verisign for .com). This is the highest-impact DNS action:
+  # it redirects ALL resolution for the entire domain (not just one zone or one
+  # record) to attacker-controlled infrastructure.
+  #
+  # Key differences from zone-level actions:
+  #   - Requires route53domains:UpdateDomainNameservers (distinct from route53:*)
+  #   - Always called against us-east-1 (Route 53 Domains is a global service
+  #     anchored to us-east-1 in IAM / SCP scope)
+  #   - Affects the registry record (TTL at the registry is typically 24–48 h)
+  #   - The existing Route 53 hosted zone becomes irrelevant once NS servers change
+  #
+  # This is a registrar-level takeover — the most severe Route 53 escalation path.
+  - id: aws-route53-registrar-ns-swap
+    emits: CanModifyConfiguration
+    description: >-
+      route53domains:UpdateDomainNameservers replaces the authoritative NS servers at
+      the domain registry — full domain takeover, redirecting ALL DNS resolution for the
+      domain to attacker-controlled infrastructure.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?zone ]
+    where:
+      - "node_type(?zone) == DNS"
+      - "?zone.provider_type in ['AWS::Route53::HostedZone', 'AWS::Route53::Domain']"
+      - "effective_action_on(?principal, ?zone) intersects ['route53domains:UpdateDomainNameservers', 'route53domains:*']"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: ?principal
+      target: ?zone
+      permissions:
+        - "route53domains:UpdateDomainNameservers"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when effective-permission evaluator confirms
+        route53domains:UpdateDomainNameservers on the domain registration (resource "*"
+        since Route 53 Domains does not support resource-level IAM for most actions).
+        BLOCKED if an SCP denying route53domains:UpdateDomainNameservers is in force
+        (SCPs for route53domains must target us-east-1 or * — not a regional SCP).
+        This action is irreversible in the short term (registry TTL 24-48 h after change).
+      confidence: 0.95
+      derived_from:
+        - "?principal HasPermission ?zone (route53domains:UpdateDomainNameservers)"
+      false_positive_note: >-
+        Route 53 Domains permissions (route53domains:*) are ENTIRELY SEPARATE from
+        Route 53 hosted zone permissions (route53:*). A principal with route53:* but
+        NOT route53domains:UpdateDomainNameservers cannot perform this action. Verify
+        that the principal's effective permissions include the route53domains namespace.
+        Route 53 Domains does not support resource-level IAM restrictions on most
+        actions (resource must be "*") — if the policy restricts the resource ARN, the
+        action may fail (IAM evaluates both identity policy and the service's supported
+        resources). An SCP targeting route53domains in us-east-1 blocks this action.
+        This is the highest-impact Route 53 escalation path — flag it accordingly in UI.
+      narrative: >-
+        {principal.name} can replace the authoritative nameservers for domain {zone.name}
+        at the domain registry (route53domains:UpdateDomainNameservers). This redirects
+        ALL DNS resolution for the entire domain to attacker-controlled infrastructure —
+        the existing Route 53 hosted zone becomes irrelevant once registry NS records change.
+        Registry TTL is typically 24-48 hours after the change propagates.
+
+  # ---------------------------------------------------------------------------
+  # 6. Registrar Domain Transfer (route53domains:TransferDomainToAnotherAwsAccount)
+  # ---------------------------------------------------------------------------
+  # route53domains:TransferDomainToAnotherAwsAccount is a separate registrar action
+  # that transfers ownership of a domain registration to another AWS account entirely.
+  # This is a complete ownership loss — more severe than NS swap (which only redirects
+  # resolution) because the attacker gains administrative control of the domain
+  # registration itself, including the ability to transfer it elsewhere or lock out
+  # the legitimate owner.
+  #
+  # The attack impact is equivalent to full zone takeover — an attacker can then
+  # set NS records to any nameserver, delete the domain, or perform other
+  # registrar-level operations on the transferred domain.
+  #
+  # Prerequisite: the attacker must have route53domains:TransferDomainToAnotherAwsAccount
+  # permission AND must be able to receive the domain in a target AWS account (or,
+  # depending on AWS transfer flow, may simply need the permission to initiate transfer).
+  - id: aws-route53-registrar-transfer-domain
+    emits: CanModifyConfiguration
+    description: >-
+      route53domains:TransferDomainToAnotherAwsAccount transfers domain registration
+      ownership to another AWS account — complete loss of domain registration control,
+      enabling the attacker to modify registrar settings and potentially lock out the
+      legitimate owner.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?zone ]
+    where:
+      - "node_type(?zone) == DNS"
+      - "?zone.provider_type in ['AWS::Route53::HostedZone', 'AWS::Route53::Domain']"
+      - "effective_action_on(?principal, ?zone) contains 'route53domains:TransferDomainToAnotherAwsAccount'"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: ?principal
+      target: ?zone
+      permissions:
+        - "route53domains:TransferDomainToAnotherAwsAccount"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when effective-permission evaluator confirms
+        route53domains:TransferDomainToAnotherAwsAccount on the domain registration
+        (resource "*" since Route 53 Domains does not support resource-level IAM for
+        this action). BLOCKED if an SCP denying route53domains:TransferDomainToAnotherAwsAccount
+        is in force (SCPs for route53domains must target us-east-1 or * — not a regional SCP).
+        Unlike NS swap, this is a permanent ownership change; the legitimate account loses
+        all control over the domain registration.
+      confidence: 0.95
+      derived_from:
+        - "?principal HasPermission ?zone (route53domains:TransferDomainToAnotherAwsAccount)"
+      false_positive_note: >-
+        route53domains:TransferDomainToAnotherAwsAccount is ENTIRELY SEPARATE from
+        route53:ChangeResourceRecordSets and route53domains:UpdateDomainNameservers.
+        A principal must have this specific action to perform domain transfer. Route 53 Domains
+        does not support resource-level IAM restrictions on this action (resource must be "*").
+        An SCP targeting route53domains in us-east-1 blocks this action.
+        This is a full ownership loss — higher impact than NS swap because the attacker
+        controls the registration itself, not just the DNS resolution.
+      narrative: >-
+        {principal.name} can transfer the domain registration for {zone.name} to another
+        AWS account (route53domains:TransferDomainToAnotherAwsAccount). This represents
+        complete loss of domain ownership and control — the attacker gains administrative
+        authority over the domain registration, including the ability to modify registrar
+        settings, change nameservers, and lock out the legitimate owner.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP denying route53:ChangeResourceRecordSets on hostedzone/* or * at the
+#     OU/account level -> emit the relevant edge(s) with state: BLOCKED and
+#     denied_by=<SCP ARN/statement>.
+#   - SCP denying route53:CreateHostedZone or route53:AssociateVPCWithHostedZone
+#     -> BLOCKED for rule 2b (private-zone-shadow).
+#   - SCP denying route53domains:UpdateDomainNameservers -> BLOCKED for rule 5
+#     (registrar-ns-swap; note: route53domains SCPs must cover us-east-1 or all regions).
+#   - SCP denying route53domains:TransferDomainToAnotherAwsAccount -> BLOCKED for rule 6
+#     (registrar-transfer-domain; note: route53domains SCPs must cover us-east-1 or all regions).
+#   - Permission boundary capping below route53:ChangeResourceRecordSets ->
+#     BLOCKED for rules 1, 2, 2b, and 4.
+#   - Route 53 has no resource-based policies; BLOCKED state comes only from
+#     SCPs, permission boundaries, or explicit Deny statements in identity policies.
+# ---------------------------------------------------------------------------
+
+# Linchpin citations:
+#   /rules/derived/can-control.yaml      — CanModifyConfiguration on a DNS zone
+#                                          does NOT roll up to Controls(zone) via
+#                                          can-control.yaml directly; DNS hijacking
+#                                          is a traffic-redirection primitive. The
+#                                          Controls roll-up applies when the principal
+#                                          holds CanAdminister(?zone) — which would
+#                                          require additional admin-level actions not
+#                                          emitted here. Cite but do not invoke.
+#   /rules/derived/network-chains.yaml   — FUTURE linchpin for composing per-service
+#                                          network facts into end-to-end reachability.
+#                                          These rules emit DNS-control FACTS; the
+#                                          network-chains file will compose them with
+#                                          routing/peering facts. DO NOT invent now.
+#   /rules/derived/credential-chains.yaml — DNS hijacking enabling credential capture
+#                                          is an out-of-band chain not modeled in
+#                                          graph edges; surface it in narrative only.
+#
+# Explicit normalization rules for this service live in
+# /rules/explicit/aws-route53.yaml (HasPermission normalization from the
+# permission evaluator for route53:ChangeResourceRecordSets and
+# route53domains:UpdateDomainNameservers, plus ContainsResourceReference for
+# dangling alias detection from collected record sets).
+explicit_rules:
+
+  - id: aws-route53-has-permission-change-records
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "route53:ChangeResourceRecordSets"
+      resource_type: "AWS::Route53::HostedZone"
+    emit:
+      source: "<principal>"
+      target: "<hosted zone node>"
+      permissions: ["route53:ChangeResourceRecordSets"]
+      narrative: >-
+        {principal.name} holds effective route53:ChangeResourceRecordSets on
+        hosted zone {zone.name}.
+
+  - id: aws-route53-has-permission-registrar-ns
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "route53domains:UpdateDomainNameservers"
+      resource_type: "AWS::Route53::Domain"
+    emit:
+      source: "<principal>"
+      target: "<domain / hosted zone node>"
+      permissions: ["route53domains:UpdateDomainNameservers"]
+      narrative: >-
+        {principal.name} holds effective route53domains:UpdateDomainNameservers —
+        can replace registry NS servers for any registered domain in this account.
+
+  - id: aws-route53-dangling-alias-reference
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Route53::HostedZone"
+      field: "ResourceRecordSets[].AliasTarget.DNSName"
+    emit:
+      source: "<hosted zone node>"
+      target: "<alias target resource node (ELB, CloudFront, S3, API GW)>"
+      api_source: "route53:ListResourceRecordSets"
+      evidence_field: "AliasTarget.DNSName"
+      annotation: "dangling=true when target_resource.state == deprovisioned or not in inventory"
+      narrative: >-
+        {zone.name} contains an alias/CNAME record pointing to {target.name};
+        flagged as dangling when the target resource is absent from collected inventory.

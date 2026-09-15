@@ -1,0 +1,136 @@
+# Azure Lighthouse — Explicit normalization rules.
+# Translate raw collected Microsoft.ManagedServices records into STRUCTURAL and
+# trust-fact explicit edges consumed by the derived rules in
+# /rules/derived/azure/lighthouse.yaml.
+#
+# These rules run BEFORE the derived rules in the fixpoint. Their outputs are:
+#   HasPolicy(scope -> registrationAssignment / registrationDefinition)
+#   CrossTenantTrust(managing-Tenant -> customer-Tenant)
+#   TrustsExternalIdentity(registrationDefinition -> ExternalPrincipal)
+#   ExternalIdentityMapsTo(ExternalPrincipal -> delegated Role)
+#   CanModify(customer-Owner -> registrationDefinition / registrationAssignment)
+#
+# DEDUP: These records may be partially emitted by the subscriptions explicit
+# adapter (azure-subscriptions.yaml). Dedupe on (edge_type, source, target).
+# Quote any scalar containing ':'.
+
+rules:
+
+  # --- Structural: scope -> registrationAssignment (HasPolicy) ----------------
+  - id: azure-lighthouse-assignment-policy
+    emits: HasPolicy
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ManagedServices/registrationAssignments"
+      field: "id"
+    where:
+      - "properties.provisioningState in ['Succeeded', 'Creating', 'Updating']"
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: Policy
+      source: "<scope node — Subscription or ResourceGroup parsed from registrationAssignment id prefix>"
+      target: "<registrationAssignment node (ResourcePolicy type)>"
+      api_source: "GET /subscriptions/{subId}/providers/Microsoft.ManagedServices/registrationAssignments?$expand=registrationDefinition"
+      evidence_field: "id, properties.registrationDefinitionId, properties.provisioningState, properties.registrationDefinition.properties.managingTenantId"
+      note: >-
+        Scope is parsed from the registrationAssignment id:
+          /subscriptions/{guid}/providers/... -> Subscription scope
+          /subscriptions/{guid}/resourceGroups/{rg}/providers/... -> ResourceGroup scope
+        The registrationAssignment carries the expanded registrationDefinition inline
+        when ?$expand=registrationDefinition is used; store managingTenantId and
+        authorizations[] on the assignment node properties for downstream rules.
+        Set node state = provisioningState on the registrationAssignment node.
+      narrative: >-
+        {scope.name} has Lighthouse registrationAssignment {assignment.name}
+        (provisioningState: {value}) pointing to managing tenant
+        {definition.managingTenantId}.
+
+  # --- CrossTenantTrust: managing-Tenant -> customer-Tenant ------------------
+  - id: azure-lighthouse-cross-tenant-trust-explicit
+    emits: CrossTenantTrust
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ManagedServices/registrationAssignments"
+      field: "properties.registrationDefinition.properties.managingTenantId"
+    where:
+      - "properties.provisioningState == 'Succeeded'"
+      - "properties.registrationDefinition.properties.authorizations is non-empty"
+      - "none of properties.registrationDefinition.properties.authorizations[].roleDefinitionId == '8e3af657-a8ff-443c-a75c-2fe8c4bcb635'"
+    emit:
+      source_type: Tenant
+      target_type: Tenant
+      source: "<Tenant node for properties.registrationDefinition.properties.managingTenantId>"
+      target: "<Tenant node for the customer subscription's tenantId>"
+      api_source: "GET /subscriptions/{subId}/providers/Microsoft.ManagedServices/registrationAssignments?$expand=registrationDefinition"
+      evidence_field: "properties.registrationDefinition.properties.managingTenantId"
+      note: >-
+        CrossTenantTrust schema source=[Tenant, ApplicationIdentity]; target=[Tenant, ExternalIdentity].
+        Source: managing Tenant node (construct from managingTenantId).
+        Target: customer Tenant node (from subscription's tenantId property).
+        NOT the Subscription node — Subscription is not in the schema source/target sets.
+        Dedupe on (CrossTenantTrust, managingTenantId, customerTenantId): if multiple
+        registrationAssignments share the same managing tenant, emit once per
+        (managing-tenant, customer-tenant) pair.
+      narrative: >-
+        Managing tenant {managingTenantId} has a Lighthouse delegation active in customer
+        tenant {customerTenantId} via registrationAssignment {assignment.name}.
+
+  # --- TrustsExternalIdentity: registrationDefinition -> ExternalPrincipal ---
+  - id: azure-lighthouse-trusts-external-principal
+    emits: TrustsExternalIdentity
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ManagedServices/registrationDefinitions"
+      field: "properties.authorizations"
+    where:
+      - "each item in properties.authorizations[] where roleDefinitionId != '8e3af657-a8ff-443c-a75c-2fe8c4bcb635'"
+    emit:
+      source_type: ResourcePolicy
+      target_type: ExternalIdentity
+      source: "<registrationDefinition TrustPolicy node (id = definition resource id)>"
+      target: "<ExternalPrincipal node (principalId from authorizations[], managingTenantId = home tenant)>"
+      api_source: "GET /subscriptions/{subId}/providers/Microsoft.ManagedServices/registrationDefinitions"
+      evidence_field: "properties.authorizations[].principalId, properties.authorizations[].roleDefinitionId, properties.authorizations[].principalIdDisplayName, properties.authorizations[].allowDelegatedRoleAssignments"
+      note: >-
+        Emit one edge per authorizations[] entry. Also emit for each
+        eligibleAuthorizations[] entry, tagging the edge with
+        state=CONDITIONAL(pim_activation) and recording justInTimeAccessPolicy details
+        (managedByTenantApprovers, maximumActivationDuration) on edge properties.
+        The ExternalPrincipal node is typed ExternalIdentity (class=Identity); its
+        home tenant is registrationDefinition.properties.managingTenantId.
+        If the managing-tenant's graph is available and the principalId resolves to a
+        known node, prefer that node over a synthetic ExternalIdentity. Record
+        allowDelegatedRoleAssignments flag (true/false) on the edge for rule 3 consumption.
+      narrative: >-
+        RegistrationDefinition {definition.name} trusts managing-tenant principal
+        {principal.name} ({principalId}) from tenant {managingTenantId} with role
+        {roleDefinitionId}{if allowDelegatedRoleAssignments: ', sub-delegation enabled'}.
+
+  # --- ExternalIdentityMapsTo: ExternalPrincipal -> delegated Role ------------
+  - id: azure-lighthouse-external-maps-to-role
+    emits: ExternalIdentityMapsTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ManagedServices/registrationDefinitions"
+      field: "properties.authorizations"
+    where:
+      - "each item in properties.authorizations[] where roleDefinitionId != '8e3af657-a8ff-443c-a75c-2fe8c4bcb635'"
+    emit:
+      source_type: ExternalIdentity
+      target_type: Role
+      source: "<ExternalPrincipal node (principalId, same as TrustsExternalIdentity target)>"
+      target: "<Role node (roleDefinitionId resolved — built-in or custom role in customer subscription)>"
+      api_source: "GET /subscriptions/{subId}/providers/Microsoft.Authorization/roleDefinitions/{roleDefinitionId}"
+      evidence_field: "properties.authorizations[].roleDefinitionId"
+      note: >-
+        Resolve roleDefinitionId to a role node in the customer subscription. For built-in
+        roles (GUID matching known built-ins), use the canonical built-in Role node.
+        For custom roles, resolve via the roleDefinitions API. The (TrustsExternalIdentity,
+        ExternalIdentityMapsTo) pair forms the normalized trust representation that
+        federation-chains.yaml federation-maps-to-identity consumes to derive
+        CanFederateAs(?ext -> ?role). For Lighthouse this is ARM-RBAC-based cross-tenant
+        access (not OIDC/SAML), so the CanFederateAs semantics represent a delegated-role
+        assumption rather than token federation; the path-finding consequence is identical.
+      narrative: >-
+        Managed-tenant principal {external_principal.name} is mapped to delegated role
+        {role.name} ({roleDefinitionId}) in customer subscription {customer_sub.name}.

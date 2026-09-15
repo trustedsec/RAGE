@@ -1,0 +1,541 @@
+# Azure Policy (Microsoft.Authorization — policy + Microsoft.PolicyInsights)
+# derived attack-path rules (Phase 12 — security & logging)
+# ---------------------------------------------------------------------------
+# PHASE-12 SERVICE ADAPTER: Azure Policy is primarily a GOVERNANCE / DETECTIVE
+# CONTROL service, but it has three attack-surface modes:
+#
+#   (1) EXECUTION via remediation MI (dominant): a deployIfNotExists / modify
+#       effect assignment carries a managed identity that the remediation engine
+#       uses to deploy ARM templates or modify resources. An attacker who can write
+#       a policy assignment and pass a privileged MI creates an execution path that
+#       runs AS that MI. This is the primary CanExecuteAs primitive for this service.
+#       => CanModifyConfiguration(remediation_task) + CanPassIdentity(MI) + CanTrigger(remediation)
+#       => CanExecuteAs(principal -> MI)
+#       LINCHPINS: can-execute-as execute-as-via-config-identity-swap (cited, not re-derived).
+#
+#   (2) DEFENSE EVASION — exemption (medium): policyExemptions/write removes a resource
+#       from policy enforcement. For Deny-effect policies this is a preventive control
+#       bypass — it does NOT grant access, but it may unblock ARM actions that were
+#       previously denied by the policy engine. Model as CanModifyPolicy on the
+#       ConfigurationService (exemption) node.
+#       => CanModifyPolicy(principal -> ConfigurationService)
+#       NOTE: Do NOT chain exemption write to CanEscalateTo or CanEnter* directly —
+#       the exemption removes a guardrail, not grants new permissions. Downstream
+#       escalation (if any) is via the now-unblocked action, not this edge itself.
+#
+#   (3) DEFENSE EVASION — definition / assignment neutralization: policyDefinitions/write
+#       and policySetDefinitions/write on assigned custom Deny/Audit definitions can
+#       neutralize the guardrail org-wide. policyAssignments/delete removes the assignment.
+#       Model as CanModifyPolicy and/or CanDelete on ConfigurationService nodes.
+#
+# LINCHPINS CITED (never re-derived here):
+#   can-execute-as  execute-as-via-config-identity-swap: CanModifyConfiguration(?p, ?compute)
+#                   + CanPassIdentity(?p, ?identity) => CanExecuteAs(?p, ?identity).
+#   can-execute-as  execute-as-via-code-modify: CanModifyCode(?p, ?compute)
+#                   + ExecutesAs(?compute, ?identity) => CanExecuteAs(?p, ?identity).
+#   cicd-chains     cicd-modify-buildspec-executes-as: CanModifyCode + ExecutesAs =>
+#                   CanExecuteAs (CI/CD framing, remediations as runners).
+#   can-control     escalate-via-execute-as: CanExecuteAs => CanEscalateTo when identity
+#                   is more privileged.
+#   credential-chains (not directly applicable to this service).
+#
+# PHASE-12 GROUND RULES (task spec):
+#   - Evasion edges (CanModifyPolicy, CanDelete) on ConfigurationService nodes
+#     are COVER-TRACKS / weaken-governance primitives — they do NOT chain to
+#     CanEnter*/CanExecuteAs.
+#   - The remediation MI execution path IS an escalation path via CanModifyConfiguration
+#     on the remediation task (BuildWorker); cite can-execute-as.
+#   - Preventive guardrail exemption/deletion may unblock BLOCKED edges elsewhere;
+#     this is noted in false_positive_note but is NOT modeled as a direct CanEscalateTo.
+#   - Detective controls (Audit/AuditIfNotExists effects) do not set BLOCKED state —
+#     BLOCKED is only for preventive controls (Deny effect, deny assignment).
+#
+# All permission strings from the official Microsoft.Authorization and
+# Microsoft.PolicyInsights resource-provider operations reference, 2026-09.
+# No hallucinated permissions.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 12-security-logging
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # 1. Policy assignment write → remediation task (BuildWorker) configuration modification
+  #    (→ CanModifyConfiguration + CanPassIdentity, consumed by can-execute-as)
+  # ===========================================================================
+
+  - id: azure-policy-assignment-write-deploy-effect
+    emits: CanModifyConfiguration
+    description: >-
+      Write a policy assignment with deployIfNotExists or modify effect, specifying
+      a managed identity (system- or user-assigned) that the remediation engine uses
+      to deploy ARM templates or modify resources. This is modeled as CanModifyConfiguration
+      on the remediation task (BuildWorker): writing the assignment modifies the identity
+      binding and ARM template that the remediation task will execute. Downstream,
+      can-execute-as execute-as-via-config-identity-swap combines this with
+      CanPassIdentity(MI) to derive CanExecuteAs(MI).
+    match_effective_permission:
+      action: "Microsoft.Authorization/policyAssignments/write"
+      scope_type: "resource|resourceGroup|subscription|managementGroup"
+    where:
+      - "principal effectively holds Microsoft.Authorization/policyAssignments/write at the scope"
+      - "the targeted or new assignment references a policyDefinition or policySetDefinition with at least one deployIfNotExists or modify effect rule"
+      - "the assignment includes a non-empty identity block (system-assigned or user-assigned MI)"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<remediation task (BuildWorker) for the policy assignment>"
+      permissions:
+        - "Microsoft.Authorization/policyAssignments/write"
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds policyAssignments/write at the target scope AND
+        the assignment is confirmed to reference a deployIfNotExists or modify effect
+        definition. For system-assigned MI: no assign/action gate — ACTIVE when
+        policyAssignments/write is confirmed (the system MI is auto-created by ARM).
+        For user-assigned MI: requires Microsoft.ManagedIdentity/userAssignedIdentities/assign/action
+        on the target MI (CanPassIdentity gate); CONDITIONAL(iam_permission) if assign/action
+        is absent or unconfirmed. CONDITIONAL(role_compatibility) if the effect type is not
+        confirmed (could be Deny/Audit only). BLOCKED if a deny assignment covers
+        policyAssignments/write at the scope. Management-group scope affects all descendant
+        subscriptions — higher blast radius, same state logic. Escalation to CanExecuteAs(MI)
+        is derived by can-execute-as execute-as-via-config-identity-swap when
+        CanPassIdentity(principal -> MI) is present; cite that rule, do NOT re-derive here.
+      confidence: 0.90
+      derived_from:
+        - "effective permission: Microsoft.Authorization/policyAssignments/write"
+        - "can-execute-as.yaml: execute-as-via-config-identity-swap (CanModifyConfiguration + CanPassIdentity => CanExecuteAs)"
+        - "cicd-chains.yaml: cicd-modify-buildspec-executes-as (remediation task is analogous to a build runner)"
+      false_positive_note: >-
+        ONLY emit when the policy assignment references a deployIfNotExists or modify effect
+        definition — Deny, Audit, and AuditIfNotExists effects do NOT produce execution paths
+        (no remediation MI execution occurs). Verify the effect type from the policyDefinition
+        properties.policyRule.then.effect field. A CanPassIdentity(principal -> MI) edge is
+        required for can-execute-as to derive CanExecuteAs; without it, this edge is a
+        governance-write capability, not a confirmed escalation. The remediation MI must also
+        hold RBAC (via roleDefinitionIds granted at assignment scope) to perform meaningful
+        actions as that MI — an MI with no granted role yields execution but no elevated
+        capability. Do NOT emit for built-in definitions that use deployIfNotExists but that
+        an attacker cannot modify (e.g., Microsoft Defender-provisioned assignments the attacker
+        did not create). Only emit when policyAssignments/write is the attacker's actual
+        capability. policyAssignments/write at resource-group scope only creates assignments
+        for that RG; scope the edge accordingly.
+      narrative: >-
+        {principal.name} can write a policy assignment
+        (Microsoft.Authorization/policyAssignments/write) with a deployIfNotExists or modify
+        effect definition and a managed identity attached. The Azure Policy remediation engine
+        deploys ARM templates or modifies resources AS that managed identity; combined with
+        CanPassIdentity on the MI, can-execute-as execute-as-via-config-identity-swap derives
+        CanExecuteAs({principal.name} -> {mi.name}).
+
+  # ===========================================================================
+  # 2. ExecutesAs fact — remediation task runs as the assignment's MI
+  #    (structural link; consumed by can-execute-as)
+  # ===========================================================================
+
+  - id: azure-policy-remediation-task-executes-as-mi
+    emits: ExecutesAs
+    description: >-
+      An Azure Policy remediation task (modeled as BuildWorker — the ARM deployment
+      runner) executes as the managed identity bound in the policy assignment's identity
+      block. Zero-cost structural fact; can-execute-as execute-as-via-code-modify and
+      cicd-chains cicd-modify-buildspec-executes-as consume this to produce CanExecuteAs.
+    match:
+      - [ ?assignment, Identity, ?identity ]
+    where:
+      - "node_type(?assignment) == BuildWorker"
+      - "?assignment.provider_type == 'Microsoft.PolicyInsights/remediations'"
+      - "node_type(?identity) in [ManagedIdentity, ServiceIdentity]"
+      - "?assignment references an assignment identity (principalId or userAssignedIdentities)"
+      - "the policy definition referenced by the assignment has at least one deployIfNotExists or modify effect rule"
+    emit:
+      source_type: BuildWorker
+      target_type: ManagedIdentity
+      source: "<remediation task for the assignment>"
+      target: ?identity
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the assignment identity block is non-empty AND the referenced policy
+        definition uses deployIfNotExists or modify effect (confirming remediation
+        execution is intended). Zero-cost structural fact. BLOCKED if the assignment is
+        disabled (enforcementMode=DoNotEnforce with no remediation scheduled). Do NOT
+        emit for Deny/Audit/AuditIfNotExists assignments — those effects do not trigger
+        remediation tasks.
+      confidence: 1.0
+      derived_from:
+        - "policyAssignment.identity.principalId or userAssignedIdentities (ARM collection)"
+        - "policyAssignment.properties.policyDefinitionId -> effect = deployIfNotExists|modify"
+        - "can-execute-as.yaml: execute-as-via-code-modify consumes this ExecutesAs to produce CanExecuteAs"
+        - "cicd-chains.yaml: cicd-modify-buildspec-executes-as (remediation task as runner)"
+      false_positive_note: >-
+        Only emit when the assignment identity block is populated AND the policy effect
+        is deployIfNotExists or modify — these are the only effects that produce
+        remediation tasks. A Deny/Audit assignment with a non-empty identity block is
+        unusual (Azure may include it for historical reasons) but does NOT produce a
+        remediation task at runtime — do not emit ExecutesAs in that case. Verify the
+        effect from the policyDefinition, not only the assignment metadata.
+      narrative: >-
+        The remediation task for policy assignment {assignment.name} executes as managed
+        identity {target.name} (assignment identity block); any ARM operations the
+        remediation task performs run under {target.name}'s RBAC. can-execute-as collapses
+        this with CanModifyConfiguration(principal -> assignment) and
+        CanPassIdentity(principal -> {target.name}) to produce CanExecuteAs.
+
+  # ===========================================================================
+  # 3. Explicit remediation trigger (→ CanTrigger, consumed by cicd-chains rule 2)
+  # ===========================================================================
+
+  - id: azure-policy-trigger-remediation
+    emits: CanTrigger
+    description: >-
+      Explicitly trigger a policy remediation task via Microsoft.PolicyInsights/remediations/write;
+      the remediation executes as the assignment's bound MI. This is a direct trigger
+      path that does not require policyAssignments/write if the assignment already has
+      a remediation MI configured.
+    match_effective_permission:
+      action: "Microsoft.PolicyInsights/remediations/write"
+      scope_type: "resource|resourceGroup|subscription|managementGroup"
+    where:
+      - "principal effectively holds Microsoft.PolicyInsights/remediations/write at the scope"
+      - "at least one policy assignment in scope has an identity block with deployIfNotExists or modify effect (ExecutesAs confirmed by azure-policy-remediation-task-executes-as-mi)"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<remediation task (BuildWorker) for the targeted assignment>"
+      permissions:
+        - "Microsoft.PolicyInsights/remediations/write"
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the principal holds remediations/write AND a remediation-eligible
+        assignment exists at that scope (assignment has identity + deployIfNotExists/modify
+        effect). CONDITIONAL(service_state) if the policy service is not evaluating (unlikely
+        for standard assignments; more relevant for paused/disabled assignments). BLOCKED if a
+        deny assignment covers remediations/write. cicd-chains cicd-trigger-runner-executes-as
+        keeps this CONDITIONAL(attacker_influenced_definition) unless the remediation task
+        already runs attacker-controlled content (which for policy remediations means the
+        underlying deployIfNotExists template is attacker-authored). When paired with
+        azure-policy-assignment-write-deploy-effect (CanModifyConfiguration), the combined path
+        is the MODIFY variant (ACTIVE). When remediations/write is held without
+        policyAssignments/write, this is the weaker trigger-only path.
+      confidence: 0.88
+      derived_from:
+        - "effective permission: Microsoft.PolicyInsights/remediations/write"
+        - "cicd-chains.yaml: cicd-trigger-runner-executes-as (rule 2, CONDITIONAL unless definition is attacker-influenced)"
+        - "can-execute-as.yaml: execute-as-via-command (if remediation triggers OS-level ops)"
+      false_positive_note: >-
+        remediations/write alone triggers the CURRENT remediation definition (the policy's
+        deployIfNotExists ARM template or modify effect). This yields the MI's token only if
+        (a) the attacker can influence the ARM template content (via policyAssignments/write or
+        policyDefinitions/write — then use the MODIFY path, not this trigger-only rule) or
+        (b) the remediation task already performs actions the attacker benefits from (e.g.,
+        the existing template grants a role assignment, creates a resource, or runs a script).
+        For a trusted, unmodified remediation template the attacker cannot influence,
+        keep CONDITIONAL(attacker_influenced_definition). Do not emit for assignments with
+        Deny/Audit effects that have no remediation task.
+      narrative: >-
+        {principal.name} can explicitly trigger a policy remediation task
+        (Microsoft.PolicyInsights/remediations/write); the task executes as the assignment's
+        bound managed identity {mi.name}. cicd-chains derives CanExecuteAs
+        CONDITIONAL(attacker_influenced_definition) from this trigger + the ExecutesAs fact.
+
+  # ===========================================================================
+  # 4. Policy exemption write → governance evasion (defense evasion mode)
+  # ===========================================================================
+
+  - id: azure-policy-exemption-write
+    emits: CanModifyPolicy
+    description: >-
+      Write a policy exemption to remove a resource or scope from Azure Policy enforcement
+      (governance evasion). For Deny-effect assignments this may unblock previously-denied
+      ARM operations. This is a control-bypass / cover-tracks primitive — it does NOT
+      directly grant access to the exempted resource.
+    match_effective_permission:
+      action: "Microsoft.Authorization/policyExemptions/write"
+      scope_type: "resource|resourceGroup|subscription|managementGroup"
+    where:
+      - "principal effectively holds Microsoft.Authorization/policyExemptions/write at the scope"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: "<principal>"
+      target: "<policy exemption (ConfigurationService) or the assignment being exempted>"
+      permissions:
+        - "Microsoft.Authorization/policyExemptions/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal holds policyExemptions/write at the target scope.
+        BLOCKED if a deny assignment covers policyExemptions/write. Management-group scope
+        exemptions affect all descendant subscriptions. This edge represents the ability to
+        write an exemption (cover-tracks/governance bypass) — it does NOT itself unblock
+        other edges; that secondary effect is captured in analyst notes.
+      confidence: 0.92
+      derived_from:
+        - "effective permission: Microsoft.Authorization/policyExemptions/write"
+      false_positive_note: >-
+        This is a GOVERNANCE EVASION primitive, not privilege escalation. Do NOT chain
+        azure-policy-exemption-write directly to CanExecuteAs, CanEnterSubscription, or
+        CanEscalateTo. The secondary effect — that exempting a Deny-effect policy may upgrade
+        a BLOCKED edge (denied by that policy) to ACTIVE — is a policy-engine concern that
+        the state evaluator handles separately when re-evaluating edges whose block condition
+        was that specific policy. Exemption categories: Waiver (permanent) vs. Mitigated
+        (temporary with expiration); both have the same security primitive. An exemption on
+        an Audit-only assignment silences compliance findings but does NOT change any BLOCKED
+        edge to ACTIVE (since Audit does not set BLOCKED). The exemption is itself a visible
+        ARM resource — less stealthy than definition modification (rule 5 below).
+      narrative: >-
+        {principal.name} can write a policy exemption
+        (Microsoft.Authorization/policyExemptions/write) removing a resource or scope from
+        Azure Policy enforcement. For Deny-effect assignments this may unblock ARM operations
+        that were previously denied by that policy (a preventive control bypass). This is a
+        governance evasion primitive — it reduces compliance coverage and may unblock other
+        attack steps, but does not by itself grant access to protected resources.
+
+  # ===========================================================================
+  # 5. Policy definition write → guardrail neutralization (defense evasion mode)
+  # ===========================================================================
+
+  - id: azure-policy-definition-write-neutralize
+    emits: CanModifyPolicy
+    description: >-
+      Overwrite a custom policy definition to change its effect from Deny (or Audit) to
+      Disabled or Audit, neutralizing a guardrail that applies wherever that definition
+      is assigned — potentially subscription-wide or org-wide. This is a stealthy
+      defense-evasion primitive that modifies the definition rather than creating a
+      visible exemption.
+    match_effective_permission:
+      action: "Microsoft.Authorization/policyDefinitions/write"
+      scope_type: "subscription|managementGroup"
+    where:
+      - "principal effectively holds Microsoft.Authorization/policyDefinitions/write at the scope"
+      - "at least one active assignment references this custom definition (the modification has effect)"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: "<principal>"
+      target: "<custom policy definition (ConfigurationService)>"
+      permissions:
+        - "Microsoft.Authorization/policyDefinitions/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal holds policyDefinitions/write at the scope AND the definition
+        is a custom definition (not a built-in — built-in definitions at
+        /providers/Microsoft.Authorization/policyDefinitions/* cannot be overwritten).
+        CONDITIONAL(service_state) if no assignment currently references the definition (the
+        modification has no effect on active enforcement). BLOCKED if a deny assignment covers
+        policyDefinitions/write. Management-group scope definitions affect all subscriptions
+        in the hierarchy; verify scope accordingly.
+      confidence: 0.88
+      derived_from:
+        - "effective permission: Microsoft.Authorization/policyDefinitions/write"
+      false_positive_note: >-
+        Only custom policy definitions at subscription or management-group scope can be
+        overwritten via policyDefinitions/write. BUILT-IN definitions
+        (/providers/Microsoft.Authorization/policyDefinitions/* path) cannot be modified
+        by any caller regardless of RBAC — do NOT emit for built-in definitions.
+        Definition modification has effect only if the definition is currently assigned;
+        an unassigned custom definition is a preparatory step (POTENTIAL or CONDITIONAL).
+        This is a DEFENSE EVASION primitive: changing Deny to Disabled removes a preventive
+        guardrail without creating a visible exemption record. Do NOT chain directly to
+        CanEscalateTo — the path is: neutralize guardrail -> previously-BLOCKED action
+        becomes unblocked -> attacker uses that action separately. This is a background
+        condition change, not a direct escalation edge.
+      narrative: >-
+        {principal.name} can overwrite the custom policy definition {target.name}
+        (Microsoft.Authorization/policyDefinitions/write), changing its effect from Deny to
+        Audit or Disabled. This silences compliance findings and removes the preventive
+        guardrail at all scopes where the definition is assigned — a stealthy alternative
+        to creating a visible exemption record.
+
+  # ===========================================================================
+  # 6. Policy assignment delete → guardrail removal (defense evasion mode)
+  # ===========================================================================
+
+  - id: azure-policy-assignment-delete
+    emits: CanDelete
+    description: >-
+      Delete a policy assignment, removing the guardrail at that scope. For Deny-effect
+      assignments this unblocks all previously-denied ARM operations at the scope.
+      Destructive impact (cover-tracks); not modeled as escalation.
+    match_effective_permission:
+      action: "Microsoft.Authorization/policyAssignments/delete"
+      scope_type: "resource|resourceGroup|subscription|managementGroup"
+    where:
+      - "principal effectively holds Microsoft.Authorization/policyAssignments/delete at the scope"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: "<principal>"
+      target: "<policy assignment (ConfigurationService)>"
+      permissions:
+        - "Microsoft.Authorization/policyAssignments/delete"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal holds policyAssignments/delete at the scope. BLOCKED if
+        a deny assignment covers policyAssignments/delete. CanDelete is excluded from
+        default path traversal (schema/edges.yaml traversal: walkable: false) — surfaced
+        for analyst review and impact assessment. Deleting a management-group assignment
+        removes enforcement from all descendant subscriptions simultaneously.
+      confidence: 0.95
+      derived_from:
+        - "effective permission: Microsoft.Authorization/policyAssignments/delete"
+      false_positive_note: >-
+        This is a DESTRUCTIVE / EVASION primitive (CanDelete, walkable: false). Do NOT
+        chain to CanEscalateTo or CanExecuteAs — the delete removes a control, it does
+        not grant new permissions. Secondary effect: deleting a Deny-effect assignment
+        may upgrade BLOCKED edges to ACTIVE where the policy was the deny source. This
+        secondary effect is the policy-engine's responsibility to re-evaluate, not a
+        direct derived edge from CanDelete. Scope matters: deleting at MG scope is
+        org-wide; at subscription scope is subscription-wide.
+      narrative: >-
+        {principal.name} can delete a policy assignment
+        (Microsoft.Authorization/policyAssignments/delete), removing the guardrail at the
+        assignment scope. Deleting a Deny-effect assignment unblocks all previously-denied
+        operations at that scope. This is a cover-tracks / governance-weakening primitive
+        with no direct escalation consequence.
+
+  # ===========================================================================
+  # 6. Policy set definition (initiative) write → guardrail neutralization
+  #    (defense evasion mode)
+  # ===========================================================================
+
+  - id: azure-policy-setdefinition-write-neutralize
+    emits: CanModifyPolicy
+    description: >-
+      Overwrite a custom policy set definition (initiative) to change the effect of
+      bundled policy rules from Deny (or Audit) to Disabled or Audit, neutralizing a
+      guardrail that applies wherever that initiative is assigned — potentially
+      subscription-wide or org-wide. An initiative can bundle multiple deployIfNotExists
+      or Deny rules; overwriting one has the same org-wide blast radius as modifying a
+      single policyDefinition. This is a stealthy defense-evasion primitive.
+    match_effective_permission:
+      action: "Microsoft.Authorization/policySetDefinitions/write"
+      scope_type: "subscription|managementGroup"
+    where:
+      - "principal effectively holds Microsoft.Authorization/policySetDefinitions/write at the scope"
+      - "at least one active assignment references this custom initiative (the modification has effect)"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: "<principal>"
+      target: "<custom policy set definition / initiative (ConfigurationService)>"
+      permissions:
+        - "Microsoft.Authorization/policySetDefinitions/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal holds policySetDefinitions/write at the scope AND the
+        initiative is a custom initiative (not a built-in — built-in initiatives at
+        /providers/Microsoft.Authorization/policySetDefinitions/* cannot be overwritten).
+        CONDITIONAL(service_state) if no assignment currently references the initiative
+        (the modification has no effect on active enforcement). BLOCKED if a deny assignment
+        covers policySetDefinitions/write. Management-group scope initiatives affect all
+        subscriptions in the hierarchy; verify scope accordingly.
+      confidence: 0.88
+      derived_from:
+        - "effective permission: Microsoft.Authorization/policySetDefinitions/write"
+      false_positive_note: >-
+        Only custom policy set definitions at subscription or management-group scope can be
+        overwritten via policySetDefinitions/write. BUILT-IN initiatives
+        (/providers/Microsoft.Authorization/policySetDefinitions/* path) cannot be modified
+        by any caller regardless of RBAC — do NOT emit for built-in initiatives.
+        Initiative modification has effect only if the initiative is currently assigned;
+        an unassigned custom initiative is a preparatory step (POTENTIAL or CONDITIONAL).
+        This is a DEFENSE EVASION primitive: changing bundled Deny rules to Disabled removes
+        a preventive guardrail without creating a visible exemption record. Do NOT chain
+        directly to CanEscalateTo — the path is: neutralize guardrail -> previously-BLOCKED
+        action becomes unblocked -> attacker uses that action separately. This is a
+        background condition change, not a direct escalation edge.
+      narrative: >-
+        {principal.name} can overwrite the custom policy set definition (initiative)
+        {target.name} (Microsoft.Authorization/policySetDefinitions/write), changing the
+        effect of bundled Deny or Audit rules to Audit or Disabled. This silences compliance
+        findings and removes the preventive guardrail at all scopes where the initiative is
+        assigned — a stealthy alternative to creating a visible exemption record.
+
+  # ===========================================================================
+  # 7. Policy assignment write (evasion variant — non-execute-effect assignments)
+  # ===========================================================================
+
+  - id: azure-policy-assignment-write-governance-evasion
+    emits: CanModifyPolicy
+    description: >-
+      Modify an existing policy assignment's parameters, scope, or enforcement mode to
+      weaken or disable its guardrail effect (e.g., set enforcementMode=DoNotEnforce to
+      turn a Deny assignment into an audit-only posture, or narrow the scope). Applies to
+      any effect type. This is governance evasion — separate from the execution-path rule
+      (rule 1) which targets deployIfNotExists/modify assignments with a bound MI.
+    match_effective_permission:
+      action: "Microsoft.Authorization/policyAssignments/write"
+      scope_type: "resource|resourceGroup|subscription|managementGroup"
+    where:
+      - "principal effectively holds Microsoft.Authorization/policyAssignments/write at the scope"
+      - "the targeted assignment uses Deny, Audit, or AuditIfNotExists effect (NOT deployIfNotExists or modify — those are covered by rule 1)"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: "<principal>"
+      target: "<policy assignment (ConfigurationService)>"
+      permissions:
+        - "Microsoft.Authorization/policyAssignments/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal holds policyAssignments/write at the scope AND the targeted
+        assignment is confirmed to be a non-remediation-effect type (Deny / Audit /
+        AuditIfNotExists). BLOCKED if a deny assignment covers policyAssignments/write.
+        Setting enforcementMode=DoNotEnforce on a Deny assignment silences the deny without
+        deleting the assignment (less obvious). Modifying assignment parameters can narrow
+        scope or loosen conditions. This is a DEFENSE EVASION primitive — do NOT chain
+        to CanExecuteAs or CanEnterSubscription.
+      confidence: 0.88
+      derived_from:
+        - "effective permission: Microsoft.Authorization/policyAssignments/write"
+      false_positive_note: >-
+        This rule covers the EVASION case (modifying a Deny/Audit assignment). The EXECUTION
+        case (writing a deployIfNotExists/modify assignment with a bound MI) is rule 1
+        (azure-policy-assignment-write-deploy-effect). Do not emit both rules for the same
+        assignment — determine the effect type and apply the appropriate rule. Modifying an
+        assignment's enforcementMode to DoNotEnforce is a stealthy softening tactic: the
+        assignment still appears in the portal and compliance results but Deny actions no
+        longer block. This is an under-documented evasion technique; verify support for
+        DoNotEnforce on Deny-effect assignments in the current API version (available since
+        API version 2020-09-01).
+      narrative: >-
+        {principal.name} can modify a Deny or Audit policy assignment
+        (Microsoft.Authorization/policyAssignments/write), for example setting
+        enforcementMode=DoNotEnforce to silently disable the deny effect without deleting
+        the assignment or creating a visible exemption. This is a governance evasion
+        primitive — it weakens detective or preventive coverage without removing the
+        assignment artefact.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A deny assignment covering Microsoft.Authorization/policyAssignments/write at
+#    the effective scope -> azure-policy-assignment-write-deploy-effect and
+#    azure-policy-assignment-write-governance-evasion emit with state: BLOCKED.
+#  - A deny assignment covering Microsoft.Authorization/policyExemptions/write ->
+#    azure-policy-exemption-write state: BLOCKED.
+#  - A deny assignment covering Microsoft.Authorization/policyDefinitions/write ->
+#    azure-policy-definition-write-neutralize state: BLOCKED.
+#  - A deny assignment covering Microsoft.Authorization/policySetDefinitions/write ->
+#    azure-policy-setdefinition-write-neutralize state: BLOCKED.
+#  - Built-in policy definitions (/providers/Microsoft.Authorization/policyDefinitions/*)
+#    and built-in initiatives (/providers/Microsoft.Authorization/policySetDefinitions/*)
+#    cannot be modified; azure-policy-definition-write-neutralize and
+#    azure-policy-setdefinition-write-neutralize do NOT fire.
+#  - A policy assignment with enforcementMode=DoNotEnforce does not generate remediation
+#    tasks; azure-policy-remediation-task-executes-as-mi state: BLOCKED for such assignments.
+#  - CanExecuteAs(principal -> MI) is derived by can-execute-as
+#    execute-as-via-config-identity-swap when BOTH CanModifyConfiguration(principal ->
+#    assignment) AND CanPassIdentity(principal -> MI) are present. If CanPassIdentity
+#    is absent (the MI cannot be passed to the assignment by the attacker), CanExecuteAs
+#    is NOT derived from rule 1 alone. For user-assigned MI: CanPassIdentity gate requires
+#    Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on the target MI.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service are in /rules/explicit/azure-policy.yaml
+# (ExecutesAs from assignment identity blocks). Explicit records are processed separately
+# by the explicit-rules engine and do not appear in derived rules files.

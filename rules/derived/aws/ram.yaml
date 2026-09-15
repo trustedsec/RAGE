@@ -1,0 +1,273 @@
+# AWS Resource Access Manager (RAM) — Derived attack-path rules (Phase 13 — cross-boundary)
+# ===========================================================================
+# RAM is the AWS control plane for intentional cross-account resource sharing.
+# A resource OWNER creates a ResourceShare listing resource ARNs + principal
+# accounts/OUs/org. When the consumer accepts (or the share is org-wide),
+# the shared resource becomes accessible cross-account. This file derives the
+# traversable security consequences from the explicit CrossAccountTrust edges
+# that /rules/explicit/aws-ram.yaml normalizes.
+#
+# WHAT THIS FILE DERIVES (emits service FACTS; defers roll-ups to linchpins):
+#   (1) CrossAccountTrust (share -> consumer Account): normalized in
+#       /rules/explicit/aws-ram.yaml; this file derives downstream consequences.
+#   (2) CanNetworkReach (consumer VPC -> shared Subnet/TGW-routed resources):
+#       shared subnet collapses the inter-account network boundary. Consumer
+#       workloads launched into the shared subnet are on-link with owner-account
+#       resources on that subnet. Shared TGW enables inter-account routing.
+#   (3) ExposedToTenant (shared resource -> org): an org-wide share broadcasts
+#       the resource to all current and future member accounts (high blast radius).
+#       OU-level shares are normalized as individual CrossAccountTrust edges
+#       to member accounts by /rules/explicit/aws-ram.yaml (org hierarchy resolution).
+#
+# LINCHPINS CITED (NOT DUPLICATED):
+#   * rules/derived/can-control.yaml
+#       - enter-account-via-assume: NOT applicable to RAM. RAM's CrossAccountTrust
+#         (share -> consumer Account) does NOT yield CanAssume (the consumer does
+#         not assume a role in the owner; they get resource access directly).
+#         CanEnterAccount from RAM flows via the NETWORK path (shared subnet +
+#         CanNetworkReach) or implicit account boundary crossing (consumer using
+#         shared resource). Do NOT cite enter-account-via-assume for RAM edges.
+#       - control-via-admin: if the consumer gains CanAdminister over resources
+#         inside the owner account via a shared resource, that CanAdminister
+#         derives from the resource's permission model (e.g. shared S3 bucket
+#         with write), not from RAM itself. Emit CanAdminister from the resource
+#         service's rules, not here.
+#   * rules/derived/hierarchy-chains.yaml
+#       - admin-inherits-down-contains: if the consumer (via a shared resource)
+#         ends up with Controls over an owner-account boundary node, rule 1 will
+#         propagate it down. Do NOT model this here; emit the boundary-level
+#         capability from the resource service.
+#       - guardrail-removal-upgrades-blocked: CanModifyPolicy over the RAM share
+#         (from explicit rules aws-ram-associate-resource-share / aws-ram-update-
+#         resource-share) is the input when the share itself or its
+#         allowExternalPrincipals flag is a guardrail; hierarchy-chains performs
+#         the BLOCKED->ACTIVE upgrade for any edge that share was suppressing.
+#   * rules/derived/federation-chains.yaml: not applicable (RAM is not a
+#     federation mechanism; no OIDC/SAML/workload-identity trust involved).
+#
+# STATE defaults: ACTIVE when the share is accepted (or org-wide and no
+# invitation required). CONDITIONAL(service_state) for pending-invitation
+# cross-account shares. BLOCKED when an SCP denies the relevant RAM action.
+# A CONDITIONAL contributor never yields a stronger output.
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml), honored by every emit:
+#   CrossAccountTrust:  source [Account, Role, ResourcePolicy]  target [Account, ExternalIdentity]
+#   CanNetworkReach:    source [Compute, Network, Identity]      target [Compute, Data, Network, PrivateEndpoint]
+#   RoutesTo:           source [Route, Subnet, TransitGateway]   target [Network, Subnet]
+#   ExposedToTenant:    source [*]                               target [Tenant, Organization]
+#   CanModifyPolicy:    source [Identity]                        target [Policy, Identity, *]
+# ===========================================================================
+
+provider: aws
+phase: 13-cross-boundary
+applies_to: [aws]
+
+rules:
+
+  # --- 1) Shared subnet collapses the inter-account network boundary -----------
+  # The most impactful RAM attack path for Phase 13. When an owner shares a
+  # subnet, consumer-account workloads are launched directly into the owner's
+  # VPC subnet and are on the same L2 segment as owner-account resources. This
+  # collapses the inter-account network boundary for those resources: no VPC
+  # peering, no TGW, no PrivateLink — just shared L2. The consumer-launched
+  # workload can reach any owner-account resource on that subnet whose security
+  # group admits traffic from the subnet CIDR. This is the canonical Phase-13
+  # RAM path: share subnet -> CrossAccountTrust (explicit) -> CanNetworkReach.
+  - id: aws-ram-shared-subnet-network-reach
+    emits: CanNetworkReach
+    description: "A shared subnet collapses the inter-account network boundary: consumer workloads launched into the shared subnet are on-link with owner-account resources, yielding on-subnet network reachability."
+    match:
+      - [ ?share, CrossAccountTrust, ?consumer_account ]
+    where:
+      - "node_type(?share) == ResourcePolicy   # the RAM ResourceShare node"
+      - "node_type(?consumer_account) == Account"
+      - "?share.resourceArns contains at least one Subnet ARN (shared_resource_type == Subnet)"
+      - "?share.status == 'ACTIVE'   # invitation accepted, or org-wide (no invitation needed)"
+      - "?share.allowExternalPrincipals == true OR consumer_account is in the same AWS Organization as the owner"
+    optional:
+      - [ ?consumer_account, CanNetworkReach, ?owner_subnet ]   # upgraded if already established
+    emit:
+      source_type: Network
+      target_type: Network
+      source: "<consumer VPC / workloads in ?consumer_account (Network or Compute)>"
+      target: "<Subnet node shared by ?share (owner-account subnet, subtype Subnet)>"
+      permissions: []
+      conditions: [network_reachability, resource_policy]
+      state_logic: >-
+        ACTIVE when the share is accepted (status==ACTIVE) and the consumer
+        account is a valid principal (allowExternalPrincipals==true for
+        cross-org accounts, or same-org). CONDITIONAL(service_state) when the
+        share is PENDING (invitation not yet accepted — cross-account, non-org).
+        CONDITIONAL(network_reachability) because security groups on owner-account
+        ENIs still gate the reachability at L4; the CanNetworkReach edge represents
+        on-subnet L2 reachability, which is a prerequisite for L4 access. BLOCKED
+        when an SCP denies ram:AcceptResourceShareInvitation on the consumer or
+        ram:CreateResourceShare on the owner. Never stronger than the weakest
+        contributing CrossAccountTrust state. NOTE: 'on-link' reachability is
+        CONDITIONAL(network_reachability) — the owner's SGs are the gating
+        condition the analyst must evaluate for each owner-side service.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<CrossAccountTrust edge_id (share -> consumer_account)>", "<shared subnet resource_type == Subnet>", "<share.status == ACTIVE>" ]
+      false_positive_note: >-
+        Consumer workloads in the shared subnet are co-located on the owner's
+        L2 but are still governed by OWNER-ACCOUNT security groups on the owner's
+        ENIs. Consumer CANNOT modify owner-account SGs. CanNetworkReach here means
+        the consumer VPC / its workloads are ON-SUBNET (L2 reachability) and MAY
+        reach owner-account services if the SG allows the subnet CIDR — not that
+        every resource is reachable. Emit CONDITIONAL(network_reachability) and
+        note the SG gate. Do NOT emit ACTIVE without confirming the relevant SG
+        rules admit traffic from the shared subnet CIDR (leave CONDITIONAL for
+        analyst evaluation). Source type is Network (consumer VPC) because Account
+        is not in CanNetworkReach.source — the reachability is realized by the
+        consumer VPC's workloads, not the account boundary node.
+        For pending-invitation shares (status==PENDING_ACCEPTANCE), emit only
+        CONDITIONAL(service_state) — no access until accepted. For org-wide shares
+        (principals == org/OU ARN), the consumer does not need to accept, so emit
+        ACTIVE once the org membership is confirmed.
+      narrative: >-
+        RAM share {share.name} in account {owner_account.name} grants account
+        {consumer_account.name} access to shared subnet {subnet.name}. Workloads
+        launched by {consumer_account.name} into that subnet (consumer VPC) are
+        on-link with owner-account resources on the same subnet, collapsing the
+        inter-account network boundary at L2 (subject to owner-side security
+        group evaluation at L4).
+
+  # --- 2) Shared Transit Gateway grants cross-account network reachability ----
+  # When an owner shares a TGW, the consumer can attach their VPC to it.
+  # The TGW then potentially routes consumer traffic to other TGW attachments
+  # (including owner-account VPCs). The routing paths are under the owner's
+  # control (TGW route tables), but the consumer's attachment is the first
+  # step. This rule derives CanNetworkReach from the consumer VPC to owner-
+  # account resources reachable via the shared TGW. (The explicit TGW attachment
+  # facts and RoutesTo edges are populated by the VPC/TGW explicit collectors
+  # and are not re-derived here.)
+  - id: aws-ram-shared-tgw-network-reach
+    emits: CanNetworkReach
+    description: "A shared Transit Gateway enables the consumer VPC to reach owner-account resources attached to the TGW, derived from the CrossAccountTrust fact and confirmed TGW attachments."
+    match:
+      - [ ?share, CrossAccountTrust, ?consumer_account ]
+    where:
+      - "node_type(?share) == ResourcePolicy   # RAM ResourceShare"
+      - "node_type(?consumer_account) == Account"
+      - "?share.resourceArns contains a Transit Gateway ARN (shared_resource_type == TransitGateway)"
+      - "?share.status == 'ACTIVE'"
+      - "?share.allowExternalPrincipals == true OR consumer_account is in the same AWS Organization"
+    emit:
+      source_type: Network
+      target_type: Network
+      source: "<consumer VPC (Network) that can attach to the shared TGW>"
+      target: "<owner-account VPCs and subnets routable via the shared TGW (Network)>"
+      permissions: ["ec2:CreateTransitGatewayVpcAttachment", "ec2:DescribeTransitGatewayAttachments"]
+      conditions: [service_state, network_reachability]
+      state_logic: >-
+        POTENTIAL when the share is ACTIVE but no consumer attachment exists yet
+        (consumer has the right to create one; the routing path is realizable).
+        ACTIVE when the consumer has an existing confirmed TGW attachment
+        (ec2:DescribeTransitGatewayAttachments + TGW route table evaluation).
+        CONDITIONAL(service_state) when the share is PENDING.
+        CONDITIONAL(network_reachability) on the TGW route table configuration
+        and owner-account SG rules for targets reached via the TGW.
+        BLOCKED if an SCP denies ec2:CreateTransitGatewayVpcAttachment in the
+        consumer account.
+      confidence: "min(contributing_confidences) * 0.80"
+      derived_from: [ "<CrossAccountTrust edge_id (share -> consumer_account)>", "<shared_resource_type == TransitGateway>", "<TGW attachment status + route table configuration>" ]
+      false_positive_note: >-
+        CanNetworkReach here expresses that the consumer VPC is on a routing path
+        via the shared TGW; it does not assert bidirectional connectivity to every
+        owner-account resource. The TGW route table is owner-managed and controls
+        which attachments can reach which other attachments. When no consumer
+        attachment exists yet, POTENTIAL is appropriate — the share grants the
+        consumer the RIGHT to create the attachment but it is not yet realized.
+        If the TGW has a default deny route table, keep CONDITIONAL(network_reachability).
+        Do NOT assert that the consumer can reach all owner-account VPCs just
+        because the TGW is shared; only the specifically-routed attachments.
+      narrative: >-
+        RAM share {share.name} grants account {consumer_account.name} access to
+        Transit Gateway {tgw.name}. The consumer can attach their VPC to the TGW
+        (ec2:CreateTransitGatewayVpcAttachment), establishing a network path
+        through the owner's TGW to other attached VPCs, potentially including
+        owner-account network segments (subject to TGW route table and SG rules).
+
+  # --- 3) Org-wide share exposes owner resource to all member accounts ---------
+  # When the share's principals list contains an Organization ARN (o-*) or OU ARN
+  # (ou-*), EVERY current AND future account in that org/OU gains access
+  # immediately (no invitation required, assuming RAM sharing with Organizations
+  # is enabled). This is a broad blast-radius posture and is modeled as
+  # ExposedToTenant (for org-level) or multiple CrossAccountTrust edges
+  # (OU-level). This rule emits the org-level ExposedToTenant for org-scoped shares.
+  - id: aws-ram-org-wide-share-exposed-to-tenant
+    emits: ExposedToTenant
+    description: "A RAM share whose principal is the organization root (o-*) exposes the shared resource to every current and future member account in the organization — ExposedToTenant."
+    match:
+      - [ ?share, CrossAccountTrust, ?org ]
+    where:
+      - "node_type(?share) == ResourcePolicy   # RAM ResourceShare"
+      - "node_type(?org) == Organization   # principals[] contains o-<org-id>"
+      - "?share.status == 'ACTIVE'"
+      - "ram:EnableSharingWithAwsOrganization has been called (org-wide sharing is enabled)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Organization
+      source: "<shared resource node referenced in ?share.resourceArns>"
+      target: ?org
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when ram:EnableSharingWithAwsOrganization is confirmed to be
+        enabled in the org and the share status is ACTIVE (no invitation required
+        for org-internal sharing). CONDITIONAL(service_state) when
+        EnableSharingWithAwsOrganization status is unknown or the share is PENDING.
+        BLOCKED if an SCP denies ram:CreateResourceShare with org-wide principals.
+        This edge carries HIGH blast radius: it covers ALL current + future org
+        members. Inherit weakest from the CrossAccountTrust contributor.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CrossAccountTrust edge_id (share -> Organization)>", "<ram:EnableSharingWithAwsOrganization confirmed>" ]
+      false_positive_note: >-
+        ONLY for org-root (o-*) principals — OU-level (ou-*) shares reach only
+        that OU's member accounts, not the whole org. Do NOT emit ExposedToTenant
+        for OU-level shares; emit individual CrossAccountTrust edges (or a set-note
+        for analysts). Org-wide sharing requires ram:EnableSharingWithAwsOrganization
+        to have been called in the management account — if that is not confirmed,
+        downgrade to CONDITIONAL(service_state). The consumer still needs to call
+        ec2:CreateTransitGatewayVpcAttachment / launch instances in the subnet /
+        etc. to REALIZE the access; ExposedToTenant reflects that EVERY member
+        account has the right to do so, not that they have already. Do NOT conflate
+        ExposedToTenant with the management-account having control of member
+        accounts — RAM sharing grants resource access, not account control.
+      narrative: >-
+        RAM share {share.name} in account {owner_account.name} grants access to
+        {resource.name} to the ENTIRE Organization {org.name} (org-wide principal
+        o-{org.id}). Every current and future member account can access this
+        resource without any invitation — ExposedToTenant (high blast radius).
+
+
+
+# ===========================================================================
+# BLOCKED-edge guidance:
+#  - SCP denying ram:CreateResourceShare (explicit rule aws-ram-create-resource-share)
+#    -> CanCreate edge BLOCKED. The share cannot be created.
+#  - SCP denying ram:AssociateResourceShare (explicit aws-ram-associate-resource-share)
+#    -> CanModifyPolicy(principal -> share) BLOCKED. The principal cannot add
+#    principals to an existing share.
+#  - SCP denying ram:UpdateResourceShare (explicit aws-ram-update-resource-share)
+#    -> CanModifyPolicy BLOCKED. The allowExternalPrincipals flag cannot be flipped.
+#    If CanModifyPolicy is otherwise ACTIVE, hierarchy-chains will detect when
+#    this policy change was the guardrail suppressing external-account trust.
+#  - SCP denying ram:AcceptResourceShareInvitation in consumer account -> shared-subnet
+#    and shared-TGW edges CONDITIONAL(service_state) (invitation can't be accepted).
+#  - share.status == PENDING_ACCEPTANCE (cross-account, non-org): all consumer
+#    capability edges are CONDITIONAL(service_state) until accepted.
+#  - Security groups on owner-account ENIs always gate L4 reachability even when
+#    the subnet is shared (L2 is open): emit CanNetworkReach as
+#    CONDITIONAL(network_reachability) to preserve this nuance for the analyst.
+#
+# EXPLICIT RULES referenced (in /rules/explicit/aws-ram.yaml):
+#   aws-ram-share-crossaccount-trust    — CrossAccountTrust(share -> Account)
+#   aws-ram-share-org-wide-exposed-to-tenant — ExposedToTenant(share -> Organization)
+#   aws-ram-share-ou-members-trust      — CrossAccountTrust(share -> Account per OU member)
+#   aws-ram-associate-resource-share    — CanModifyPolicy(principal -> share)
+#   aws-ram-update-resource-share       — CanModifyPolicy(principal -> share)
+#   aws-ram-create-resource-share       — CanCreate(principal -> Account)
+#   aws-ram-accept-invitation           — HasPermission(consumer principal -> owner Account)
+# ===========================================================================
+

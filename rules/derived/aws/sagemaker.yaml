@@ -1,0 +1,447 @@
+# AWS SageMaker — Derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Permissions are exact
+# identifiers from the AWS SageMaker Service Authorization Reference.
+#
+# DOMINANT PRIMITIVE (Phase 11):
+#   SageMaker compute (notebook / training / processing / pipeline / Studio app)
+#   RUNS AS an execution role. Whoever can submit a job, modify a notebook lifecycle
+#   config, rewrite a pipeline definition, or open a presigned URL executes arbitrary
+#   code AS that role => CanExecuteAs / CanExecuteCommand / CanPassIdentity /
+#   CanCreateWorkloadAs. This is the SageMaker realisation of the patterns in:
+#     - /rules/derived/can-execute-as.yaml  (CanModifyCode + ExecutesAs -> CanExecuteAs)
+#     - /rules/derived/cicd-chains.yaml     (modify-what-it-runs -> executes-as)
+#   Those linchpins produce the roll-up; this file emits the FACTS (ExecutesAs,
+#   CanModifyCode, CanModifyConfiguration, CanPassIdentity) and two SageMaker-specific
+#   shortcuts (presigned URL, transform job) that the generic rules cannot derive.
+#
+# SECONDARY MODES:
+#   (2) PRESIGNED URL: sagemaker:CreatePresignedNotebookInstanceUrl /
+#       CreatePresignedDomainUrl bypasses PassRole and gives direct kernel access.
+#   (3) DATA ACCESS: Feature group reads (GetRecord/BatchGetRecord), offline-store
+#       S3 exfiltration.
+#   (4) CREDENTIALS: execution role credentials exposed via IMDS / container
+#       credentials endpoint to all running code.
+#
+# State defaults to ACTIVE unless a precondition is unsatisfied.
+# BLOCKED when SCP / permission boundary / explicit deny neutralises the action.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 11-data-analytics-ml
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # SECTION A — ExecutesAs FACTS (moved to explicit/aws/sagemaker.yaml)
+  # ===========================================================================
+  # ExecutesAs edges are EXPLICIT in nature (edges.yaml line 350).
+  # All six ExecutesAs rules have been moved to:
+  #   /rules/explicit/aws/sagemaker.yaml (sections A + model endpoint)
+  # This derived file now begins with CanModifyCode (Section B) and contains
+  # only derived-nature edge emissions.
+
+  # ===========================================================================
+  # SECTION B — CanModifyCode FACTS (executable content control)
+  # ===========================================================================
+
+  - id: aws-sagemaker-update-notebook-lifecycle
+    emits: CanModifyCode
+    description: "UpdateNotebookInstance changing the lifecycle config injects a shell script that runs as root on next start, within the notebook's execution role context."
+    match_effective_permission:
+      action: "sagemaker:UpdateNotebookInstance"
+      resource_type: "AWS::SageMaker::NotebookInstance"
+    where:
+      - "principal can set or change LifecycleConfigName on the target notebook"
+    emit:
+      source_type: Identity
+      target_type: Notebook
+      source: "<principal>"
+      target: "<SageMaker NotebookInstance>"
+      permissions: ["sagemaker:UpdateNotebookInstance"]
+      state: CONDITIONAL
+      conditions: [iam_permission, trigger_exists]
+      false_positive_note: >-
+        Code injection via lifecycle config only executes on the NEXT notebook start.
+        Emit CONDITIONAL(trigger_exists): the attacker has injected the config but
+        cannot execute code until the notebook is restarted. If the attacker also has
+        sagemaker:StopNotebookInstance + sagemaker:StartNotebookInstance, the edge
+        can be upgraded to ACTIVE. The lifecycle config runs as root on the notebook's
+        EC2 instance, which means all code runs with access to the execution role via IMDS.
+      narrative: >-
+        {principal.name} can update {notebook.name}'s lifecycle config
+        (sagemaker:UpdateNotebookInstance), injecting a shell script that runs as
+        root on the next start and can call AWS APIs as the notebook's execution role.
+
+  - id: aws-sagemaker-update-pipeline-definition
+    emits: CanModifyCode
+    description: "UpdatePipeline replacing the pipeline definition injects attacker-controlled step code that runs as the pipeline's execution role."
+    match_effective_permission:
+      action: "sagemaker:UpdatePipeline"
+      resource_type: "AWS::SageMaker::Pipeline"
+    emit:
+      source_type: Identity
+      target_type: Workflow
+      source: "<principal>"
+      target: "<SageMaker Pipeline>"
+      permissions: ["sagemaker:UpdatePipeline"]
+      conditions: [iam_permission]
+      false_positive_note: >-
+        Modifying the pipeline definition only affects the NEXT execution. If no
+        subsequent execution is triggered, the code is planted but never runs:
+        emit CONDITIONAL(trigger_exists) unless the attacker also has
+        sagemaker:StartPipelineExecution. This mirrors cicd-chains rule 1 — the
+        pipeline is a CI/CD-style compute surface whose definition the attacker controls.
+        Cite can-execute-as.yaml (execute-as-via-code-modify) for the CanExecuteAs
+        roll-up; do not re-derive it here.
+      narrative: >-
+        {principal.name} can rewrite {pipeline.name}'s definition
+        (sagemaker:UpdatePipeline), injecting steps that execute attacker code as the
+        pipeline's execution role on the next StartPipelineExecution.
+
+  # ===========================================================================
+  # SECTION C — CanModifyConfiguration FACTS (config changes that affect identity)
+  # ===========================================================================
+
+  - id: aws-sagemaker-update-notebook-config
+    emits: CanModifyConfiguration
+    description: "UpdateNotebookInstance changes notebook configuration including RoleArn (with PassRole), instance type, subnet, and security groups."
+    match_effective_permission:
+      action: "sagemaker:UpdateNotebookInstance"
+      resource_type: "AWS::SageMaker::NotebookInstance"
+    emit:
+      source_type: Identity
+      target_type: Notebook
+      source: "<principal>"
+      target: "<SageMaker NotebookInstance>"
+      permissions: ["sagemaker:UpdateNotebookInstance"]
+      conditions: [iam_permission]
+      false_positive_note: >-
+        Changing RoleArn requires iam:PassRole on the new role (sagemaker.amazonaws.com).
+        Without PassRole, the attacker can change instance type/subnet/security-groups
+        but NOT the execution identity — CanModifyConfiguration is still valid for
+        network/placement changes but CanAttachIdentity is blocked. Model the role-swap
+        capability only when iam:PassRole is also effective.
+      narrative: >-
+        {principal.name} can change {notebook.name}'s configuration including execution
+        role (with iam:PassRole), network placement, and lifecycle config
+        (sagemaker:UpdateNotebookInstance).
+
+  - id: aws-sagemaker-update-domain-config
+    emits: CanModifyConfiguration
+    description: "UpdateDomain changes the default execution role for all new Studio apps in the domain."
+    match_effective_permission:
+      action: "sagemaker:UpdateDomain"
+      resource_type: "AWS::SageMaker::Domain"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<SageMaker Domain>"
+      permissions: ["sagemaker:UpdateDomain"]
+      conditions: [iam_permission]
+      false_positive_note: >-
+        Changing DefaultUserSettings.ExecutionRole requires iam:PassRole on the new
+        role. The change affects only NEW Studio apps; existing running apps retain
+        their current role until restarted. Without PassRole, UpdateDomain can still
+        change other domain settings (network, encryption, app settings) but not the
+        identity — partial CanModifyConfiguration.
+      narrative: >-
+        {principal.name} can change {domain.name}'s default execution role
+        (sagemaker:UpdateDomain + iam:PassRole), affecting all future Studio apps
+        spawned in that domain.
+
+  - id: aws-sagemaker-update-user-profile-config
+    emits: CanModifyConfiguration
+    description: "UpdateUserProfile changes the execution role for a specific Studio user profile."
+    match_effective_permission:
+      action: "sagemaker:UpdateUserProfile"
+      resource_type: "AWS::SageMaker::UserProfile"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<SageMaker UserProfile>"
+      permissions: ["sagemaker:UpdateUserProfile"]
+      conditions: [iam_permission]
+      false_positive_note: >-
+        Changing UserSettings.ExecutionRole requires iam:PassRole on the new role.
+        Affects new Studio apps for this user; existing running apps unaffected.
+      narrative: >-
+        {principal.name} can change {profile.name}'s execution role
+        (sagemaker:UpdateUserProfile + iam:PassRole), affecting new Studio apps
+        for this user.
+
+  - id: aws-sagemaker-update-pipeline-config
+    emits: CanModifyConfiguration
+    description: "UpdatePipeline can also change the pipeline's RoleArn (with PassRole), swapping the execution identity for all future pipeline executions."
+    match_effective_permission:
+      action: "sagemaker:UpdatePipeline"
+      resource_type: "AWS::SageMaker::Pipeline"
+    emit:
+      source_type: Identity
+      target_type: Workflow
+      source: "<principal>"
+      target: "<SageMaker Pipeline>"
+      permissions: ["sagemaker:UpdatePipeline"]
+      conditions: [iam_permission]
+      false_positive_note: >-
+        This overlaps with aws-sagemaker-update-pipeline-definition (CanModifyCode).
+        When UpdatePipeline changes the RoleArn with PassRole, it is a config-identity
+        swap (CanModifyConfiguration + CanPassIdentity -> CanExecuteAs via
+        can-execute-as execute-as-via-config-identity-swap). The de-duplication of the
+        two matching rules on the same action is intentional: code-injection and role-swap
+        are distinct attack paths off the same permission.
+      narrative: >-
+        {principal.name} can also swap {pipeline.name}'s execution role via
+        sagemaker:UpdatePipeline, redirecting all future executions to a different
+        (possibly more privileged) identity.
+
+  # ===========================================================================
+  # SECTION D — CanPassIdentity FACTS (moved to explicit/aws/sagemaker.yaml)
+  # ===========================================================================
+  # CanPassIdentity has nature=explicit in edges.yaml (line 239).
+  # All CanPassIdentity rules have been moved to:
+  #   /rules/explicit/aws/sagemaker.yaml (Section D + MLflow update)
+  # This derived file consumes CanPassIdentity edges from the explicit rules
+  # via the aws-sagemaker-create-workload-as rule (Section F).
+
+  # ===========================================================================
+  # SECTION E — SageMaker-specific CanExecuteAs shortcuts
+  #             (presigned URLs bypass PassRole — generic linchpins cannot derive)
+  # ===========================================================================
+
+  - id: aws-sagemaker-presigned-notebook-url
+    emits: CanExecuteAs
+    description: "CreatePresignedNotebookInstanceUrl opens a browser-based Jupyter shell on a running notebook, giving the caller immediate code execution as the notebook's execution role — no iam:PassRole required."
+    match:
+      - [ ?principal, HasPermission, ?notebook ]
+      - [ ?notebook, ExecutesAs, ?role ]
+    where:
+      - "node_type(?notebook) == Notebook"
+      - "?principal has EFFECTIVE sagemaker:CreatePresignedNotebookInstanceUrl on ?notebook"
+      - "?notebook is InService (running)"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["sagemaker:CreatePresignedNotebookInstanceUrl"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the notebook is InService and the principal has effective
+        sagemaker:CreatePresignedNotebookInstanceUrl on the notebook ARN.
+        CONDITIONAL(service_state) when the notebook is Stopped/Stopping/Pending.
+        BLOCKED when SCP or permission boundary denies the presigned URL action.
+      confidence: "min(contributing_confidences) * 0.98"
+      derived_from: [ "<HasPermission edge: principal -> notebook>", "<ExecutesAs edge: notebook -> role>" ]
+      false_positive_note: >-
+        This is the most direct SageMaker escalation path — it requires NO iam:PassRole.
+        The presigned URL is valid for up to 12 hours; the Jupyter shell runs with the
+        full execution role credentials via IMDS. Emit ACTIVE only when the notebook is
+        InService; a Stopped notebook returns an error on CreatePresignedNotebookInstanceUrl.
+        Cite can-execute-as.yaml for the conceptual derivation but note that the generic
+        linchpin cannot derive this because the presigned URL creates no CanModifyCode or
+        CanModifyConfiguration intermediate — it is a direct execution path. This rule is
+        NOT redundant with can-execute-as execute-as-via-code-modify.
+      narrative: >-
+        {principal.name} can call sagemaker:CreatePresignedNotebookInstanceUrl on
+        {notebook.name} and open a Jupyter shell running as {role.name} — no
+        iam:PassRole needed. This is a direct, no-prerequisite escalation to the
+        notebook's execution role.
+
+  - id: aws-sagemaker-presigned-domain-url
+    emits: CanExecuteAs
+    description: "CreatePresignedDomainUrl opens a Studio session as the specified user profile's execution role — no iam:PassRole required."
+    match:
+      - [ ?principal, HasPermission, ?app ]
+      - [ ?app, ExecutesAs, ?role ]
+    where:
+      - "node_type(?app) == Notebook"
+      - "?app is a SageMaker Studio App (AWS::SageMaker::App) spawned from a UserProfile"
+      - "?principal has EFFECTIVE sagemaker:CreatePresignedDomainUrl on the domain or user-profile ARN"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["sagemaker:CreatePresignedDomainUrl"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when a Studio app can be launched for the user profile. CONDITIONAL when
+        the domain or Studio app must first be started. BLOCKED when SCP or boundary
+        denies the presigned domain URL action.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<HasPermission edge: principal -> app>", "<ExecutesAs edge: app -> role>" ]
+      false_positive_note: >-
+        Like the notebook presigned URL, this bypasses iam:PassRole. The Studio session
+        runs as the Studio App's ExecutionRole (bound from the UserProfile's ExecutionRole).
+        Match consumes the App node (type Notebook), not UserProfile directly, as that is
+        where ExecutesAs is emitted in the explicit rules. A domain with VPCOnly mode may
+        require network access to the VPC endpoint. The caller must specify a valid
+        UserProfileName; this rule fires once per app-execution-role pair.
+      narrative: >-
+        {principal.name} can call sagemaker:CreatePresignedDomainUrl and open a Studio
+        session as {role.name} (via the Studio App for user profile {profile.name}) — no
+        iam:PassRole needed.
+
+  # ===========================================================================
+  # SECTION F — CanCreateWorkloadAs (SageMaker create + PassRole composite)
+  # ===========================================================================
+
+  - id: aws-sagemaker-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new SageMaker compute resource (training/processing job, notebook, pipeline) bound to a passed privileged role — the canonical SageMaker PassRole privesc pattern."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has one or more of: sagemaker:CreateTrainingJob, sagemaker:CreateProcessingJob, sagemaker:CreateNotebookInstance, sagemaker:CreatePipeline"
+      - "?role trust policy allows sagemaker.amazonaws.com"
+      - "iam:PassRole condition iam:PassedToService (if present) includes sagemaker.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "sagemaker:CreateTrainingJob|sagemaker:CreateProcessingJob|sagemaker:CreateNotebookInstance|sagemaker:CreatePipeline"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when the role trust and iam:PassedToService admit sagemaker.amazonaws.com;
+        POTENTIAL(role_compatibility) when trust is unknown or unresolved;
+        CONDITIONAL(iam_permission) when the create permission is missing.
+        The escalation roll-up (CanCreateWorkloadAs -> CanExecuteAs) is produced by
+        can-execute-as.yaml execute-as-via-new-workload — cite, do not re-derive.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanPassIdentity edge: principal -> role>" ]
+      false_positive_note: >-
+        This rule implements a DEVIATION from the canonical CanCreateWorkloadAs derivation
+        (edges.yaml §423: CanDeploy + CanPassIdentity + role_compatible => CanCreateWorkloadAs).
+        For SageMaker, the create action (CreateTrainingJob/CreateNotebookInstance/etc.)
+        doubles as the deployment primitive; no separate "CanDeploy" edge is emitted.
+        The where-clause check on create permission substitutes for the CanDeploy edge.
+        RATIONALE: SageMaker conflates workload creation and code submission into a single
+        action, whereas Lambda/Batch model creation (CanDeploy) separately from identity
+        attachment. This rule preserves the correct semantics while deviating from the
+        canonical form for practical alignment with SageMaker's API model.
+
+        Honor iam:PassedToService strictly: a role passable only to lambda.amazonaws.com
+        or ec2.amazonaws.com does NOT qualify. The role must trust sagemaker.amazonaws.com
+        in its AssumeRolePolicyDocument. Do not escalate if the passed role has equal or
+        lower privilege.
+      narrative: >-
+        {principal.name} can create a SageMaker compute resource (training/processing
+        job, notebook, or pipeline) and bind {role.name} to it (iam:PassRole +
+        Create*Job/CreateNotebookInstance/CreatePipeline), causing attacker-controlled
+        code to run as {role.name}.
+
+  # ===========================================================================
+  # SECTION G — CanInvoke (pipeline execution trigger)
+  # ===========================================================================
+
+  - id: aws-sagemaker-invoke-pipeline
+    emits: CanInvoke
+    description: "StartPipelineExecution directly invokes a SageMaker Pipeline, running its steps as the pipeline's execution role."
+    match_effective_permission:
+      action: "sagemaker:StartPipelineExecution"
+      resource_type: "AWS::SageMaker::Pipeline"
+    emit:
+      source_type: Identity
+      target_type: Workflow
+      source: "<principal>"
+      target: "<SageMaker Pipeline>"
+      permissions: ["sagemaker:StartPipelineExecution"]
+      conditions: [iam_permission]
+      false_positive_note: >-
+        StartPipelineExecution alone only grants execution of the CURRENT pipeline
+        definition. If the definition already contains attacker-controllable steps
+        (e.g. a custom script source that can be overwritten), this becomes ACTIVE
+        for CanExecuteAs via cicd-chains (trigger-runner-executes-as). If the pipeline
+        definition is clean and pinned, triggering it is CONDITIONAL(attacker_influenced_definition).
+      narrative: >-
+        {principal.name} can start {pipeline.name} (sagemaker:StartPipelineExecution),
+        causing its steps to run as the pipeline's execution role.
+
+  # ===========================================================================
+  # SECTION H — Data access (Phase 11 secondary mode) [moved to explicit]
+  # ===========================================================================
+  # aws-sagemaker-feature-group-read-data has been moved to:
+  #   /rules/explicit/aws/sagemaker.yaml (Section E)
+  # Reason: CanReadData has nature=derived, but the rule uses match_effective_permission
+  # (an explicit normalization pattern). Emitting a derived edge from explicit permission
+  # evaluation requires the rule to be in the explicit file.
+
+  # ===========================================================================
+  # SECTION I — ExposesCredential (execution role credentials surface)
+  # ===========================================================================
+
+  - id: aws-sagemaker-exposes-exec-role-cred
+    emits: ExposesCredential
+    description: "SageMaker compute surfaces (notebook/training/processing job/pipeline/Studio app) expose execution-role credentials to all code running inside them via IMDS or the container credentials endpoint."
+    match:
+      - [ ?compute, ExecutesAs, ?role ]
+    where:
+      - "node_type(?compute) in [Notebook, BatchJob, Workflow, ApplicationPlatform]"
+      - "?compute is a SageMaker resource (provider_type starts with AWS::SageMaker::)"
+    emit:
+      source_type: Compute  # ?compute is a SageMaker Notebook/BatchJob/Workflow/ApplicationPlatform (all Compute); was an unresolved template placeholder
+      target_type: MachineIdentity
+      source: ?compute
+      target: ?role
+      permissions: []
+      derived_from: [ "<ExecutesAs edge: compute -> role>" ]
+      false_positive_note: >-
+        Not an escalation by itself; this expresses the structural fact that
+        code-execution in the compute resource equals holding the role's credentials.
+        Attack value comes from combining this with a CanModifyCode / presigned URL /
+        CanTrigger edge. Emit source_type dynamically from node_type(?compute):
+        Notebook for Notebooks, BatchJob for Training/Processing jobs, Workflow for
+        Pipelines, ApplicationPlatform for MLflow servers. Notebook instances use IMDS
+        (169.254.169.254); training and processing jobs use the SageMaker training
+        toolkit credential injection or the ECS-compatible container credentials endpoint.
+      narrative: >-
+        {compute.name} exposes the credentials of its execution role {role.name}
+        to any code running inside it (IMDS / container credentials endpoint).
+
+  # ===========================================================================
+  # SECTION J — CanEscalateTo (roll-up — delegated to can-control.yaml linchpin)
+  # ===========================================================================
+  # CanEscalateTo is a derived edge (edges.yaml §991-999) that rolls up from
+  # CanExecuteAs. The can-control.yaml linchpin (escalate-via-execute-as) produces
+  # CanEscalateTo generically from any CanExecuteAs edge where the target role is
+  # strictly more privileged. This SageMaker-specific rule would duplicate that
+  # linchpin and introduce double-counting in path weights. RECOMMENDATION: Consume
+  # the can-control.yaml derivation; do not emit a SageMaker-specific CanEscalateTo
+  # rule.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP or permission boundary denying sagemaker:CreateTrainingJob,
+#    sagemaker:CreateProcessingJob, sagemaker:CreateNotebookInstance,
+#    sagemaker:UpdateNotebookInstance, sagemaker:CreatePresignedNotebookInstanceUrl,
+#    sagemaker:CreatePresignedDomainUrl, sagemaker:UpdatePipeline,
+#    sagemaker:StartPipelineExecution, or iam:PassRole at the effective scope ->
+#    emit the corresponding edge with state: BLOCKED and denied_by=<SCP/boundary>.
+#  - iam:PassRole with iam:PassedToService NOT including sagemaker.amazonaws.com ->
+#    aws-sagemaker-pass-role-create-training-job / aws-sagemaker-create-workload-as
+#    remain at POTENTIAL(role_compatibility) — do not upgrade.
+#  - A notebook in Stopped/Stopping/Pending state ->
+#    aws-sagemaker-presigned-notebook-url emits CONDITIONAL(service_state),
+#    not ACTIVE. UpdateNotebookInstance code injection also emits
+#    CONDITIONAL(service_state) because the lifecycle config cannot run until
+#    the notebook is started.
+# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# EXPLICIT RULES NOW LIVE IN: /rules/explicit/aws/sagemaker.yaml
+# ===========================================================================
+# ExecutesAs, CanPassIdentity, and CanReadData (explicit normalization) rules
+# have been moved to the explicit rules file. See that file for:
+#   - aws-sagemaker-executes-as-* (ExecutesAs from resource config)
+#   - aws-sagemaker-executes-as-model (Model ExecutionRoleArn for Endpoint/Transform)
+#   - aws-sagemaker-pass-role-* (CanPassIdentity from IAM PassRole evaluation)
+#   - aws-sagemaker-feature-group-read-data (CanReadData from permission evaluation)
+#   - aws-sagemaker-pass-role-update-mlflow-config (MLflow role update PassRole)
+#
+# The derived file contains only rules that traverse existing edges and produce
+# derived-nature capabilities (Sections B-J above).

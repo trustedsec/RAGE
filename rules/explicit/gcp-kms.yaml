@@ -1,0 +1,175 @@
+# Normalizing GCP Cloud KMS into explicit edges.
+# The adapter emits raw Cloud KMS records (keyRings.list, cryptoKeys.list with
+# purpose/primary/versionTemplate, cryptoKeyVersions.list with state, and
+# getIamPolicy on keys/rings); the effective-permission evaluator emits the
+# crypto-capability edges. These rules translate one observed fact into one
+# explicit edge (schema/edges.yaml); they do not combine edges.
+#
+# Permission/purpose names are verbatim from
+# cloud.google.com/kms/docs/reference/permissions-and-roles. Key facts encoded:
+#   * IAM is per project/keyRing/cryptoKey — NO per-version IAM.
+#   * CryptoKey.purpose selects the meaningful crypto op and the node subtype:
+#       ENCRYPT_DECRYPT / RAW_ENCRYPT_DECRYPT / ASYMMETRIC_DECRYPT -> EncryptionKey
+#       ASYMMETRIC_SIGN / MAC -> SigningKey
+#   * Raw key material is NON-exportable -> NO CanExportKey edge is normalized.
+#   * roles/cloudkms.admin has setIamPolicy but NOT useTo* (separation of duties):
+#     CanDecrypt/CanSignAs come ONLY from an effective useTo* grant, never from admin.
+
+rules:
+
+  # --- KeyRing contains CryptoKey (structural) -------------------------------
+  # NODE MODELING: the KeyRing is the Contains SOURCE, so it MUST be classed
+  # AdministrativeBoundary (Contains.source == [AdministrativeBoundary]).
+  # nodes.yaml AdministrativeBoundary.types has no KeyRing-specific member, so tag
+  # the KeyRing as AdministrativeBoundary subtype GenericBoundary (the declared
+  # fallback). It carries the ring-level IAM allow policy inherited by every key,
+  # which is a boundary, not a Secret/Policy. Do NOT class the KeyRing as Secret or
+  # Policy or the Contains source-class check will reject this edge.
+  - id: gcp-kms-contains-key
+    emits: Contains
+    applies_to: [gcp]
+    match_record: {resource_type: "google.cloud.kms.KeyRing", field: "cryptoKeys"}
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: "*"
+      source: "<KeyRing (AdministrativeBoundary / GenericBoundary container) node>"
+      target: "<CryptoKey node>"
+      api_source: "cloudkms.projects.locations.keyRings.cryptoKeys.list"
+      evidence_field: "name (keyRings/*/cryptoKeys/*)"
+      narrative: "{keyring.name} contains key {key.name}."
+
+  # --- CryptoKey/KeyRing placement -> LocatedIn ------------------------------
+  - id: gcp-kms-located-in
+    emits: LocatedIn
+    applies_to: [gcp]
+    match_record: {resource_type: "google.cloud.kms.CryptoKey", field: "name (locations/*)"}
+    where: ["key/ring name pins a location (locations/<region|global>)"]
+    emit:
+      source_type: "*"
+      source: "<CryptoKey node>"
+      target: "<location boundary>"
+      api_source: "cloudkms.projects.locations.keyRings.cryptoKeys.list"
+      evidence_field: "name"
+      narrative: "{key.name} is located in {location} (KMS keys are location-scoped)."
+
+  # --- Key IAM allow policy -> HasPolicy -------------------------------------
+  - id: gcp-kms-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record: {resource_type: "google.cloud.kms.CryptoKey", field: "iamPolicy.bindings"}
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<CryptoKey node>"
+      target: "<CryptoKey ResourcePolicy node>"
+      api_source: "cloudkms.projects.locations.keyRings.cryptoKeys.getIamPolicy"
+      evidence_field: "iamPolicy.bindings"
+      narrative: "{key.name} has an IAM allow policy governing who may use/manage it."
+
+  - id: gcp-kms-keyring-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record: {resource_type: "google.cloud.kms.KeyRing", field: "iamPolicy.bindings"}
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<KeyRing node>"
+      target: "<KeyRing ResourcePolicy node>"
+      api_source: "cloudkms.projects.locations.keyRings.getIamPolicy"
+      evidence_field: "iamPolicy.bindings"
+      narrative: "{keyring.name} has an IAM allow policy inherited by every key in the ring."
+
+  # --- Effective useToDecrypt -> CanDecrypt (EncryptionKey) ------------------
+  # Emitted by the permission evaluator; exists only if a principal's EFFECTIVE
+  # permissions include useToDecrypt on the key scope AND the key is a decrypt
+  # purpose with >=1 ENABLED version.
+  # OWNER of the base CanDecrypt emit (CanDecrypt is nature=explicit). The derived
+  # file's gcp-kms-can-decrypt-explicit matches the SAME fact only to anchor downstream
+  # Phase-5 rules; the pipeline must emit ONE CanDecrypt(principal->key) per
+  # (principal, key) — de-dup by (type, source, target, scope) — and NOT double-count
+  # confidence across the two files.
+  - id: gcp-kms-can-decrypt-explicit
+    emits: CanDecrypt
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "cloudkms.cryptoKeyVersions.useToDecrypt"
+      resource_type: "google.cloud.kms.CryptoKey"
+    where:
+      - "CryptoKey.purpose in [ENCRYPT_DECRYPT, RAW_ENCRYPT_DECRYPT, ASYMMETRIC_DECRYPT]"
+      - ">=1 CryptoKeyVersion is ENABLED"
+    emit:
+      target_type: EncryptionKey
+      source: "<principal>"
+      target: "<CryptoKey node (EncryptionKey subtype)>"
+      api_source: "policy evaluation (Policy Analyzer) — NOT a live decrypt call"
+      permissions: ["cloudkms.cryptoKeyVersions.useToDecrypt"]
+      narrative: "{principal.name} can decrypt with {key.name} (cloudkms.cryptoKeyVersions.useToDecrypt)."
+
+  # --- Effective useToSign -> CanSignAs (asymmetric SigningKey) --------------
+  - id: gcp-kms-can-sign-explicit
+    emits: CanSignAs
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "cloudkms.cryptoKeyVersions.useToSign"
+      resource_type: "google.cloud.kms.CryptoKey"
+    where:
+      - "CryptoKey.purpose == ASYMMETRIC_SIGN"
+      - ">=1 CryptoKeyVersion is ENABLED"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<CryptoKey node (SigningKey subtype)>"
+      api_source: "policy evaluation + cryptoKeys.list (purpose)"
+      permissions: ["cloudkms.cryptoKeyVersions.useToSign"]
+      narrative: "{principal.name} can sign as {key.name} (cloudkms.cryptoKeyVersions.useToSign) — forge signatures against its public key."
+
+  # --- Effective macSign -> CanSignAs (MAC SigningKey) -----------------------
+  - id: gcp-kms-can-mac-explicit
+    emits: CanSignAs
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "cloudkms.cryptoKeyVersions.macSign"
+      resource_type: "google.cloud.kms.CryptoKey"
+    where:
+      - "CryptoKey.purpose == MAC"
+      - ">=1 CryptoKeyVersion is ENABLED"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<CryptoKey node (SigningKey subtype, MAC)>"
+      api_source: "policy evaluation + cryptoKeys.list (purpose)"
+      permissions: ["cloudkms.cryptoKeyVersions.macSign"]
+      narrative: "{principal.name} can produce valid MACs with {key.name} (cloudkms.cryptoKeyVersions.macSign)."
+
+  # --- Effective setIamPolicy on key OR ring -> CanModifyPolicy --------------
+  # any-of: per-key setIamPolicy OR ring-scoped setIamPolicy. A keyRings binding is
+  # inherited by every key in the ring, so a principal with ONLY
+  # cloudkms.keyRings.setIamPolicy (no per-key grant) still controls each key's
+  # allow policy and must emit this edge.
+  - id: gcp-kms-can-modify-policy
+    emits: CanModifyPolicy
+    applies_to: [gcp]
+    match_effective_permission:
+      any_of:
+        - {action: "cloudkms.cryptoKeys.setIamPolicy", resource_type: "google.cloud.kms.CryptoKey"}
+        - {action: "cloudkms.keyRings.setIamPolicy",   resource_type: "google.cloud.kms.KeyRing"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<CryptoKey (or KeyRing) allow policy node>"
+      permissions: ["cloudkms.cryptoKeys.setIamPolicy", "cloudkms.keyRings.setIamPolicy"]
+      narrative: "{principal.name} can modify the IAM allow policy of {key.name} (cloudkms.cryptoKeys.setIamPolicy, or cloudkms.keyRings.setIamPolicy on its ring — inherited by every key) — self-grant decrypt/sign."
+
+  # --- Cross-project member in a key binding -> CrossProjectTrust ------------
+  - id: gcp-kms-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record: {resource_type: "google.cloud.kms.CryptoKey", field: "iamPolicy.bindings[].members"}
+    where: ["a member (user/SA/service-agent) belongs to a different project than the key"]
+    emit:
+      source: "<key.project>"
+      target: "<member.project | external identity>"
+      api_source: "cloudkms.projects.locations.keyRings.cryptoKeys.getIamPolicy"
+      evidence_field: "iamPolicy.bindings[].members"
+      narrative: "{key.name} grants crypto use to {external.name} in project {project} (cross-project CMEK trust)."

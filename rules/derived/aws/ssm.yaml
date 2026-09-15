@@ -1,0 +1,864 @@
+# AWS Systems Manager (Run Command / Session Manager / Automation / State Manager)
+# Derived attack-path rules (Phase 9 — CI/CD pipelines / remote execution)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (ExecutesAs, CanExecuteCommand, CanModifyCode, CanPassIdentity, CanTrigger,
+# CrossAccountTrust) already lives in /rules/explicit/aws-ssm.yaml; these rules
+# combine those explicit edges with cicd-chains / can-execute-as linchpins to
+# derive execution and escalation capabilities.
+#
+# PHASE 9 FRAMING — SSM has two orthogonal attack surfaces:
+#
+#  (A) RUN COMMAND / SESSION MANAGER — delivers OS-level commands to managed
+#      instances. ssm:SendCommand / ssm:StartSession -> CanExecuteCommand on the
+#      VirtualMachine. Combined with ExecutesAs(instance -> instance-profile role)
+#      -> CanExecuteAs(caller -> role) via can-execute-as:execute-as-via-command.
+#      This is the "headline" path: SendCommand = RCE as instance profile on every
+#      managed node the caller can target.
+#
+#  (B) AUTOMATION (RUNBOOK) — ssm:StartAutomationExecution runs a document
+#      (definition) as an AutomationAssumeRole (iam:PassRole required). The
+#      Automation runner is a BuildWorker (cicd-chains' framing). CanModifyCode on
+#      the document + ExecutesAs(runner -> role) -> CanExecuteAs via cicd-chains
+#      cicd-modify-buildspec-executes-as. ssm:UpdateDocument on an existing
+#      customer-owned document = persistent buildspec rewrite. ssm:CreateDocument
+#      + ssm:StartAutomationExecution + iam:PassRole = create-new-workload path.
+#
+#  (C) STATE MANAGER ASSOCIATIONS — a State Manager association is a Scheduler that
+#      fires a document on a cron schedule against a set of target instances. An
+#      association provides the AUTOMATIC RUN PATH for both (A) and (B) above.
+#      ssm:UpdateAssociation lets the caller swap the document, change its
+#      parameters (including attacker-controlled `commands`), or broaden target scope
+#      -> CanModifyCode(runner) for cicd-chains.
+#
+# LINCHPINS CITED (do NOT re-derive their roll-ups here):
+#   cicd-chains.yaml        — cicd-modify-buildspec-executes-as (rule A/B/C modify path)
+#                             cicd-trigger-runner-executes-as  (trigger-only path)
+#                             cicd-pipeline-orchestrates-stages (association fan-out)
+#   can-execute-as.yaml     — execute-as-via-command (SendCommand/StartSession path)
+#                             execute-as-via-code-modify (Automation modify path)
+#                             execute-as-via-config-identity-swap (PassRole swap)
+#   can-control.yaml        — escalate-via-execute-as (CanEscalateTo roll-up)
+#                             enter-account-via-assume (CanEnterAccount)
+#   credential-chains.yaml  — execute-then-read-secret (inherited secret-read)
+#
+# SERVICE FACTS THIS FILE EMITS (fed into linchpins above):
+#   CanExecuteCommand   — SendCommand / StartSession -> command exec on managed instance
+#   CanModifyCode       — UpdateDocument / CreateDocument / SendCommand commands param /
+#                         UpdateAssociation -> definition of the runner changes
+#   CanPassIdentity     — iam:PassRole to ssm.amazonaws.com
+#   CanTrigger          — StartAutomationExecution / SendCommand (caller-initiated)
+#                         Association (scheduled trigger)
+#   CrossAccountTrust   — ModifyDocumentPermission sharing a document cross-account
+#   ExecutesAs          — AutomationExecution -> AutomationAssumeRole
+#                         ManagedInstance -> InstanceProfileRole
+#
+# Explicit normalization for this service lives in /rules/explicit/aws-ssm.yaml.
+# Additional explicit records recommended for full coverage are listed at the
+# bottom of this file.
+#
+# Permissions are EFFECTIVE actions the permission evaluator must confirm on the
+# given resource scope. State defaults to ACTIVE; an unmet condition yields
+# CONDITIONAL/POTENTIAL; an explicit deny/SCP/boundary yields BLOCKED.
+#
+# Official docs:
+#  https://docs.aws.amazon.com/systems-manager/latest/userguide/
+#  https://docs.aws.amazon.com/service-authorization/latest/reference/list_awssystemsmanager.html
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-pipelines
+applies_to: [aws]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # (A) RUN COMMAND / SESSION MANAGER — OS-level command execution on managed
+  #     instances. This yields CanExecuteCommand on the VirtualMachine, which is
+  #     then consumed by can-execute-as:execute-as-via-command to produce
+  #     CanExecuteAs(caller -> instance-profile role).
+  # ---------------------------------------------------------------------------
+
+  # --- SendCommand -> CanExecuteCommand on managed instance ------------------
+  - id: aws-ssm-send-command-execute-command
+    emits: CanExecuteCommand
+    description: "ssm:SendCommand delivers attacker-controlled commands to a managed instance, yielding OS-level execution as root/SYSTEM."
+    match:
+      - [ ?principal, HasPermission, ?instance ]
+    where:
+      - "effective_action == 'ssm:SendCommand'"
+      - "node_type(?instance) == VirtualMachine"
+      - "?instance.ssm_ping_status == 'Online'  # instance is SSM-managed and reachable"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: ?principal
+      target: ?instance
+      permissions: ["ssm:SendCommand"]
+      conditions: [service_state, iam_permission]
+      state_logic: >-
+        ACTIVE when ssm:SendCommand is EFFECTIVE on the instance ARN scope and the
+        instance PingStatus is Online (SSM Agent reachable). CONDITIONAL(service_state)
+        when the instance is registered as managed but PingStatus is not Online (agent
+        connectivity may be missing — VPC endpoint absent, security group, NAT).
+        BLOCKED when an SCP / permission boundary denies ssm:SendCommand at the
+        effective scope.
+      confidence: 0.95
+      derived_from: ["effective ssm:SendCommand on ?instance"]
+      false_positive_note: >-
+        Honor the resource scope: a grant scoped by ssm:resourceTag (e.g.
+        tag:Env=dev) does NOT cover instances without that tag. Emit only for
+        instances confirmed Online in ssm:DescribeInstanceInformation. AWS-managed
+        documents (AWS-RunShellScript, AWS-RunPowerShellScript) can be specified at
+        call time — the commands parameter is fully attacker-controlled, making this
+        functionally equivalent to CanModifyCode for the specific invocation.
+        A grant scoped to tag:Env=* or a very broad resource ARN means the attacker
+        can target every managed instance in scope — scale confidence to 0.95 for each
+        in-scope instance.
+      narrative: >-
+        {principal.name} can run arbitrary shell commands on {instance.name} via SSM
+        Run Command (ssm:SendCommand + AWS-RunShellScript/RunPowerShellScript),
+        gaining OS-level command execution as root or SYSTEM without requiring inbound
+        network access.
+
+  # --- StartSession -> CanExecuteCommand on managed instance -----------------
+  - id: aws-ssm-start-session-execute-command
+    emits: CanExecuteCommand
+    description: "ssm:StartSession opens an interactive WebSocket shell to a managed instance, bypassing firewall rules."
+    match:
+      - [ ?principal, HasPermission, ?instance ]
+    where:
+      - "effective_action == 'ssm:StartSession'"
+      - "node_type(?instance) == VirtualMachine"
+      - "?instance.ssm_ping_status == 'Online'"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: ?principal
+      target: ?instance
+      permissions: ["ssm:StartSession"]
+      conditions: [service_state, iam_permission]
+      state_logic: >-
+        ACTIVE when ssm:StartSession is EFFECTIVE on the instance ARN scope and the
+        instance is Online. CONDITIONAL(service_state) when agent connectivity is
+        uncertain. BLOCKED when an SCP / boundary denies ssm:StartSession.
+        Note: Session Manager requires no inbound security-group rule — this edge
+        is often ACTIVE even when SSH port 22 is closed.
+      confidence: 0.95
+      derived_from: ["effective ssm:StartSession on ?instance"]
+      false_positive_note: >-
+        ssm:StartSession may be constrained by the ssm:SessionDocumentAccessCheck
+        condition and document-level resource policy. Honor both. Session Manager
+        requires the SSM Session Manager plugin on the caller's local machine for
+        AWS CLI-initiated sessions, but programmatic WebSocket access does not.
+        The same service_state gate as SendCommand applies: agent must be Online.
+      narrative: >-
+        {principal.name} can open an interactive shell to {instance.name} via Session
+        Manager (ssm:StartSession), bypassing any SSH/RDP firewall restrictions.
+        The session executes as the SSM Agent user (root or SYSTEM).
+
+  # --- CanExecuteCommand on instance -> CanExecuteAs instance profile role ---
+  # This is the headline path: SendCommand/StartSession = RCE as instance profile.
+  # can-execute-as:execute-as-via-command collapses
+  #   CanExecuteCommand(?principal -> ?instance) + ExecutesAs(?instance -> ?role)
+  #   => CanExecuteAs(?principal -> ?role)
+  # We emit the FACT edges (CanExecuteCommand above, ExecutesAs in explicit rules);
+  # the linchpin rolls them up. This rule emits only the narrative-enriched fact
+  # that the IMDS credential endpoint is the mechanism, not the roll-up itself.
+  - id: aws-ssm-instance-exposes-role-via-imds
+    emits: ExposesCredential
+    description: "A managed instance exposes its instance-profile role credentials to any code running on it via the IMDS endpoint."
+    match:
+      - [ ?instance, ExecutesAs, ?role ]
+    where:
+      - "node_type(?instance) == VirtualMachine"
+      - "?instance.ssm_ping_status == 'Online'  # instance is SSM-reachable, making this fact actionable"
+    emit:
+      source_type: VirtualMachine
+      target_type: Role
+      source: ?instance
+      target: ?role
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE — the IMDS credential endpoint at 169.254.169.254 is always present
+        on EC2 instances and delivers the instance-profile credentials. Any code
+        executing on the instance (via SSM, SSH, application RCE, or any other vector)
+        can call IMDS and obtain the role's temporary credentials. The edge is ACTIVE
+        whenever the instance is SSM-Online (making it reachable for command injection);
+        it does not become ACTIVE or BLOCKED independently — its exploitation is
+        gated by the contributing CanExecuteCommand edge.
+      confidence: 0.98
+      derived_from: ["?instance ExecutesAs ?role"]
+      false_positive_note: >-
+        Not an escalation by itself — it states that code execution on the instance
+        equals holding the instance-profile role's credentials. Path value comes from
+        a contributing CanExecuteCommand edge. IMDSv2 (instance metadata service
+        version 2, requiring a PUT token exchange) limits some SSRF-based credential
+        theft but does NOT protect against command execution via SSM — the commands
+        run as OS processes that can call IMDS normally. Only if IMDSv2 hop-limit is
+        1 AND the instance has http-put-response-hop-limit=1 does SSRF from an
+        application NOT reach IMDS; direct OS command execution still does.
+      narrative: >-
+        {instance.name} exposes its instance-profile role {role.name} credentials
+        to any code executing on it via the EC2 IMDS endpoint (169.254.169.254);
+        ssm:SendCommand or ssm:StartSession delivers that code.
+
+  # ---------------------------------------------------------------------------
+  # (B) AUTOMATION — Automation document as a CI/CD runner (BuildWorker).
+  #     The cicd-chains linchpin consumes CanModifyCode + ExecutesAs + CanTrigger
+  #     and produces CanExecuteAs. We emit the SERVICE FACTS only.
+  # ---------------------------------------------------------------------------
+
+  # --- UpdateDocument -> CanModifyCode on Automation runner ------------------
+  # The Automation runner is modeled as a BuildWorker (Compute subtype), not as
+  # the document (AutomationService/ManagementService). CanModifyCode.target must
+  # be a Compute class node. The document IS the definition; the runner (execution)
+  # is the BuildWorker node. We target the runner, which ExecutesAs the role.
+  - id: aws-ssm-update-document-modify-code
+    emits: CanModifyCode
+    description: "ssm:UpdateDocument rewrites a customer-owned Automation document's steps — the executed definition of the BuildWorker runner."
+    match:
+      - [ ?principal, HasPermission, ?document ]
+      - [ ?runner, ExecutesAs, ?role ]
+    where:
+      - "effective_action == 'ssm:UpdateDocument'"
+      - "node_type(?document) == AutomationService"
+      - "?document.document_type == 'Automation'"
+      - "?document.owner != 'Amazon'  # AWS-managed documents cannot be updated by customers"
+      - "node_type(?runner) == BuildWorker"
+      - "?runner.document_arn == ?document.arn  # this runner executes the document being updated"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: ?runner
+      permissions: ["ssm:UpdateDocument", "ssm:UpdateDocumentDefaultVersion"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ssm:UpdateDocument is EFFECTIVE on the document ARN and the
+        document is customer-owned (owner != 'Amazon'). BLOCKED when an SCP /
+        permission boundary denies ssm:UpdateDocument. POTENTIAL when the runner
+        does not yet have an AutomationAssumeRole binding (no execution identity
+        yet). A new version does not automatically become default;
+        ssm:UpdateDocumentDefaultVersion must also be EFFECTIVE for the persistent
+        code modification to become ACTIVE — if ssm:UpdateDocumentDefaultVersion is
+        missing, downgrade to CONDITIONAL(iam_permission) because the new version
+        remains inactive.
+      confidence: 0.9
+      derived_from: ["effective ssm:UpdateDocument on ?document", "?runner ExecutesAs ?role"]
+      false_positive_note: >-
+        AWS-managed documents (document.owner == 'Amazon', name prefix 'AWS-*') cannot
+        be modified by customers — do NOT emit CanModifyCode for them. For those,
+        the code-control vector is at invocation time via parameter injection
+        (aws-ssm-send-command-execute-command above). A new document version is
+        inactive until set as default via ssm:UpdateDocumentDefaultVersion or the
+        default-version promotion flag at UpdateDocument call time — if that action
+        is not EFFECTIVE, the persistent-modification impact is CONDITIONAL. The
+        target is the BuildWorker runner node (the Automation execution), not the
+        document node (AutomationService/ManagementService) — CanModifyCode.target
+        must be Compute-class per schema/edges.yaml.
+      narrative: >-
+        {principal.name} can rewrite the steps of Automation document {document.name}
+        (ssm:UpdateDocument), injecting malicious automation steps that will execute
+        as {role.name} via runner {runner.name} on the next invocation.
+
+  # --- CreateDocument + StartAutomationExecution + PassRole -> CanCreateWorkloadAs
+  - id: aws-ssm-create-automation-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new Automation document with attacker-controlled steps and bind a passable privileged role, yielding code execution as that role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE ssm:CreateDocument (resource scope covers the new document ARN or *)"
+      - "?principal has EFFECTIVE ssm:StartAutomationExecution (resource scope covers the new document ARN or *)"
+      - "?role trust policy allows ssm.amazonaws.com (AssumedBy ssm.amazonaws.com)"
+      - "iam:PassRole for ?role permits iam:PassedToService including ssm.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "ssm:CreateDocument", "ssm:StartAutomationExecution"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        if the ?role trust policy or iam:PassedToService is unknown/unresolved:
+        POTENTIAL(role_compatibility); elif all three effective permissions are ACTIVE:
+        ACTIVE (caller creates the document, starts execution with AutomationAssumeRole
+        = ?role, and the document's aws:executeScript step runs attacker code as ?role);
+        else CONDITIONAL(iam_permission) for whichever permission is missing.
+        BLOCKED when an SCP denies ssm:CreateDocument or iam:PassRole.
+      confidence: 0.9
+      derived_from: ["?principal CanPassIdentity ?role", "effective ssm:CreateDocument", "effective ssm:StartAutomationExecution"]
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to ec2.amazonaws.com does NOT
+        yield SSM Automation execution. The role MUST trust ssm.amazonaws.com or
+        StartAutomationExecution fails with an invalid-role error -> downgrade to
+        POTENTIAL(role_compatibility) when trust is unknown. All three actions must
+        be EFFECTIVE; a partial grant (e.g. CreateDocument but not StartAutomationExecution)
+        leaves the path CONDITIONAL. The aws:executeScript step requires Lambda runtime
+        (Python/PowerShell) in the AutomationAssumeRole — the role needs no specific
+        Lambda permissions but must exist and trust SSM.
+      narrative: >-
+        {principal.name} can pass {role.name} to SSM Automation (iam:PassRole to
+        ssm.amazonaws.com), create a new document with attacker-controlled steps
+        (ssm:CreateDocument), and execute it (ssm:StartAutomationExecution), running
+        attacker code as {role.name}.
+
+  # --- StartAutomationExecution -> CanTrigger on existing Automation runner --
+  # CanTrigger.target must be Compute-class. The runner is a BuildWorker (Compute).
+  # Triggering without code control: the current document must already run
+  # attacker-influenced content for this to yield the identity. cicd-chains
+  # cicd-trigger-runner-executes-as handles the roll-up at CONDITIONAL state.
+  - id: aws-ssm-start-automation-trigger
+    emits: CanTrigger
+    description: "ssm:StartAutomationExecution triggers an existing Automation BuildWorker runner that executes as its AutomationAssumeRole."
+    match:
+      - [ ?principal, HasPermission, ?document ]
+      - [ ?runner, ExecutesAs, ?role ]
+    where:
+      - "effective_action == 'ssm:StartAutomationExecution'"
+      - "node_type(?document) == AutomationService"
+      - "?document.document_type == 'Automation'"
+      - "node_type(?runner) == BuildWorker"
+      - "?runner.document_arn == ?document.arn  # runner is the Automation execution context for this document"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: ?runner
+      permissions: ["ssm:StartAutomationExecution"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ssm:StartAutomationExecution is EFFECTIVE on the document ARN.
+        The trigger itself is ACTIVE (the principal can start an execution); whether
+        that execution yields the AutomationAssumeRole's credentials to the attacker
+        depends on whether the document definition already runs attacker-controllable
+        code — that is cicd-chains:cicd-trigger-runner-executes-as's judgment
+        (CONDITIONAL(attacker_influenced_definition) by default). BLOCKED when an SCP
+        denies ssm:StartAutomationExecution.
+      confidence: 0.9
+      derived_from: ["effective ssm:StartAutomationExecution on ?document", "?runner ExecutesAs ?role"]
+      false_positive_note: >-
+        Triggering is strictly weaker than code modification (0.7 prior in cicd-chains).
+        Do NOT emit CanExecuteAs here — that is cicd-chains' job off this CanTrigger
+        plus the runner's ExecutesAs. A caller who both CanModifyCode and CanTrigger
+        the same runner: cicd-chains rule 1 (ACTIVE) dominates over rule 2 (CONDITIONAL)
+        — do not double-count. If AutomationAssumeRole is NOT specified and the
+        Automation runs in the caller's context, the caller already IS the identity;
+        no CanTrigger toward a new identity is needed (no-op for escalation). The target
+        is the BuildWorker runner (Compute-class), not the AutomationService document
+        node, to satisfy CanTrigger.target = [Compute] per schema/edges.yaml.
+      narrative: >-
+        {principal.name} can trigger runner {runner.name} via ssm:StartAutomationExecution
+        on document {document.name}; if the document's steps already run attacker-
+        influenceable code, this yields execution as {role.name}.
+
+  # --- CreateAssociation + PassRole -> CanCreateWorkloadAs (recurring scheduled trigger)
+  - id: aws-ssm-create-association-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new State Manager association with a privileged role and attacker-controlled document parameters, yielding recurring scheduled code execution as that role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE ssm:CreateAssociation (resource scope covers new associations or *)"
+      - "?role trust policy allows ssm.amazonaws.com"
+      - "iam:PassRole for ?role permits iam:PassedToService including ssm.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "ssm:CreateAssociation"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        if the ?role trust policy or iam:PassedToService is unknown/unresolved:
+        POTENTIAL(role_compatibility); elif both ssm:CreateAssociation and
+        iam:PassRole are ACTIVE: ACTIVE (caller creates a State Manager association
+        with an Automation document that will run on a schedule as ?role). BLOCKED
+        when an SCP denies ssm:CreateAssociation or iam:PassRole.
+      confidence: 0.85
+      derived_from: ["?principal CanPassIdentity ?role", "effective ssm:CreateAssociation"]
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to ec2.amazonaws.com does NOT
+        work for State Manager association runners. The role MUST trust ssm.amazonaws.com.
+        The association provides an automatic run path (ScheduleExpression) that makes
+        the created workload ACTIVE unlike POTENTIAL. If the association has no schedule
+        or ApplyOnly mode, downgrade to CONDITIONAL(trigger_exists). All permissions
+        must be EFFECTIVE; a partial grant leaves the path CONDITIONAL.
+      narrative: >-
+        {principal.name} can pass {role.name} to SSM (iam:PassRole), create a new
+        State Manager association (ssm:CreateAssociation) with an Automation document
+        that will run on schedule, executing attacker code as {role.name} automatically
+        on each scheduled tick.
+
+  # --- Maintenance Window task registration + PassRole -> CanCreateWorkloadAs
+  - id: aws-ssm-register-maintenance-window-task-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Register a Run Command / Automation task with a Maintenance Window, binding a privileged service role that the task will run as."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE ssm:RegisterTaskWithMaintenanceWindow (resource scope covers maintenance windows or *)"
+      - "?role trust policy allows ssm.amazonaws.com"
+      - "iam:PassRole for ?role permits iam:PassedToService including ssm.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "ssm:RegisterTaskWithMaintenanceWindow"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        if the ?role trust policy or iam:PassedToService is unknown/unresolved:
+        POTENTIAL(role_compatibility); elif both ssm:RegisterTaskWithMaintenanceWindow
+        and iam:PassRole are ACTIVE: ACTIVE (caller registers a task with a
+        maintenance window that will run at scheduled times as ?role). BLOCKED
+        when an SCP denies ssm:RegisterTaskWithMaintenanceWindow or iam:PassRole.
+      confidence: 0.85
+      derived_from: ["?principal CanPassIdentity ?role", "effective ssm:RegisterTaskWithMaintenanceWindow"]
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to ec2.amazonaws.com does NOT
+        work for Maintenance Window tasks. The role MUST trust ssm.amazonaws.com.
+        The task must reference a RunCommand or Automation document; the document's
+        definition or parameters must be attacker-controllable for code execution
+        (either via ssm:UpdateDocument on an existing Automation document, or
+        injected parameters on a RunCommand). This edge captures the privilege
+        escalation at workload creation time; the trigger (scheduled window) is
+        modeled separately in explicit rules.
+      narrative: >-
+        {principal.name} can pass {role.name} to SSM (iam:PassRole) and register a
+        task with a Maintenance Window (ssm:RegisterTaskWithMaintenanceWindow) that
+        will execute attacker-controlled commands as {role.name} within the window's
+        scheduled timeframe.
+
+  # ---------------------------------------------------------------------------
+  # (C) STATE MANAGER ASSOCIATIONS — scheduled runner with automatic trigger.
+  # ---------------------------------------------------------------------------
+
+  # --- UpdateAssociation -> CanModifyCode on the target instances -----------
+  # CanModifyCode.target must be Compute-class. The association targets VirtualMachine
+  # nodes (the managed instances it runs the document on). We emit CanModifyCode from
+  # the principal to each targeted VirtualMachine: the principal effectively controls
+  # what commands run on those instances via the association's scheduled document.
+  - id: aws-ssm-update-association-modify-code
+    emits: CanModifyCode
+    description: "ssm:UpdateAssociation changes the document or command parameters of a State Manager association, injecting attacker code into the managed instances the association targets."
+    match:
+      - [ ?principal, HasPermission, ?association ]
+      - [ ?association, CanTrigger, ?instance ]
+    where:
+      - "effective_action == 'ssm:UpdateAssociation'"
+      - "node_type(?association) == Scheduler"
+      - "?association.origin_service == 'aws:ssm'"
+      - "node_type(?instance) == VirtualMachine"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: ?principal
+      target: ?instance
+      permissions: ["ssm:UpdateAssociation"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ssm:UpdateAssociation is EFFECTIVE on the association ID scope and
+        the instance is in scope of the association's Targets filter and Online. The
+        association has an existing schedule (ScheduleExpression) that provides an
+        automatic run path — cicd-chains inherits ACTIVE state because the modification
+        arms the next scheduled tick. BLOCKED when an SCP denies ssm:UpdateAssociation.
+        CONDITIONAL(iam_permission) when the permission is scoped to specific
+        association IDs and the target is not in scope.
+      confidence: 0.88
+      derived_from: ["effective ssm:UpdateAssociation on ?association", "?association CanTrigger ?instance"]
+      false_positive_note: >-
+        UpdateAssociation can change (a) the document ARN (swap to attacker document),
+        (b) the Parameters (including commands for AWS-RunShellScript), or (c) the
+        Targets (broaden the set of instances). All three are code/config injection;
+        CanModifyCode is emitted because the parameter change is equivalent to rewriting
+        the commands the runner executes on the instance. The association's
+        ScheduleExpression is the automatic run path that makes this ACTIVE rather than
+        CONDITIONAL(run_path). If the association has no schedule (ApplyOnly without a
+        cron), the run path is CONDITIONAL(trigger_exists) — downgrade accordingly.
+        The target is the VirtualMachine (Compute class) the association executes on,
+        not the Scheduler node, to satisfy CanModifyCode.target per schema/edges.yaml.
+      narrative: >-
+        {principal.name} can modify State Manager association {association.name}
+        (ssm:UpdateAssociation), injecting attacker-controlled commands that will run
+        automatically on {instance.name} at the next scheduled tick.
+
+  # --- StartChangeRequestExecution -> CanTrigger (with approval gate condition) ---
+  # Change Manager requires an approval workflow before the runbook executes.
+  # This is distinct from StartAutomationExecution (direct/immediate). The trigger
+  # exists but is CONDITIONAL(approval_gate) by default.
+  - id: aws-ssm-change-request-execution-trigger
+    emits: CanTrigger
+    description: "ssm:StartChangeRequestExecution triggers an Automation runbook with Change Manager approval gating."
+    match:
+      - [ ?principal, HasPermission, ?document ]
+      - [ ?runner, ExecutesAs, ?role ]
+    where:
+      - "effective_action == 'ssm:StartChangeRequestExecution'"
+      - "node_type(?document) == AutomationService"
+      - "?document.document_type == 'Automation'"
+      - "node_type(?runner) == BuildWorker"
+      - "?runner.document_arn == ?document.arn"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: ?runner
+      permissions: ["ssm:StartChangeRequestExecution"]
+      conditions: [iam_permission, approval_gate]
+      state_logic: >-
+        CONDITIONAL(approval_gate) by default — ssm:StartChangeRequestExecution
+        submits a change request that must be approved by a Change Manager approver
+        before the runbook executes. The approval workflow is a gating condition that
+        prevents immediate execution. ACTIVE only if approval is pre-authorized or
+        if the principal themselves hold iam:approveChangeRequest. BLOCKED when an
+        SCP denies ssm:StartChangeRequestExecution.
+      confidence: 0.85
+      derived_from: ["effective ssm:StartChangeRequestExecution on ?document", "?runner ExecutesAs ?role"]
+      false_positive_note: >-
+        StartChangeRequestExecution is distinct from StartAutomationExecution because
+        it routes through Change Manager approval. By default, emit this as
+        CONDITIONAL(approval_gate) because an approver must review and accept the
+        change request before execution. If the principal also holds iam:approveChangeRequest
+        on their own changes, upgrade to ACTIVE (self-approval). Honor Change Manager
+        configuration (approval required yes/no, approver list). Do NOT conflate with
+        the direct-trigger path (StartAutomationExecution, which is ACTIVE by default).
+      narrative: >-
+        {principal.name} can submit a change request via ssm:StartChangeRequestExecution
+        to trigger runner {runner.name} (executing {document.name} as {role.name}),
+        but the request must be approved by a Change Manager approver before execution
+        proceeds.
+
+  # --- Association as scheduled CanTrigger -----------------------------------
+  # Modeled in the explicit rules (ssm:ListAssociations evidence). Derived here
+  # only for the fan-out narrative: one association fires against many instances.
+  - id: aws-ssm-association-scheduled-trigger
+    emits: CanTrigger
+    description: "A State Manager association with a cron schedule triggers the bound document against targeted instances automatically."
+    match:
+      - [ ?association, CanTrigger, ?instance ]
+    where:
+      - "node_type(?association) == Scheduler"
+      - "?association.origin_service == 'aws:ssm'"
+      - "?association.schedule_expression != null  # has an active schedule"
+      - "node_type(?instance) == VirtualMachine"
+    emit:
+      source_type: Scheduler
+      target_type: VirtualMachine
+      source: ?association
+      target: ?instance
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the association has a non-null ScheduleExpression and the instance
+        is in scope (matches Targets tag/resource-group/instance-ID filter) and Online.
+        CONDITIONAL(service_state) when the instance is targeted by the association
+        filter but its SSM connectivity is uncertain (PingStatus not Online).
+        This edge enables cicd-chains:cicd-pipeline-orchestrates-stages to propagate
+        a principal's CanTrigger(?principal -> ?association) to CanTrigger(?principal
+        -> ?instance), and then cicd-trigger-runner-executes-as to produce
+        CanExecuteAs if the definition is attacker-influenced.
+      confidence: 0.9
+      derived_from: ["?association CanTrigger ?instance (explicit, from ssm:ListAssociations)"]
+      false_positive_note: >-
+        Only emit when ScheduleExpression is present and non-empty. An association with
+        ApplyOnlyAtCronInterval=true and no schedule is a one-shot, not a recurring
+        trigger; emit CanTrigger CONDITIONAL(trigger_exists) instead of ACTIVE.
+        The instance must be in scope of the Targets filter (check tag values, resource
+        group membership, or explicit instance IDs). Do not emit for every instance in
+        the account — only those matched by the Targets specification.
+      narrative: >-
+        The State Manager association {association.name} fires on schedule
+        ({association.schedule_expression}) and targets {instance.name}, automatically
+        delivering its document to that instance.
+
+  # ---------------------------------------------------------------------------
+  # (D) CROSS-ACCOUNT DOCUMENT SHARING — CanModifyCode in target account
+  # ---------------------------------------------------------------------------
+
+  # --- ModifyDocumentPermission + target account runner -> CanModifyCode -----
+  # When a document owner shares a document cross-account and a runner in the target
+  # account executes it (BuildWorker node in the target account, ExecutesAs a role
+  # in that account), the document owner can modify the document content
+  # (ssm:UpdateDocument) and thereby control what code the target-account runner
+  # executes. This is a supply-chain: CanModifyCode from the sharing Identity to the
+  # target-account BuildWorker. Source must be Identity; target must be Compute.
+  - id: aws-ssm-shared-document-cross-account
+    emits: CanModifyCode
+    description: "A shared SSM Automation document gives the sharing-account identity code control over any BuildWorker in the target account that executes it."
+    match:
+      - [ ?document, CrossAccountTrust, ?targetAccount ]
+      - [ ?owner, HasPermission, ?document ]
+      - [ ?targetRunner, ExecutesAs, ?targetRole ]
+    where:
+      - "node_type(?document) == AutomationService"
+      - "?document.document_type == 'Automation'"
+      - "effective_action == 'ssm:UpdateDocument'  # document owner can modify the definition"
+      - "node_type(?targetRunner) == BuildWorker"
+      - "?targetRunner.document_arn == ?document.arn  # target runner executes this shared document"
+      - "?targetRunner.account == ?targetAccount.id   # runner lives in the target account"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?owner
+      target: ?targetRunner
+      permissions: ["ssm:UpdateDocument"]
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when (a) the document's permission list includes the target account,
+        (b) the sharing-account identity has ssm:UpdateDocument on the document,
+        AND (c) the target account has a runner that executes this document. If the
+        target account's use of the document is not yet confirmed, CONDITIONAL(resource_policy).
+        This edge models the supply-chain risk: the document owner controls the
+        definition the target-account runner executes.
+      confidence: 0.80
+      derived_from: ["?document CrossAccountTrust ?targetAccount", "effective ssm:UpdateDocument by ?owner", "?targetRunner ExecutesAs ?targetRole"]
+      false_positive_note: >-
+        Requires confirmation that the target account actually runs the shared document
+        (a BuildWorker node with document_arn matching the shared document). Without
+        that confirmation, the cross-account trust is a POTENTIAL supply-chain risk,
+        not ACTIVE. The document owner (source = Identity) must have ssm:UpdateDocument
+        to modify the definition; merely sharing it does not grant code control if the
+        content cannot be changed. ssm:ModifyDocumentPermission is the action that
+        established the cross-account sharing trust (present in the CrossAccountTrust
+        edge), but is not required by the document owner to modify code after sharing
+        is in place. CanModifyCode.source = [Identity] and .target = [Compute] per
+        schema/edges.yaml; AutomationService/Scheduler nodes are ManagementService
+        class and are not in scope as target here.
+      narrative: >-
+        The sharing-account principal {owner.name} controls the content of Automation
+        document {document.name} (via ssm:UpdateDocument) shared with
+        account {targetAccount.name}; the target-account runner {targetRunner.name}
+        executes that document as {targetRole.name}, giving {owner.name} indirect
+        code execution in the target account.
+
+  # ---------------------------------------------------------------------------
+  # (E) ESCALATION ROLL-UP (CITE, not re-derive)
+  # can-execute-as:execute-as-via-command already handles:
+  #   CanExecuteCommand(?principal, ?instance) + ExecutesAs(?instance, ?role)
+  #   => CanExecuteAs(?principal, ?role)
+  #
+  # cicd-chains:cicd-modify-buildspec-executes-as already handles:
+  #   CanModifyCode(?principal, ?runner) + ExecutesAs(?runner, ?role)
+  #   [+ CanTrigger(?principal, ?runner) optional]
+  #   => CanExecuteAs(?principal, ?role)
+  #
+  # can-control:escalate-via-execute-as already handles:
+  #   CanExecuteAs(?principal, ?role) where privilege(?role) > privilege(?principal)
+  #   => CanEscalateTo(?principal, ?role)
+  #
+  # This rule emits CanEscalateTo ONLY for the SendCommand path where can-execute-as
+  # does NOT have a node_type(?instance)==VirtualMachine guard (it is provider-agnostic
+  # and already fires on the CanExecuteCommand+ExecutesAs chain). This rule is
+  # CITED NOT DUPLICATED — do not re-emit CanEscalateTo if can-control fires first.
+  # ---------------------------------------------------------------------------
+
+  # --- Cross-account SendCommand -> CanEnterAccount --------------------------
+  - id: aws-ssm-cross-account-sendcommand-enter-account
+    emits: CanEnterAccount
+    description: "A principal in account A that can execute commands on an instance in account B, which runs as a role in account B, gains a foothold in account B."
+    match:
+      - [ ?principal, CanExecuteCommand, ?instance ]
+      - [ ?instance,  ExecutesAs,        ?role ]
+    where:
+      - "node_type(?instance) == VirtualMachine"
+      - "?principal.account != ?instance.account  # cross-account execution"
+      - "?instance.account == ?role.account        # role lives in the instance's account"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?principal
+      target: "<Account boundary node that Contains ?instance>"
+      permissions: []
+      conditions: [resource_policy, iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the CanExecuteCommand edge is ACTIVE (principal's ssm:SendCommand or
+        ssm:StartSession is EFFECTIVE on the instance ARN cross-account, the instance is
+        Online, and any cross-account resource policy / IAM trust permits the call);
+        CONDITIONAL(resource_policy) when the cross-account permission is present but
+        not fully confirmed (e.g. the remote-account resource policy or IAM role
+        granting the cross-account ssm access is not yet modeled);
+        BLOCKED when an SCP in account B denies ssm:SendCommand from external accounts.
+      confidence: 0.88
+      derived_from: ["?principal CanExecuteCommand ?instance", "?instance ExecutesAs ?role (cross-account)"]
+      false_positive_note: >-
+        Cross-account SSM command execution requires the caller's IAM policy to permit
+        ssm:SendCommand on the target instance ARN in account B, AND account B's IAM /
+        resource policy must allow it (typically a cross-account IAM role with
+        ssm:SendCommand + ec2:DescribeInstances that the caller assumes, or an
+        instance-level resource policy if supported). A principal in account A using
+        their own identity to SendCommand to account B's instance directly is uncommon
+        and requires explicit account-B-side permission; more typical is assuming a
+        cross-account role in account B first (CanAssume -> CanEnterAccount).
+        Only emit when the cross-account permission is confirmed.
+      narrative: >-
+        {principal.name} (account {principal.account}) can execute commands on
+        {instance.name} (account {instance.account}) via SSM, and that instance runs
+        as {role.name} in account {instance.account}, giving {principal.name} a
+        credential foothold in account {instance.account}.
+
+  # --- Tag-based SendCommand fan-out -> multiple instances -------------------
+  # NOTE: This rule's pattern is covered by aws-ssm-send-command-execute-command above,
+  # which already handles broad tag-based resource scopes via the HasPermission edge
+  # binding ?principal and ?instance where resource_scope covers the instance ARN
+  # (including tag-based wildcards). The fan-out narrative is captured in the
+  # false_positive_note of that rule. We do NOT duplicate it here.
+  # For explicitly modeling tag-based fanout, the rule would need to bind ?instance
+  # in the match clause via a query over node properties (tags matching the Targets
+  # filter), which is non-standard in YAML-based rule format. The rule engine must
+  # evaluate this at emission time. The recommendation is to let the first rule
+  # (aws-ssm-send-command-execute-command) fire for each matched instance and use
+  # confidence/narrative to surface the fanout scale.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP / permission boundary denying ssm:SendCommand or ssm:StartSession at
+#     the effective scope -> CanExecuteCommand BLOCKED with denied_by=<SCP>.
+#   - SCP denying ssm:StartAutomationExecution -> Automation CanTrigger / CanExecuteAs
+#     BLOCKED.
+#   - SCP denying iam:PassRole with iam:PassedToService=ssm.amazonaws.com -> block
+#     all Automation AutomationAssumeRole paths (CanPassIdentity BLOCKED ->
+#     CanCreateWorkloadAs BLOCKED).
+#   - Instance not SSM-managed (no agent, no profile with ssm:UpdateInstanceInformation,
+#     no endpoint connectivity) -> CanExecuteCommand BLOCKED or POTENTIAL(service_state).
+#   - AWS-managed documents (owner == Amazon) cannot be updated -> ssm:UpdateDocument
+#     attempts are denied -> CanModifyCode via UpdateDocument BLOCKED for those;
+#     the vector shifts to parameter injection at invocation time (SendCommand).
+#   - Change Manager approval gate -> CanTrigger via ssm:StartChangeRequestExecution
+#     is CONDITIONAL(approval_gate), not ACTIVE.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service belong in /rules/explicit/aws-ssm.yaml.
+explicit_rules:
+
+  - id: aws-ssm-executes-as-automation
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::SSM::AutomationExecution", field: "AutomationAssumeRole"}
+    emit:
+      source_type: BuildWorker
+      target_type: Role
+      source: "<AutomationExecution node>"
+      target: "<IAM Role node for AutomationAssumeRole ARN>"
+      api_source: "ssm:DescribeAutomationExecutions"
+      evidence_field: "AutomationAssumeRole"
+      narrative: "Automation execution {runner.name} runs as {role.name} (AutomationAssumeRole)."
+
+  - id: aws-ssm-executes-as-instance-profile
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::SSM::ManagedInstance", field: "IamInstanceProfile"}
+    emit:
+      source_type: VirtualMachine
+      target_type: Role
+      source: "<ManagedInstance/VirtualMachine node>"
+      target: "<IAM Role node resolved from instance profile ARN>"
+      api_source: "ec2:DescribeInstances + ec2:DescribeIamInstanceProfileAssociations + iam:GetInstanceProfile"
+      evidence_field: "IamInstanceProfile.Arn -> role"
+      narrative: "{instance.name} runs as instance-profile role {role.name}."
+
+  - id: aws-ssm-can-execute-command-sendcommand
+    emits: CanExecuteCommand
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ssm:SendCommand"
+      resource_type: "AWS::SSM::ManagedInstance"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: "<principal>"
+      target: "<ManagedInstance node in scope>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ssm:SendCommand"]
+      narrative: "{principal.name} can run commands on {instance.name} (ssm:SendCommand)."
+
+  - id: aws-ssm-can-execute-command-startsession
+    emits: CanExecuteCommand
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ssm:StartSession"
+      resource_type: "AWS::SSM::ManagedInstance"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: "<principal>"
+      target: "<ManagedInstance node in scope>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ssm:StartSession"]
+      narrative: "{principal.name} can open a shell session on {instance.name} (ssm:StartSession)."
+
+  - id: aws-ssm-can-modify-code-update-document
+    emits: CanModifyCode
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ssm:UpdateDocument"
+      resource_type: "AWS::SSM::Document"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<BuildWorker (AutomationExecution) node whose document_arn matches this document>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ssm:UpdateDocument"]
+      note: >-
+        CanModifyCode.target must be Compute-class per schema/edges.yaml; the document
+        node is AutomationService (ManagementService class). The explicit normalizer
+        therefore targets the BuildWorker runner that executes this document, not the
+        document node itself. The runner is resolved via the document_arn property on
+        the BuildWorker node.
+      narrative: "{principal.name} can update the content of document {document.name} (ssm:UpdateDocument), modifying the definition executed by the Automation BuildWorker runner."
+
+  - id: aws-ssm-pass-role
+    emits: CanPassIdentity
+    applies_to: [aws]
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "iam:PassedToService condition includes ssm.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: "<principal>"
+      target: "<IAM role passable to ssm.amazonaws.com>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["iam:PassRole"]
+      conditions: [role_compatibility]
+      narrative: "{principal.name} can pass {role.name} to SSM (iam:PassRole → ssm.amazonaws.com)."
+
+  - id: aws-ssm-association-trigger
+    emits: CanTrigger
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::SSM::Association", field: "Targets"}
+    emit:
+      source_type: Scheduler
+      target_type: VirtualMachine
+      source: "<Association node>"
+      target: "<each ManagedInstance matched by Targets filter>"
+      api_source: "ssm:ListAssociations + ssm:DescribeAssociation"
+      evidence_field: "Targets + ScheduleExpression"
+      narrative: "Association {association.name} targets {instance.name} on schedule {schedule}."
+
+  - id: aws-ssm-document-cross-account-share
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::SSM::Document", field: "AccountIds"}
+    where:
+      - "ssm:DescribeDocumentPermission returns non-empty AccountIds list"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<ResourcePolicy node representing the document's permission list>"
+      target: "<external Account node for each entry in AccountIds>"
+      api_source: "ssm:DescribeDocumentPermission"
+      evidence_field: "AccountIds"
+      note: >-
+        The source of CrossAccountTrust must be [Account, Role, ResourcePolicy] per
+        schema/edges.yaml. The document itself is AutomationService (ManagementService
+        class), which is NOT in the allowed source set. The correct source is the
+        ResourcePolicy artifact that represents the document's permission list
+        (ssm:ModifyDocumentPermission backing). If a ResourcePolicy node is not
+        explicitly modeled, the owning Account node may be used as an alternative.
+      narrative: "{document.name} is shared with account {account} via its resource policy (ssm:DescribeDocumentPermission)."

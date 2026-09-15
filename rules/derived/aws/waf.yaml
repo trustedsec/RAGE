@@ -1,0 +1,589 @@
+# AWS WAF v2 / Shield — Derived attack-path rules (Phase 12 — security & logging)
+# ---------------------------------------------------------------------------
+# Dominant mode: DEFENSE EVASION / TAMPERING (Phase 12 mode 1).
+#
+# WAF v2 is a LOW-relevance security service. Its entire attack-path surface is
+# the ability to weaken or remove HTTP-layer filtering from protected resources
+# (ALBs, API Gateways, CloudFront distributions, AppSync endpoints).
+#
+# WHAT THESE RULES EMIT:
+#   - CanModify(Identity -> SecurityService/GenericManagement) for UpdateWebACL,
+#     DisassociateWebACL, UpdateRuleGroup, UpdateIPSet, UpdateRegexPatternSet,
+#     and logging/Shield tampering.
+#   - CanDelete(Identity -> SecurityService) for DeleteWebACL and DeleteRuleGroup.
+#   - CanRead(Identity -> SecurityService) for WAF logging config recon.
+#
+# WHAT THESE RULES DO NOT EMIT:
+#   - CanEnterAccount / CanExecuteAs / CanEscalateTo — removing a WAF does not
+#     grant access to protected application resources or any IAM identity.
+#   - CanReadData / ContainsSecret — WAF log content (tokens/cookies) is modeled
+#     at the log destination (S3/Firehose/CloudWatch Logs), not here.
+#   - ExecutesAs — WAF/Shield have no execution-identity surface.
+#
+# NARRATIVE FRAMING: each emitted edge should appear in the UI as a
+# "cover-tracks / weaken-defenses" node, NOT as a privilege-escalation step.
+#
+# PERMISSIONS are exact wafv2 IAM action names from the AWS Service Authorization
+# Reference:
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_awswafv2.html
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsshieldadvanced.html
+#
+# NODE CLASS CONFORMANCE (schema/nodes.yaml):
+#   Web ACLs and Rule Groups map to ManagementService class, type SecurityService.
+#   CanModifyConfiguration target set admits "*" (schema/edges.yaml line ~394).
+#   CanDelete target set admits "*" (schema/edges.yaml line ~636).
+#   source (Identity) is within both edges' declared source set.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 12-security-logging
+applies_to: [aws]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1a. Weaken a Web ACL — UpdateWebACL / DisassociateWebACL
+  # ---------------------------------------------------------------------------
+  # UpdateWebACL:        Modify rules, rule priority, default action (ALLOW/BLOCK),
+  #                      visibility config. Setting default action to ALLOW and
+  #                      removing all blocking rules is a silent ACL bypass.
+  # DisassociateWebACL:  Detach the entire WAF from a protected resource, leaving
+  #                      it completely unprotected by WAF.
+  #
+  # STATE LOGIC: ACTIVE when the effective permission is confirmed. BLOCKED if an
+  # SCP or permission boundary explicitly denies the action on this ACL's ARN.
+  - id: aws-waf-weaken-web-acl
+    emits: CanModify
+    description: >-
+      Update or disassociate a Web ACL to weaken or remove HTTP-layer filtering
+      from protected resources (defense evasion, not access grant).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?webacl ]
+    where:
+      - "node_type(?webacl) == SecurityService"
+      - "?webacl.provider_type == 'AWS::WAFv2::WebACL'"
+      - "effective_action_on(?principal, ?webacl) intersects ['wafv2:UpdateWebACL', 'wafv2:DisassociateWebACL']"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?webacl
+      permissions:
+        - "wafv2:UpdateWebACL"
+        - "wafv2:DisassociateWebACL"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when effective-permission evaluator confirms at least one of
+        wafv2:UpdateWebACL or wafv2:DisassociateWebACL on the Web ACL ARN (or scope
+        wildcard). BLOCKED if an SCP or permission boundary denies the matching
+        action(s) on the ACL's ARN. No additional precondition required — WAFv2
+        control-plane actions require only IAM (no resource-based policy, no network
+        gate).
+      confidence: 0.95
+      derived_from:
+        - "?principal HasPermission ?webacl (wafv2:UpdateWebACL | wafv2:DisassociateWebACL)"
+      false_positive_note: >-
+        This edge is a DEFENSE-EVASION primitive — it does NOT grant access to the
+        application or data protected by the Web ACL. Removing or weakening a WAF
+        lowers the bar for external exploitation (allows previously-blocked HTTP
+        payloads) but is not itself an access grant. Do NOT chain this edge to
+        CanEnterAccount / CanExecuteAs / CanEscalateTo. Detective controls are not
+        BLOCKED-state nodes: removing the WAF disables a filter, not a guardrail that
+        the reference engine models as BLOCKED. wafv2:DeleteWebACL additionally requires the
+        ACL to have no active associations — emit CanDelete separately (rule
+        aws-waf-delete-web-acl). Scope to the correct AWS region (CLOUDFRONT scope is
+        us-east-1 only).
+      narrative: >-
+        {principal.name} can modify or disassociate the Web ACL {webacl.name}
+        (wafv2:UpdateWebACL / wafv2:DisassociateWebACL), weakening or removing
+        HTTP-layer filtering (SQLi, XSS, bot, rate-limit rules) from protected
+        resources. This reduces detection coverage and may allow previously-blocked
+        traffic — it is a cover-tracks / weaken-defenses action, not an access grant.
+
+  # ---------------------------------------------------------------------------
+  # 1b. Swap a Web ACL — AssociateWebACL (with precondition)
+  # ---------------------------------------------------------------------------
+  # AssociateWebACL re-associates a (possibly attacker-controlled, permissive)
+  # Web ACL in place of the current protective one. This is only an attack primitive
+  # if the principal also controls a second, permissive Web ACL to substitute.
+  # Without that precondition, the action is a no-op (cannot associate an ACL
+  # one does not own).
+  #
+  # STATE LOGIC: CONDITIONAL(service_state) on attacker-controlled Web ACL
+  # availability (either CanCreateWebACL or existing ownership of another ACL).
+  - id: aws-waf-swap-web-acl
+    emits: CanModify
+    description: >-
+      Replace a Web ACL with an attacker-controlled permissive one to weaken
+      HTTP-layer filtering (requires owning a substitute Web ACL).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?webacl ]
+    where:
+      - "node_type(?webacl) == SecurityService"
+      - "?webacl.provider_type == 'AWS::WAFv2::WebACL'"
+      - "effective_action_on(?principal, ?webacl) contains 'wafv2:AssociateWebACL'"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?webacl
+      permissions:
+        - "wafv2:AssociateWebACL"
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        CONDITIONAL(service_state) — AssociateWebACL is only an attack primitive if
+        the principal also controls a permissive Web ACL to substitute (either by
+        holding wafv2:CreateWebACL to create a new one, or by already owning another
+        Web ACL in the same scope/region). ACTIVE only if evaluator confirms the
+        principal can provide a substitute Web ACL. BLOCKED if an SCP or permission
+        boundary denies wafv2:AssociateWebACL.
+      confidence: 0.85
+      derived_from:
+        - "?principal HasPermission ?webacl (wafv2:AssociateWebACL)"
+      false_positive_note: >-
+        AssociateWebACL without a substitute ACL is a no-op. Do NOT emit ACTIVE unless
+        the principal demonstrably controls another Web ACL in the same scope/region or
+        holds wafv2:CreateWebACL. This edge is a DEFENSE-EVASION primitive — it does
+        NOT grant access to the application or data protected by the Web ACL. Do NOT
+        chain this edge to CanEnterAccount / CanExecuteAs / CanEscalateTo. Scope to
+        the correct AWS region (CLOUDFRONT scope is us-east-1 only).
+      narrative: >-
+        {principal.name} can associate a Web ACL (wafv2:AssociateWebACL). If
+        {principal.name} also controls a permissive Web ACL, this can replace the
+        current protective one, weakening or removing HTTP-layer filtering from
+        protected resources. This reduces detection coverage and may allow
+        previously-blocked traffic — it is a cover-tracks / weaken-defenses action,
+        not an access grant.
+
+  # ---------------------------------------------------------------------------
+  # 2a. Modify a Rule Group — UpdateRuleGroup
+  # ---------------------------------------------------------------------------
+  # A Rule Group is referenced by one or more Web ACLs. Modifying it corrupts all
+  # ACLs that reference it simultaneously — potentially a higher-blast-radius
+  # action than modifying individual ACLs.
+  #
+  # NOTE: Modifying an AWS Marketplace-managed rule group is NOT possible via the
+  # customer's IAM (AWS manages those). This rule applies only to customer-managed
+  # Rule Groups.
+  - id: aws-waf-corrupt-rule-group
+    emits: CanModify
+    description: >-
+      Modify a customer-managed Rule Group to corrupt all Web ACLs that
+      reference it (defense evasion with potentially multi-ACL blast radius).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?rulegroup ]
+    where:
+      - "node_type(?rulegroup) == SecurityService"
+      - "?rulegroup.provider_type == 'AWS::WAFv2::RuleGroup'"
+      - "effective_action_on(?principal, ?rulegroup) contains 'wafv2:UpdateRuleGroup'"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?rulegroup
+      permissions:
+        - "wafv2:UpdateRuleGroup"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when effective-permission evaluator confirms wafv2:UpdateRuleGroup on
+        the Rule Group ARN. BLOCKED if an SCP or permission boundary explicitly denies
+        the action. Blast radius increases with the number of Web ACLs referencing this
+        rule group — note this in evidence but do not spawn additional edges for each
+        consuming ACL (path-finding handles fan-out via structural referencing edges at
+        query time).
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?rulegroup (wafv2:UpdateRuleGroup)"
+      false_positive_note: >-
+        Customer-managed Rule Groups only. AWS-managed rule groups (vendor-managed,
+        e.g. AWSManagedRulesCommonRuleSet) cannot be updated by customer IAM actions —
+        do not emit for those. If the rule group is referenced by zero Web ACLs
+        (orphaned), the blast radius is nil; downgrade to POTENTIAL or annotate low
+        impact. This edge is defense evasion, NOT privilege escalation — do NOT chain
+        to CanEnterAccount / CanExecuteAs / CanEscalateTo.
+      narrative: >-
+        {principal.name} can update the Rule Group {rulegroup.name}
+        (wafv2:UpdateRuleGroup). Every Web ACL that references this rule group would
+        lose the updated rules, potentially allowing previously-blocked HTTP traffic
+        across multiple protected resources.
+
+  # ---------------------------------------------------------------------------
+  # 2b. Delete a Rule Group — DeleteRuleGroup
+  # ---------------------------------------------------------------------------
+  # DeleteRuleGroup permanently removes a rule group. It FAILS if the rule group is
+  # still referenced by a Web ACL. Deletion is a destructive action, distinct from
+  # configuration modification.
+  - id: aws-waf-delete-rule-group
+    emits: CanDelete
+    description: >-
+      Permanently delete a customer-managed Rule Group, breaking all Web ACLs
+      that reference it (requires prior removal of all associations).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?rulegroup ]
+    where:
+      - "node_type(?rulegroup) == SecurityService"
+      - "?rulegroup.provider_type == 'AWS::WAFv2::RuleGroup'"
+      - "effective_action_on(?principal, ?rulegroup) contains 'wafv2:DeleteRuleGroup'"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?rulegroup
+      permissions:
+        - "wafv2:DeleteRuleGroup"
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        ACTIVE when wafv2:DeleteRuleGroup is confirmed effective. CONDITIONAL(service_state)
+        if the Rule Group is currently referenced by one or more Web ACLs — deletion will
+        fail until all Web ACLs have removed their references (if the principal also holds
+        wafv2:UpdateWebACL, removing the reference is feasible and the edge may be ACTIVE;
+        otherwise CONDITIONAL). BLOCKED if an SCP or permission boundary denies
+        wafv2:DeleteRuleGroup.
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?rulegroup (wafv2:DeleteRuleGroup)"
+      false_positive_note: >-
+        AWS enforces that a Rule Group with active Web ACL references cannot be deleted —
+        the API returns a WAFAssociatedItemException. If the rule group is referenced and
+        the principal does NOT also hold wafv2:UpdateWebACL, this action will fail in
+        practice; emit CONDITIONAL(service_state) rather than ACTIVE. This is a
+        destructive impact edge (not escalation) and is excluded from default attack path
+        traversal by CanDelete's schema setting (walkable: false). Surface it for
+        blast-radius/impact analysis, not for path-finding to a higher-privilege identity.
+      narrative: >-
+        {principal.name} can delete the Rule Group {rulegroup.name}
+        (wafv2:DeleteRuleGroup), permanently removing the rules it provides. If the
+        rule group is currently referenced by Web ACLs, removal from each ACL is
+        required first; if {principal.name} also holds wafv2:UpdateWebACL, the full
+        removal sequence is feasible. This is a destructive cover-tracks action, not
+        an access grant.
+
+  # ---------------------------------------------------------------------------
+  # 3. Delete a Web ACL — wafv2:DeleteWebACL
+  # ---------------------------------------------------------------------------
+  # DeleteWebACL permanently removes the ACL. It FAILS if the ACL still has active
+  # resource associations (wafv2:DisassociateWebACL must precede it). Modeled
+  # separately from CanModify because CanDelete has different traversal
+  # semantics (walkable: false by default — surfaced for impact, not path-finding).
+  - id: aws-waf-delete-web-acl
+    emits: CanDelete
+    description: >-
+      Permanently delete a Web ACL, removing WAF protection from all previously
+      associated resources (requires prior disassociation).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?webacl ]
+    where:
+      - "node_type(?webacl) == SecurityService"
+      - "?webacl.provider_type == 'AWS::WAFv2::WebACL'"
+      - "effective_action_on(?principal, ?webacl) contains 'wafv2:DeleteWebACL'"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?webacl
+      permissions:
+        - "wafv2:DeleteWebACL"
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        ACTIVE when wafv2:DeleteWebACL is confirmed effective. CONDITIONAL(service_state)
+        if the Web ACL currently has active resource associations — deletion will fail
+        until wafv2:DisassociateWebACL has been called for each association (if the
+        principal also holds DisassociateWebACL, the full destroy sequence is feasible
+        and the edge may be ACTIVE; otherwise CONDITIONAL). BLOCKED if an SCP or
+        permission boundary denies wafv2:DeleteWebACL.
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?webacl (wafv2:DeleteWebACL)"
+      false_positive_note: >-
+        AWS enforces that a Web ACL with active associations cannot be deleted — the
+        API returns a WAFAssociatedItemException. If the ACL has associations and the
+        principal does NOT also hold wafv2:DisassociateWebACL, this action will fail in
+        practice; emit CONDITIONAL(service_state) rather than ACTIVE. This is a
+        destructive impact edge (not escalation) and is excluded from default attack
+        path traversal by CanDelete's schema setting (walkable: false). Surface it for
+        blast-radius/impact analysis, not for path-finding to a higher-privilege
+        identity.
+      narrative: >-
+        {principal.name} can delete the Web ACL {webacl.name}
+        (wafv2:DeleteWebACL), permanently removing its HTTP filtering rules. If the
+        ACL is currently associated with resources, disassociation is required first;
+        if {principal.name} also holds wafv2:DisassociateWebACL, the full destroy
+        sequence is feasible. This is a destructive cover-tracks action, not an
+        access grant.
+
+  # ---------------------------------------------------------------------------
+  # 4. Tamper with IP Sets — wafv2:UpdateIPSet
+  # ---------------------------------------------------------------------------
+  # An IP Set defines an allow/block list of IP addresses. Modifying it (adding
+  # attacker IPs to allow list, removing malicious IPs from block list) changes
+  # filtering behavior for all Web ACLs that reference it.
+  #
+  # NOTE: This is defense evasion only if the IP Set is actually referenced by a
+  # Web ACL. An orphaned IP Set has no blast radius.
+  - id: aws-waf-tamper-ip-set
+    emits: CanModify
+    description: >-
+      Modify an IP Set to add attacker-controlled IPs to allow lists or remove
+      blocking IPs (defense evasion with blast radius tied to referencing Web ACLs).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?ipset ]
+    where:
+      - "node_type(?ipset) == GenericManagement"
+      - "?ipset.provider_type == 'AWS::WAFv2::IPSet'"
+      - "effective_action_on(?principal, ?ipset) contains 'wafv2:UpdateIPSet'"
+    emit:
+      source_type: Identity
+      target_type: GenericManagement
+      source: ?principal
+      target: ?ipset
+      permissions:
+        - "wafv2:UpdateIPSet"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when wafv2:UpdateIPSet is confirmed effective. Blast radius materializes
+        only if the IP Set is referenced by at least one Web ACL in an active association
+        — if referenced by zero ACLs (orphaned), downgrade to POTENTIAL or annotate low
+        impact. BLOCKED if an SCP or permission boundary denies wafv2:UpdateIPSet.
+      confidence: 0.85
+      derived_from:
+        - "?principal HasPermission ?ipset (wafv2:UpdateIPSet)"
+      false_positive_note: >-
+        IP Sets are referenced by Web ACL rules as match conditions. Adding an attacker
+        IP to an allow list or removing a malicious pattern from a block list changes
+        HTTP filtering for all consuming ACLs. This edge is defense evasion, NOT
+        privilege escalation — do NOT chain to CanEnterAccount / CanExecuteAs /
+        CanEscalateTo. Blast radius is zero if the IP Set has no referencing Web ACLs.
+      narrative: >-
+        {principal.name} can modify the IP Set {ipset.name} (wafv2:UpdateIPSet). Adding
+        attacker-controlled IPs to allow lists or removing defensive IPs from block
+        lists would weaken HTTP-layer filtering for all Web ACLs that reference this
+        set. This reduces detection coverage and may allow previously-blocked traffic —
+        it is a cover-tracks / weaken-defenses action, not an access grant.
+
+  # ---------------------------------------------------------------------------
+  # 5. Tamper with Regex Pattern Sets — wafv2:UpdateRegexPatternSet
+  # ---------------------------------------------------------------------------
+  # A Regex Pattern Set defines an allow/block list of regex patterns. Modifying it
+  # (removing malicious patterns from block list, adding permissive patterns to
+  # allow list) changes filtering behavior for all Web ACLs that reference it.
+  #
+  # NOTE: This is defense evasion only if the Pattern Set is actually referenced by a
+  # Web ACL. An orphaned Pattern Set has no blast radius.
+  - id: aws-waf-tamper-regex-set
+    emits: CanModify
+    description: >-
+      Modify a Regex Pattern Set to remove blocking patterns or add permissive ones
+      (defense evasion with blast radius tied to referencing Web ACLs).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?patternset ]
+    where:
+      - "node_type(?patternset) == GenericManagement"
+      - "?patternset.provider_type == 'AWS::WAFv2::RegexPatternSet'"
+      - "effective_action_on(?principal, ?patternset) contains 'wafv2:UpdateRegexPatternSet'"
+    emit:
+      source_type: Identity
+      target_type: GenericManagement
+      source: ?principal
+      target: ?patternset
+      permissions:
+        - "wafv2:UpdateRegexPatternSet"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when wafv2:UpdateRegexPatternSet is confirmed effective. Blast radius
+        materializes only if the Pattern Set is referenced by at least one Web ACL in
+        an active association — if referenced by zero ACLs (orphaned), downgrade to
+        POTENTIAL or annotate low impact. BLOCKED if an SCP or permission boundary
+        denies wafv2:UpdateRegexPatternSet.
+      confidence: 0.85
+      derived_from:
+        - "?principal HasPermission ?patternset (wafv2:UpdateRegexPatternSet)"
+      false_positive_note: >-
+        Regex Pattern Sets are referenced by Web ACL rules as match conditions. Removing
+        malicious patterns from a block list or adding permissive patterns to an allow
+        list changes HTTP filtering for all consuming ACLs. This edge is defense evasion,
+        NOT privilege escalation — do NOT chain to CanEnterAccount / CanExecuteAs /
+        CanEscalateTo. Blast radius is zero if the Pattern Set has no referencing
+        Web ACLs.
+      narrative: >-
+        {principal.name} can modify the Regex Pattern Set {patternset.name}
+        (wafv2:UpdateRegexPatternSet). Removing malicious regex patterns from block
+        lists or adding permissive patterns to allow lists would weaken HTTP-layer
+        filtering for all Web ACLs that reference this set. This reduces detection
+        coverage and may allow previously-blocked traffic — it is a cover-tracks /
+        weaken-defenses action, not an access grant.
+
+  # ---------------------------------------------------------------------------
+  # 6. Disable WAF Logging — wafv2:PutLoggingConfiguration / DeleteLoggingConfiguration
+  # ---------------------------------------------------------------------------
+  # Logging configuration controls where WAF logs are delivered (Kinesis Firehose or
+  # CloudWatch Logs). Disabling logging (PutLoggingConfiguration with disabled flag
+  # or DeleteLoggingConfiguration) stops log delivery, reducing evasion detection and
+  # allowing an attacker to mask WAF rule triggers.
+  #
+  # NOTE: This is modeled as CanModify on a pseudo LoggingService node representing
+  # the Firehose/CloudWatch Logs destination. First-time logging setup may require
+  # wafv2:PutLoggingConfiguration + iam:CreateServiceLinkedRole (for logging SLR).
+  - id: aws-waf-disable-logging
+    emits: CanModify
+    description: >-
+      Disable WAF logging by deleting or disabling logging configuration,
+      removing event coverage and aiding evasion.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?webacl ]
+    where:
+      - "node_type(?webacl) == SecurityService"
+      - "?webacl.provider_type == 'AWS::WAFv2::WebACL'"
+      - "effective_action_on(?principal, ?webacl) intersects ['wafv2:PutLoggingConfiguration', 'wafv2:DeleteLoggingConfiguration']"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?webacl
+      permissions:
+        - "wafv2:PutLoggingConfiguration"
+        - "wafv2:DeleteLoggingConfiguration"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when wafv2:PutLoggingConfiguration or wafv2:DeleteLoggingConfiguration
+        is confirmed effective. For initial setup (first-time PutLoggingConfiguration),
+        the principal must also hold iam:CreateServiceLinkedRole for the logging
+        service-linked role — if confirmed, ACTIVE; otherwise CONDITIONAL(iam_permission).
+        BLOCKED if an SCP or permission boundary denies the action.
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?webacl (wafv2:PutLoggingConfiguration | wafv2:DeleteLoggingConfiguration)"
+      false_positive_note: >-
+        Disabling logging is a cover-tracks action: it does NOT grant access to
+        protected resources or data. Do NOT chain to CanEnterAccount / CanExecuteAs /
+        CanEscalateTo. First-time logging configuration may fail if the principal
+        lacks iam:CreateServiceLinkedRole (for the logging SLR) — emit
+        CONDITIONAL(iam_permission) in that case. This edge targets the Web ACL
+        (source of logging config) rather than the log destination (S3/Firehose/CWL),
+        which are modeled separately.
+      narrative: >-
+        {principal.name} can disable WAF logging (wafv2:PutLoggingConfiguration /
+        wafv2:DeleteLoggingConfiguration), stopping delivery of HTTP request logs
+        that would otherwise be captured by the logging destination (Kinesis Firehose
+        or CloudWatch Logs). This removes audit coverage, aiding evasion of detection
+        systems that analyze WAF logs. This is a cover-tracks action, not an access
+        grant.
+
+  # ---------------------------------------------------------------------------
+  # 7. Recon — WAF Logging Configuration — wafv2:GetLoggingConfiguration
+  # ---------------------------------------------------------------------------
+  # GetLoggingConfiguration reveals where logs are sent (Firehose/S3/CloudWatch Logs
+  # ARN), which is useful recon into the logging pipeline and a prerequisite for
+  # targeting the logging destination.
+  - id: aws-waf-recon-logging
+    emits: CanRead
+    description: >-
+      Discover WAF logging configuration (destination Firehose/S3/CloudWatch Logs),
+      aiding recon into the logging pipeline.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?webacl ]
+    where:
+      - "node_type(?webacl) == SecurityService"
+      - "?webacl.provider_type == 'AWS::WAFv2::WebACL'"
+      - "effective_action_on(?principal, ?webacl) contains 'wafv2:GetLoggingConfiguration'"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?webacl
+      permissions:
+        - "wafv2:GetLoggingConfiguration"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when wafv2:GetLoggingConfiguration is confirmed effective. BLOCKED if
+        an SCP or permission boundary denies the action.
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?webacl (wafv2:GetLoggingConfiguration)"
+      false_positive_note: >-
+        This is recon only — discovering the log destination does not grant access to
+        the logs themselves. Do NOT emit this as CanReadData; the destination's own
+        data-plane permissions control log access. This edge is walkable for recon
+        chains, not escalation.
+      narrative: >-
+        {principal.name} can query the WAF logging configuration (wafv2:GetLoggingConfiguration),
+        revealing the Firehose/S3/CloudWatch Logs destination where HTTP request logs
+        are delivered. This is recon into the logging pipeline and may guide follow-up
+        attacks against the log destination itself.
+
+  # ---------------------------------------------------------------------------
+  # 8. Shield Advanced — Defense Evasion — shield:DeleteProtection
+  # ---------------------------------------------------------------------------
+  # Shield Advanced provides DDoS protection for resources. DeleteProtection removes
+  # Shield Advanced protection, reducing DDoS coverage (defense evasion).
+  - id: aws-shield-delete-protection
+    emits: CanModify
+    description: >-
+      Remove Shield Advanced DDoS protection from a resource (defense evasion,
+      reduces DDoS coverage).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?protection ]
+    where:
+      - "node_type(?protection) == SecurityService"
+      - "?protection.provider_type == 'AWS::Shield::Protection'"
+      - "effective_action_on(?principal, ?protection) contains 'shield:DeleteProtection'"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?protection
+      permissions:
+        - "shield:DeleteProtection"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when shield:DeleteProtection is confirmed effective. BLOCKED if an SCP
+        or permission boundary denies the action. Shield Advanced subscriptions are
+        account-scoped; deletion removes protection from the target resource globally.
+      confidence: 0.85
+      derived_from:
+        - "?principal HasPermission ?protection (shield:DeleteProtection)"
+      false_positive_note: >-
+        Shield Advanced requires an active subscription; if the account is not subscribed,
+        DeleteProtection will fail. Verify subscription state via shield:DescribeSubscription
+        before emitting ACTIVE. This is defense evasion, NOT privilege escalation — do NOT
+        chain to CanEnterAccount / CanExecuteAs / CanEscalateTo.
+      narrative: >-
+        {principal.name} can remove Shield Advanced DDoS protection from {protection.name}
+        (shield:DeleteProtection), reducing DDoS coverage on the resource. This lowers
+        resilience to volumetric attacks but does not grant access to protected data. This
+        is a cover-tracks / weaken-defenses action, not an access grant.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying wafv2:UpdateWebACL, wafv2:DisassociateWebACL, or
+#     wafv2:DeleteWebACL at the account or OU scope -> emit the relevant edge(s)
+#     with state: BLOCKED and denied_by=<SCP ARN/statement>.
+#   - A permission boundary capping the principal's effective permissions below
+#     the wafv2 write actions -> BLOCKED similarly.
+#   - AWS-managed rule groups (AWSManagedRules*) cannot be modified via customer
+#     IAM — do not emit CanModifyConfiguration for those group ARNs.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service would live in
+# /rules/explicit/aws-waf.yaml (HasPermission normalization from the permission
+# evaluator output). No explicit file is required for Phase 12 WAF because all
+# three derived rules above consume HasPermission (produced by the permission
+# evaluator) rather than requiring bespoke structural edges. No explicit file
+# is created for this service.
+#
+# Linchpin citations (for awareness — NOT applicable to WAF's attack surface):
+#   /rules/derived/can-execute-as.yaml   — WAF has no execution identity; N/A.
+#   /rules/derived/cicd-chains.yaml      — WAF is not a runner; N/A.
+#   /rules/derived/credential-chains.yaml — WAF log credentials modeled at log
+#                                            destination (S3/CWL), not here; N/A.
+#   /rules/derived/can-control.yaml      — WAF tampering does not yield Controls
+#                                          over any boundary; N/A.

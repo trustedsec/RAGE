@@ -1,0 +1,392 @@
+# AWS FSx — Derived attack-path rules (Phase 6 — Storage & Databases)
+# ---------------------------------------------------------------------------
+# FSx (Windows/Lustre/ONTAP/OpenZFS) is a managed network file service. It
+# does not execute attacker code and holds no execution role, so the primary
+# attack surface is:
+#
+#   (1) CROSS-ACCOUNT BACKUP EXFIL: fsx:CopyBackup on a source backup ARN in
+#       a foreign account copies the backup into the attacker's account; a
+#       subsequent CreateFileSystemFromBackup + mount yields full data read.
+#       -> CanExfiltrate(Identity -> Backup)
+#
+#   (2) POLICY MODIFY (staged exfil setup): fsx:PutResourcePolicy on a
+#       backup lets a principal add an external account as a principal ->
+#       downstream CopyBackup exfil from that account. Modeled as a capability
+#       to modify the backup's resource policy, gated separately from the
+#       cross-account grant itself.
+#       -> CanModifyPolicy(Identity -> ResourcePolicy on backup)
+#
+#   (3) ONTAP VOLUME RESTORE FROM BACKUP (lateral movement):
+#       fsx:CreateVolumeFromBackup on an ONTAP volume backup (same account) restores
+#       the volume to an ONTAP file system the attacker controls, enabling lateral
+#       movement and data access (NFS/CIFS/iSCSI).
+#       -> CanReadData(Identity -> Backup)
+#
+#   (4) LUSTRE DATA REPOSITORY ASSOCIATION (DRA) EXFIL:
+#       fsx:CreateDataRepositoryTask on a Lustre FS with a DRA pointing to an
+#       attacker-accessible S3 bucket triggers a data export from the Lustre FS
+#       to S3, enabling data exfiltration.
+#       -> CanExfiltrate(Identity -> FileStorage)
+#
+#   (5) SAME-ACCOUNT BACKUP RESTORE (lateral movement):
+#       fsx:CreateFileSystemFromBackup on a same-account backup allows an
+#       attacker to restore data to a different VPC/AD domain (lateral movement
+#       within the same account, lower impact than cross-account exfil).
+#       -> CanReadData(Identity -> Backup via restored FileStorage)
+#
+#   (6) ONTAP VOLUME RESTORE FROM BACKUP (lateral movement):
+#       fsx:CreateVolumeFromBackup on an ONTAP volume backup (same account)
+#       restores the volume to an ONTAP file system the attacker controls.
+#       -> CanReadData(Identity -> Backup)
+#
+# WHAT IS OUT OF SCOPE HERE:
+#   - Data-plane read (CanReadData) is network-gated and mount-authenticated;
+#     it is NOT derivable from IAM alone. Do not emit CanReadData without a
+#     CanNetworkReach contributor.
+#   - ExecutesAs: FSx holds no execution role. Omitted.
+#   - CanModifyCode: FSx stores no user-deployed code. Omitted.
+#
+# LINCHPIN CITATIONS (do not re-derive):
+#   * can-control.yaml or messaging-chains.yaml: cross-account exfil via DRA.
+#   * can-control.yaml: enter-account-via-assume for cross-account paths.
+#
+# EXPLICIT NORMALIZATION RULES (in /rules/explicit/aws-fsx.yaml):
+#   * CrossAccountTrust(Backup -> ExternalAccount) when fsx:GetResourcePolicy
+#     reveals a foreign account principal on a backup resource policy. This is
+#     required to ground the resource-policy side of cross-account exfil.
+#
+# ALL permissions are from the AWS Service Authorization Reference for Amazon
+# FSx. No permissions are invented.
+#
+# STATE CONVENTIONS (RULE-FORMAT.md): a derived edge is never stronger than
+# its weakest contributor. CONDITIONAL contributors cap output at CONDITIONAL.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # --- (1) Cross-account backup copy -> exfiltration -----------------------
+  # An IAM principal with fsx:CopyBackup scoped to a backup ARN in a DIFFERENT
+  # account (i.e., the resource ARN in their identity policy includes the
+  # foreign account number, OR the source backup has a resource policy granting
+  # this principal CopyBackup) can pull a full copy of the backup into their
+  # own account. Restoring via fsx:CreateFileSystemFromBackup and mounting the
+  # resulting file system yields complete access to all file data that existed
+  # at backup time.
+  #
+  # This is the primary FSx exfil primitive: no access to the live file system
+  # is required, no mount-level activity occurs in the source account.
+  #
+  # SCOPE VERIFICATION: The where clause validates that the identity policy
+  # resource scope (or backup resource policy) INCLUDES the foreign-account
+  # backup ARN. Broad Resource:* grants in caller account only cover
+  # same-account backups. Do not emit ACTIVE without cross-account ARN scope.
+  - id: aws-fsx-backup-cross-account-exfil
+    emits: CanExfiltrate
+    description: >-
+      An identity with fsx:CopyBackup on a source backup ARN in a foreign
+      account can pull a complete copy into an attacker-controlled account;
+      restoring via CreateFileSystemFromBackup gives full read of all data
+      at backup time.
+    match:
+      - [ ?principal, HasPermission, ?backup ]
+    where:
+      - "node_type(?backup) == Backup"
+      - "?backup.provider_type == 'AWS::FSx::Backup'"
+      - "?principal.account != ?backup.account  # cross-account: principal in a different account than the backup"
+      - "?principal has EFFECTIVE fsx:CopyBackup on ?backup (identity policy resource scope covers the backup ARN, OR backup has a resource policy granting ?principal fsx:CopyBackup)"
+      - "EFFECTIVE resource scope includes the foreign-account backup ARN OR ?backup has CrossAccountTrust(Backup -> ?principal.account)"
+    emit:
+      source_type: Identity
+      target_type: Backup
+      source: ?principal
+      target: ?backup
+      permissions: ["fsx:CopyBackup"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE if the identity policy resource scope explicitly includes the
+        source backup ARN (foreign account) AND the permission is not denied
+        by an SCP or permission boundary; CONDITIONAL(resource_policy) if only
+        the backup resource policy confirms the cross-account grant but caller's
+        identity policy does not explicitly include the foreign ARN;
+        POTENTIAL if fsx:CopyBackup is broadly present but the foreign backup
+        ARN scope is not confirmed reachable via either identity policy or
+        resource policy. Restore via fsx:CreateFileSystemFromBackup is a
+        subsequent action in the attacker's own account (not gated here).
+      confidence: 0.85
+      derived_from: [ "?principal HasPermission fsx:CopyBackup on ?backup" ]
+      false_positive_note: >-
+        fsx:CopyBackup with Resource:* in the caller's identity policy covers
+        only backups IN THE SAME ACCOUNT unless the source backup ARN from a
+        foreign account is explicitly included. Confirm that the effective
+        resource scope includes the foreign-account backup ARN or that the
+        backup has CrossAccountTrust(Backup -> ?principal.account). Do not emit
+        ACTIVE when only a same-account fsx:CopyBackup grant is present.
+      narrative: >-
+        {principal.name} holds fsx:CopyBackup on {backup.name} (owned by a
+        different account), enabling it to pull a full copy of the backup into
+        its own account and restore it via fsx:CreateFileSystemFromBackup,
+        obtaining complete read access to all data captured in the backup
+        without touching the live file system.
+
+  # --- (2) PutResourcePolicy on backup -> CanModifyPolicy (staged exfil) ----
+  # An IAM principal with fsx:PutResourcePolicy on an FSx backup can attach a
+  # resource-based policy that names a foreign account as a principal, granting
+  # it fsx:CopyBackup on that backup. This is the SETUP step that enables the
+  # exfil in rule (1).
+  #
+  # Modeled as CanModifyPolicy (Identity -> ResourcePolicy): the principal can
+  # rewrite the backup's resource policy to grant an external account CopyBackup
+  # access. The downstream exfil path is:
+  #   CanModifyPolicy(principal -> backup ResourcePolicy) -> CrossAccountTrust
+  #   (explicit normalization rule from fsx:GetResourcePolicy observation) ->
+  #   CopyBackup by the external account -> CanExfiltrate (rule 1).
+  # Note: CanModifyPolicy source=[Identity], target=[Policy, Identity, "*"] —
+  # ResourcePolicy is a subtype of Policy; this is within the allowed set.
+  - id: aws-fsx-put-resource-policy-cross-account-grant
+    emits: CanModifyPolicy
+    description: >-
+      An identity with fsx:PutResourcePolicy on an FSx backup can rewrite the
+      backup's resource policy to grant an external account fsx:CopyBackup
+      access, staging a cross-account backup exfil without touching the live
+      file system.
+    match:
+      - [ ?principal, HasPermission, ?backup ]
+    where:
+      - "node_type(?backup) == Backup"
+      - "?backup.provider_type == 'AWS::FSx::Backup'"
+      - "?principal has EFFECTIVE fsx:PutResourcePolicy on ?backup"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: ?principal
+      target: "<ResourcePolicy node attached to ?backup>"
+      permissions: ["fsx:PutResourcePolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if ?principal has confirmed effective fsx:PutResourcePolicy on
+        the backup ARN (no deny from SCP/boundary); CONDITIONAL(iam_permission)
+        if the grant is present but an SCP or permission boundary may deny it;
+        BLOCKED if an explicit deny or SCP on fsx:PutResourcePolicy applies.
+      confidence: 0.80
+      derived_from: [ "?principal HasPermission fsx:PutResourcePolicy on ?backup" ]
+      false_positive_note: >-
+        This rule models the CAPABILITY to rewrite the backup policy, not an
+        existing cross-account grant. An SCP deny on fsx:PutResourcePolicy
+        blocks this path entirely. Honor iam:ResourceTag conditions that might
+        scope PutResourcePolicy to specific backup tags. The downstream
+        CrossAccountTrust (via fsx:GetResourcePolicy observation) plus
+        CopyBackup exfil (rule 1) still requires the actual policy write plus
+        a separate copy call by the external account.
+      narrative: >-
+        {principal.name} can call fsx:PutResourcePolicy on {backup.name}'s
+        resource policy to grant an attacker-controlled external account
+        fsx:CopyBackup access, staging a cross-account exfil path that does
+        not touch the live file system.
+
+  # --- (4) Lustre DRA (Data Repository Association) exfiltration -----------
+  # FSx for Lustre can be configured with a Data Repository Association (DRA)
+  # linking the file system to an S3 bucket. An IAM principal with
+  # fsx:CreateDataRepositoryTask on the Lustre file system can trigger a data
+  # export from the file system to the associated S3 bucket, moving the data
+  # out of FSx. If the S3 bucket is attacker-controlled or attacker-readable,
+  # this constitutes exfiltration.
+  #
+  # State is CONDITIONAL(trigger_exists) because the attacker must confirm
+  # that (1) a DRA exists on the file system, (2) it points to an attacker-
+  # accessible S3 bucket. Without these preconditions, emit POTENTIAL.
+  #
+  # NOTE: DRA is represented as a resource property on the FileStorage node
+  # (FileStorage.properties.DataRepositoryAssociations[]) rather than as a
+  # separate DataRepositoryAssociation node. The where clause checks the
+  # property directly to verify the DRA + S3 bucket linkage.
+  - id: aws-fsx-lustre-dra-exfil
+    emits: CanExfiltrate
+    description: >-
+      An identity with fsx:CreateDataRepositoryTask on an FSx for Lustre file
+      system with a Data Repository Association (DRA) pointing to an
+      attacker-accessible S3 bucket can trigger a data export from the Lustre
+      FS to S3, exfiltrating all file data.
+    match:
+      - [ ?principal, HasPermission, ?filesystem ]
+    where:
+      - "node_type(?filesystem) == FileStorage"
+      - "?filesystem.provider_type == 'AWS::FSx::FileSystem'"
+      - "?filesystem.properties.FileSystemType == 'Lustre'"
+      - "?principal has EFFECTIVE fsx:CreateDataRepositoryTask on ?filesystem"
+      - "?filesystem.properties.DataRepositoryAssociations exists and is non-empty (collector evidence: DescribeDataRepositoryAssociations response includes at least one DRA for this file system)"
+      - "at least one DRA in ?filesystem.properties.DataRepositoryAssociations has DataRepositoryPath starting with 's3://' (points to an S3 bucket)"
+    emit:
+      source_type: Identity
+      target_type: FileStorage
+      source: ?principal
+      target: ?filesystem
+      permissions: ["fsx:CreateDataRepositoryTask"]
+      conditions: [iam_permission, trigger_exists]
+      state_logic: >-
+        ACTIVE if the identity policy grants fsx:CreateDataRepositoryTask on
+        the Lustre FS ARN and the collector has confirmed that the FS has a DRA
+        pointing to an S3 bucket (accessible to the attacker); CONDITIONAL(trigger_exists)
+        if the fsx:CreateDataRepositoryTask permission is confirmed but the DRA
+        configuration or S3 bucket access/ownership is not yet confirmed; POTENTIAL
+        if fsx:CreateDataRepositoryTask is broadly granted but DRA existence on
+        the FS is not confirmed by collector data.
+      confidence: 0.80
+      derived_from: [ "?principal HasPermission fsx:CreateDataRepositoryTask on ?filesystem" ]
+      false_positive_note: >-
+        This rule requires confirmation of three preconditions: (1) the Lustre
+        file system has an active DRA (confirmed by DescribeDataRepositoryAssociations
+        collector evidence in ?filesystem.properties.DataRepositoryAssociations),
+        (2) the DRA points to an S3 bucket (DataRepositoryPath starts with 's3://'),
+        (3) the attacker can read/write to that S3 bucket (requires separate S3
+        bucket permission check). If the S3 bucket is owned by a different account
+        or has deny policies blocking the attacker, emit CONDITIONAL(trigger_exists)
+        not ACTIVE. A Lustre FS without any DRA configured (empty or absent
+        DataRepositoryAssociations property) cannot reach this path; emit POTENTIAL only.
+      narrative: >-
+        {principal.name} holds fsx:CreateDataRepositoryTask on {filesystem.name}
+        (FSx for Lustre), which has a Data Repository Association linking to an
+        S3 bucket. This allows the attacker to trigger fsx:CreateDataRepositoryTask
+        to export data from the Lustre FS to S3, exfiltrating all file data.
+
+  # --- (5) Same-account backup restore (lateral movement) -------------------
+  # Within the same account, an IAM principal with fsx:CreateFileSystemFromBackup
+  # on a backup can restore the data to a new file system in a different VPC or
+  # AD domain, achieving lateral movement without cross-account access. While
+  # lower-value than cross-account exfil, this enables data access in a
+  # different network segment or administrative boundary.
+  #
+  # State is CONDITIONAL(region_or_boundary) because restore success depends on
+  # network reachability and domain trust in the destination VPC/AD.
+  - id: aws-fsx-same-account-backup-restore
+    emits: CanReadData
+    description: >-
+      An identity with fsx:CreateFileSystemFromBackup on a same-account backup
+      can restore the data to a new file system in a different VPC or AD domain,
+      achieving lateral movement and data access within the same account.
+    match:
+      - [ ?principal, HasPermission, ?backup ]
+    where:
+      - "node_type(?backup) == Backup"
+      - "?backup.provider_type == 'AWS::FSx::Backup'"
+      - "?principal.account == ?backup.account  # same-account: not cross-boundary"
+      - "?principal has EFFECTIVE fsx:CreateFileSystemFromBackup on ?backup"
+    emit:
+      source_type: Identity
+      target_type: Backup
+      source: ?principal
+      target: ?backup
+      permissions: ["fsx:CreateFileSystemFromBackup"]
+      conditions: [iam_permission, region_or_boundary]
+      state_logic: >-
+        ACTIVE if the identity policy grants fsx:CreateFileSystemFromBackup on
+        the backup ARN in the same account and the principal can restore to a
+        different VPC/AD domain they control; CONDITIONAL(region_or_boundary)
+        if the permission is confirmed but restore success depends on network
+        reachability or AD domain trust in the destination environment;
+        POTENTIAL if fsx:CreateFileSystemFromBackup is broadly granted but
+        destination VPC/AD reachability is not confirmed.
+      confidence: 0.75
+      derived_from: [ "?principal HasPermission fsx:CreateFileSystemFromBackup on ?backup" ]
+      false_positive_note: >-
+        This rule applies only to same-account restores. Do not emit for
+        cross-account backups (use rule 1, CanExfiltrate, instead). The restored
+        file system must be in a different VPC/AD domain from the original for
+        this to constitute meaningful lateral movement; otherwise it is a
+        same-VPC/AD data read. Confirm destination VPC/AD reachability before
+        emitting ACTIVE.
+      narrative: >-
+        {principal.name} holds fsx:CreateFileSystemFromBackup on {backup.name}
+        (same account, different VPC/AD domain). This enables lateral movement:
+        the attacker can restore the backup to a new file system in a segment
+        they control, obtaining complete read access to all data from the backup
+        without crossing account boundaries.
+
+  # --- (6) ONTAP volume restore from backup (lateral movement) ---------------
+  # For FSx for NetApp ONTAP, fsx:CreateVolumeFromBackup is the volume-level
+  # equivalent of CreateFileSystemFromBackup: it restores an ONTAP volume from
+  # a backup directly into the same or different ONTAP file system. Within the
+  # same account, this enables lateral movement and data access to a volume the
+  # attacker can mount/administer.
+  #
+  # State is CONDITIONAL(region_or_boundary) because the restored volume must be
+  # in a file system the attacker can access (same FS or different FS under their
+  # control) and network reachability + ONTAP admin/user permissions gate access.
+  - id: aws-fsx-ontap-volume-restore-from-backup
+    emits: CanReadData
+    description: >-
+      An identity with fsx:CreateVolumeFromBackup on an ONTAP volume backup
+      (same account) can restore the volume to an ONTAP file system they control,
+      achieving lateral movement and data access to the restored volume.
+    match:
+      - [ ?principal, HasPermission, ?backup ]
+    where:
+      - "node_type(?backup) == Backup"
+      - "?backup.provider_type == 'AWS::FSx::Backup'"
+      - "?backup.properties.FileSystemType == 'ONTAP'  # backup is from an ONTAP file system or volume"
+      - "?principal.account == ?backup.account  # same-account: not cross-boundary"
+      - "?principal has EFFECTIVE fsx:CreateVolumeFromBackup on ?backup"
+    emit:
+      source_type: Identity
+      target_type: Backup
+      source: ?principal
+      target: ?backup
+      permissions: ["fsx:CreateVolumeFromBackup"]
+      conditions: [iam_permission, region_or_boundary]
+      state_logic: >-
+        ACTIVE if the identity policy grants fsx:CreateVolumeFromBackup on
+        the backup ARN in the same account and the principal can restore to an
+        ONTAP file system they control (administrative access to the target FS);
+        CONDITIONAL(region_or_boundary) if the permission is confirmed but the
+        target file system access or network reachability is not yet confirmed;
+        POTENTIAL if fsx:CreateVolumeFromBackup is broadly granted but target
+        file system control is not confirmed.
+      confidence: 0.75
+      derived_from: [ "?principal HasPermission fsx:CreateVolumeFromBackup on ?backup" ]
+      false_positive_note: >-
+        This rule applies only to same-account ONTAP volume restores. Do not emit
+        for cross-account backups (use rule 1, CanExfiltrate, instead). The
+        restored volume must land in an ONTAP file system the attacker controls
+        (or has read/admin access to via OS-level mount permissions). Confirm that
+        the principal has administrative access (via ONTAP fsxadmin credential or
+        NFS/SMB/iSCSI export permissions) to the destination file system before
+        emitting ACTIVE. This rule models ONTAP-specific volume restore; use rule 5
+        (CreateFileSystemFromBackup) for full file system restore.
+      narrative: >-
+        {principal.name} holds fsx:CreateVolumeFromBackup on {backup.name}
+        (ONTAP volume backup, same account). This enables lateral movement:
+        the attacker can restore the volume to an ONTAP file system they control,
+        obtaining complete read access to the volume's data (NFS/CIFS/iSCSI exports
+        and LUNs) without crossing account boundaries.
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION RULES REQUIRED
+# These live in /rules/explicit/aws-fsx.yaml and emit explicit edges that
+# feed the derived rules above. See aws-fsx.yaml for implementation.
+#
+# Critical explicit rules:
+#   (1) CrossAccountTrust(ResourcePolicy -> ExternalAccount) normalization:
+#       fsx:GetResourcePolicy on a backup ARN returns a policy with a
+#       Principal from a different account. Emitted as an explicit edge
+#       (ResourcePolicy node source) grounding rule (1)
+#       aws-fsx-backup-cross-account-exfil.
+#
+# Collector APIs needed:
+#   fsx:DescribeBackups       -- emits Backup nodes + owner account
+#   fsx:GetResourcePolicy     -- emits ResourcePolicy nodes + cross-account principals
+#   fsx:DescribeFileSystems   -- emits FileStorage nodes
+#   fsx:DescribeVolumes       -- emits FileStorage (ONTAP/OpenZFS volume) nodes
+#   fsx:DescribeSnapshots     -- emits Snapshot nodes
+#   fsx:DescribeDataRepositoryAssociations -- emits DRA metadata in FileStorage props
+#   fsx:DescribeDataRepositoryTasks -- emits task execution records (optional)
+#
+# BLOCKED-edge guidance:
+#   - SCP / permission boundary denying fsx:CopyBackup -> CanExfiltrate BLOCKED
+#   - SCP / permission boundary denying fsx:PutResourcePolicy -> CanModifyPolicy BLOCKED
+#   - SCP / permission boundary denying fsx:CreateDataRepositoryTask -> CanExfiltrate BLOCKED
+#   - SCP / permission boundary denying fsx:CreateFileSystemFromBackup -> CanReadData BLOCKED
+#   - SCP / permission boundary denying fsx:CreateVolumeFromBackup -> CanReadData BLOCKED
+# ---------------------------------------------------------------------------

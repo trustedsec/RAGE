@@ -1,0 +1,665 @@
+# AWS Glue — derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (ExecutesAs, CanModifyCode, CanModifyConfiguration, CanPassIdentity,
+# CanAttachIdentity, ExposesCredential, CanTrigger, CrossAccountTrust)
+# already lives in /rules/explicit/aws-glue.yaml; these rules combine those
+# explicit edges with IAM PassRole / code-control / trigger facts to derive
+# execution and escalation capabilities.
+#
+# Phase-11 dominant primitive:
+#   Glue ETL jobs, dev endpoints, crawlers, and notebooks all RUN AS a
+#   caller-supplied IAM role (iam:PassRole to glue.amazonaws.com is the
+#   scoping gate). Whoever can modify the job script or start a job run with
+#   an already-attacker-influenced script executes arbitrary Python/Spark code
+#   AS that role. This mirrors:
+#     * can-execute-as.yaml execute-as-via-code-modify
+#     * cicd-chains.yaml cicd-modify-buildspec-executes-as
+#   CITE those linchpins for roll-up; emit only the Glue-specific facts here.
+#
+# Secondary vectors covered:
+#   (2) S3 script supply-chain: s3:PutObject on the script key -> CanModifyCode
+#       already in explicit rules; derived CanExecuteAs collapses here.
+#   (3) Dev endpoint SSH: CanExecuteCommand (SSH to cluster) -> CanExecuteAs
+#       via can-execute-as execute-as-via-command.
+#   (4) Connection credentials: glue:GetConnection -> ExposesCredential ->
+#       CredentialsFor -> CanImpersonate (credential-chains.yaml rolls up).
+#   (5) CanCreateWorkloadAs: CreateJob + PassRole + StartJobRun.
+#   (6) Data Catalog resource policy -> CrossAccountTrust (cross-account data).
+#   (7) CanAttachIdentity: UpdateJob + PassRole -> change job role in place.
+#
+# Permissions are the effective actions from the AWS Glue Service Authorization
+# Reference (list_awsglue.html). State defaults to ACTIVE; an unmet condition
+# yields CONDITIONAL/POTENTIAL; an explicit deny/SCP/boundary yields BLOCKED.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 11-data-analytics-ml
+applies_to: [aws]
+
+rules:
+
+  # --- 1) Modify job script + start run -> execute as job role -----------------
+  # THE primary Glue escalation path. glue:UpdateJob changes ScriptLocation to
+  # an attacker-controlled S3 object; glue:StartJobRun then runs it as the
+  # job's RoleArn. Mirrors can-execute-as execute-as-via-code-modify and
+  # cicd-chains cicd-modify-buildspec-executes-as (cite for CanExecuteAs roll-up;
+  # this rule emits CanModifyCode and ExecutesAs linchpin feeds only).
+  - id: aws-glue-execute-as-update-script
+    emits: [CanModifyCode, CanTrigger]
+    description: "Update a Glue job's ScriptLocation to an attacker-controlled S3 object, establishing the code-modify and trigger facts needed for can-execute-as derivation."
+    applies_to: [aws]
+    match:
+      - [ ?principal, CanModifyCode,  ?job ]
+      - [ ?job,        ExecutesAs,    ?role ]
+    where:
+      - "node_type(?job) in [BatchJob, Notebook]"
+      - "CanModifyCode comes from glue:UpdateJob (ScriptLocation) or glue:CreateSession code injection"
+    optional:
+      - [ ?principal, CanTrigger, ?job ]
+    note: >-
+      This rule ensures the prerequisite CanModifyCode and CanTrigger edges are correctly
+      normalized. The CanExecuteAs roll-up (principal -> role) is derived via
+      can-execute-as execute-as-via-code-modify linchpin (CanModifyCode + ExecutesAs +
+      optional CanTrigger => CanExecuteAs). Do NOT emit CanExecuteAs directly here.
+      If a Glue-specific gate (e.g. trigger confirmation) is needed, encode it as a
+      condition annotation on the CanModifyCode edge.
+    false_positive_note: >-
+        CanModifyCode here is via glue:UpdateJob changing ScriptLocation; do not conflate
+        with glue:UpdateJob on non-script fields (those yield CanModifyConfiguration, not
+        CanModifyCode). Honor SCP/boundary denying glue:UpdateJob -> BLOCKED. Citation:
+        can-execute-as execute-as-via-code-modify and cicd-chains cicd-modify-buildspec-executes-as
+        for CanExecuteAs roll-up and CanEscalateTo summary.
+
+  # --- 2) S3 script supply-chain + start run -> execute as job role ------------
+  # An attacker with s3:PutObject on the script S3 key can poison the ETL code
+  # without touching any Glue API. The CanModifyCode edge from the S3 path lands
+  # on the GlueJob node (emitted by explicit normalization). This rule ensures
+  # prerequisite edges are in place for can-execute-as linchpin derivation.
+  - id: aws-glue-execute-as-s3-script-poison
+    emits: [CanModifyCode, CanTrigger]
+    description: "Overwrite the S3 object that a Glue job's ScriptLocation references (s3:PutObject), poisoning the ETL code; the next run executes as the job's IAM role."
+    applies_to: [aws]
+    match:
+      - [ ?principal, CanModifyCode, ?job ]
+      - [ ?job,        ExecutesAs,   ?role ]
+    where:
+      - "node_type(?job) in [BatchJob]"
+      - "CanModifyCode comes from s3:PutObject on the ScriptLocation S3 key (supply-chain path, not glue:UpdateJob)"
+    optional:
+      - [ ?principal, CanTrigger, ?job ]
+    note: >-
+      This rule ensures the prerequisite CanModifyCode and CanTrigger edges are correctly
+      normalized. The CanExecuteAs roll-up (principal -> role) is derived via
+      can-execute-as execute-as-via-code-modify linchpin (CanModifyCode + ExecutesAs +
+      optional CanTrigger => CanExecuteAs). Do NOT emit CanExecuteAs directly here.
+    false_positive_note: >-
+        s3:PutObject must scope to the EXACT S3 key (or prefix that covers it)
+        identified in the job's ScriptLocation. A general S3 write on a different
+        bucket is not this path. S3 versioning + object lock on the script bucket
+        can mitigate; check whether object overwrite is possible. The attacker
+        does NOT need any glue:* permission for the code-plant step; only a run
+        path (glue:StartJobRun or an existing trigger) is needed to realize the
+        execution. Dedupes with rule 1 on (CanExecuteAs, ?principal, ?role) via
+        can-execute-as linchpin. Citation: can-execute-as execute-as-via-code-modify
+        for CanExecuteAs roll-up.
+
+  # --- 3) CreateJob + PassRole + StartJobRun -> CanCreateWorkloadAs ------------
+  # A principal that can pass a privileged role to Glue AND create a new job
+  # can create a workload bound to any role it can pass, then run it.
+  # Mirrors can-execute-as execute-as-via-new-workload canonical derivation:
+  #   CanDeploy + CanPassIdentity + role_compatible => CanCreateWorkloadAs.
+  # glue:CreateJob is the CanDeploy-equivalent for Glue (see note).
+  - id: aws-glue-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new Glue job bound to a passable privileged IAM role, then run it, to execute as that role."
+    applies_to: [aws]
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE glue:CreateJob (resource scope covers new job in target account/region)"
+      - "?principal has EFFECTIVE glue:StartJobRun (or a trigger can start the new job)"
+      - "?role trust policy allows glue.amazonaws.com as a service principal (or trust is unresolved)"
+      - "iam:PassRole for ?role permits iam:PassedToService including glue.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["glue:CreateJob", "iam:PassRole", "glue:StartJobRun"]
+      conditions: [iam_permission, role_compatibility, condition_expression]
+      state_logic: >-
+        if ?role trust policy or iam:PassedToService is unknown/unresolved:
+        POTENTIAL(role_compatibility). Elif principal has glue:CreateJob AND
+        glue:StartJobRun AND iam:PassRole to glue.amazonaws.com is confirmed:
+        ACTIVE. Else CONDITIONAL(iam_permission, role_compatibility) when one
+        of the required actions is present but not fully confirmed.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "<CanPassIdentity(principal, role) edge_id>"
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to ec2.amazonaws.com /
+        ecs-tasks.amazonaws.com does NOT yield Glue execution. The role MUST
+        trust glue.amazonaws.com or CreateJob fails (downgrade to POTENTIAL when
+        trust is unknown). glue:CreateJob is folded as the CanDeploy-equivalent
+        for Glue; no separate CanDeploy(principal -> Glue platform) edge is
+        emitted. Do not emit when the principal lacks glue:CreateJob — that
+        check is in the where-clause. This rule emits the create/bind step
+        (CanCreateWorkloadAs); the execution consequence rolls up via
+        can-execute-as execute-as-via-new-workload (cite, do not re-derive).
+      narrative: >-
+        {principal.name} can create a new Glue job (glue:CreateJob) bound to
+        {role.name} (iam:PassRole to glue.amazonaws.com), then run it
+        (glue:StartJobRun) to execute arbitrary code as {role.name}.
+
+  # --- 4) UpdateJob + PassRole -> CanAttachIdentity (re-bind existing job role) -
+  # Re-points an existing job's RoleArn to a more-privileged role the attacker
+  # can pass; next run executes as that higher-priv role.
+  - id: aws-glue-attach-role-via-update
+    emits: CanAttachIdentity
+    description: "Change an existing Glue job's RoleArn to a passed privileged role via glue:UpdateJob + iam:PassRole; the next run executes as the new role."
+    applies_to: [aws]
+    match:
+      - [ ?principal, CanModifyConfiguration, ?job ]
+      - [ ?principal, CanPassIdentity,        ?role ]
+    where:
+      - "node_type(?job) in [BatchJob]"
+      - "CanModifyConfiguration comes from glue:UpdateJob"
+      - "?role trust policy allows glue.amazonaws.com"
+      - "iam:PassRole for ?role permits iam:PassedToService including glue.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?job
+      permissions: ["glue:UpdateJob", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility, condition_expression]
+      state_logic: >-
+        if ?role trust policy or iam:PassedToService is unknown/unresolved:
+        POTENTIAL(role_compatibility). Else ACTIVE for the attach step (the job's
+        RoleArn is now the passed role). Full execution-as-new-role still requires
+        a start path (glue:StartJobRun or an existing trigger): this edge feeds
+        aws-glue-execute-as-update-script once the role is attached.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "<CanModifyConfiguration(principal, job) edge_id>"
+        - "<CanPassIdentity(principal, role) edge_id>"
+      false_positive_note: >-
+        Requires iam:PassRole for the NEW role scoped to glue.amazonaws.com;
+        when the new role's trust or iam:PassedToService is unknown, downgrade to
+        POTENTIAL(role_compatibility). The attach step is ACTIVE once trust/
+        PassedToService admits Glue, but privilege gain only materializes on the
+        next run — this edge chains to CanExecuteAs via aws-glue-execute-as-update-script
+        after the role is attached AND a run path exists.
+      narrative: >-
+        {principal.name} can re-point Glue job {job.name} to run as {role.name}
+        (glue:UpdateJob + iam:PassRole to glue.amazonaws.com), so the next run
+        executes as {role.name}.
+
+  # --- 5) Dev endpoint SSH key injection -> CanExecuteCommand ------------------
+  # glue:UpdateDevEndpoint (or glue:CreateDevEndpoint) can inject an attacker
+  # SSH public key onto the Spark master. SSH access to the running endpoint
+  # yields shell-level code execution as the endpoint's IAM role (readable
+  # from IMDS). Mirrors can-execute-as execute-as-via-command which then
+  # produces CanExecuteAs(principal -> devRole).
+  - id: aws-glue-dev-endpoint-execute-command
+    emits: CanExecuteCommand
+    description: "Inject an SSH public key into a running Glue development endpoint via glue:UpdateDevEndpoint, gaining OS-level command execution on the Spark cluster host."
+    applies_to: [aws]
+    match:
+      - [ ?principal, CanModifyConfiguration, ?endpoint ]
+    where:
+      - "node_type(?endpoint) == VirtualMachine"
+      - "CanModifyConfiguration comes from glue:UpdateDevEndpoint (adds PublicKey)"
+      - "?endpoint status is READY (or provisioning)"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: ?principal
+      target: ?endpoint
+      permissions: ["glue:UpdateDevEndpoint"]
+      conditions: [iam_permission, service_state, network_reachability]
+      state_logic: >-
+        ACTIVE when the endpoint is READY and network_reachability to SSH port
+        (22) is satisfied (network_reachability condition). CONDITIONAL(service_state)
+        if the endpoint is still provisioning. CONDITIONAL(network_reachability)
+        if the endpoint's SG or the attacker's network position blocks SSH.
+        BLOCKED if glue:UpdateDevEndpoint is denied by SCP/boundary.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from:
+        - "<CanModifyConfiguration(principal, endpoint) edge_id>"
+      false_positive_note: >-
+        Only ACTIVE for READY endpoints; FAILED / DELETING endpoints provide no
+        SSH access. Network reachability to TCP/22 is required — check the dev
+        endpoint's security group (EndpointSecurityGroupIds) and whether
+        PublicAddress is set (public endpoint) or the attacker is within the
+        configured VPC subnet (private endpoint). If glue:UpdateDevEndpoint is
+        denied (SCP/permission boundary), mark BLOCKED.
+        can-execute-as execute-as-via-command then derives CanExecuteAs(principal ->
+        devRole) off this CanExecuteCommand + the endpoint's ExecutesAs edge.
+        Do not re-derive CanExecuteAs here — cite can-execute-as.
+      narrative: >-
+        {principal.name} can add an attacker SSH public key to development endpoint
+        {endpoint.name} (glue:UpdateDevEndpoint → PublicKey), then SSH into the
+        Spark master and run OS-level commands as the endpoint's IAM role
+        (credentials available from IMDS).
+
+  # --- 6) CreateSession + RunStatement -> CanCreateWorkloadAs (interactive sessions)
+  # A principal with glue:CreateSession can spin up an interactive Glue Session
+  # (bound to a passable role via iam:PassRole), then immediately submit Python/Spark
+  # code via glue:RunStatement without any job definition or trigger needed. This is
+  # ACTIVE execution (not conditional on triggers). Complements rule 3 (CreateJob path).
+  - id: aws-glue-create-session-execute-as
+    emits: CanCreateWorkloadAs
+    description: "Create an interactive Glue Session bound to a passable role, then execute code inline via RunStatement to run as that role."
+    applies_to: [aws]
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE glue:CreateSession (resource scope covers new session in target account/region)"
+      - "?principal has EFFECTIVE glue:RunStatement (or implied by CreateSession on same session)"
+      - "?role trust policy allows glue.amazonaws.com as a service principal (or trust is unresolved)"
+      - "iam:PassRole for ?role permits iam:PassedToService including glue.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["glue:CreateSession", "iam:PassRole", "glue:RunStatement"]
+      conditions: [iam_permission, role_compatibility, condition_expression]
+      state_logic: >-
+        if ?role trust policy or iam:PassedToService is unknown/unresolved:
+        POTENTIAL(role_compatibility). Elif principal has glue:CreateSession AND
+        glue:RunStatement AND iam:PassRole to glue.amazonaws.com is confirmed:
+        ACTIVE (the session is spun up and code runs immediately inline, no
+        trigger gate needed). Else CONDITIONAL(iam_permission, role_compatibility)
+        when one of the required actions is present but not fully confirmed.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "<CanPassIdentity(principal, role) edge_id>"
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to ec2.amazonaws.com /
+        ecs-tasks.amazonaws.com does NOT yield Glue execution. The role MUST
+        trust glue.amazonaws.com or CreateSession fails (downgrade to POTENTIAL
+        when trust is unknown). glue:RunStatement is the execution trigger — it is
+        synchronous and does not require an EventBridge rule or Glue Trigger.
+        This rule emits CanCreateWorkloadAs; can-execute-as execute-as-via-new-workload
+        linchpin derives CanExecuteAs(principal -> role). Do not emit CanExecuteAs
+        directly here — cite can-execute-as.
+      narrative: >-
+        {principal.name} can create an interactive Glue Session (glue:CreateSession)
+        bound to {role.name} (iam:PassRole to glue.amazonaws.com), then run
+        arbitrary Python/Spark code inline (glue:RunStatement) to execute as
+        {role.name}.
+
+  # --- 6b) Job DefaultArguments & per-run Arguments expose credentials ---------
+  # AWS Glue jobs accept `DefaultArguments` and per-run `Arguments` in StartJobRun
+  # that can contain connection strings, API keys, tokens, and other credentials
+  # as `--` parameters. A principal with glue:GetJob / glue:GetJobRun can read the
+  # arguments and extract the embedded credentials. This is ACTIVE when arguments
+  # are non-empty and non-encrypted.
+  - id: aws-glue-job-exposes-credential
+    emits: ExposesCredential
+    description: "A Glue job's DefaultArguments or StartJobRun Arguments contain embedded credentials (connection strings, API keys, tokens) that are exposed via glue:GetJob or glue:GetJobRun."
+    applies_to: [aws]
+    match:
+      - [ ?job, ContainsCredential, ?credential ]
+    where:
+      - "node_type(?job) == BatchJob"
+      - "ContainsCredential comes from AWS::Glue::Job.DefaultArguments or observed StartJobRun.Arguments matching known credential patterns (-- connection string, -- api_key, -- token)"
+    emit:
+      source_type: Compute
+      target_type: Credential
+      source: ?job
+      target: ?credential
+      permissions: ["glue:GetJob", "glue:GetJobRun"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the argument is confirmed to contain a non-empty, non-encrypted
+        credential pattern (regex match on AWS access key, connection string, OAuth
+        token, or similar). CONDITIONAL when the argument is encrypted or
+        obfuscated and the caller lacks decryption permissions. BLOCKED if a
+        SecurityConfiguration encryption is applied and the caller cannot decrypt.
+      confidence: 0.85
+      derived_from:
+        - "<ContainsCredential(job, credential) edge_id>"
+      false_positive_note: >-
+        Arguments should be scanned at graph-ingestion time for credential patterns
+        (e.g. regex on AKIA, connection:://, Bearer, etc.). Encrypted arguments
+        (wrapped under a SecurityConfiguration CMK) should yield CONDITIONAL. A
+        principal without glue:GetJob/GetJobRun cannot read the arguments, so this
+        is a pure read-permission gate. The embedded credentials are often database
+        or service-account credentials intended for the ETL script — they do NOT
+        represent the Glue job's execution role; model the job -> role link via
+        ExecutesAs. This rule surfaces unintended credential leakage in job args.
+      narrative: >-
+        Glue job {job.name} stores credentials in its DefaultArguments or per-run
+        Arguments (e.g., connection string, API key); any principal with glue:GetJob
+        or glue:GetJobRun can read these arguments and extract the embedded
+        credentials to authenticate as {credential.target}.
+
+  # --- 7) glue:GetConnection -> ExposesCredential (plaintext JDBC password) ----
+  # Glue Connections store JDBC/Kafka/OAuth connection properties including the
+  # plaintext PASSWORD field. A principal with glue:GetConnection retrieves it.
+  # This derived rule matches on the structural ContainsSecret link established
+  # by explicit normalization, then derives ExposesCredential via the permission gate.
+  # credential-chains read-secret-yields-identity rolls up to CanImpersonate the
+  # downstream database service account.
+  - id: aws-glue-connection-exposes-credential
+    emits: ExposesCredential
+    description: "A Glue Connection stores JDBC/Kafka/OAuth credentials; glue:GetConnection returns the plaintext PASSWORD, exposing the database credential."
+    applies_to: [aws]
+    match:
+      - [ ?connection, ContainsSecret, ?credential ]
+    where:
+      - "node_type(?connection) == ConnectionString"
+      - "?connection has non-empty ConnectionProperties.PASSWORD or OAuth token"
+    emit:
+      source_type: Secret
+      target_type: Credential
+      source: ?connection
+      target: ?credential
+      permissions: ["glue:GetConnection"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        ACTIVE when the PASSWORD field is non-empty and is not encrypted by a
+        customer-managed key the caller cannot decrypt. CONDITIONAL(key_permission)
+        if the connection's password is wrapped under a SecurityConfiguration
+        encryption key and the retriever lacks kms:Decrypt on that key.
+      confidence: 0.95
+      derived_from:
+        - "<ContainsSecret(connection, credential) edge_id>"
+      false_positive_note: >-
+        Glue may encrypt connection passwords with an SSE-KMS key specified in
+        the SecurityConfiguration; if so, glue:GetConnection returns ciphertext,
+        and the caller needs kms:Decrypt on the CMK to obtain plaintext —
+        downgrade to CONDITIONAL(key_permission). Connections with
+        NETWORK_TYPE=JDBC typically have plaintext PASSWORD; Kafka connections
+        may use certificate auth (no PASSWORD field). For OAuth connections, the
+        access token or client secret in ConnectionProperties is the sensitive
+        field. credential-chains read-secret-yields-identity rolls up this
+        ExposesCredential + CredentialsFor to CanImpersonate the DB identity —
+        cite credential-chains, do not re-derive here.
+      narrative: >-
+        Glue Connection {connection.name} stores a plaintext JDBC password (or
+        OAuth token) for {credential.target}; any principal with glue:GetConnection
+        on this connection can retrieve it and authenticate to the target data store.
+
+  # --- 7) Data Catalog resource policy cross-account trust ---------------------
+  # glue:PutResourcePolicy overwrites the Data Catalog resource policy, enabling
+  # a principal to grant cross-account access to catalog databases and tables.
+  # Produces CrossAccountTrust(DataCatalog -> ExternalIdentity) when the existing
+  # policy already names an external account.
+  - id: aws-glue-catalog-cross-account
+    emits: CrossAccountTrust
+    description: "The Glue Data Catalog resource policy names a principal in another AWS account, granting cross-account metadata (and optionally data) access."
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::Glue::DataCatalog"
+      field: "ResourcePolicy.Statement[].Principal"
+    where:
+      - "at least one Statement principal is in a different account (arn:aws:iam::<other-account>:*)"
+      - "Effect == Allow"
+      - "Action includes glue:GetDatabase / glue:GetTable / glue:GetConnection or glue:* (wildcard)"
+    emit:
+      source_type: Data
+      target_type: ExternalIdentity
+      source: "<DataCatalog node>"
+      target: "<external account principal named in the policy>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the resource policy grants the external principal access and
+        the Lake Formation fine-grained grants (if any) also admit the principal.
+        CONDITIONAL(resource_policy) if Lake Formation override controls are enabled
+        and the specific database/table grants are unknown. BLOCKED if the Data
+        Catalog resource policy has been superseded by Lake Formation deny.
+      confidence: 0.90
+      derived_from:
+        - "<HasPolicy(DataCatalog, ResourcePolicy) edge_id>"
+      false_positive_note: >-
+        The Glue Data Catalog resource policy grants METADATA access (list/get
+        databases and tables). Actual data reads from underlying S3 locations
+        require separate S3 bucket policies and Lake Formation column/row
+        permissions. Do not conflate a Catalog metadata grant with unrestricted
+        data access. When Lake Formation is in control (UseOnlyIAMAccessControl=false),
+        Lake Formation grants take precedence over the IAM Catalog policy for
+        data access; model data access under lakeformation.yaml. When both are
+        relevant, emit CrossAccountTrust here for the Catalog trust and defer
+        data-access derivation to Lake Formation rules. A condition on the
+        resource policy (e.g. aws:SourceAccount) may restrict which principals
+        in the listed account can use the trust; honor it before emitting ACTIVE.
+      narrative: >-
+        The Glue Data Catalog resource policy in account {account.name} grants
+        principal {external.name} (account {external.account}) access to catalog
+        metadata (databases and tables), enabling cross-account ETL and data
+        discovery.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP / permission boundary denying glue:UpdateJob, glue:CreateJob,
+#     glue:StartJobRun, glue:UpdateDevEndpoint, or iam:PassRole at the
+#     effective scope -> emit the relevant edge with state: BLOCKED and
+#     denied_by=<SCP/boundary statement>.
+#   - iam:PassRole with iam:PassedToService NOT including glue.amazonaws.com ->
+#     blocks aws-glue-create-workload-as and aws-glue-attach-role-via-update.
+#   - S3 object lock / versioning-enforced WORM on the script bucket blocks
+#     aws-glue-execute-as-s3-script-poison -> BLOCKED(s3_object_lock).
+#   - Dev endpoint FAILED/DELETING state -> CanExecuteCommand BLOCKED(service_state).
+#   - SCP denying glue:GetConnection -> ExposesCredential(Connection) BLOCKED.
+#
+# CITATION NOTES (cite these linchpins; do NOT re-derive their roll-ups here):
+#   * can-execute-as.yaml execute-as-via-code-modify: CanModifyCode + ExecutesAs
+#     -> CanExecuteAs (general collapse — rules 1 & 2 above ARE this pattern).
+#   * can-execute-as.yaml execute-as-via-command: CanExecuteCommand + ExecutesAs
+#     -> CanExecuteAs (rule 5 above sets up this chain; can-execute-as fires it).
+#   * can-execute-as.yaml execute-as-via-new-workload: CanCreateWorkloadAs ->
+#     CanExecuteAs (rule 3 above feeds this).
+#   * cicd-chains.yaml cicd-modify-buildspec-executes-as: CI/CD framing of
+#     the same CanModifyCode -> CanExecuteAs collapse — same deduplication on
+#     (CanExecuteAs, ?principal, ?role).
+#   * can-control.yaml escalate-via-execute-as: CanExecuteAs + privilege delta
+#     -> CanEscalateTo. Never re-derive here.
+#   * credential-chains.yaml read-secret-yields-identity: ExposesCredential +
+#     CredentialsFor -> CanImpersonate. Rule 6 (connection creds) feeds this
+#     chain; credential-chains rolls it up.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/aws-glue.yaml. Key records to emit there:
+explicit_rules:
+
+  - id: aws-glue-job-executes-as
+    emits: ExecutesAs
+    from_field: "AWS::Glue::Job.Role"
+    note: >-
+      Emit ExecutesAs(GlueJob -> role) when Role ARN is non-empty. The job
+      (BatchJob) node is the source; the IAM role (Role/ServiceIdentity) is
+      the target.
+
+  - id: aws-glue-dev-endpoint-executes-as
+    emits: ExecutesAs
+    from_field: "AWS::Glue::DevEndpoint.RoleArn"
+    note: >-
+      Emit ExecutesAs(DevEndpoint -> role) for READY dev endpoints. Use
+      node_type VirtualMachine for the endpoint.
+
+  - id: aws-glue-crawler-executes-as
+    emits: ExecutesAs
+    from_field: "AWS::Glue::Crawler.Role"
+    note: >-
+      Emit ExecutesAs(Crawler -> role). Crawlers are GenericCompute.
+
+  - id: aws-glue-session-executes-as
+    emits: ExecutesAs
+    from_field: "AWS::Glue::Session.Role"
+    note: >-
+      Emit ExecutesAs(Session/Notebook -> role) for interactive Glue Sessions.
+      Use node_type Notebook.
+
+  - id: aws-glue-mltransform-executes-as
+    emits: ExecutesAs
+    from_field: "AWS::Glue::MLTransform.Role"
+    note: >-
+      Emit ExecutesAs(MLTransform -> role). ML transforms are BatchJob.
+
+  - id: aws-glue-job-update-modify-code
+    emits: CanModifyCode
+    match_effective_permission:
+      action: "glue:UpdateJob"
+      resource_type: "AWS::Glue::Job"
+    note: >-
+      glue:UpdateJob allows changing Command.ScriptLocation to an attacker S3
+      path. Emit CanModifyCode(principal -> GlueJob). Also emit
+      CanModifyConfiguration(principal -> GlueJob) from the same permission
+      (see below) — they are separate edges.
+
+  - id: aws-glue-job-update-modify-config
+    emits: CanModifyConfiguration
+    match_effective_permission:
+      action: "glue:UpdateJob"
+      resource_type: "AWS::Glue::Job"
+    note: >-
+      glue:UpdateJob allows changing RoleArn (with iam:PassRole), DefaultArguments,
+      Connections, GlueVersion, WorkerType, NumberOfWorkers, SecurityConfiguration,
+      MaxConcurrentRuns, Timeout.
+
+  - id: aws-glue-s3-script-supply-chain
+    emits: CanModifyCode
+    description: "s3:PutObject on the S3 key referenced by a Glue job's ScriptLocation is code control of that job."
+    match_record:
+      resource_type: "AWS::Glue::Job"
+      field: "Command.ScriptLocation"
+    where:
+      - "?principal has EFFECTIVE s3:PutObject on the S3 key (or prefix covering the key) at ?job.Command.ScriptLocation"
+    note: >-
+      Emit CanModifyCode(s3-writing principal -> GlueJob) where the S3 object
+      is the script. The s3:PutObject permission is evaluated against the S3
+      bucket policy + IAM policy; scope tightly to the script key/prefix.
+
+  - id: aws-glue-update-dev-endpoint-modify-config
+    emits: CanModifyConfiguration
+    match_effective_permission:
+      action: "glue:UpdateDevEndpoint"
+      resource_type: "AWS::Glue::DevEndpoint"
+    note: >-
+      glue:UpdateDevEndpoint changes PublicKey (SSH key injection), RoleArn
+      (with PassRole), CustomLibraries, AddArguments.
+
+  - id: aws-glue-update-crawler-modify-config
+    emits: CanModifyConfiguration
+    match_effective_permission:
+      action: "glue:UpdateCrawler"
+      resource_type: "AWS::Glue::Crawler"
+    note: >-
+      glue:UpdateCrawler changes Role (with PassRole), Targets, Schedule,
+      Configuration, SecurityConfiguration.
+
+  - id: aws-glue-pass-role-to-glue
+    emits: CanPassIdentity
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "PassedToService condition (if any) includes glue.amazonaws.com"
+      - "principal has at least one of: glue:CreateJob, glue:UpdateJob, glue:CreateCrawler, glue:UpdateCrawler, glue:CreateDevEndpoint, glue:UpdateDevEndpoint, glue:CreateSession, glue:CreateMLTransform, glue:UpdateMLTransform"
+    note: >-
+      Emit CanPassIdentity(principal -> role) when the principal can pass ?role
+      to Glue (confirmed by PassedToService or unconditioned). Downgrade to
+      POTENTIAL when PassedToService is unknown / not present and the role's
+      trust policy does not explicitly name glue.amazonaws.com.
+
+  - id: aws-glue-start-job-run-trigger
+    emits: CanTrigger
+    match_effective_permission:
+      action: "glue:StartJobRun"
+      resource_type: "AWS::Glue::Job"
+    note: >-
+      Emit CanTrigger(principal -> GlueJob). This is the direct invocation
+      path completing ExecutesAs escalations.
+
+  - id: aws-glue-start-workflow-run-trigger
+    emits: CanTrigger
+    match_effective_permission:
+      action: "glue:StartWorkflowRun"
+      resource_type: "AWS::Glue::Workflow"
+    note: >-
+      Emit CanTrigger(principal -> Workflow).
+
+  - id: aws-glue-trigger-fires-job
+    emits: CanTrigger
+    match_record:
+      resource_type: "AWS::Glue::Trigger"
+      field: "Actions[].JobName"
+    note: >-
+      Emit CanTrigger(Trigger -> GlueJob) for each job named in the trigger's
+      Actions. Source is the Trigger (EventRule) node. State is CONDITIONAL
+      when type=CONDITIONAL (predecessor job completion) or SCHEDULED; ACTIVE
+      for ON_DEMAND triggers that have been started.
+
+  - id: aws-glue-job-args-contain-credential
+    emits: ContainsCredential
+    from_field: "AWS::Glue::Job.DefaultArguments"
+    note: >-
+      Scan DefaultArguments for credential patterns (AKIA-style access keys,
+      connection:// strings, Bearer tokens, etc.). Emit ContainsCredential(Job -> Credential)
+      when a match is found and the argument is non-empty. Also scan observed
+      StartJobRun.Arguments for the same patterns. This feeds aws-glue-job-exposes-credential
+      (derived) to model glue:GetJob/GetJobRun credential exposure.
+
+  - id: aws-glue-connection-contains-secret
+    emits: ContainsSecret
+    from_field: "AWS::Glue::Connection.ConnectionProperties.PASSWORD"
+    note: >-
+      Emit ContainsSecret(Connection -> Secret/Credential) when PASSWORD is
+      non-empty. A Glue Connection (ConnectionString node) wraps plaintext or
+      encrypted database credentials; this is a legitimate containment relationship.
+      Currently ContainsSecret source set is [Storage, Data, Compute, Messaging] per
+      edges.yaml — consider amending to include Secret class (since a
+      ConnectionString holding another credential is a credential container).
+      This feeds aws-glue-connection-exposes-credential (derived) and
+      credential-chains read-secret-yields-identity. Also check
+      KAFKA_CLIENT_KEYSTORE_PASSWORD, SECRET_ID (OAuth secrets), and
+      ENCRYPTED_PASSWORD fields.
+
+  - id: aws-glue-connection-credentials-for
+    emits: CredentialsFor
+    from_field: "AWS::Glue::Connection.ConnectionProperties"
+    note: >-
+      Emit CredentialsFor(ConnectionSecret -> DataStore/Identity) linking the
+      stored credential to the target database identity/service the connection
+      authenticates to. Resolve the JDBC_CONNECTION_URL hostname to a known
+      database node in the graph if present.
+
+  - id: aws-glue-catalog-resource-policy
+    emits: HasPolicy
+    from_field: "AWS::Glue::DataCatalog.ResourcePolicy"
+    note: >-
+      Emit HasPolicy(DataCatalog -> ResourcePolicy) when the catalog has a
+      non-empty resource policy. The CrossAccountTrust derivation
+      (aws-glue-catalog-cross-account) fires when the policy names external-account
+      principals. The ResourcePolicy node itself is emitted via normal policy
+      artifact normalization.
+
+  - id: aws-glue-put-resource-policy-modify-policy
+    emits: CanModifyPolicy
+    match_effective_permission:
+      action: "glue:PutResourcePolicy"
+      resource_type: "AWS::Glue::DataCatalog"
+    note: >-
+      Emit CanModifyPolicy(principal -> DataCatalog). A principal with this
+      permission can rewrite the catalog resource policy to grant themselves
+      or an external account full catalog access.
+
+  - id: aws-glue-dev-endpoint-exposed-to-internet
+    emits: ExposedToInternet
+    match_record:
+      resource_type: "AWS::Glue::DevEndpoint"
+      field: "PublicAddress"
+    where:
+      - "PublicAddress is non-empty (endpoint has a public IP)"
+      - "EndpointSecurityGroupIds permits inbound TCP/22 from 0.0.0.0/0 or ::/0"
+    note: >-
+      Emit ExposedToInternet(DevEndpoint -> AnonymousIdentity) when the dev
+      endpoint is publicly reachable via SSH. A properly SG-restricted endpoint
+      with PublicAddress but no 0.0.0.0/0 ingress is NOT ExposedToInternet.

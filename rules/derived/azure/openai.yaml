@@ -1,0 +1,128 @@
+# Azure OpenAI / AI Services — Derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# Resource provider: Microsoft.CognitiveServices (kind == OpenAI | AIServices)
+# Operations verified against the Microsoft.CognitiveServices resource-provider
+# operations reference and the Azure OpenAI access-control docs (2026-08 snapshot).
+#
+# SECURITY SURFACE SUMMARY:
+#   Azure OpenAI is a managed inference API — it does NOT run customer code, has
+#   no job-submission or notebook primitive, and does NOT expose a managed identity
+#   that callers can assume. There is therefore NO CanExecuteAs / ExecutesAs surface.
+#
+#   Two conservative, well-conditioned rules are correct:
+#
+#   (1) listKeys / regenerateKey -> CanReadSecret(principal -> APIKey):
+#       Symmetric account keys bypass Entra RBAC and authenticate to any model
+#       deployment. A principal with the action retrieves (or regenerates + reads)
+#       the key. Key-based access is guarded by disableLocalAuth; if set, the
+#       edge is BLOCKED. Cite credential-chains.yaml for downstream pivots.
+#
+#   (2) publicNetworkAccess Enabled -> ExposedToInternet(account -> AnonymousIdentity):
+#       The inference endpoint is internet-reachable by default; any key or Entra
+#       token holder can call it with no VNet foothold required. Network access
+#       rules (networkAcls.defaultAction == Deny) or private-endpoint-only config
+#       remove this; check both before emitting.
+#
+# LINCHPIN CITATIONS (these rules emit FACTS; the linchpins do the roll-up):
+#   - /rules/derived/credential-chains.yaml: if the APIKey CredentialsFor an
+#     identity, read-secret-yields-identity derives CanImpersonate.
+#   - /rules/derived/can-control.yaml: CanAdminister -> Controls.
+#
+# This file intentionally omits rules for:
+#   - CanExecuteAs / ExecutesAs (no customer code execution surface).
+#   - CanPassIdentity / CanAttachIdentity (no execution identity attachment).
+#   - CanReadData / CanExfiltrate at the account level (fine-tuning data lives in
+#     a backing storage account; model completions are caller-controlled — scope
+#     those to the storage account, not Azure OpenAI).
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 11-data-analytics-ml
+applies_to: [azure]
+
+rules:
+
+  # --- Account key credential access ----------------------------------------
+  # listKeys/action or regenerateKey/action on a Cognitive Services account whose
+  # disableLocalAuth is not true -> attacker retrieves symmetric API keys that
+  # authenticate to all model deployments in the account.
+  - id: azure-openai-listkeys
+    emits: CanReadSecret
+    description: "listKeys or regenerateKey on an Azure OpenAI account retrieves symmetric API keys that authenticate to all model deployments."
+    match_effective_permission:
+      any_of:
+        - {action: "Microsoft.CognitiveServices/accounts/listKeys/action", scope_type: [resource, resourceGroup, subscription]}
+        - {action: "Microsoft.CognitiveServices/accounts/regenerateKey/action", scope_type: [resource, resourceGroup, subscription]}
+    where:
+      - "account.properties.disableLocalAuth != true   # key-based auth is not disabled"
+      - "node_type(account) == GenericData and account.kind in [OpenAI, AIServices, CognitiveServices]"
+    emit:
+      source_type: Identity
+      target_type: APIKey
+      source: "<principal>"
+      target: "<Cognitive Services account API keys (primary and secondary)>"
+      permissions:
+        - "Microsoft.CognitiveServices/accounts/listKeys/action"
+        - "Microsoft.CognitiveServices/accounts/regenerateKey/action"
+      state_logic: |
+        if account.properties.disableLocalAuth == true: BLOCKED  # keys disabled at account level
+        elif principal has listKeys/action OR regenerateKey/action effective at resource|RG|sub scope: ACTIVE
+        else: do not emit
+      conditions: [iam_permission]
+      conditions_from: []
+      derived_from: ["iam_permission:principal:Microsoft.CognitiveServices/accounts/listKeys/action", "iam_permission:principal:Microsoft.CognitiveServices/accounts/regenerateKey/action"]
+      false_positive_note: >-
+        BLOCKED when disableLocalAuth is true — in that configuration Azure OpenAI
+        rejects key-based authentication entirely and listKeys returns an error.
+        regenerateKey/action alone is sufficient: the regenerated key value is
+        returned in the response, so the caller obtains a usable key even without
+        listKeys/action. Honor the action scope: a role assignment scoped to a
+        different account does NOT grant key retrieval for this account.
+        Do NOT model the API key as yielding CanExecuteAs — Azure OpenAI exposes
+        no managed identity or execution role to key holders.
+      narrative: >-
+        {principal.name} can call listKeys (or regenerateKey) on Azure OpenAI account
+        {account.name} (Microsoft.CognitiveServices/accounts/listKeys/action or
+        …/regenerateKey/action), retrieving the symmetric API key that authenticates
+        to all model deployments in the account without Entra RBAC.
+
+  # --- Public inference endpoint exposure ------------------------------------
+  # Azure OpenAI accounts are internet-reachable by default. Any key or Entra
+  # token holder can call the inference API from the public internet without a
+  # VNet foothold. This is an explicit normalization rule deriving from raw
+  # config properties (publicNetworkAccess, networkAcls), not from edge patterns,
+  # and therefore belongs in /rules/explicit/azure-openai.yaml. Retained here
+  # for reference during schema migration to explicit layer.
+  #
+  # NOTE: This rule has been moved to /rules/explicit/azure-openai.yaml as
+  # azure-openai-endpoint-public; removal from this file pending collector cutover.
+  # - id: azure-openai-endpoint-public
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - disableLocalAuth == true -> azure-openai-listkeys emits with state: BLOCKED
+#     and blocked_by="account.properties.disableLocalAuth"; the rule does not fire
+#     for credential access even if the principal has listKeys/action.
+#   - publicNetworkAccess == Disabled -> azure-openai-endpoint-public emits BLOCKED.
+#   - A deny assignment covering Microsoft.CognitiveServices/accounts/listKeys/action
+#     blocks azure-openai-listkeys regardless of role grants.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# DEFERRED / MISSING RULES (to be implemented in follow-up phase):
+#
+# 1. CanAdminister(principal -> account) from Microsoft.CognitiveServices/accounts/write
+#    Source: HasPermission edge produced by the permission evaluator.
+#    Impact: The can-control.yaml linchpin derives Controls(principal -> account),
+#    enabling full resource modification/deletion attacks.
+#    Status: Requires derived-layer rule matching HasPermission edge.
+#
+# 2. CanModifyConfiguration(principal -> account) for disableLocalAuth toggle
+#    Source: HasPermission(principal, accounts/write) combined with explicit
+#    config observation that disableLocalAuth == true.
+#    Impact: Enables lateral escalation by re-enabling key-based access on a
+#    previously key-disabled account, unlocking the azure-openai-listkeys path.
+#    Status: Requires tracking state mutation across time (config change detection)
+#    or CONDITIONAL edge emission noting the prerequisite condition.
+# ---------------------------------------------------------------------------
+

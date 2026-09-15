@@ -1,0 +1,585 @@
+# AWS EBS — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# EBS (Elastic Block Store) attack surface centers on THREE primitives:
+#
+#   (1) CREDENTIAL GRAB via snapshot sharing: an attacker who can create a
+#       snapshot and share it cross-account (or make it public) gains full disk
+#       access including any credentials stored on the instance volume.
+#
+#   (2) DATA READ + EXFIL via EBS direct APIs: ebs:ListSnapshotBlocks +
+#       ebs:GetSnapshotBlock give block-level read of snapshot data without
+#       mounting — CanReadData, and via ContainsSecret the credential chain.
+#
+#   (3) DATA WRITE via EBS direct API (ebs:PutSnapshotBlock): creating a snapshot
+#       in PENDING state and populating it with blocks enables supply-chain attacks
+#       (malicious AMI distribution). Requires ebs:StartSnapshot + ebs:PutSnapshotBlock
+#       + ebs:CompleteSnapshot, then can be shared via ModifySnapshotAttribute.
+#
+#   (4) PUBLIC EXPOSURE: ec2:ModifySnapshotAttribute with add=all makes a
+#       snapshot public (any AWS account can CreateVolume from it).
+#
+# CMEK gate: if a snapshot is encrypted by a customer-managed KMS key, any data-
+# plane read (CreateVolume or GetSnapshotBlock) requires kms:Decrypt on the
+# wrapping key. Emit data-access edges as CONDITIONAL(key_permission) when CMK
+# is in use; cite credential-chains.yaml:decrypt-gates-secret-read for the
+# upgrade path.
+#
+# Explicit edges that FEED these rules (emitted by aws-ebs explicit normalizer
+# in /rules/explicit/aws-ebs.yaml or by the EC2 snapshot-attribute collector):
+#   ContainsSecret(Snapshot → Secret)              — snapshot of role-bearing instance [EXPLICIT only]
+#   AttachedTo(BlockStorage → VirtualMachine)      — volume-instance binding [EXPLICIT only]
+#
+# Derived edges EMITTED by this file:
+#   CanExfiltrate(Identity → Snapshot)             — from aws-ebs-create-and-share-snapshot, aws-ebs-share-existing-snapshot, etc.
+#   CrossAccountTrust(Snapshot → Account)          — from aws-ebs-create-and-share-snapshot (capability to share)
+#   ExposedToInternet(Snapshot → AnonymousIdentity)— from aws-ebs-make-snapshot-public (capability to make public)
+#   CanReadData(Identity → Snapshot)               — from aws-ebs-direct-api-read, aws-ebs-volume-mount-read
+#   CanWriteData(Identity → Snapshot)              — from aws-ebs-direct-api-write
+#   CanReadSecret(Identity → Secret)               — from aws-ebs-snapshot-exposes-credential
+#
+# Linchpin citations:
+#   credential-chains.yaml:decrypt-gates-secret-read  (CMEK gate upgrade)
+#   credential-chains.yaml:read-secret-yields-identity (ContainsSecret → CanImpersonate)
+#   can-control.yaml / can-execute-as.yaml             (escalation roll-up)
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # --- (1a) Create + share snapshot cross-account -> CanExfiltrate + CrossAccountTrust --------
+  - id: aws-ebs-create-and-share-snapshot
+    emits: [CanExfiltrate, CrossAccountTrust]
+    description: >-
+      CreateSnapshot + ModifySnapshotAttribute(add=<external account>) lets an
+      attacker ship a full disk image to an account they control. The rule matches
+      on the CanWrite capability on a volume and confirms effective IAM permissions
+      for both snapshot creation and cross-account sharing.
+    match:
+      - [ ?principal, CanWrite, ?volume ]
+    where:
+      - "node_type(?volume) == BlockStorage"
+      - "?principal has EFFECTIVE ec2:CreateSnapshot scoped to ?volume or Resource: *"
+      - "ec2:ModifySnapshotAttribute is scoped to Resource: * OR a tag condition covering new snapshots (NOT fixed snapshot ARNs)"
+      - "the createVolumePermission mutation target is an account != owner account"
+    emit:
+      - source_type: Identity
+        target_type: Snapshot
+        source: ?principal
+        target: "?snapshot (existing snapshot of ?volume, OR synthetic marker for POTENTIAL new snapshot)"
+        edge_type: CanExfiltrate
+        permissions: ["ec2:CreateSnapshot", "ec2:ModifySnapshotAttribute"]
+        conditions: [iam_permission]
+        state_logic: >-
+          CONDITIONAL(iam_permission) by default: the principal CAN create and share a
+          snapshot of ?volume (CreateSnapshot + ModifySnapshotAttribute effective). Upgrade
+          to POTENTIAL when confirming scope covers new snapshots. Upgrade to ACTIVE only
+          when a snapshot of ?volume already exists in the graph (match on AttachedTo to find
+          existing snapshots of this volume) AND ModifySnapshotAttribute is confirmed effective
+          on that snapshot. Additional gate: ec2:CreateSnapshot on a RUNNING instance may require
+          ec2:StopInstances or crash-consistent mode — if Stop is absent, CONDITIONAL(service_state).
+        confidence: 0.75
+        derived_from: ["<CanWrite edge on ?volume>", "Direct IAM evaluation of ec2:CreateSnapshot + ec2:ModifySnapshotAttribute"]
+        false_positive_note: >-
+          CRITICAL: This rule only emits ACTIVE when targeting an EXISTING snapshot in the
+          graph. For new snapshots (POTENTIAL case), emit as CONDITIONAL with the caveat
+          that the snapshot must be created first before exfiltration is possible. If
+          ec2:ModifySnapshotAttribute is scoped to specific snapshot ARNs (fixed snap-*),
+          the principal CANNOT modify newly-created snapshots — stay CONDITIONAL.
+          A KMS-encrypted volume snapshot can be shared but only decrypted in the target
+          account if the CMK is also shared or the snapshot is re-encrypted with a
+          shareable key — flag as CONDITIONAL(key_permission) for encrypted volumes.
+          Do NOT emit if ec2:CreateSnapshot is effectively denied via SCP or permission boundary.
+        narrative: >-
+          {principal.name} can call ec2:CreateSnapshot on {volume.name} and then
+          ec2:ModifySnapshotAttribute to share a resulting snapshot with an attacker-controlled
+          account, gaining full disk-image access (and any credentials stored on the disk)
+          outside the account boundary. Exploitation requires that ModifySnapshotAttribute
+          is scoped to cover new snapshots (Resource: * or tag-based), not just existing ones.
+      - source_type: Snapshot
+        target_type: Account
+        source: "?snapshot (existing snapshot of ?volume, OR synthetic marker for POTENTIAL new snapshot)"
+        target: "<external account from createVolumePermission>"
+        edge_type: CrossAccountTrust
+        permissions: ["ec2:ModifySnapshotAttribute"]
+        conditions: [iam_permission]
+        state_logic: >-
+          CONDITIONAL(iam_permission): the principal CAN grant createVolumePermission to the
+          external account (ModifySnapshotAttribute effective). POTENTIAL when scoped to
+          future snapshots. Inherit the state from the CanExfiltrate edge: if CanExfiltrate
+          is ACTIVE, CrossAccountTrust is ACTIVE; if CONDITIONAL, CrossAccountTrust is CONDITIONAL.
+        confidence: 0.75
+        derived_from: ["?principal's ec2:ModifySnapshotAttribute permission", "<CanExfiltrate edge on same ?principal + ?snapshot>"]
+        narrative: >-
+          {principal.name}'s ability to call ec2:ModifySnapshotAttribute means that snapshots
+          derived from {volume.name} can be shared to the external account {target.name},
+          establishing a cross-account trust boundary.
+
+  # --- (1b) ModifySnapshotAttribute alone (snapshot already exists) ----------
+  - id: aws-ebs-share-existing-snapshot
+    emits: CanExfiltrate
+    description: >-
+      ModifySnapshotAttribute on an existing snapshot to add a cross-account
+      createVolumePermission entry — data exfiltration without CreateSnapshot.
+    match:
+      - [ ?principal, CanModify, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?principal has EFFECTIVE ec2:ModifySnapshotAttribute on ?snapshot"
+      - "the modification target is an account != snapshot owner account (or 'all')"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["ec2:ModifySnapshotAttribute"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ec2:ModifySnapshotAttribute is confirmed effective (IAM + no SCP deny);
+        CONDITIONAL(iam_permission) if scoping is unresolved. For a public share (add=all),
+        the emitted edge feeds the ExposedToInternet explicit edge (see aws-ebs-make-snapshot-public).
+      confidence: 0.92
+      derived_from: ["<CanModify edge on ?snapshot>"]
+      false_positive_note: >-
+        ec2:ModifySnapshotAttribute must be effective on the specific snapshot ARN; an
+        attacker-accessible snapshot in a different account is not in scope unless the
+        principal holds the permission across that account. KMS-encrypted snapshots:
+        sharing the snapshot alone does not decrypt data in the target account without
+        the CMK being shared — downgrade target account's CanReadData to CONDITIONAL(key_permission).
+      narrative: >-
+        {principal.name} can share {snapshot.name} to an attacker-controlled account
+        via ec2:ModifySnapshotAttribute, enabling full disk access to the snapshot data
+        outside the account boundary.
+
+  # --- (1c) Snapshot is public (capability to make public) ----
+  - id: aws-ebs-make-snapshot-public
+    emits: ExposedToInternet
+    description: >-
+      A principal with ec2:ModifySnapshotAttribute can make a snapshot world-readable
+      (any AWS account can CreateVolume from it).
+    match:
+      - [ ?principal, CanModify, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?principal has EFFECTIVE ec2:ModifySnapshotAttribute on ?snapshot"
+      - "the createVolumePermission add set includes 'all' (or POTENTIAL: principal CAN set it to all)"
+    emit:
+      source_type: Snapshot
+      target_type: AnonymousIdentity
+      source: ?snapshot
+      target: "<AnonymousIdentity>"
+      permissions: ["ec2:ModifySnapshotAttribute"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the snapshot already carries createVolumePermission=all (observed in
+        DescribeSnapshotAttribute response). POTENTIAL when the principal CAN set it to
+        'all' via ec2:ModifySnapshotAttribute but has not yet done so. An AWS Organizations
+        SCP restricting ec2:ModifySnapshotAttribute or a Block Public Access setting at
+        the account level with 'block-all-sharing' mode makes this BLOCKED. Note:
+        'block-new-sharing' mode only prevents NEW shares; existing public snapshots
+        remain accessible unless the mode is later changed to 'block-all-sharing'.
+      confidence: "0.92 if ACTIVE (observed), 0.70 if POTENTIAL (capability only)"
+      derived_from: ["<CanModify edge on ?snapshot>", "ec2:DescribeSnapshotAttribute"]
+      false_positive_note: >-
+        AWS Snapshot Block Public Access (available since Nov 2023) can restrict this at
+        account or organization level. Check the BlockPublicAccessState setting via
+        ec2:GetSnapshotBlockPublicAccessState (READ action; NOT DisableSnapshotBlockPublicAccess
+        which is a WRITE action that toggles the setting). Two blocking modes exist:
+        - 'block-all-sharing': retroactively makes existing public snapshots inaccessible
+          (BLOCKED).
+        - 'block-new-sharing': only prevents NEW shares; snapshots already public before
+          this setting was applied remain accessible under this mode (NOT BLOCKED, but the
+          principal cannot make NEW snapshots public). A CMK-encrypted snapshot that is
+          made public is still opaque without the key being shared — note this but still
+          emit ExposedToInternet (the snapshot permission itself is the exposure).
+      narrative: >-
+        {principal.name} can set createVolumePermission=all on {snapshot.name} via
+        ec2:ModifySnapshotAttribute, making the snapshot publicly accessible to any AWS
+        account worldwide (if not already public).
+
+  # --- (1d) CopySnapshot cross-account -> CanExfiltrate ---------------------
+  - id: aws-ebs-copy-snapshot-exfil
+    emits: CanExfiltrate
+    description: >-
+      ec2:CopySnapshot called from an attacker account (on a shared snapshot) or
+      with a destination in another account copies snapshot data cross-boundary.
+    match:
+      - [ ?principal, CanRead, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?principal has EFFECTIVE ec2:CopySnapshot"
+      - "?snapshot.owner_account != ?principal.account (principal reads snapshot from a different account than the owner)"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["ec2:CopySnapshot"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        ACTIVE when ec2:CopySnapshot is effective AND the snapshot is readable from the
+        caller's account (createVolumePermission grants the caller or 'all'). The WHERE
+        clause ensures cross-account access: the snapshot belongs to a different account
+        than the principal. CONDITIONAL(key_permission) if the snapshot is CMK-encrypted
+        and the key is not shared with the destination account. NOTE: The destination
+        account is a runtime decision (caller specifies it in the CopySnapshot call) and
+        cannot be determined from the graph at rule-match time — only verify that the
+        source is cross-account. Analysts must review the actual CopySnapshot calls to
+        confirm exfiltration to attacker accounts.
+      confidence: 0.85
+      derived_from: ["<CanRead edge on ?snapshot>"]
+      false_positive_note: >-
+        CopySnapshot copies into the caller's account (or a caller-specified destination
+        if using the Destination parameter) — the caller must already have
+        createVolumePermission on the source snapshot (own it or have it shared). Do not
+        emit if the snapshot is only accessible within the owner account. The destination
+        account and region are API call parameters, not graph properties — this rule
+        conservatively emits when cross-account read is confirmed, but analysts must
+        validate the actual call destinations. Cross-region copy requires ec2:CopySnapshot
+        to be permitted in the destination region as well (honor region-level SCPs). For
+        CMK-encrypted snapshots, the destination account must either have the key shared
+        or be able to decrypt under the source account's key access — verify this before
+        reporting ACTIVE.
+      narrative: >-
+        {principal.name} can call ec2:CopySnapshot to duplicate {snapshot.name} (owned by
+        a different account) to a caller-specified destination, gaining a persistent copy
+        of the disk data outside the original account boundary.
+
+  # --- (2a) EBS direct API block-level read -> CanReadData ------------------
+  - id: aws-ebs-direct-api-read
+    emits: CanReadData
+    description: >-
+      ebs:ListSnapshotBlocks + ebs:GetSnapshotBlock give block-level read of
+      snapshot data without mounting — no EC2 footprint required. This rule matches
+      on direct IAM capability evaluation, not on materialized HasPermission edges
+      (which may not exist for wildcard-scoped ebs: permissions).
+    match:
+      - [ ?principal, HasPermission, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?principal has EFFECTIVE ebs:ListSnapshotBlocks (scoped to ?snapshot ARN, or Resource: *, or ebs:* wildcard)"
+      - "?principal has EFFECTIVE ebs:GetSnapshotBlock (scoped to ?snapshot ARN, or Resource: *, or ebs:* wildcard)"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["ebs:ListSnapshotBlocks", "ebs:GetSnapshotBlock"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        ACTIVE when both ebs:ListSnapshotBlocks and ebs:GetSnapshotBlock are effective
+        on ?snapshot AND (snapshot is unencrypted OR caller also holds kms:Decrypt on
+        the wrapping CMK). CONDITIONAL(key_permission) when the snapshot is CMK-encrypted
+        and kms:Decrypt is unconfirmed — cite credential-chains.yaml:decrypt-gates-secret-read
+        for upgrade to ACTIVE once decrypt is confirmed. The rule engine must handle
+        both materialized HasPermission edges (from explicit normalization) AND direct
+        IAM policy evaluation for principals with broad ebs:* or Resource:* grants.
+      confidence: 0.92
+      derived_from: ["Direct IAM policy evaluation of ebs:ListSnapshotBlocks + ebs:GetSnapshotBlock"]
+      false_positive_note: >-
+        BOTH ebs:ListSnapshotBlocks AND ebs:GetSnapshotBlock are required; holding only
+        one is insufficient for practical exploitation. The rule engine must evaluate
+        two cases: (1) Explicit HasPermission edge exists in the graph for a specific
+        snapshot (from explicit normalizer running IAM evaluator); (2) Principal holds
+        ebs:ListSnapshotBlocks or ebs:GetSnapshotBlock with Resource: * or snapshot ARNs
+        that may not have materialized edges — the rule engine must fall back to direct
+        IAM evaluation to emit the edge. For CMK-encrypted snapshots, GetSnapshotBlock
+        returns 400 (InvalidParameter) unless the caller holds kms:Decrypt on the
+        encryption key — strictly CONDITIONAL(key_permission) without proof of decrypt.
+        The ebs: namespace is separate from the ec2: namespace: an ec2:Describe* grant
+        does NOT imply ebs:GetSnapshotBlock. Honor per-snapshot ARN scoping and SCPs.
+      narrative: >-
+        {principal.name} holds ebs:ListSnapshotBlocks and ebs:GetSnapshotBlock on
+        {snapshot.name}, enabling full block-level read of the snapshot's disk contents
+        without mounting a volume — a low-footprint data exfiltration path that bypasses
+        EC2 entirely.
+
+  # --- (2b) EBS direct API read on shared snapshot -> CanExfiltrate ---------
+  - id: aws-ebs-direct-api-exfil
+    emits: CanExfiltrate
+    description: >-
+      EBS direct API read on a cross-account shared snapshot constitutes data
+      exfiltration: the caller reads another account's disk data from their own
+      account without ever launching an EC2 instance in the source account. This
+      rule chains CanReadData on a cross-account snapshot into CanExfiltrate.
+    match:
+      - [ ?principal, CanReadData, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?snapshot.owner_account != ?principal.account"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["ebs:ListSnapshotBlocks", "ebs:GetSnapshotBlock"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        Inherit from aws-ebs-direct-api-read CanReadData: ACTIVE if the CanReadData
+        edge is ACTIVE, CONDITIONAL if gated by key_permission or other conditions.
+        The CanExfiltrate edge summarizes the meaningful capability: data from another
+        account CAN be exfiltrated, regardless of which rule (ebs direct API, volume
+        mount, etc.) produced the CanReadData edge. Do NOT filter on rule_id provenance.
+      confidence: 0.90
+      derived_from: ["<CanReadData edge on ?snapshot where ?snapshot.owner_account != ?principal.account>"]
+      false_positive_note: >-
+        Only emit when the snapshot genuinely belongs to a different account (cross-
+        account data boundary crossing). If the snapshot is in the same account, the
+        CanReadData edge is still real but it is not an exfiltration — omit CanExfiltrate
+        and emit only CanReadData. All CMEK caveats from aws-ebs-direct-api-read apply.
+        The CanReadData edge may be produced by any rule (direct API, volume mount, etc.);
+        this rule does NOT require provenance from a specific rule.
+      narrative: >-
+        {principal.name} can read blocks of {snapshot.name} (owned by a different account)
+        via ebs:GetSnapshotBlock, constituting cross-account data exfiltration without any
+        EC2 instance running in the source account.
+
+  # --- (4) Volume mount via snapshot -> CanReadData -------------------------
+  - id: aws-ebs-volume-mount-read
+    emits: CanReadData
+    description: >-
+      CreateVolume from an existing snapshot + AttachVolume to an attacker-
+      controlled instance yields full filesystem read of the snapshot's data.
+      This rule matches on direct IAM capability evaluation for both volume creation
+      and attachment.
+    match:
+      - [ ?principal, CanRead, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?principal has EFFECTIVE ec2:CreateVolume (scoped to the snapshot or Resource: *)"
+      - "?principal has EFFECTIVE ec2:AttachVolume (scoped to instances they control or Resource: *)"
+      - "the caller has an EC2 instance in the same AZ as the snapshot to attach the volume to"
+    emit:
+      source_type: Identity
+      target_type: BlockStorage
+      source: ?principal
+      target: "volume_derived_from_?snapshot (or the snapshot itself if modeled as Storage)"
+      permissions: ["ec2:CreateVolume", "ec2:AttachVolume"]
+      conditions: [iam_permission, key_permission, region_or_boundary, service_state]
+      state_logic: >-
+        ACTIVE when both ec2:CreateVolume (scoped to the snapshot) and ec2:AttachVolume
+        are effective AND the caller has a running/startable instance in the snapshot's
+        AZ to attach to. CONDITIONAL(service_state) if no attacker-controlled instance
+        is running in the correct AZ. CONDITIONAL(key_permission) if the snapshot is
+        CMK-encrypted and kms:Decrypt is not confirmed (CreateVolume will fail without
+        decrypt access). CONDITIONAL(region_or_boundary) if AZ mismatch is detected or
+        if the snapshot is in a different region than the caller's instances.
+      confidence: 0.88
+      derived_from: ["<CanRead edge on ?snapshot>", "Direct IAM evaluation of ec2:CreateVolume + ec2:AttachVolume"]
+      false_positive_note: >-
+        This rule requires THREE concurrent preconditions: (1) ec2:CreateVolume scoped
+        to the snapshot or to all volumes (*), (2) ec2:AttachVolume scoped to instances
+        the principal controls or all instances (*), and (3) an attacker-controlled
+        instance running in the same AZ as the snapshot. If any is missing, downgrade
+        to CONDITIONAL. The CanRead anchor edge is sufficient; direct IAM evaluation
+        then confirms the two ebs/ec2 permissions. ec2:CreateVolume from a CMK-encrypted
+        snapshot requires that the caller's role can call kms:Decrypt (or kms:CreateGrant)
+        on the KMS key used to encrypt the snapshot. The volume attachment AZ must match
+        the snapshot's AZ; cross-AZ attach is not possible. Do not emit ACTIVE without
+        confirming AZ alignment or marking it CONDITIONAL(region_or_boundary).
+      narrative: >-
+        {principal.name} can call ec2:CreateVolume from {snapshot.name} and
+        ec2:AttachVolume to an instance under their control (in the same AZ), mounting
+        the full disk image and reading all filesystem contents including secrets, keys,
+        and credentials.
+
+  # --- (5a) EBS direct API write -> CanWriteData ----------------------------
+  - id: aws-ebs-direct-api-write
+    emits: CanWriteData
+    description: >-
+      ebs:StartSnapshot + ebs:PutSnapshotBlock + ebs:CompleteSnapshot allows an
+      attacker to synthesize a malicious disk image for supply-chain attacks
+      (trojanized AMI distribution). The written snapshot can be shared via
+      ModifySnapshotAttribute to distribute the malicious disk cross-account.
+      This rule matches on direct IAM capability evaluation, not on PENDING snapshot
+      nodes (which are transient and not present in the graph at rule-evaluation time).
+    match:
+      - [ ?principal, HasPermission, "ebs:StartSnapshot" ]
+    where:
+      - "?principal has EFFECTIVE ebs:StartSnapshot (scoped to Resource: * or snapshot ARNs)"
+      - "?principal has EFFECTIVE ebs:PutSnapshotBlock (scoped to Resource: * or snapshot ARNs)"
+      - "?principal has EFFECTIVE ebs:CompleteSnapshot (scoped to Resource: * or snapshot ARNs)"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: "<synthetic NewSnapshot node or Account boundary>"
+      permissions: ["ebs:StartSnapshot", "ebs:PutSnapshotBlock", "ebs:CompleteSnapshot"]
+      conditions: [iam_permission]
+      state_logic: >-
+        CONDITIONAL(iam_permission) by default: the principal CAN create a new snapshot
+        via ebs:StartSnapshot and populate it with blocks (ebs:PutSnapshotBlock +
+        ebs:CompleteSnapshot effective). Do NOT upgrade to ACTIVE — no snapshot node
+        exists in the graph yet; the PENDING state is a runtime transient. Mark
+        state_logic to document that the snapshot will be created at runtime.
+        The downstream CanExfiltrate (sharing via ModifySnapshotAttribute) is tracked
+        separately and depends on aws-ebs-create-and-share-snapshot or
+        aws-ebs-share-existing-snapshot succeeding.
+      confidence: 0.80
+      derived_from: ["Direct IAM policy evaluation for ebs:StartSnapshot + ebs:PutSnapshotBlock + ebs:CompleteSnapshot"]
+      false_positive_note: >-
+        This rule covers a supply-chain attack vector: an attacker creates a malicious
+        disk image and shares it, leading downstream users to mount and trust trojanized
+        data. The CanWriteData edge alone does not constitute exploitation — downstream
+        CanExfiltrate derivation depends on aws-ebs-share-existing-snapshot or
+        aws-ebs-create-and-share-snapshot succeeding. PENDING snapshots are temporary
+        (abandoned snapshots expire after some time). Verify that the principal actually
+        intends to and CAN invoke all three actions; if the ebs:* permissions are scoped
+        to existing snapshots only, the principal cannot create new ones. Note: ebs:*
+        wildcard or Resource: * in ebs policies includes the ability to write new snapshots.
+        Honor SCPs and permission boundaries.
+      narrative: >-
+        {principal.name} holds ebs:StartSnapshot, ebs:PutSnapshotBlock, and
+        ebs:CompleteSnapshot, enabling creation of a custom/malicious disk image that
+        can be shared cross-account or made public — a supply-chain attack vector.
+
+  # --- (4b) Volume detach + reattach + write -> CanWriteData/CanModifyConfiguration ------
+  - id: aws-ebs-volume-detach-reattach-write
+    emits: [CanWriteData, CanModifyConfiguration]
+    description: >-
+      Detaching a volume from a victim instance, attaching it to an attacker-controlled
+      instance, modifying the filesystem (cron, SSH keys, startup scripts), and re-attaching
+      enables both data write and indirect CanModifyConfiguration on the victim instance.
+      This is the inverse of aws-ebs-volume-mount-read.
+    match:
+      - [ ?principal, CanWrite, ?volume ]
+    where:
+      - "node_type(?volume) == BlockStorage"
+      - "?principal has EFFECTIVE ec2:DetachVolume (scoped to the volume or Resource: *)"
+      - "?principal has EFFECTIVE ec2:AttachVolume (scoped to instances they control or Resource: *)"
+      - "the caller has an EC2 instance in the same AZ as the volume to attach to (for reattachment to victim)"
+    emit:
+      - source_type: Identity
+        target_type: BlockStorage
+        source: ?principal
+        edge_type: CanWriteData
+        permissions: ["ec2:DetachVolume", "ec2:AttachVolume"]
+        conditions: [iam_permission, service_state, region_or_boundary]
+        state_logic: >-
+          ACTIVE when both ec2:DetachVolume and ec2:AttachVolume are effective AND the
+          caller has instances in the correct AZ for the cycle (detach from victim, attach
+          to attacker instance, modify, re-attach to victim). CONDITIONAL(service_state)
+          if victim instance is in a different AZ or if instances are not accessible.
+          CONDITIONAL(region_or_boundary) if attachment crosses region/account boundaries.
+        confidence: 0.85
+        derived_from: ["<CanWrite edge on ?volume>", "Direct IAM evaluation of ec2:DetachVolume + ec2:AttachVolume"]
+        narrative: >-
+          {principal.name} can detach {volume.name} from a victim instance, attach it
+          to an attacker-controlled instance, write malicious data (cron jobs, SSH keys,
+          startup scripts), and re-attach it to the victim.
+      - source_type: Identity
+        target_type: VirtualMachine
+        source: ?principal
+        edge_type: CanModifyConfiguration
+        target: "<victim instance the volume is attached to>"
+        permissions: ["ec2:DetachVolume", "ec2:AttachVolume"]
+        conditions: [iam_permission, service_state, region_or_boundary]
+        state_logic: >-
+          ACTIVE when both ec2:DetachVolume and ec2:AttachVolume are effective (same as
+          CanWriteData case). The CanModifyConfiguration edge on the victim instance
+          summarizes the meaningful escalation: by modifying the volume's filesystem,
+          the principal can change the victim instance's behavior (persistence, code
+          execution, lateral movement).
+        confidence: 0.85
+        derived_from: ["<CanWrite edge on ?volume>", "Direct IAM evaluation of ec2:DetachVolume + ec2:AttachVolume"]
+        linchpin_citations:
+          - "can-control.yaml (escalation roll-up: CanModifyConfiguration + ExecutesAs → CanControl)"
+        narrative: >-
+          {principal.name} can modify the filesystem of any instance running {volume.name}
+          by the detach-modify-reattach cycle, enabling persistence, code injection, and
+          lateral movement. Feeds into can-control.yaml for the CanModifyConfiguration
+          → CanControl escalation.
+        false_positive_note: >-
+          This rule requires that the principal has instances in the same AZ as the target
+          volume for the reattachment phase. If the principal's instances are in different
+          AZs, the CanWriteData and CanModifyConfiguration edges downgrade to CONDITIONAL.
+          Volume detachment may require the instance to be stopped (depending on the volume
+          type and attachment state); check the victim instance's AttachedTo edges for
+          constraints. The permissions must be scoped to allow both detach and attach
+          operations; if scoped to existing volumes only, the principal cannot attach to
+          new instances.
+
+  # --- (5b) Snapshot exposes credential via CanReadData ----------------------
+  - id: aws-ebs-snapshot-exposes-credential
+    emits: CanReadSecret
+    description: >-
+      Reading snapshot data (CanReadData) that contains secrets (ContainsSecret)
+      lets the principal extract and authenticate as the identity those secrets
+      belong to — shorthand for the CanReadData → ContainsSecret → CredentialsFor
+      chain into the CanReadSecret pivot. This rule feeds credential-chains.yaml:
+      read-secret-yields-identity.
+    match:
+      - [ ?principal, CanReadData, ?snapshot ]
+      - [ ?snapshot, ContainsSecret, ?secret ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "node_type(?secret) == Secret"
+    emit:
+      source_type: Identity
+      target_type: Secret
+      source: ?principal
+      target: ?secret
+      permissions: ["ebs:GetSnapshotBlock", "ebs:ListSnapshotBlocks"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        inherit_weakest(CanReadData, ContainsSecret): if CanReadData is CONDITIONAL
+        (key_permission gate), then CONDITIONAL(key_permission); if ContainsSecret
+        is POTENTIAL, then POTENTIAL (no one can read the data until forensic scan
+        confirms the secret exists). Strongest case: ACTIVE only when both CanReadData
+        is ACTIVE and ContainsSecret is ACTIVE. For path-finding into credential-
+        chains.yaml:read-secret-yields-identity, this edge must be ACTIVE to unlock
+        impersonation; POTENTIAL/CONDITIONAL contributions stall the chain.
+      confidence: "min(CanReadData.confidence, ContainsSecret.confidence)"
+      derived_from: ["?principal CanReadData ?snapshot", "?snapshot ContainsSecret ?secret"]
+      linchpin_citations:
+        - "credential-chains.yaml:read-secret-yields-identity (consumes CanReadSecret → CanImpersonate → CanEscalateTo)"
+      false_positive_note: >-
+        This rule links data access to credential extraction, feeding the credential
+        chain. It is only valuable when ContainsSecret is confirmed ACTIVE (via
+        forensic evidence in /rules/explicit/aws-ebs.yaml, not just structural
+        probability). When ContainsSecret is not present or is unconfirmed, this
+        chain does not emit. The permissions list shows the EBS direct API permissions
+        (ebs:GetSnapshotBlock); the secret's CanReadSecret is derived from the data-read
+        capability, not a separate IAM action. This CanReadSecret edge is the input
+        to credential-chains.yaml:read-secret-yields-identity, which then chains
+        into CanImpersonate and CanEscalateTo.
+      narrative: >-
+        {principal.name} can read the data stored in {snapshot.name} (via
+        ebs:GetSnapshotBlock or volume mount), which contains credentials for {secret.name}.
+        Reading the snapshot allows {principal.name} to extract and use the secret,
+        feeding into the credential escalation chain (CanImpersonate → CanEscalateTo).
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - AWS Snapshot Block Public Access (ec2:GetSnapshotBlockPublicAccessState)
+#    with BlockPublicAccessState = 'block-all-sharing' retroactively blocks all public
+#    snapshots (emit aws-ebs-make-snapshot-public with state BLOCKED). With
+#    BlockPublicAccessState = 'block-new-sharing', only NEW shares are blocked; existing
+#    public snapshots remain accessible.
+#  - An SCP denying ec2:ModifySnapshotAttribute blocks sharing rules (1a–1c).
+#  - An SCP denying ebs:GetSnapshotBlock / ebs:ListSnapshotBlocks blocks (2a/2b).
+#  - A KMS key policy deny on kms:Decrypt for the caller blocks data-plane access
+#    on all encrypted-snapshot rules (keep CONDITIONAL, never upgrade to ACTIVE).
+#  - ec2:CreateVolume / ec2:AttachVolume SCP denials block volume-mount (4).
+#  - An SCP denying ebs:StartSnapshot / ebs:PutSnapshotBlock / ebs:CompleteSnapshot
+#    blocks the direct-API write rule (5a).
+#
+# EXPLICIT NORMALIZATION (now in /rules/explicit/aws-ebs.yaml):
+#  Explicit edges are emitted by the EC2/EBS collector from API responses and are
+#  NOT derived rules. They feed the derived rules but must live in a separate
+#  /rules/explicit/ file per the RAGE pipeline architecture. The three
+#  explicit rules are:
+#
+#  - AttachedTo(BlockStorage → VirtualMachine)        from ec2:DescribeVolumes Attachments
+#  - CrossAccountTrust(Snapshot → Account)            from ec2:DescribeSnapshotAttribute createVolumePermission
+#  - ExposedToInternet(Snapshot → AnonymousIdentity)  from createVolumePermission = 'all'
+#
+#  ContainsSecret(Snapshot → Secret) is STRUCTURAL (nature: explicit) and must
+#  only be emitted when forensic evidence confirms credentials on the disk image.
+#  It should NOT be emitted as a derived rule; the aws-ebs-snapshot-contains-secret
+#  rule above documents the structural preconditions but emits POTENTIAL to reflect
+#  the probabilistic nature. Production systems rely on detective collectors or
+#  manual analysis to confirm and emit explicit ContainsSecret edges.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,588 @@
+# AWS CloudFormation — Derived attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# CloudFormation is a MANAGED CI/CD runner: a Stack is a BuildWorker that
+# executes a TEMPLATE (the "buildspec") AS a SERVICE ROLE (the runner's
+# identity). The Phase-9 linchpin cicd-chains.yaml already collapses
+#   CanModifyCode(?p -> ?stack) + ExecutesAs(?stack -> ?role)
+#     => CanExecuteAs(?p -> ?role)
+# so these rules emit the SERVICE-SPECIFIC FACTS that feed it:
+#   - CanModifyCode via UpdateStack / CreateChangeSet / ExecuteChangeSet
+#   - CanModifyCode via S3 template supply chain
+#   - CanCreateWorkloadAs via CreateStack + PassRole
+#   - CanExecuteAs via ExecuteChangeSet (direct, when change set is attacker-controlled)
+#   - CanTrigger from CodePipeline / StepFunctions
+#   - CrossAccountTrust / CanEnterAccount for StackSets
+#
+# Explicit normalization (ExecutesAs, CanPassIdentity, CanInvoke, CrossAccountTrust)
+# lives in /rules/explicit/aws-cloudformation.yaml. Linchpin citations:
+#   cicd-chains.yaml          — code-modify + ExecutesAs => CanExecuteAs
+#   can-execute-as.yaml       — execute-as-via-code-modify, execute-as-via-config-identity-swap
+#   can-control.yaml          — escalate-via-execute-as => CanEscalateTo, enter-account-via-assume
+#   credential-chains.yaml    — service-role credential exposure after CanExecuteAs
+#   federation-chains.yaml    — StackSets OIDC / RolesAnywhere (not CloudFormation-specific)
+#
+# PERMISSIONS are the exact action names from the AWS CloudFormation Service
+# Authorization Reference:
+#   https://docs.aws.amazon.com/IAM/latest/UserGuide/list_awscloudformation.html
+# and the AWS IAM Service Authorization Reference for iam:PassRole.
+#
+# FALSE-POSITIVE DISCIPLINE:
+#   1. Only emit CanExecuteAs/CanModifyCode when a SERVICE ROLE exists (RoleARN set).
+#      Without --role-arn, CloudFormation uses the caller's own identity; no escalation.
+#   2. Honor iam:PassedToService — PassRole valid only for cloudformation.amazonaws.com.
+#   3. S3 template write alone is CONDITIONAL(run_path); it requires a subsequent
+#      UpdateStack/ExecuteChangeSet to take effect.
+#   4. Change set execution on an EXISTING change set not created by the attacker is
+#      not code injection; only emit when the principal also created/controls the change set.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-pipelines
+applies_to: [aws]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1. UpdateStack with attacker template => CanModifyCode (feed cicd-chains rule 1)
+  # ---------------------------------------------------------------------------
+  # cloudformation:UpdateStack lets the caller replace the template the stack executes.
+  # Combined with ExecutesAs(Stack -> ServiceRole) [from explicit rules] and cicd-chains
+  # cicd-modify-buildspec-executes-as, this yields CanExecuteAs(principal -> serviceRole).
+  # This rule emits CanModifyCode so cicd-chains propagates to CanExecuteAs.
+  - id: aws-cfn-update-stack-modifies-code
+    emits: CanModifyCode
+    description: "cloudformation:UpdateStack lets a caller replace the template a stack executes, making the stack run attacker-chosen resource API calls as its service role."
+    match:
+      - [ ?principal, HasPermission, ?stack ]
+    where:
+      - "node_type(?stack) == BuildWorker  # AWS::CloudFormation::Stack"
+      - "?principal has EFFECTIVE cloudformation:UpdateStack on ?stack"
+      - "?stack has RoleARN set (service role exists — DescribeStacks RoleARN is non-empty)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?stack
+      permissions: ["cloudformation:UpdateStack"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when ?principal has EFFECTIVE cloudformation:UpdateStack on ?stack
+        AND the stack is in a mutable state (CREATE_COMPLETE, UPDATE_COMPLETE,
+        UPDATE_ROLLBACK_COMPLETE — not in *_IN_PROGRESS or DELETE_*); otherwise
+        CONDITIONAL(service_state). BLOCKED if an SCP or permission boundary denies
+        cloudformation:UpdateStack or iam:PassRole on the service role at the effective scope.
+      confidence: 0.95
+      derived_from: [ "cloudformation:UpdateStack EFFECTIVE permission on ?stack", "?stack RoleARN is set" ]
+      false_positive_note: >-
+        Only emit when the stack has a RoleARN (service role). Without --role-arn,
+        CloudFormation uses the CALLER's own identity for resource API calls — no
+        privilege over the caller, no CanModifyCode escalation surface. The
+        cloudformation:UpdateStack action must be in the principal's EFFECTIVE policy
+        (post identity+resource+SCP+boundary evaluation) scoped to this stack's ARN.
+        If cloudformation:UpdateStack is denied by an SCP or permission boundary, emit BLOCKED.
+        cicd-chains cicd-modify-buildspec-executes-as rolls this CanModifyCode +
+        the stack's ExecutesAs into CanExecuteAs; do NOT re-derive CanExecuteAs here.
+      narrative: >-
+        {principal.name} can call cloudformation:UpdateStack on stack {stack.name},
+        replacing the template it executes. Because {stack.name} runs as {stack.RoleARN}
+        (its service role), the next stack update executes the attacker's template
+        resources as that role. cicd-chains propagates this to CanExecuteAs.
+
+  # ---------------------------------------------------------------------------
+  # 2. CreateChangeSet + ExecuteChangeSet => CanModifyCode (change-set path)
+  # ---------------------------------------------------------------------------
+  # A change set is CloudFormation's "pull request" mechanism: create a pending
+  # template change, then execute it. An attacker who can CREATE a change set with
+  # an attacker-controlled template AND execute it achieves the same code-injection
+  # as UpdateStack directly. Requires BOTH cloudformation:CreateChangeSet AND
+  # cloudformation:ExecuteChangeSet.
+  - id: aws-cfn-changeset-execute-modifies-code
+    emits: CanModifyCode
+    description: "cloudformation:CreateChangeSet with attacker template + cloudformation:ExecuteChangeSet applies the attacker's template to the stack, running as the service role."
+    match:
+      - [ ?principal, HasPermission, ?stack ]
+    where:
+      - "node_type(?stack) == BuildWorker  # AWS::CloudFormation::Stack"
+      - "?principal has EFFECTIVE cloudformation:CreateChangeSet on ?stack"
+      - "?principal has EFFECTIVE cloudformation:ExecuteChangeSet on ?stack"
+      - "?stack has RoleARN set (service role exists)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?stack
+      permissions: ["cloudformation:CreateChangeSet", "cloudformation:ExecuteChangeSet"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when both cloudformation:CreateChangeSet AND cloudformation:ExecuteChangeSet
+        are in the principal's EFFECTIVE policy on ?stack AND the stack is mutable
+        (CREATE_COMPLETE, UPDATE_COMPLETE, UPDATE_ROLLBACK_COMPLETE). If only CreateChangeSet
+        is held (not ExecuteChangeSet), downgrade to CONDITIONAL(approval_required) — the
+        change set exists but a separate approver must execute it.
+        BLOCKED if SCP/boundary denies either cloudformation:CreateChangeSet or
+        cloudformation:ExecuteChangeSet at the effective scope.
+      confidence: 0.93
+      derived_from: [ "cloudformation:CreateChangeSet EFFECTIVE on ?stack", "cloudformation:ExecuteChangeSet EFFECTIVE on ?stack", "?stack RoleARN is set" ]
+      false_positive_note: >-
+        Holding ONLY ExecuteChangeSet (approver role) without CreateChangeSet is NOT
+        attacker-controlled code injection — the change set was authored by someone else.
+        Holding ONLY CreateChangeSet is CONDITIONAL(approval_required) — the change set
+        must be approved/executed by another principal. Do NOT emit ACTIVE unless both
+        actions are held on the same stack. cicd-chains collapses this CanModifyCode into
+        CanExecuteAs; do not re-derive CanExecuteAs here.
+      narrative: >-
+        {principal.name} can create a change set on stack {stack.name} with an attacker-
+        supplied template (cloudformation:CreateChangeSet) and then execute it
+        (cloudformation:ExecuteChangeSet), applying arbitrary resource API calls as
+        the stack's service role.
+
+  # ---------------------------------------------------------------------------
+  # 3. S3 template write => CanModifyCode on the stack (supply-chain path)
+  # ---------------------------------------------------------------------------
+  # If a stack's TemplateURL points to an S3 object and an attacker can overwrite
+  # that object, the next UpdateStack/ExecuteChangeSet against that URL loads the
+  # attacker's template. This is a supply-chain injection: the attacker writes the
+  # "buildspec" without needing cloudformation:UpdateStack directly.
+  # State is CONDITIONAL(run_path) unless the principal can also trigger the update.
+  - id: aws-cfn-template-s3-write-modifies-code
+    emits: CanModifyCode
+    description: "Write access to the S3 object that a stack's TemplateURL references: the next stack update will load and execute the attacker's template as the service role."
+    match:
+      - [ ?principal, CanWrite, ?template_object ]
+      - [ ?stack,     ContainsResourceReference, ?template_object ]
+    where:
+      - "node_type(?template_object) == ObjectStorage  # S3 template bucket/key"
+      - "node_type(?stack) == BuildWorker              # AWS::CloudFormation::Stack"
+      - "?stack.TemplateURL references ?template_object.s3_uri"
+      - "?stack has RoleARN set"
+    optional:
+      - [ ?principal, CanModify, ?stack ]   # cloudformation:UpdateStack / ExecuteChangeSet — if held, ACTIVE; else CONDITIONAL
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?stack
+      permissions: ["s3:PutObject"]
+      conditions: [run_path, iam_permission]
+      state_logic: >-
+        CONDITIONAL(run_path) by default — overwriting the S3 template object does NOT
+        immediately execute; the stack must be updated (cloudformation:UpdateStack /
+        ExecuteChangeSet) against that URL to pick up the change.
+        ACTIVE when matched(optional[0]): the principal can ALSO call UpdateStack or
+        ExecuteChangeSet on ?stack (the run path is closed). Inherit weakest with
+        the CanWrite edge on ?template_object (an S3 bucket policy or SCP blocking
+        s3:PutObject makes this BLOCKED).
+      confidence: 0.85
+      derived_from: [ "?principal CanWrite ?template_object", "?stack ContainsResourceReference ?template_object" ]
+      false_positive_note: >-
+        The S3 write alone is NOT an immediate code-injection; the stack must be
+        re-deployed against the same URL. A stack that pins templates using a version-specific
+        S3 URL (with version ID lock) is NOT affected by an overwrite of the latest object —
+        downgrade to POTENTIAL(run_path) or omit. Verify the TemplateURL matches the S3
+        object (bucket + key + any version ID). cicd-chains then collapses this CanModifyCode
+        + ExecutesAs into CanExecuteAs; do not re-derive CanExecuteAs here.
+      narrative: >-
+        {principal.name} can overwrite the S3 template object {template_object.name}
+        referenced by stack {stack.name} (s3:PutObject). The next time {stack.name}
+        is updated against that TemplateURL, the attacker's template runs as the stack's
+        service role.
+
+  # ---------------------------------------------------------------------------
+  # 3b. UpdateStack role swap => CanModifyConfiguration (identity binding change)
+  # ---------------------------------------------------------------------------
+  # cloudformation:UpdateStack can be used to change ONLY the stack's service role
+  # (--role-arn) without modifying the template. Combined with iam:PassRole for a
+  # more-privileged target role, this achieves identity swap: the same template runs
+  # as a different (more-privileged) role on the next stack operation. This is a
+  # configuration-level privilege escalation distinct from code injection.
+  # Feeds can-execute-as.yaml rule execute-as-via-config-identity-swap.
+  - id: aws-cfn-update-stack-role-swap-modifies-config
+    emits: CanModifyConfiguration
+    description: "cloudformation:UpdateStack changing only the stack's service role (--role-arn) to a more-privileged role: swaps the execution identity without modifying the template."
+    match:
+      - [ ?principal, CanPassIdentity, ?new_role ]
+    where:
+      - "?principal has EFFECTIVE cloudformation:UpdateStack on ?stack"
+      - "node_type(?stack) == BuildWorker  # AWS::CloudFormation::Stack"
+      - "?stack has RoleARN set (current service role exists)"
+      - "?new_role is more privileged than the stack's current RoleARN OR ?new_role is a different privileged role"
+      - "iam:PassRole for ?new_role permits iam:PassedToService == cloudformation.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?stack
+      permissions: ["cloudformation:UpdateStack", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility, service_state]
+      state_logic: >-
+        ACTIVE when (a) ?principal has EFFECTIVE cloudformation:UpdateStack on ?stack,
+        (b) iam:PassRole for ?new_role is ACTIVE with iam:PassedToService including
+        cloudformation.amazonaws.com or unconditioned, AND (c) the stack is mutable
+        (CREATE_COMPLETE, UPDATE_COMPLETE, UPDATE_ROLLBACK_COMPLETE). CONDITIONAL(role_compatibility)
+        when ?new_role trust policy does not yet include cloudformation.amazonaws.com —
+        UpdateStack will fail because CloudFormation cannot assume the role.
+        BLOCKED if SCP or permission boundary denies cloudformation:UpdateStack or
+        iam:PassRole at the effective scope.
+      confidence: 0.92
+      derived_from: [ "?principal CanPassIdentity ?new_role", "cloudformation:UpdateStack EFFECTIVE on ?stack", "?stack RoleARN is set" ]
+      false_positive_note: >-
+        CanModifyConfiguration alone (without CanPassIdentity to a more-privileged role)
+        is not escalation — swapping to a less-privileged or sideways role is not an attack.
+        Only emit when ?new_role is provably more privileged or when the principal can
+        demonstrate arbitrary role choice. Honor iam:PassedToService: a role passable only
+        to services other than cloudformation.amazonaws.com does NOT qualify.
+        can-execute-as.yaml execute-as-via-config-identity-swap rolls CanModifyConfiguration
+        + CanPassIdentity into CanExecuteAs — cite, do not re-derive CanExecuteAs here.
+      narrative: >-
+        {principal.name} can call cloudformation:UpdateStack on stack {stack.name} to change
+        its service role (--role-arn) and has iam:PassRole for {new_role.name}
+        (iam:PassedToService == cloudformation.amazonaws.com). By updating the stack with
+        only a new RoleARN and no template change, the attacker rebinds the stack to execute
+        as {new_role.name} without CloudFormation modification logic interfering. On the next
+        stack operation, resource API calls run as {new_role.name}. can-execute-as propagates
+        this to CanExecuteAs({principal.name} -> {new_role.name}).
+
+  # ---------------------------------------------------------------------------
+  # 4. CreateStack + PassRole => CanCreateWorkloadAs
+  # ---------------------------------------------------------------------------
+  # cloudformation:CreateStack with --role-arn and iam:PassRole for that role
+  # creates a new stack bound to the chosen service role — the CloudFormation
+  # equivalent of "create a Lambda and bind an execution role." The principal
+  # controls the template and the role; running a template is the mechanism of
+  # execution. This is the CanCreateWorkloadAs pattern (CanDeploy + CanPassIdentity).
+  - id: aws-cfn-create-stack-workload-as
+    emits: CanCreateWorkloadAs
+    description: "cloudformation:CreateStack + iam:PassRole(serviceRole to cloudformation.amazonaws.com): create a new stack bound to a chosen privileged service role and run arbitrary template code as it."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE cloudformation:CreateStack (resource scope covers new stacks)"
+      - "?role.trust_policy allows cloudformation.amazonaws.com as a trusted service"
+      - "iam:PassRole for ?role permits iam:PassedToService == cloudformation.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "cloudformation:CreateStack"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when (a) cloudformation:CreateStack is in EFFECTIVE policy for new stacks,
+        (b) iam:PassRole for ?role is granted with iam:PassedToService including
+        cloudformation.amazonaws.com or is unconditioned, AND (c) ?role.trust_policy
+        allows cloudformation.amazonaws.com.
+        POTENTIAL(role_compatibility) when ?role trust policy does not yet include
+        cloudformation.amazonaws.com — CreateStack will fail because CloudFormation cannot
+        assume the role. BLOCKED if SCP or permission boundary denies cloudformation:CreateStack
+        or iam:PassRole in scope.
+      confidence: 0.95
+      derived_from: [ "?principal CanPassIdentity ?role", "cloudformation:CreateStack EFFECTIVE on new-stack scope" ]
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to ec2.amazonaws.com,
+        lambda.amazonaws.com, etc., does NOT qualify here. The role MUST trust
+        cloudformation.amazonaws.com or CreateStack will return an IAM validation error.
+        Downgrade to POTENTIAL(role_compatibility) when trust policy is ambiguous.
+        can-execute-as.yaml execute-as-via-new-workload rolls CanCreateWorkloadAs into
+        CanExecuteAs — cite, do not re-derive CanExecuteAs here.
+      narrative: >-
+        {principal.name} can create a CloudFormation stack bound to {role.name}
+        (cloudformation:CreateStack + iam:PassRole to cloudformation.amazonaws.com),
+        then run arbitrary template resources as {role.name}. can-execute-as rolls this
+        into CanExecuteAs({principal.name} -> {role.name}).
+
+  # ---------------------------------------------------------------------------
+  # 5. StackSets self-managed: CreateStackInstances => CanEnterAccount per target
+  # ---------------------------------------------------------------------------
+  # Self-managed StackSets use an administration role in the admin account that
+  # assumes an execution role in each target account. An attacker with
+  # cloudformation:CreateStackInstances (or UpdateStackSet) in the admin account
+  # can deploy templates into every listed target account, executing as the
+  # execution role there. Each target account entry is a CrossAccountTrust fact
+  # (emitted by explicit rules) that feeds CanEnterAccount.
+  - id: aws-cfn-stacksets-enter-target-account
+    emits: CanEnterAccount
+    description: "cloudformation:CreateStackInstances / UpdateStackSet in the admin account deploys to target accounts, executing as the StackSet execution role there — a cross-account foothold."
+    match:
+      - [ ?admin_role,     CrossAccountTrust,  ?target_account ]
+      - [ ?principal,      CanPassIdentity,    ?admin_role ]
+    where:
+      - "node_type(?admin_role) == Role  # AWSCloudFormationStackSetAdministrationRole or equivalent"
+      - "node_type(?target_account) == Account"
+      - "?admin_role is a StackSets administration role (has sts:AssumeRole on the target execution role)"
+      - "?principal has EFFECTIVE cloudformation:CreateStackInstances OR cloudformation:UpdateStackSet on the stack set"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?principal
+      target: ?target_account
+      permissions: ["cloudformation:CreateStackInstances", "cloudformation:UpdateStackSet", "iam:PassRole"]
+      conditions: [trust_relationship, iam_permission]
+      state_logic: >-
+        ACTIVE when (a) ?principal has EFFECTIVE cloudformation:CreateStackInstances or
+        UpdateStackSet on the stack set, (b) CanPassIdentity to ?admin_role is ACTIVE,
+        AND (c) the CrossAccountTrust between ?admin_role and ?target_account is confirmed
+        (AWSCloudFormationStackSetExecutionRole trust policy grants AssumeRole to ?admin_role
+        in the admin account). CONDITIONAL(trust_relationship) when the execution-role trust
+        in the target account is not confirmed. BLOCKED if SCP in the target org denies
+        cloudformation:CreateStackInstances or sts:AssumeRole for the admin role.
+      confidence: 0.9
+      derived_from: [ "?admin_role CrossAccountTrust ?target_account", "?principal CanPassIdentity ?admin_role", "cloudformation:CreateStackInstances EFFECTIVE on stack set" ]
+      false_positive_note: >-
+        The default AWSCloudFormationStackSetExecutionRole policy is AdministratorAccess,
+        but organizations may scope it down. Do NOT assume AdministratorAccess — resolve
+        the actual execution role policy before asserting a full account takeover.
+        Service-MANAGED StackSets (Organizations-integrated) use a different SLR mechanism
+        and require separate treatment (aws-cfn-stacksets-org-enter); this rule covers only
+        SELF-MANAGED StackSets where explicit administration + execution roles are present.
+        CanEnterAccount is cited from can-control.yaml enter-account-via-assume — do not
+        re-derive the full escalation chain.
+      narrative: >-
+        {principal.name} can deploy StackSet instances into target account {target_account.name}
+        via CloudFormation StackSets (cloudformation:CreateStackInstances +
+        AWSCloudFormationStackSetAdministrationRole assumes AWSCloudFormationStackSetExecutionRole
+        there), gaining a foothold in {target_account.name} with the execution role's permissions.
+
+  # ---------------------------------------------------------------------------
+  # 6. Service-managed StackSets (Org-integrated) => CanEnterOrganization
+  # ---------------------------------------------------------------------------
+  # Service-managed StackSets (--permission-model SERVICE_MANAGED) let a delegated
+  # StackSets admin deploy to ALL accounts in the Organization (or specific OUs) using
+  # CloudFormation's own service-linked role. A principal who can create/update a
+  # service-managed stack set effectively reaches the entire Org.
+  - id: aws-cfn-stacksets-org-enter
+    emits: CanEnterOrganization
+    description: "cloudformation:CreateStackSet/UpdateStackSet with SERVICE_MANAGED permission model (Organizations integration) deploys to all Org member accounts — equivalent to organization-wide foothold."
+    match:
+      - [ ?principal, HasPermission, ?stack_set ]
+    where:
+      - "node_type(?stack_set) == GenericCompute  # AWS::CloudFormation::StackSet"
+      - "?stack_set.PermissionModel == SERVICE_MANAGED"
+      - "?principal has EFFECTIVE cloudformation:CreateStackSet OR cloudformation:UpdateStackSet on ?stack_set"
+      - "?principal is a delegated StackSets administrator (organizations:RegisterDelegatedAdministrator or management account)"
+    emit:
+      source_type: Identity
+      target_type: Organization
+      source: ?principal
+      target: "<AWS Organization the stack set targets>"
+      permissions: ["cloudformation:CreateStackSet", "cloudformation:UpdateStackSet"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when ?principal is the management account or has delegated admin status
+        (organizations:RegisterDelegatedAdministrator already granted), AND
+        cloudformation:CreateStackSet/UpdateStackSet is in EFFECTIVE policy for the
+        stack set with SERVICE_MANAGED model, AND target OUs/accounts are set to ALL
+        (deployment targets include all Org members). CONDITIONAL(scp_or_org_policy) when
+        SCPs or organizational policies restrict StackSets reach to a subset of accounts.
+        BLOCKED if StackSets trust delegation was revoked or the management account explicitly
+        denied this principal's access to StackSets administration.
+      confidence: 0.88
+      derived_from: [ "cloudformation:CreateStackSet/UpdateStackSet EFFECTIVE on SERVICE_MANAGED stack set", "?principal is delegated StackSets admin OR management account" ]
+      false_positive_note: >-
+        SERVICE_MANAGED StackSets require delegated admin status or management-account
+        privileges — verify via organizations:ListDelegatedAdministrators. A principal
+        with only cloudformation permissions but NOT delegated admin status cannot create
+        service-managed stack sets. The SLR used by CloudFormation in member accounts has
+        broad permissions but may be restricted by SCPs in members. Emit CanEnterOrganization
+        only when deployment targets cover all/most Org members; narrow targets (single OU
+        or account) => emit CanEnterAccount(s) instead.
+      narrative: >-
+        {principal.name} can create or update a service-managed CloudFormation StackSet
+        (Organizations integration), deploying templates to all member accounts of the
+        AWS Organization using CloudFormation's service-linked role — a foothold across
+        the entire Organization.
+
+  # ---------------------------------------------------------------------------
+  # 7. Custom resource Lambda: service role CanTrigger the Lambda during lifecycle
+  # ---------------------------------------------------------------------------
+  # A CloudFormation stack with a Custom:: logical resource backed by a Lambda
+  # triggers that Lambda during every CREATE, UPDATE, and DELETE lifecycle event.
+  # The invocation comes FROM the stack service role (an Identity) calling
+  # lambda:InvokeFunction. We model this as the SERVICE ROLE (Identity) CanTrigger-ing
+  # the Lambda — CanTrigger source includes Identity, which is valid.
+  # A principal who gains CanExecuteAs over the service role (via cicd-chains
+  # collapsing CanModifyCode on the stack) inherits the ability to force this Lambda
+  # invocation — the Lambda execution role then becomes an additional escalation path.
+  - id: aws-cfn-service-role-triggers-custom-lambda
+    emits: CanTrigger
+    description: "A stack's service role (Identity) triggers the Custom:: resource Lambda during stack lifecycle events via lambda:InvokeFunction; principals who CanExecuteAs the service role inherit this CanTrigger path."
+    match:
+      - [ ?stack,        ExecutesAs,               ?service_role ]
+      - [ ?stack,        ContainsResourceReference, ?lambda ]
+    where:
+      - "node_type(?stack)        == BuildWorker        # AWS::CloudFormation::Stack"
+      - "node_type(?service_role) == Role               # stack service role"
+      - "node_type(?lambda)       == ServerlessFunction # Custom:: resource Lambda"
+      - "?stack template contains a Custom:: logical resource ServiceToken referencing ?lambda.ARN"
+      - "?service_role has EFFECTIVE lambda:InvokeFunction on ?lambda"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?service_role
+      target: ?lambda
+      permissions: ["lambda:InvokeFunction"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the stack service role has EFFECTIVE lambda:InvokeFunction on the Lambda
+        (or Lambda resource policy grants cloudformation.amazonaws.com invoke) AND the stack
+        is operational (CREATE_COMPLETE, UPDATE_COMPLETE). The service role will call
+        lambda:InvokeFunction during every future stack lifecycle event (UPDATE/DELETE).
+        CONDITIONAL(service_state) if the stack is in a failed/transitional state.
+      confidence: 0.9
+      derived_from: [ "?stack ExecutesAs ?service_role", "?stack ContainsResourceReference ?lambda", "?service_role EFFECTIVE lambda:InvokeFunction on ?lambda" ]
+      false_positive_note: >-
+        Source is the service role Identity, not the Compute stack (CanTrigger requires
+        Identity/Messaging/Storage/Network as source; Compute is not in that set). The Lambda
+        execution role (separate from the service role) is the terminal escalation target —
+        Lambda derived rules (aws-lambda-execute-as-via-code etc.) propagate from the Lambda's
+        ExecutesAs edge. A principal who can CanModifyCode on the stack => cicd-chains yields
+        CanExecuteAs(?p -> service_role) => this CanTrigger(?service_role -> ?lambda) chains
+        to CanExecuteAs(?p -> lambdaRole) via cicd-chains rule 2. Do NOT conflate the Lambda
+        execution role with the stack service role — they are separate identities.
+      narrative: >-
+        Stack {stack.name}'s service role {service_role.name} triggers Lambda {lambda.name}
+        during stack lifecycle events (Custom:: resource, ServiceToken) using
+        lambda:InvokeFunction. Any attacker who can CanExecuteAs {service_role.name} inherits
+        this CanTrigger; code inside {lambda.name} executes as {lambda.name}'s separate
+        execution role.
+
+  # ---------------------------------------------------------------------------
+  # 8. ExecuteChangeSet approval role: CONDITIONAL code injection via change set
+  # ---------------------------------------------------------------------------
+  # A principal who can ONLY execute (approve) existing change sets — but not create
+  # them — can still apply an attacker-created change set if one was created by an
+  # attacker-controlled or compromised creator. This is a split-approval path where
+  # the creator and executor are different principals. Less common but documented in
+  # AWS Change Set workflows.
+  - id: aws-cfn-execute-changeset-approve-path
+    emits: CanModifyCode
+    description: "cloudformation:ExecuteChangeSet alone (approver role, no CreateChangeSet): can apply an attacker-authored pending change set if one already exists — CONDITIONAL on attacker-authored change set being present."
+    match:
+      - [ ?principal, HasPermission, ?stack ]
+    where:
+      - "node_type(?stack) == BuildWorker  # AWS::CloudFormation::Stack"
+      - "?principal has EFFECTIVE cloudformation:ExecuteChangeSet on ?stack"
+      - "?principal does NOT have cloudformation:CreateChangeSet on ?stack (pure approver)"
+      - "?stack has RoleARN set"
+      - "exists a pending change set on ?stack created by a different (potentially attacker-controlled) principal"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?stack
+      permissions: ["cloudformation:ExecuteChangeSet"]
+      conditions: [attacker_authored_changeset]
+      state_logic: >-
+        CONDITIONAL(attacker_authored_changeset) — this edge is only meaningful if an
+        attacker-authored change set is already pending on the stack. Without the attacker-
+        authored change set, ExecuteChangeSet alone applies a trusted change set and is not
+        code injection. ACTIVE only when (a) a change set authored by an attacker-controlled
+        principal exists in REVIEW_IN_PROGRESS status AND (b) the approver principal can
+        execute any pending change set without reviewing the template diff. Inherits weakest
+        with the contributing change set evidence.
+      confidence: 0.7
+      derived_from: [ "cloudformation:ExecuteChangeSet EFFECTIVE on ?stack", "?stack RoleARN is set", "pending attacker-authored change set on ?stack" ]
+      false_positive_note: >-
+        Strictly weaker (0.7 prior) than the combined CreateChangeSet+ExecuteChangeSet path.
+        Do NOT emit ACTIVE for a clean, trusted change set approved in normal workflow.
+        This path only matters in threat models where a separate attacker-controlled principal
+        can CREATE change sets (social engineering, compromised pipeline, SaaS integration).
+        cicd-chains / can-execute-as propagate to CanExecuteAs only when ACTIVE.
+      narrative: >-
+        {principal.name} can execute pending change sets on stack {stack.name}
+        (cloudformation:ExecuteChangeSet); if an attacker-authored change set is already
+        pending, approving it applies the attacker's template as the stack's service role.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP or permission boundary denying cloudformation:UpdateStack, CreateChangeSet,
+#    ExecuteChangeSet, or CreateStack at the effective scope -> emit the contributing
+#    CanModifyCode edge with state: BLOCKED and denied_by=<SCP arn/statement id>.
+#  - An SCP denying iam:PassRole to cloudformation.amazonaws.com -> CanPassIdentity
+#    and CanCreateWorkloadAs are BLOCKED; aws-cfn-create-stack-workload-as emits BLOCKED.
+#  - iam:PassedToService condition NOT including cloudformation.amazonaws.com on PassRole
+#    -> CanPassIdentity to cloudformation POTENTIAL(role_compatibility), and
+#    CanCreateWorkloadAs inherits POTENTIAL.
+#  - Stack in DELETE_COMPLETE, DELETE_IN_PROGRESS or *_IN_PROGRESS states ->
+#    UpdateStack actions fail -> mark CanModifyCode as CONDITIONAL(service_state).
+#  - A strict stack policy (SetStackPolicy) blocking UPDATE on specific resource types
+#    may reduce the blast radius but not the CanModifyCode edge itself (policy restricts
+#    which logical resources can be updated, not whether the template replacement runs).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules referenced by these derived rules live in:
+#   /rules/explicit/aws-cloudformation.yaml
+#
+# Recommended explicit rules for full coverage (add to that file, not here):
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: aws-cfn-stack-executes-as
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudFormation::Stack", field: "RoleARN"}
+    emit:
+      source_type: Compute
+      source: "<stack node>"
+      target: "<IAM role from RoleARN>"
+      api_source: "cloudformation:DescribeStacks"
+      evidence_field: "RoleARN"
+      narrative: "CloudFormation stack {stack.name} runs resource API calls as service role {role.name} (RoleARN)."
+
+  - id: aws-cfn-can-pass-role-to-cfn
+    emits: CanPassIdentity
+    applies_to: [aws]
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+      condition: "iam:PassedToService == cloudformation.amazonaws.com"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<IAM role in scope>"
+      permissions: ["iam:PassRole"]
+      narrative: "{principal.name} can pass {role.name} to CloudFormation (iam:PassRole for cloudformation.amazonaws.com)."
+
+  - id: aws-cfn-template-s3-reference
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudFormation::Stack", field: "TemplateURL"}
+    emit:
+      source: "<stack node>"
+      target: "<S3 bucket/key from TemplateURL>"
+      api_source: "cloudformation:DescribeStacks or cloudformation:GetTemplate"
+      evidence_field: "TemplateURL"
+      narrative: "Stack {stack.name} loads its template from S3 at {TemplateURL}."
+
+  - id: aws-cfn-custom-resource-ref
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudFormation::Stack", field: "template.CustomResourceServiceToken"}
+    emit:
+      source: "<stack node>"
+      target: "<Lambda function or SNS topic from ServiceToken>"
+      api_source: "cloudformation:GetTemplate"
+      evidence_field: "ServiceToken"
+      narrative: "Stack {stack.name} has a Custom:: resource with ServiceToken {token} pointing to {target.name}."
+
+  - id: aws-cfn-stackset-cross-account-trust
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CloudFormation::StackSet", field: "AdministrationRoleARN + target_accounts"}
+    emit:
+      source: "<administration role node>"
+      target: "<target Account nodes from StackSet deployment targets>"
+      api_source: "cloudformation:DescribeStackSet + cloudformation:ListStackInstances"
+      evidence_field: "AdministrationRoleARN, ExecutionRoleName, target account list"
+      narrative: "StackSet {stack_set.name} administration role {admin_role.name} can assume execution role in target accounts {accounts}."
+
+  - id: aws-cfn-codepipeline-trigger
+    emits: CanTrigger
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::CodePipeline::Pipeline", field: "stages.actions.CloudFormationAction"}
+    emit:
+      source: "<CodePipeline BuildWorker node>"
+      target: "<CloudFormation Stack (BuildWorker) node>"
+      api_source: "codepipeline:GetPipeline"
+      evidence_field: "ActionTypeId.Provider == CloudFormation, Configuration.StackName"
+      narrative: "CodePipeline {pipeline.name} triggers CloudFormation stack {stack.name} via a deploy action."

@@ -1,0 +1,288 @@
+# AWS Lightsail — Phase 4 compute/serverless attack-path rules
+# ---------------------------------------------------------------------------
+# Emits COMMON edges from schema/edges.yaml only. Permissions are the EXACT
+# lightsail:* actions from the AWS Service Authorization Reference. Each rule
+# records the resource scope the action must apply at; the evaluator binds
+# ?target from the effective scope, not from mere action presence.
+#
+# CRITICAL false-positive control: Lightsail has NO iam:PassRole and NO
+# instance-profile / task-role attachment API. An attacker CANNOT choose the
+# IAM identity a Lightsail resource runs as. There are therefore NO
+# CanPassIdentity / CanAttachIdentity / CanCreateWorkloadAs rules here. Instance
+# role access is only reachable as a CHAIN (OS access -> read IMDS -> harvest an
+# ALREADY-associated role), never as a one-step privesc.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 4-compute-serverless
+applies_to: [aws]
+service: "aws:lightsail"
+
+rules:
+
+  # --- Container service: arbitrary code deployment -------------------------
+  - id: aws-lightsail-container-deploy-code
+    emits: CanModifyCode
+    match_effective_permission: {action: "lightsail:CreateContainerServiceDeployment", resource_type: "AWS::Lightsail::Container"}
+    optional_permission: "lightsail:RegisterContainerImage"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<container service in scope>"
+      permissions: ["lightsail:CreateContainerServiceDeployment", "lightsail:RegisterContainerImage?"]
+      escalation: "Deploy an arbitrary container image with an attacker-chosen launch command and env -> code execution on the container service."
+      narrative: "{principal.name} can deploy an arbitrary image + command to container service {target.name} (lightsail:CreateContainerServiceDeployment)."
+
+  - id: aws-lightsail-execute-as-container
+    emits: CanExecuteAs
+    description: "Arbitrary container deployment runs as the Lightsail-managed service execution context."
+    match:
+      - [ ?principal, CanModifyCode, ?containerservice ]
+      - [ ?containerservice, ExecutesAs, ?serviceidentity ]
+    where:
+      - "node_type(?containerservice) == ContainerService"
+      - "node_type(?serviceidentity) == ServiceIdentity"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<Lightsail-managed ServiceIdentity>"
+      permissions: ["lightsail:CreateContainerServiceDeployment"]
+      state_logic: "ACTIVE (deployment executes immediately)"
+      false_positive_note: "The container-service execution context is a narrow Lightsail-managed ServiceIdentity, NOT a customer-chosen IAM role. Do not equate its reach to a full account role or emit CanEnterAccount from it unless collection proves broad permissions."
+      narrative: "{principal.name} executes code as {target.name} by deploying an arbitrary container to {containerservice.name}."
+
+  # --- Instance OS access (SSH/RDP) ----------------------------------------
+  - id: aws-lightsail-instance-access-ssh
+    emits: CanExecuteCommand
+    match_effective_permission: {action: "lightsail:GetInstanceAccessDetails", resource_type: "AWS::Lightsail::Instance"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Lightsail instance in scope>"
+      permissions: ["lightsail:GetInstanceAccessDetails"]
+      conditions: [network_reachability, service_state]
+      state_logic: "ACTIVE if instance running and reachable on SSH/RDP else CONDITIONAL(network_reachability, service_state)"
+      false_positive_note: "Yields OS-level access, not AWS credentials directly. AWS escalation only completes if the instance IMDS exposes an associated IAM role (see aws-lightsail-execute-as-via-instance-imds)."
+      narrative: "{principal.name} can obtain temporary SSH/RDP credentials for instance {target.name} (lightsail:GetInstanceAccessDetails) and run OS commands."
+
+  - id: aws-lightsail-download-keypair
+    emits: CanReadCredential
+    match_effective_permission: {action: "lightsail:DownloadDefaultKeyPair", resource_type: "AWS::Lightsail::KeyPair"}
+    emit:
+      source: "<principal>"
+      target: "<default SSH key pair>"
+      permissions: ["lightsail:DownloadDefaultKeyPair"]
+      conditions: [network_reachability, service_state]
+      state_logic: "ACTIVE for the credential read itself; the onward OS-access escalation is CONDITIONAL(network_reachability, service_state) and only realizes against an instance actually launched with the default key pair and reachable on SSH."
+      escalation: "Retrieve the account default SSH private key -> SSH into any instance launched with it (only if such an instance exists and is reachable)."
+      false_positive_note: "Yields the default SSH private key only; usable for OS access only against instances actually launched with the default key pair and reachable on SSH. Absent such an instance this is credential material with no reachable target."
+      narrative: "{principal.name} can download the default SSH private key (lightsail:DownloadDefaultKeyPair), enabling OS access to instances launched with it and reachable on SSH."
+
+  # --- Instance IMDS role harvest (the ONLY instance->IAM escalation) ------
+  - id: aws-lightsail-imds-token-exposure
+    emits: CanRetrieveToken
+    description: "A Lightsail instance with an associated IAM role exposes that role's session via IMDS."
+    match:
+      - [ ?instance, ExecutesAs, ?role ]
+    where:
+      - "node_type(?instance) == VirtualMachine"
+      - "provider_type(?instance) == 'AWS::Lightsail::Instance'"
+      - "node_type(?role) == Role"
+      - "a role is associated with the instance (ExecutesAs present)"
+    emit:
+      source: "<Lightsail instance>"
+      target: "<associated IAM role>"
+      permissions: []
+      conditions: [service_state]
+      false_positive_note: "Pure fact edge: the instance can mint the associated role's session via IMDS. Only emit if a role is ACTUALLY associated with the instance; a Lightsail instance with no associated role runs as no AWS identity - do not assume one exists. The OS-access / IMDSv2-session precondition lives entirely in aws-lightsail-execute-as-via-instance-imds; do not duplicate it here or walk both as independent hops for the same role."
+      narrative: "Instance {instance.name} exposes {role.name} session credentials via the metadata service (169.254.169.254)."
+
+  - id: aws-lightsail-execute-as-via-instance-imds
+    emits: CanExecuteAs
+    description: "OS access to a Lightsail instance -> read IMDS -> act as the associated role."
+    match:
+      - [ ?principal, CanExecuteCommand, ?instance ]
+      - [ ?instance, ExecutesAs, ?role ]
+    where:
+      - "node_type(?instance) == VirtualMachine"
+      - "provider_type(?instance) == 'AWS::Lightsail::Instance'"
+      - "IMDS reachable from the OS session"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<associated IAM role>"
+      permissions: ["lightsail:GetInstanceAccessDetails"]
+      conditions: [service_state, network_reachability]
+      escalation: "SSH into the instance, read IMDS, and use the associated role's session credentials."
+      false_positive_note: "Requires an IAM role to be associated with the instance AND IMDS reachable. Absent an associated role, this yields OS control only, not AWS privilege escalation."
+      narrative: "{principal.name} can execute as {role.name} by getting OS access to {instance.name} and reading its instance metadata credentials."
+
+  - id: aws-lightsail-update-imds-options
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "lightsail:UpdateInstanceMetadataOptions", resource_type: "AWS::Lightsail::Instance"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Lightsail instance in scope>"
+      permissions: ["lightsail:UpdateInstanceMetadataOptions"]
+      escalation: "Re-enable IMDSv1 or raise the hop limit to widen exposure of the instance role's credentials."
+      false_positive_note: "Only meaningful for credential exposure when the instance has an associated IAM role. On its own it is a config change, not privilege gain."
+      narrative: "{principal.name} can change the instance metadata options of {target.name} (lightsail:UpdateInstanceMetadataOptions), widening IMDS credential exposure."
+
+  # --- Bucket access keys (mint / read long-lived data-plane creds) --------
+  - id: aws-lightsail-create-bucket-access-key
+    emits: CanCreateCredentialFor
+    match_effective_permission: {action: "lightsail:CreateBucketAccessKey", resource_type: "AWS::Lightsail::Bucket"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<bucket access-key identity (AccessKey/ServiceIdentity for the bucket data plane)>"
+      permissions: ["lightsail:CreateBucketAccessKey"]
+      escalation: "Mint a new long-lived bucket access key -> authenticate as the bucket's data-plane principal -> read/write bucket data from anywhere."
+      false_positive_note: "CanCreateCredentialFor targets an Identity, never the ObjectStorage resource itself. The minted key is a credential for a synthetic bucket access-key identity; the CredentialsFor edge (see aws-lightsail-bucket-access-key-credentials-for) links that identity to the bucket data."
+      narrative: "{principal.name} can mint a bucket access key for {target.name} (lightsail:CreateBucketAccessKey) and authenticate as the bucket's data-plane identity."
+
+  - id: aws-lightsail-bucket-access-key-credentials-for
+    emits: CredentialsFor
+    description: "A Lightsail bucket access key authenticates to the bucket's data plane."
+    match_record: {resource_type: "AWS::Lightsail::Bucket", field: "arn"}
+    emit:
+      source: "<bucket access-key identity (AccessKey for the bucket data plane)>"
+      target: "<Lightsail bucket data in scope>"
+      note: "Zero-cost link completing the credential chain: the minted/read bucket access key grants data-plane access to the bucket objects."
+      narrative: "Bucket access key {source.name} authenticates to the data plane of bucket {target.name}."
+
+  - id: aws-lightsail-get-bucket-access-keys
+    emits: CanReadSecret
+    match_effective_permission: {action: "lightsail:GetBucketAccessKeys", resource_type: "AWS::Lightsail::Bucket"}
+    emit:
+      source: "<principal>"
+      target: "<Lightsail bucket in scope>"
+      permissions: ["lightsail:GetBucketAccessKeys"]
+      escalation: "Read existing bucket access keys -> direct data-plane access."
+      narrative: "{principal.name} can read the access keys of bucket {target.name} (lightsail:GetBucketAccessKeys)."
+
+  # --- Relational DB master password ---------------------------------------
+  - id: aws-lightsail-get-db-master-password
+    emits: CanReadSecret
+    match_effective_permission: {action: "lightsail:GetRelationalDatabaseMasterUserPassword", resource_type: "AWS::Lightsail::Database"}
+    emit:
+      source: "<principal>"
+      target: "<Lightsail relational database in scope>"
+      permissions: ["lightsail:GetRelationalDatabaseMasterUserPassword"]
+      conditions: [network_reachability]
+      escalation: "Read the DB master password -> full data-plane access if the DB endpoint is reachable."
+      state_logic: "ACTIVE if DB endpoint reachable else CONDITIONAL(network_reachability)"
+      narrative: "{principal.name} can read the master password of database {target.name} (lightsail:GetRelationalDatabaseMasterUserPassword)."
+
+  # --- Network exposure -----------------------------------------------------
+  - id: aws-lightsail-open-public-ports
+    emits: ExposedToInternet
+    match_effective_permission: {action: "lightsail:OpenInstancePublicPorts", resource_type: "AWS::Lightsail::Instance"}
+    optional_permission: "lightsail:PutInstancePublicPorts"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<Lightsail instance in scope>"
+      target: "<AnonymousIdentity>"
+      permissions: ["lightsail:OpenInstancePublicPorts", "lightsail:PutInstancePublicPorts?"]
+      conditions: [condition_expression]
+      state_logic: "ACTIVE if a port is opened to 0.0.0.0/0 else CONDITIONAL(condition_expression on cidr)"
+      false_positive_note: "Only ExposedToInternet when the opened CIDR is 0.0.0.0/0 (or ::/0). A restricted CIDR is not internet exposure - emit CanNetworkReach scoped to that CIDR instead."
+      narrative: "Instance {source.name} can be opened to the internet via lightsail:OpenInstancePublicPorts / PutInstancePublicPorts (firewall ports opened to 0.0.0.0/0)."
+
+  # --- Snapshot export (cross-service exfiltration) ------------------------
+  - id: aws-lightsail-export-snapshot
+    emits: CanExfiltrate
+    match_effective_permission: {action: "lightsail:ExportSnapshot", resource_type: "AWS::Lightsail::InstanceSnapshot"}
+    emit:
+      source: "<principal>"
+      target: "<Lightsail instance/disk snapshot in scope>"
+      permissions: ["lightsail:ExportSnapshot"]
+      conditions: [iam_permission]
+      escalation: "Export a Lightsail snapshot to EC2/EBS, then mount the volume offline to read secrets, keys, and role config (requires EC2/EBS permissions on the follow-on)."
+      false_positive_note: "ExportSnapshot lands the image in EC2/EBS in the SAME account; reading its contents requires separate EC2/EBS permissions (ec2:DescribeSnapshots, ec2:CreateVolume, ec2:AttachVolume / OS mount) the Lightsail principal may not hold. Emit the harvest continuation only when those EC2-side permissions are present."
+      narrative: "{principal.name} can export snapshot {target.name} to EC2/EBS (lightsail:ExportSnapshot); harvesting its contents requires follow-on EC2/EBS mount permissions."
+
+  # --- Container registry image supply (feeds a deployment) ----------------
+  - id: aws-lightsail-register-container-image
+    emits: CanModifyCode
+    description: "Pushing an attacker image into the Lightsail private registry supplies the code a deployment will run."
+    match_effective_permission: {action: "lightsail:RegisterContainerImage", resource_type: "AWS::Lightsail::Container"}
+    optional_permission: "lightsail:CreateContainerServiceRegistryLogin"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Lightsail container-service private registry feeding deployments>"
+      permissions: ["lightsail:RegisterContainerImage", "lightsail:CreateContainerServiceRegistryLogin?"]
+      conditions: [trigger_exists]
+      state_logic: "CONDITIONAL(trigger_exists) until a CreateContainerServiceDeployment references the image; pushing the image alone stages code, execution requires a deployment (see aws-lightsail-container-deploy-code)."
+      false_positive_note: "RegisterContainerImage / CreateContainerServiceRegistryLogin push an image to the private registry but do not run it. Execution occurs only when a deployment (lightsail:CreateContainerServiceDeployment) references the pushed image."
+      narrative: "{principal.name} can push an attacker-controlled image to the private registry of container service {target.name} (lightsail:RegisterContainerImage), supplying code for a subsequent deployment."
+
+  # --- Instance-from-snapshot (within-account snapshot content exposure) ----
+  - id: aws-lightsail-create-instance-from-snapshot
+    emits: CanExfiltrate
+    description: "Standing up an instance from someone else's snapshot exposes the snapshot's on-disk contents within the account."
+    match_effective_permission: {action: "lightsail:CreateInstancesFromSnapshot", resource_type: "AWS::Lightsail::InstanceSnapshot"}
+    optional_permission: "lightsail:CopySnapshot"
+    emit:
+      source: "<principal>"
+      target: "<source Lightsail instance/disk snapshot in scope>"
+      permissions: ["lightsail:CreateInstancesFromSnapshot", "lightsail:CopySnapshot?"]
+      conditions: [network_reachability, service_state]
+      escalation: "Rebuild an instance from an existing snapshot (attacker may supply keyName at create -> attacker-keyed OS access), then read the snapshot's disk contents (secrets, keys, role config)."
+      false_positive_note: "Within-account analog of ExportSnapshot: reading the disk requires OS access to the new instance (attacker-supplied keyName or default key pair) and network reachability. Absent OS access this is instance creation, not a completed read."
+      narrative: "{principal.name} can create an instance from snapshot {target.name} (lightsail:CreateInstancesFromSnapshot), optionally supplying an attacker key pair, to read the snapshot's disk contents."
+
+  # --- Bucket resource access (make bucket data instance/account readable) --
+  - id: aws-lightsail-set-bucket-resource-access
+    emits: CanModifyConfiguration
+    description: "Granting resource access to a bucket makes its objects readable by an instance/account principal."
+    match_effective_permission: {action: "lightsail:SetResourceAccessForBucket", resource_type: "AWS::Lightsail::Bucket"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Lightsail bucket in scope>"
+      permissions: ["lightsail:SetResourceAccessForBucket"]
+      escalation: "Grant an instance (or account) read/write access to bucket objects without minting a data-plane key -> widened data access."
+      false_positive_note: "SetResourceAccessForBucket changes the bucket's access policy so a named Lightsail resource can read its objects; it is a config/resource-policy change, not itself a data read. Value depends on the granted principal being attacker-reachable."
+      narrative: "{principal.name} can grant resource access to bucket {target.name} (lightsail:SetResourceAccessForBucket), making its objects readable by an instance/account principal."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: if an SCP or permission boundary denies any
+# lightsail: action above at the effective scope, emit the edge with
+# state: BLOCKED and denied_by=<SCP arn/statement> so the UI explains why the
+# path does not work.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw config -> explicit edges). These belong
+# conceptually in rules/explicit/ ; recorded here for completeness.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: aws-lightsail-instance-executes-as-role
+    emits: ExecutesAs
+    description: "A Lightsail instance with an associated IAM role runs as that role (creds via IMDS)."
+    match_record: {resource_type: "AWS::Lightsail::Instance", field: "associatedIamRole"}
+    where:
+      - "instance has an associated IAM role"
+    emit:
+      source: "<Lightsail instance>"
+      target: "<associated IAM role>"
+      note: "Zero-cost fact. Absent an associated role, emit NO ExecutesAs - the instance runs as no AWS identity."
+      narrative: "Instance {instance.name} executes as {role.name}."
+
+  - id: aws-lightsail-container-executes-as-service-identity
+    emits: ExecutesAs
+    description: "A container service runs its containers under a Lightsail-managed service execution context."
+    match_record: {resource_type: "AWS::Lightsail::Container", field: "arn"}
+    emit:
+      source: "<container service>"
+      target: "<Lightsail-managed ServiceIdentity>"
+      note: "Not a customer-chosen IAM role; narrow managed context."
+      narrative: "Container service {service.name} executes as a Lightsail-managed service identity."

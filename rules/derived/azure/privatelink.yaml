@@ -1,0 +1,509 @@
+# Azure Private Link — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# Covers: Microsoft.Network/privateEndpoints, Microsoft.Network/privateLinkServices,
+#         Microsoft.Network/privateDnsZones, per-resource privateEndpointConnections.
+#
+# Core attack surface:
+#   (1) PRIVATE CONNECTIVITY — an Approved PE with DNS configured makes a PaaS
+#       resource (Key Vault, Storage, SQL, Service Bus, etc.) reachable at a
+#       private VNet IP from any compute in the same VNet or a peered VNet.
+#       This bypasses the resource's public firewall from a foothold in the VNet.
+#
+#   (2) CONNECTION APPROVAL ABUSE — an identity with
+#       <resource>/privateEndpointConnections/write can approve a PE connection
+#       from an attacker-controlled VNet, granting that VNet private access.
+#
+#   (3) DNS HIJACK — write access to a private DNS zone's A records lets an
+#       attacker redirect in-VNet FQDN resolution for a PaaS service to an
+#       attacker-controlled IP (credential interception / MITM).
+#
+#   (4) PE DNS GROUP WRITE — relinking a PE's privateDnsZoneGroup to an
+#       attacker-controlled zone redirects resolution for that single PE.
+#
+#   (5) PRIVATE LINK SERVICE — creating a PLS fronting an attacker backend
+#       intercepts network traffic from any consumer VNet that connects to it.
+#
+#   (6) CROSS-SUBSCRIPTION PE APPROVAL — approving a PE connection from another
+#       subscription records a network-level cross-subscription trust.
+#
+# Permissions are exact Microsoft.Network / per-resource operation strings from
+# the Azure RP operations reference (2026-09 snapshot). No permissions invented.
+#
+# Transitive network reachability (PE + NSG + peering composing into end-to-end
+# reach) is a FUTURE provider-agnostic network-chains linchpin. Emit FACTS only.
+#
+# can-control.yaml is CITED, not duplicated: CanAdminister -> Controls derivations
+# for PE objects are handled there.
+#
+# NOTE: azure-vnet-private-endpoint-fact in vnet.yaml emits a generic
+# PrivateReachability fact from the Microsoft.Network/privateEndpoints ARM record.
+# The rules below extend that fact with service-specific attack vectors (approval
+# abuse, DNS hijack, cross-subscription trust) that are specific to the Private
+# Link attack surface and are not covered by the VNet rules.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 8-networking
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # SECTION 1 — PRIVATE CONNECTIVITY: PE → PaaS private reachability
+  # ===========================================================================
+
+  - id: azure-pl-pe-private-reachability
+    emits: PrivateReachability
+    description: >-
+      An Approved private endpoint with a working private DNS zone group makes the
+      backing PaaS resource (Key Vault, Storage, SQL, etc.) reachable at a private IP
+      from any compute in the same VNet or a peered VNet — bypassing the public firewall.
+    where:
+      - "Microsoft.Network/privateEndpoints resource with properties.provisioningState == 'Succeeded'"
+      - "properties.privateLinkServiceConnections[].privateLinkServiceConnectionState.status == 'Approved'"
+      - "properties.privateDnsZoneGroups is non-empty (DNS zone group linking the PE to a private zone)"
+      - "the private DNS zone has an A record mapping the PaaS service FQDN to the PE's private IP"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<Compute resource located in the same VNet as the PE's subnet, or in a peered VNet with allowVirtualNetworkAccess=true>"
+      target: "<private endpoint node (and the PaaS resource it fronts)>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): the PE is approved and DNS resolves, but actual
+        reachability from a specific compute source requires:
+          (a) source is in the same VNet as the PE subnet, OR
+          (b) source is in a peered VNet with allowVirtualNetworkAccess=true, OR
+          (c) source is connected via a VPN/ExpressRoute that routes to the PE subnet.
+        Additionally, if PrivateLinkNetworkPolicies == Enabled on the PE subnet, NSG rules
+        on that subnet must allow the source IP. Emit ACTIVE only when the source is
+        confirmed in the same subnet or VNet with no blocking NSG confirmed.
+        Do NOT emit if provisioningState != Succeeded or connection status != Approved.
+      derived_from: ["<PE ARM record (provisioningState + connectionState)>", "<privateDnsZoneGroup record>", "<private DNS zone A record>"]
+      false_positive_note: >-
+        Three independent facts must ALL hold: (1) PE provisioningState == Succeeded,
+        (2) connection status == Approved (not Pending or Rejected), (3) a private DNS
+        zone group is attached and the zone has an A record mapping the service FQDN
+        to the PE's private IP. Missing any of these means the PE either carries no
+        traffic (not Approved) or DNS still resolves to the public IP (no zone/record).
+        Also: if publicNetworkAccess is STILL Enabled on the target resource, the PE
+        provides an ADDITIONAL private path but does not make the resource PE-only. Do
+        not mark the resource as firewall-restricted unless publicNetworkAccess == Disabled.
+        If PrivateLinkNetworkPolicies == Enabled on the PE subnet, NSG rules apply to PE
+        traffic — confirm no blocking rule before emitting ACTIVE.
+      narrative: >-
+        Private endpoint {target.name} is Approved and DNS-configured for {linkedService.name};
+        any compute in VNet {vnet.name} (or a peered VNet) can reach {linkedService.name}
+        at its private IP without an internet path, bypassing the public firewall.
+
+  # ===========================================================================
+  # SECTION 2 — CONNECTION APPROVAL ABUSE: approve PE from attacker VNet
+  # ===========================================================================
+
+  - id: azure-pl-approve-connection
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to a PaaS resource's privateEndpointConnections lets an attacker
+      approve a PE connection from an attacker-controlled VNet, granting that VNet
+      private network access to the resource — bypassing its public firewall.
+    match_effective_permission:
+      action: "<resource-type>/privateEndpointConnections/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - >-
+        Effective permission is one of:
+        Microsoft.KeyVault/vaults/privateEndpointConnections/write,
+        Microsoft.Storage/storageAccounts/privateEndpointConnections/write,
+        Microsoft.Sql/servers/privateEndpointConnections/write,
+        Microsoft.ServiceBus/namespaces/privateEndpointConnections/write,
+        Microsoft.DocumentDB/databaseAccounts/privateEndpointConnections/write,
+        Microsoft.Cache/redis/privateEndpointConnections/write,
+        Microsoft.ContainerRegistry/registries/privateEndpointConnections/write,
+        Microsoft.CognitiveServices/accounts/privateEndpointConnections/write,
+        Microsoft.Search/searchServices/privateEndpointConnections/write,
+        or any resource-type equivalent included via Contributor / Owner.
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<PaaS resource (Key Vault / Storage / SQL / etc.) that owns the PE connection>"
+      permissions:
+        - "Microsoft.KeyVault/vaults/privateEndpointConnections/write"
+        - "Microsoft.Storage/storageAccounts/privateEndpointConnections/write"
+        - "Microsoft.Sql/servers/privateEndpointConnections/write"
+        - "Microsoft.ServiceBus/namespaces/privateEndpointConnections/write"
+        - "Microsoft.DocumentDB/databaseAccounts/privateEndpointConnections/write"
+        - "Microsoft.Cache/redis/privateEndpointConnections/write"
+        - "Microsoft.ContainerRegistry/registries/privateEndpointConnections/write"
+        - "Microsoft.CognitiveServices/accounts/privateEndpointConnections/write"
+        - "Microsoft.Search/searchServices/privateEndpointConnections/write"
+      state_logic: >-
+        ACTIVE: the principal can immediately approve any pending PE connection on the
+        resource. The capability is realized at approval time; a Pending PE from an
+        attacker VNet may or may not exist yet. If only Pending connections exist in
+        an attacker-controlled subscription: ACTIVE (attacker creates PE + approves).
+        If no Pending connections exist: POTENTIAL (attacker must first create a PE
+        in a VNet they control, then approve it using this permission).
+      derived_from: ["<effective permission record: <resource>/privateEndpointConnections/write>"]
+      false_positive_note: >-
+        Approving a PE connection grants NETWORK-LAYER access to the resource from
+        the consumer VNet; data-plane authentication (RBAC or SAS key or connection
+        string) is STILL required for actual data access. This edge models the network
+        control capability, not data-plane auth. A deny assignment covering
+        privateEndpointConnections/write at the resource or RG scope -> emit BLOCKED.
+        Contributor and Owner roles include this capability via the wildcard action.
+        Reader and custom roles without explicit */write do NOT have it.
+      narrative: >-
+        {principal.name} can approve private endpoint connection requests on
+        {target.name} (privateEndpointConnections/write). Approving a PE from an
+        attacker-controlled VNet grants that VNet private network access to
+        {target.name}, bypassing its public firewall.
+
+  - id: azure-pl-pls-cross-tenant
+    emits: CrossTenantTrust
+    description: >-
+      A Private Link Service configured to accept connections from other tenants
+      (via properties.autoApproval or explicit allowedSubscriptions from cross-tenant
+      subscriptions) records a cross-tenant network trust. A PE from a different tenant
+      connecting to this PLS extends network reachability and access across the tenant
+      boundary.
+    where:
+      - "Microsoft.Network/privateLinkServices resource with properties.autoApproval.subscriptions containing subscription IDs from different Entra tenants"
+      - "OR properties.visibility.subscriptions includes external-tenant subscriptions"
+    emit:
+      source_type: ApplicationIdentity
+      target_type: Tenant
+      source: "<Private Link Service (records the cross-tenant authorization)>"
+      target: "<external Entra tenant whose subscription can connect to this PLS>"
+      permissions: []
+      properties:
+        cross_tenant: true
+        pls_tenant: "<Entra tenant owning the PLS>"
+        consumer_tenant: "<external Entra tenant of the PE-creating subscription>"
+      state_logic: >-
+        ACTIVE: if the PLS properties explicitly list auto-approval or visibility settings
+        allowing subscriptions from a different tenant, the cross-tenant trust is in effect.
+        A PE from that tenant's subscription can connect to the PLS immediately (auto-approval)
+        or after PLS owner approval (still cross-tenant).
+      derived_from: ["<PLS properties: autoApproval.subscriptions or visibility.subscriptions>"]
+      false_positive_note: >-
+        The PLS must explicitly allow subscriptions from external tenants via autoApproval or
+        visibility configuration. If the PLS allows "*" (any subscription), this is effectively
+        a cross-tenant trust to all external tenants. If the PLS restricts to internal tenants
+        only, no cross-tenant edge. Clarify the tenant ownership via subscription ID lookup.
+      narrative: >-
+        Private Link Service {pls.name} allows automatic or approved connections from
+        subscriptions in external Entra tenant {consumerTenant.name}. This records a
+        cross-tenant network trust enabling PE-based access to the PLS backend from
+        that external tenant.
+
+  # ===========================================================================
+  # SECTION 3 — CROSS-SUBSCRIPTION PE: private reachability across subs
+  # ===========================================================================
+
+  - id: azure-pl-cross-sub-pe-trust
+    emits: PrivateReachability
+    description: >-
+      An Approved private endpoint connection that crosses subscription boundaries extends
+      private network reach across the subscription boundary: a foothold in the consumer
+      VNet (sub A) gains private network access to the PaaS resource in the provider
+      subscription (sub B).
+    where:
+      - "Microsoft.Network/privateEndpoints PE record: properties.provisioningState == 'Succeeded'"
+      - "properties.privateLinkServiceConnections[].privateLinkServiceConnectionState.status == 'Approved'"
+      - "PE subscription-segment of properties.id != subscription-segment of the backing resource's id"
+      - "private DNS zone group is attached and A record resolves the PaaS FQDN to the PE private IP"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<Compute resource in the consumer VNet (the VNet hosting the PE)>"
+      target: "<private endpoint node (in the consumer subscription, fronting the cross-sub PaaS resource)>"
+      permissions: []
+      properties:
+        cross_subscription: true
+        consumer_subscription: "<subscription hosting the PE>"
+        provider_subscription: "<subscription hosting the PaaS resource>"
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): connection is Approved and DNS resolves, but
+        source must be confirmed in the consumer VNet. ACTIVE when source compute is in the
+        same or peered VNet as the PE subnet with no blocking NSG. CONDITIONAL if only one
+        subscription is in collected inventory (collection gap on the other side).
+      derived_from: ["<PE ARM record (cross-subscription connection, Approved state)>", "<privateDnsZoneGroup record>"]
+      false_positive_note: >-
+        Same conditions as azure-pl-pe-private-reachability: PE must be Approved, DNS
+        must resolve, and source must be in the same/peered VNet. Additionally, the
+        cross-subscription check requires confirming BOTH subscription IDs differ (from
+        the PE's resource ID vs. the privateLinkServiceId). ARM RBAC does NOT cross
+        subscription boundaries via a PE — only network traffic flows cross-sub.
+        Pending connections do not carry traffic; do not emit for Pending state.
+      narrative: >-
+        Private endpoint {target.name} (in subscription {consumerSub.id}) has an Approved
+        cross-subscription connection to {linkedService.name} (in subscription {providerSub.id}).
+        A foothold in the consumer VNet grants private network access to {linkedService.name}
+        across the subscription boundary without traversing the internet.
+
+  - id: azure-pl-cross-sub-pe-authz
+    emits: CrossAccountTrust
+    description: >-
+      An Approved private endpoint connection from a different subscription records an
+      authorization relationship: the resource owner (in the provider subscription) has
+      approved a network connection from an external (consumer) subscription. This models
+      the cross-subscription trust relationship established by the approval.
+    where:
+      - "Microsoft.Network/privateEndpoints PE record: properties.provisioningState == 'Succeeded'"
+      - "properties.privateLinkServiceConnections[].privateLinkServiceConnectionState.status == 'Approved'"
+      - "PE subscription-segment of properties.id != subscription-segment of the backing resource's id"
+      - "The PaaS resource's privateEndpointConnections array contains this PE connection with status=Approved"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Subscription
+      source: "<resource policy approval record (the privateEndpointConnections entry on the backing resource)>"
+      target: "<consumer subscription (the external subscription hosting the PE)>"
+      permissions: []
+      properties:
+        cross_subscription: true
+        provider_subscription: "<subscription hosting the PaaS resource>"
+        consumer_subscription: "<external subscription hosting the PE>"
+      state_logic: >-
+        ACTIVE: the approval is recorded and in effect (connection status = Approved).
+        The cross-subscription trust is now materialized, allowing network traffic to flow
+        from the consumer subscription's VNet to the provider's PaaS resource.
+      derived_from: ["<PE connection record in PaaS resource's privateEndpointConnections, status=Approved>"]
+      false_positive_note: >-
+        This edge models the AUTHORIZATION relationship (cross-subscription trust),
+        separate from the network REACHABILITY fact (modeled by azure-pl-cross-sub-pe-trust).
+        The approval is a policy decision by the resource owner; the network path is the
+        technical realization. Both edges are needed for complete attack-path modeling.
+      narrative: >-
+        PaaS resource {linkedService.name} (in subscription {providerSub.id}) has approved
+        a PE connection from subscription {consumerSub.id}. This records a cross-subscription
+        trust relationship enabling the external subscription's network access to the resource.
+
+  # ===========================================================================
+  # SECTION 4 — DNS HIJACK: private DNS zone record writes
+  # ===========================================================================
+
+  - id: azure-pl-dns-zone-record-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to A or CNAME records in a private DNS zone (e.g.,
+      privatelink.vaultcore.azure.net) lets an attacker redirect in-VNet FQDN
+      resolution for a PaaS service to an attacker-controlled IP — intercepting
+      credentials or data sent to that service from any linked VNet.
+    match_effective_permission:
+      action: "Microsoft.Network/privateDnsZones/A/write OR Microsoft.Network/privateDnsZones/*/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal>"
+      target: "<private DNS zone (e.g., privatelink.vaultcore.azure.net)>"
+      permissions:
+        - "Microsoft.Network/privateDnsZones/A/write"
+        - "Microsoft.Network/privateDnsZones/CNAME/write"
+        - "Microsoft.Network/privateDnsZones/*/write"
+      conditions: [service_state]
+      state_logic: >-
+        CONDITIONAL(service_state): the principal can immediately write or overwrite
+        A/CNAME records in the zone. Impact is realized ONLY if at least one VNet has
+        an active virtual network link to this zone (DNS resolution propagates to that VNet
+        on next TTL expiry). Emit ACTIVE when at least one virtualNetworkLink exists with
+        provisioningState=Succeeded. If no linked VNets are found in inventory, emit
+        CONDITIONAL with condition_note='no VNet link confirmed; zone record write may
+        have no effect if not linked'. Effect extends to all linked VNets — check
+        virtualNetworkLinks to scope the blast radius.
+      derived_from: ["<effective permission record: privateDnsZones/A/write or privateDnsZones/*/write>"]
+      false_positive_note: >-
+        Private DNS zones affect name resolution ONLY within VNets that have a virtual
+        network link (autoRegistration=true or false) to the zone. If no VNet is linked,
+        the record write has no effect on resolution. Confirm that at least one VNet
+        is linked to the zone before emitting ACTIVE. Private DNS zone write does NOT affect
+        public DNS resolution (Azure-managed zones like vault.azure.net, blob.core.windows.net
+        are separate public zones). Do NOT emit for public DNS zones (Microsoft.Network/dnsZones)
+        — those are covered by azure-vnet-dns-record-write in vnet.yaml.
+        Private DNS Zone Contributor (role def b12aa53e-6015-4669-85d0-8515ebb3ae7f) grants
+        this capability; Network Contributor does NOT grant private DNS write unless
+        explicitly scoped. Deny assignments at the zone or RG scope block this -> BLOCKED.
+      narrative: >-
+        {principal.name} can write A/CNAME records in private DNS zone {target.name}
+        (privateDnsZones/*/write). If the zone is linked to at least one VNet,
+        overwriting the A record for the PaaS service FQDN redirects in-VNet DNS
+        resolution to an attacker-controlled IP, enabling MITM interception of
+        credentials or data.
+
+  # ===========================================================================
+  # SECTION 5 — DNS ZONE VNet LINK WRITE: expand zone blast radius
+  # ===========================================================================
+
+  - id: azure-pl-dns-zone-vnet-link-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to virtual network links in a private DNS zone lets an attacker
+      link additional VNets to the zone, expanding the blast radius of a compromised
+      or attacker-controlled DNS zone to additional VNets whose resources now resolve
+      PaaS FQDNs via the attacker-influenced zone.
+    match_effective_permission:
+      action: "Microsoft.Network/privateDnsZones/virtualNetworkLinks/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal>"
+      target: "<private DNS zone>"
+      permissions:
+        - "Microsoft.Network/privateDnsZones/virtualNetworkLinks/write"
+      state_logic: >-
+        ACTIVE: the principal can immediately create a new virtual network link to the
+        zone from any VNet they can reference (requires at minimum read access on the
+        target VNet to reference its ID). The zone's A records immediately apply to
+        the newly linked VNet on the next DNS refresh.
+      derived_from: ["<effective permission record: privateDnsZones/virtualNetworkLinks/write>"]
+      false_positive_note: >-
+        Linking a VNet to a zone does NOT grant any data-plane access on the VNet or
+        its resources; it only changes DNS resolution within that VNet. If the zone
+        already has accurate/benign A records, this capability alone is low-impact.
+        The attack value is realized only when combined with zone record write
+        (azure-pl-dns-zone-record-write) or when the zone is attacker-controlled.
+        Deny assignments at the zone or RG scope block this -> BLOCKED.
+      narrative: >-
+        {principal.name} can add virtual network links to private DNS zone {target.name}
+        (privateDnsZones/virtualNetworkLinks/write). This can extend a compromised or
+        attacker-controlled zone's reach to additional VNets, hijacking PaaS FQDN
+        resolution within those VNets.
+
+  # ===========================================================================
+  # SECTION 6 — PE DNS GROUP WRITE: redirect single PE's DNS resolution
+  # ===========================================================================
+
+  - id: azure-pl-pe-dnsgroup-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to a private endpoint's privateDnsZoneGroups lets an attacker
+      re-link the PE to an attacker-controlled private DNS zone, redirecting DNS
+      resolution of the PaaS service FQDN for that specific PE to an arbitrary IP.
+    match_effective_permission:
+      action: "Microsoft.Network/privateEndpoints/privateDnsZoneGroups/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: PrivateEndpoint
+      source: "<principal>"
+      target: "<private endpoint>"
+      permissions:
+        - "Microsoft.Network/privateEndpoints/privateDnsZoneGroups/write"
+      conditions: [service_state]
+      state_logic: >-
+        CONDITIONAL(service_state): the principal can immediately replace or add a DNS
+        zone group on the PE, re-linking it to an attacker-controlled private DNS zone.
+        Emit ACTIVE if the attacker already controls or can write to a private DNS zone
+        that is accessible from the PE's VNet (service_state=zone-exists-and-attacker-controls).
+        If the attacker must first create an attacker-controlled zone: emit POTENTIAL
+        (service_state=zone-not-yet-created). The DNS zone must exist and be provisioned
+        for the re-linking to have effect.
+      derived_from: ["<effective permission record: privateEndpoints/privateDnsZoneGroups/write>"]
+      false_positive_note: >-
+        This capability targets a SPECIFIC PE (not a zone-wide attack). The attacker
+        must reference a private DNS zone they control or can write to — this edge does
+        not in isolation imply zone control. Requires Network Contributor or a custom
+        role granting privateEndpoints/privateDnsZoneGroups/write at the PE, RG, or
+        sub scope. Deny assignments -> BLOCKED. Lower blast radius than zone record
+        write (only affects resolution via this specific PE).
+      narrative: >-
+        {principal.name} can overwrite the DNS zone group on private endpoint {target.name}
+        (privateEndpoints/privateDnsZoneGroups/write). If an attacker-controlled private
+        DNS zone is available, this redirects DNS resolution of the PaaS service FQDN
+        to an arbitrary IP.
+
+  # ===========================================================================
+  # SECTION 7 — PRIVATE LINK SERVICE: traffic interception
+  # ===========================================================================
+
+  - id: azure-pl-pls-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to a Private Link Service (PLS) lets an attacker create or modify
+      a PLS that fronts an attacker-controlled backend. This edge models the control-plane
+      write capability (can create/modify a PLS), not the data-plane traffic interception
+      (which is conditional on a consumer connecting to it).
+    match_effective_permission:
+      action: "Microsoft.Network/privateLinkServices/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: PrivateEndpoint
+      source: "<principal>"
+      target: "<Private Link Service>"
+      permissions:
+        - "Microsoft.Network/privateLinkServices/write"
+      state_logic: >-
+        ACTIVE: the principal can immediately create or modify a PLS. The write
+        capability is directly exercisable. Network traffic interception is realized only
+        after a consumer VNet creates a PE to this PLS and the connection is approved;
+        that traffic-flow scenario is modeled by a separate derived rule (see below).
+      derived_from: ["<effective permission record: privateLinkServices/write>"]
+      false_positive_note: >-
+        A PLS routes network traffic to a backend load-balancer IP; TLS is terminated
+        by the backend application. If the PaaS service uses TLS with certificate pinning
+        or mutual TLS, simple traffic redirection will not yield plaintext interception
+        (but may cause connection failures or DoS). The high-value case is PLS fronting
+        a cleartext or attacker-TLS-terminated service. Also: PLS requires an internal
+        Azure Standard Load Balancer frontend as the origin; the attacker must control
+        compute behind that LB to actually intercept traffic. Network Contributor
+        includes privateLinkServices/write; Contributor/Owner inherit it.
+      narrative: >-
+        {principal.name} can write Private Link Service {target.name}
+        (privateLinkServices/write), enabling creation or modification of a PLS.
+
+  - id: azure-pl-pls-traffic-interception
+    emits: PrivateReachability
+    description: >-
+      When a consumer PE is Approved and connected to an attacker-controlled Private Link
+      Service, network traffic from the consumer VNet is routed to the attacker's backend.
+      This models the realized traffic-interception attack scenario (distinct from the
+      write capability).
+    where:
+      - "Private Link Service exists with properties.provisioningState == 'Succeeded'"
+      - "A consumer PE connection to this PLS exists with status == 'Approved'"
+      - "The PLS fronts an attacker-controlled backend (sourced from threat model or collection)"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<Compute resources in the consumer VNet hosting the PE"
+      target: "<Private Link Service (fronting attacker backend)>"
+      permissions: []
+      conditions: [trigger_exists]
+      state_logic: >-
+        CONDITIONAL(trigger_exists): traffic interception is realized only when a consumer
+        PE is Approved and connects to the attacker-controlled PLS. Emit ACTIVE when an
+        Approved consumer PE connection exists in inventory. If only the PLS exists but no
+        consumer PE is Approved yet, emit POTENTIAL (attack requires getting a victim to
+        connect).
+      derived_from: ["<PLS provisioned + Approved consumer PE connection>"]
+      false_positive_note: >-
+        This rule assumes the PLS backend is attacker-controlled. If the PLS legitimately
+        fronts a defender-controlled backend, this is not an attack edge. The separation of
+        this rule from azure-pl-pls-write clarifies that the control-plane capability is
+        always ACTIVE but data-plane impact is conditional.
+      narrative: >-
+        Private Link Service {target.name} (fronting attacker backend) receives an Approved
+        PE connection from consumer VNet {consumerVNet.name}. Traffic from that VNet is now
+        routed to the attacker's backend — network MITM / credential harvesting.
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - Any deny assignment (Azure Blueprint / Managed Application) covering
+#     privateEndpoints/write, privateEndpointConnections/write, privateDnsZones/*/write,
+#     or privateLinkServices/write at the relevant scope -> emit with state: BLOCKED
+#     and denied_by=<deny assignment id>.
+#   - Azure Policy (deny effect) blocking privateEndpointConnections/write at
+#     specific scopes -> BLOCKED for azure-pl-approve-connection in that scope.
+#   - A deny assignment blocking Microsoft.Network/privateDnsZones/*/write ->
+#     BLOCKED for azure-pl-dns-zone-record-write and azure-pl-dns-zone-vnet-link-write.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw config -> explicit edges) now reside in
+# /rules/explicit/azure-privatelink.yaml to properly segregate explicit edges
+# (nature: explicit) from derived rules (nature: derived).

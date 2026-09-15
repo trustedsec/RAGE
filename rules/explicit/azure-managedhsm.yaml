@@ -1,0 +1,149 @@
+# Normalizing Azure Managed HSM (Microsoft.KeyVault/managedHSMs) into explicit edges.
+# The adapter must collect BOTH the ARM pool (Microsoft.KeyVault/managedHSMs) and,
+# via the data plane, the keys and the LOCAL role assignments/definitions
+# (Microsoft.KeyVault/managedHsm/roleAssignments|roleDefinitions). Data-plane
+# collection requires a local role granting keys/read + roleAssignments/read
+# (e.g. Managed HSM Crypto Auditor) — Azure RBAC Reader is NOT sufficient.
+#
+# CRITICAL: crypto edges below are emitted ONLY from Managed HSM LOCAL role
+# assignments' dataActions, NEVER from Azure RBAC. Azure RBAC over the pool
+# normalizes only to CanAdminister on the pool object (management-plane).
+
+rules:
+
+  # --- Inventory: pool (KMS boundary) contains keys -------------------------
+  # Contains requires an AdministrativeBoundary source. The Managed HSM pool is
+  # modeled as a boundary node (ManagementService that ALSO acts as the KMS/
+  # containment boundary for its keys), mirroring the aws-cloudhsm precedent where
+  # the account/region boundary Contains the cluster. Derived rules bind ?key via
+  # this Contains edge.
+  - id: azure-mhsm-contains-key
+    emits: Contains
+    applies_to: [azure]
+    match_record: {resource_type: "Microsoft.KeyVault/managedHSMs/keys", field: "id"}
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: "*"
+      source: "<Managed HSM pool boundary node (AdministrativeBoundary/KMS boundary)>"
+      target: "<key node>"
+      api_source: "GET {hsm}/keys"
+      evidence_field: "id"
+      narrative: "Managed HSM pool {pool.name} contains HSM key {key.name}."
+
+  # --- Local role assignment attached to a principal (HasPolicy) ------------
+  # The assignment's scope ('/' = whole pool, or a specific key id) is carried on
+  # the assignment record itself and consulted in the derived rules' where-clause
+  # ("?assignment.scope covers ?key"); no separate structural key-scope edge is
+  # emitted (AttachedTo forbids a Policy source).
+  - id: azure-mhsm-local-role-assignment
+    emits: HasPolicy
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.KeyVault/managedHsm/roleAssignments"
+      field: "properties.principalId"
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<principal (properties.principalId)>"
+      target: "<local role assignment node (Policy)>"
+      api_source: "GET {hsm}/RoleAssignments"
+      evidence_field: "properties.roleDefinitionId + properties.scope"
+      narrative: "{principal.name} holds Managed HSM local role {roleDefinition.name} at scope {scope}."
+
+  # --- Data action -> CanDecrypt (Crypto User only) -------------------------
+  - id: azure-mhsm-can-decrypt
+    emits: CanDecrypt
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.KeyVault/managedHsm/keys/decrypt/action"
+      resource_type: "Microsoft.KeyVault/managedHSMs/keys"
+    where:
+      - "the effective grant is a Managed HSM LOCAL role dataAction carrying keys/decrypt/action (Crypto User only — Crypto Officer does NOT hold any crypto data action), NOT Azure RBAC"
+      - "(also emit for Microsoft.KeyVault/managedHsm/keys/unwrap/action)"
+    emit:
+      target_type: EncryptionKey
+      source: "<principal>"
+      target: "<key node>"
+      api_source: "GET {hsm}/RoleAssignments + roleDefinition dataActions"
+      permissions: ["Microsoft.KeyVault/managedHsm/keys/decrypt/action", "Microsoft.KeyVault/managedHsm/keys/unwrap/action"]
+      narrative: "{principal.name} can decrypt/unwrap with {key.name} (Managed HSM local Crypto role)."
+
+  # --- Data action -> CanSignAs (Crypto User only) --------------------------
+  - id: azure-mhsm-can-sign
+    emits: CanSignAs
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.KeyVault/managedHsm/keys/sign/action"
+      resource_type: "Microsoft.KeyVault/managedHSMs/keys"
+    where:
+      - "effective grant is a Managed HSM LOCAL role dataAction carrying keys/sign/action (Crypto User only — Crypto Officer does NOT hold any crypto data action), NOT Azure RBAC"
+      - "key.keyOps includes 'sign'"
+    emit:
+      source_type: Identity
+      target_type: SigningKey
+      source: "<principal>"
+      target: "<key node (SigningKey)>"
+      api_source: "GET {hsm}/RoleAssignments + roleDefinition dataActions"
+      permissions: ["Microsoft.KeyVault/managedHsm/keys/sign/action"]
+      narrative: "{principal.name} can sign with {key.name} (Managed HSM local Crypto role)."
+
+  # --- Data action -> CanExportKey (keys/release: Crypto User OR Crypto Service Release User) -------------
+  - id: azure-mhsm-can-release
+    emits: CanExportKey
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.KeyVault/managedHsm/keys/release/action"
+      resource_type: "Microsoft.KeyVault/managedHSMs/keys"
+    where:
+      - "effective grant is a Managed HSM LOCAL role carrying keys/release/action (Crypto User OR Crypto Service Release User — match on the data action, not a single role name)"
+      - "key.attributes.exportable == true AND a release policy is present (else do not emit — see derived rule state)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<key node>"
+      api_source: "GET {hsm}/RoleAssignments + GET {hsm}/keys/{name} (exportable, release_policy)"
+      permissions: ["Microsoft.KeyVault/managedHsm/keys/release/action"]
+      narrative: "{principal.name} can request Secure Key Release of exportable key {key.name}."
+
+  # --- Data action -> CanGrantPermission (roleAssignments/write: Administrator, Crypto Officer, or Policy Administrator) --------------------
+  - id: azure-mhsm-can-grant-role
+    emits: CanGrantPermission
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.KeyVault/managedHsm/roleAssignments/write/action"
+      resource_type: "Microsoft.KeyVault/managedHSMs"
+    where:
+      - "effective grant is a Managed HSM LOCAL role dataAction carrying roleAssignments/write/action (Managed HSM Administrator, Crypto Officer, OR Policy Administrator — match on the data action, not a single role name)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<principal>"
+      api_source: "GET {hsm}/RoleAssignments + roleDefinition dataActions"
+      permissions: ["Microsoft.KeyVault/managedHsm/roleAssignments/write/action"]
+      narrative: "{principal.name} holds a Managed HSM local role with roleAssignments/write (Administrator, Crypto Officer, or Policy Administrator) and can grant local roles (incl. to itself)."
+
+  # --- Azure RBAC over the pool -> CanAdminister (management-plane ONLY) -----
+  - id: azure-mhsm-mgmt-admin
+    emits: CanAdminister
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.KeyVault/managedHSMs/write"
+      resource_type: "Microsoft.KeyVault/managedHSMs"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Managed HSM pool node>"
+      api_source: "Azure RBAC role assignments (ARM)"
+      permissions: ["Microsoft.KeyVault/managedHSMs/write"]
+      false_positive_note: >-
+        CRITICAL GUARD: this grants control of the ARM pool object (networking,
+        purge protection, initiating security-domain recovery) but does NOT grant
+        ANY data-plane key usage. Do NOT chain this to CanDecrypt/CanSignAs/
+        CanExportKey. A subscription Owner / Managed HSM Contributor is NOT a crypto
+        operator on a Managed HSM. The only data-plane path from here is initiating
+        security-domain recovery (derived azure-mhsm-security-domain-clone), which
+        requires out-of-band SD custody. State: ACTIVE for management-plane control;
+        BLOCKED if an Azure deny assignment denies managedHSMs/write at scope.
+      narrative: "{principal.name} controls the Managed HSM pool at the ARM layer (NOT data-plane key usage)."

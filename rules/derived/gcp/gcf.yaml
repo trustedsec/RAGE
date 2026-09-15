@@ -1,0 +1,413 @@
+# GCP Cloud Functions — Phase 4 execution / attack-path rules
+# ---------------------------------------------------------------------------
+# Catalog key gcp:gcf. Emits COMMON edges from schema/edges.yaml only.
+# Permissions are the EFFECTIVE cloudfunctions.* / iam.* actions the evaluator
+# must confirm on the given resource scope before the edge is emitted.
+#
+# Central pivot: a Cloud Function ExecutesAs its RUNTIME SERVICE ACCOUNT
+# (function.serviceAccountEmail; default PROJECT_ID@appspot.gserviceaccount.com,
+# usually roles/editor). Any way to run attacker code in the function -> that
+# SA's token via the metadata server.
+#
+# State discipline:
+#   - Code/config change WITHOUT an existing event trigger and WITHOUT invoke/
+#     call permission -> CONDITIONAL(trigger_exists).
+#   - Runtime-SA attach/change requires iam.serviceAccounts.actAs on that SA
+#     (per-SA scope); missing actAs -> POTENTIAL.
+#   - IAM inheritance: project-scoped grant applies to all functions; keep the
+#     target scope precise (never widen a function-scoped grant to project-wide).
+#   - IAM deny policy / org policy denying an action -> BLOCKED (denied_by=...).
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 4-compute-serverless
+service: gcf
+applies_to: [gcp]
+
+rules:
+
+  # --- Explicit: function runs as its runtime service account ----------------
+  - id: gcp-gcf-executes-as
+    emits: ExecutesAs
+    match_record: {resource_type: "google.cloudfunctions.Function", field: "serviceAccountEmail"}
+    where: ["runtime SA = serviceAccountEmail, or PROJECT_ID@appspot.gserviceaccount.com if unset"]
+    emit:
+      source_type: Compute
+      source: "<function>"
+      target: "<runtime service account>"
+      permissions: []
+      note: "Zero-cost fact. Default appspot SA typically holds roles/editor."
+      narrative: "{function.name} executes as runtime service account {sa.name}."
+
+  # --- Code modification -----------------------------------------------------
+  - id: gcp-gcf-source-code-set
+    emits: CanModifyCode
+    match_effective_permission: {action: "cloudfunctions.functions.sourceCodeSet", resource_type: "google.cloudfunctions.Function"}
+    alt_permission: "cloudfunctions.functions.update"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<function in scope>"
+      permissions: ["cloudfunctions.functions.sourceCodeSet", "cloudfunctions.functions.update"]
+      escalation: "Replace deployed source, then trigger/invoke to run code as the runtime SA."
+      narrative: "{principal.name} can replace the source of {function.name} (cloudfunctions.functions.sourceCodeSet)."
+
+  # --- Configuration modification (env/secret/runtime + runtime SA field) ----
+  - id: gcp-gcf-update-config
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "cloudfunctions.functions.update", resource_type: "google.cloudfunctions.Function"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<function in scope>"
+      permissions: ["cloudfunctions.functions.update"]
+      escalation: "Change env vars / secrets / entry point (code injection) or repoint the runtime SA."
+      note: "Repointing serviceAccountEmail additionally needs iam.serviceAccounts.actAs on the new SA."
+      narrative: "{principal.name} can update the configuration of {function.name} (cloudfunctions.functions.update)."
+
+  # --- Invocation, 1st gen (completes an execution escalation) ---------------
+  - id: gcp-gcf-invoke
+    emits: CanInvoke
+    match_effective_permission: {action: "cloudfunctions.functions.invoke", resource_type: "google.cloudfunctions.Function"}
+    alt_permission: "cloudfunctions.functions.call"
+    where:
+      - "?function.environment == GEN_1 (1st-gen function)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<function in scope>"
+      permissions: ["cloudfunctions.functions.invoke", "cloudfunctions.functions.call"]
+      conditions: [service_state, iam_permission]
+      false_positive_note: "1st-gen ONLY. cloudfunctions.functions.invoke/.call is inert on 2nd-gen functions: 2nd-gen invocation is authorized by run.routes.invoke (roles/run.invoker) on the backing Cloud Run service - see gcp-gcf-invoke-run. Do NOT emit an ACTIVE CanInvoke for a 2nd-gen (GEN_2) function from this perm."
+      narrative: "{principal.name} can invoke 1st-gen {function.name} (cloudfunctions.functions.invoke / .call)."
+
+  # --- Invocation, 2nd gen via backing Cloud Run service --------------------
+  - id: gcp-gcf-invoke-run
+    emits: CanInvoke
+    description: "2nd-gen invoke: run.routes.invoke / roles/run.invoker on the backing Cloud Run service invokes the function."
+    match_effective_permission: {action: "run.routes.invoke", resource_type: "google.cloud.run.Service"}
+    where:
+      - "?function.environment == GEN_2 (2nd-gen function)"
+      - "the run.Service in scope is the backing service of ?function (serviceConfig.service)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<function in scope>"
+      permissions: ["run.routes.invoke"]
+      conditions: [service_state, iam_permission]
+      false_positive_note: "2nd-gen ONLY. Invocation of a 2nd-gen Cloud Function is authorized by run.routes.invoke (roles/run.invoker) on the backing Cloud Run service, NOT by cloudfunctions.functions.invoke. This is the invoke path that completes CanExecuteAs for 2nd-gen functions."
+      narrative: "{principal.name} can invoke 2nd-gen {function.name} via run.routes.invoke on its backing Cloud Run service."
+
+  # --- actAs on the runtime SA (PassRole analog) -----------------------------
+  # NOTE: the generic actAs->CanPassIdentity edge is emitted by the identity
+  # rule gcp-sa-act-as; this rule is a SCOPED ALIAS recording the GCF-specific
+  # pairing for clarity. It emits the SAME edge type/source/target/scope as
+  # gcp-sa-act-as, so the graph builder MUST de-dupe on edge_id
+  # (hash(type|source|target|scope)) - the two collapse to one CanPassIdentity
+  # edge. Keep conditions identical to gcp-sa-act-as so they cannot diverge.
+  - id: gcp-gcf-passidentity-actas
+    emits: CanPassIdentity
+    alias_of: gcp-sa-act-as
+    dedupe_on: edge_id
+    match_effective_permission: {action: "iam.serviceAccounts.actAs", resource_type: "google.iam.ServiceAccount"}
+    where: ["?principal can create or update a function (cloudfunctions.functions.create/update)"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<runtime service account>"
+      permissions: ["iam.serviceAccounts.actAs"]
+      conditions: [role_compatibility, iam_permission]
+      false_positive_note: "Scoped alias of gcp-sa-act-as - de-duped on edge_id (type|source|target|scope) so no duplicate CanPassIdentity edge is produced. actAs is per-SA: actAs on sa-a does NOT let you attach sa-b. Only emit for SAs the caller can actAs; no actAs -> POTENTIAL."
+      narrative: "{principal.name} can attach {sa.name} to a function it deploys (iam.serviceAccounts.actAs)."
+
+  # --- CanExecuteAs via code modification ------------------------------------
+  - id: gcp-gcf-execute-as-via-code
+    emits: CanExecuteAs
+    description: "Modify function source + (invoke/call OR existing trigger) + ExecutesAs."
+    match:
+      - [ ?principal, CanModifyCode, ?function ]
+      - [ ?function,  ExecutesAs,    ?sa ]
+    optional:
+      - [ ?principal, CanInvoke, ?function ]
+    where:
+      - "node_type(?function) == ServerlessFunction"
+      - "?sa.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<runtime service account>"
+      permissions: ["cloudfunctions.functions.sourceCodeSet"]
+      state_logic: "ACTIVE if matched(optional[0]) or trigger_exists(?function) else CONDITIONAL(trigger_exists). The CanInvoke that satisfies optional[0] is gcp-gcf-invoke for 1st-gen or gcp-gcf-invoke-run (run.routes.invoke on the backing Cloud Run service) for 2nd-gen."
+      conditions_from: [ ?function, ?sa ]
+      false_positive_note: "Without invoke/call (1st-gen: cloudfunctions.functions.invoke/.call; 2nd-gen: run.routes.invoke on the backing Cloud Run service) AND without an existing event trigger -> CONDITIONAL(trigger_exists), not ACTIVE. Only escalation when SA privilege exceeds caller's (default appspot editor SA qualifies)."
+      narrative: "{principal.name} can replace the source of {function.name} (cloudfunctions.functions.sourceCodeSet) and run it, executing as {sa.name}."
+
+  # --- CanExecuteAs via config injection (env/secret/entrypoint) -------------
+  - id: gcp-gcf-execute-as-via-config-injection
+    emits: CanExecuteAs
+    description: "Config change (env/secret/entry point) that injects code + run + ExecutesAs."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?function ]
+      - [ ?function,  ExecutesAs,             ?sa ]
+    optional:
+      - [ ?principal, CanInvoke, ?function ]
+    where:
+      - "node_type(?function) == ServerlessFunction"
+      - "?sa.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<runtime service account>"
+      permissions: ["cloudfunctions.functions.update"]
+      state_logic: "ACTIVE if matched(optional[0]) or trigger_exists(?function) else CONDITIONAL(trigger_exists)"
+      conditions_from: [ ?function, ?sa ]
+      false_positive_note: "Same trigger gating as the code path. update carries source too, so this overlaps gcp-gcf-execute-as-via-code."
+      narrative: "{principal.name} can inject code into {function.name} via config (cloudfunctions.functions.update) and run it, executing as {sa.name}."
+
+  # --- CanExecuteAs via re-pointing the runtime SA (config + actAs) ----------
+  - id: gcp-gcf-execute-as-via-config
+    emits: CanExecuteAs
+    description: "Update the runtime SA of an existing function to a more-privileged actAs-able SA."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?function ]
+      - [ ?principal, CanPassIdentity,        ?sa ]
+    optional:
+      - [ ?principal, CanInvoke, ?function ]
+    where:
+      - "node_type(?function) == ServerlessFunction"
+      - "?principal has iam.serviceAccounts.actAs on ?sa"
+      - "?sa.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<chosen service account>"
+      permissions: ["cloudfunctions.functions.update", "iam.serviceAccounts.actAs"]
+      state_logic: "ACTIVE if matched(optional[0]) or trigger_exists(?function) else CONDITIONAL(trigger_exists)"
+      conditions_from: [ ?function, ?sa ]
+      false_positive_note: "Requires actAs on the target SA (per-SA). Combined with code control (attacker sets source too), so runtime SA choice is attacker-controlled."
+      narrative: "{principal.name} can repoint {function.name} to {sa.name} (cloudfunctions.functions.update + iam.serviceAccounts.actAs) and run it, executing as {sa.name}."
+
+  # --- CanAttachIdentity: swap runtime SA on an existing function ------------
+  - id: gcp-gcf-attach-sa-via-update
+    emits: CanAttachIdentity
+    match:
+      - [ ?principal, CanModifyConfiguration, ?function ]
+      - [ ?principal, CanPassIdentity,        ?sa ]
+    where:
+      - "node_type(?function) == ServerlessFunction"
+      - "?principal has iam.serviceAccounts.actAs on ?sa"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<function>"
+      permissions: ["cloudfunctions.functions.update", "iam.serviceAccounts.actAs"]
+      note: "Chains to CanExecuteAs(?sa) once code is run — see gcp-gcf-execute-as-via-config."
+      narrative: "{principal.name} can change the runtime SA of {function.name} to {sa.name} (cloudfunctions.functions.update + actAs)."
+
+  # --- CanCreateWorkloadAs: create a new function bound to an actAs-able SA ---
+  - id: gcp-gcf-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new function bound to a passable SA (create + actAs)."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has cloudfunctions.functions.create in scope"
+      - "?principal has iam.serviceAccounts.actAs on ?sa"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["cloudfunctions.functions.create", "iam.serviceAccounts.actAs"]
+      escalation: "Deploy a new function whose runtime SA is a privileged SA, then invoke it."
+      false_positive_note: "actAs must apply to the chosen SA. Without it -> POTENTIAL. New function is attacker-invocable (attacker sets the invoker binding or has invoke)."
+      narrative: "{principal.name} can create a function bound to {sa.name} (cloudfunctions.functions.create + iam.serviceAccounts.actAs), executing code as {sa.name}."
+
+  # --- ExposesCredential / CanRetrieveToken: runtime SA token via metadata ---
+  - id: gcp-gcf-exposes-runtime-sa
+    emits: ExposesCredential
+    description: "Code running in the function reads the runtime SA token from the metadata server."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    emit:
+      source: "<function>"
+      target: "<runtime service account>"
+      permissions: []
+      note: "Metadata endpoint: http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+      narrative: "{function.name} exposes credentials for {sa.name} to any code it runs (GCE metadata server token endpoint)."
+
+  - id: gcp-gcf-retrieve-runtime-sa-token
+    emits: CanRetrieveToken
+    description: "Attacker with execution in the function can mint the runtime SA token."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    emit:
+      source: "<principal>"
+      target: "<runtime service account>"
+      permissions: []
+      narrative: "{principal.name}, executing in {function.name}, can retrieve an access token for {sa.name} from the metadata server."
+
+  # --- Private network reachability via VPC connector ------------------------
+  - id: gcp-gcf-vpc-network-reach
+    emits: PrivateReachability
+    description: "A function with a VPC connector can reach private resources; code running in it moves laterally into the VPC."
+    match_record: {resource_type: "google.cloudfunctions.Function", field: "serviceConfig.vpcConnector"}
+    where:
+      - "serviceConfig.vpcConnector (1st gen: vpcConnector) is set on ?function"
+    emit:
+      source_type: Compute
+      source: "<function>"
+      target: "<private network / resources reachable via the connector>"
+      permissions: []
+      conditions: [network_reachability]
+      false_positive_note: "Only meaningful once an attacker has code/exec in the function (CanExecuteAs/CanModifyCode + invoke). Egress is further scoped by vpcConnectorEgressSettings (PRIVATE_RANGES_ONLY vs ALL_TRAFFIC) and by firewall rules on the target network."
+      narrative: "{function.name} can reach private resources over its VPC connector; code running in it moves laterally into the VPC."
+
+  # --- ContainsSecret: env vars / mounted Secret Manager secrets -------------
+  - id: gcp-gcf-env-secret-contains
+    emits: ContainsSecret
+    description: "Function env vars / mounted Secret Manager bindings carry connection strings / API keys."
+    match_record: {resource_type: "google.cloudfunctions.Function", field: "serviceConfig.environmentVariables | serviceConfig.secretEnvironmentVariables | serviceConfig.secretVolumes"}
+    where:
+      - "environmentVariables contain credential-like material OR secretEnvironmentVariables/secretVolumes bind Secret Manager secrets"
+    emit:
+      source: "<function>"
+      target: "<secret / credential material in env vars or bound Secret Manager secret>"
+      permissions: []
+      note: "Drives ExposesCredential once code/config control exists: an attacker with CanModifyCode/CanModifyConfiguration or execution reads the env/secret material."
+      narrative: "{function.name} contains secret material in its environment variables / bound Secret Manager secrets."
+
+  # --- Source disclosure: sourceCodeGet leaks source (recon / hardcoded creds)
+  - id: gcp-gcf-source-code-get
+    emits: CanReadCredential
+    description: "cloudfunctions.functions.sourceCodeGet returns the deployed source archive, which may embed hardcoded credentials."
+    match_effective_permission: {action: "cloudfunctions.functions.sourceCodeGet", resource_type: "google.cloudfunctions.Function"}
+    emit:
+      source: "<principal>"
+      target: "<hardcoded credentials / tokens in the function source>"
+      permissions: ["cloudfunctions.functions.sourceCodeGet"]
+      conditions: [iam_permission]
+      false_positive_note: "Recon primitive: only yields a credential when the source actually embeds one. Absent hardcoded secrets this is source disclosure only."
+      narrative: "{principal.name} can download the source of {function.name} (cloudfunctions.functions.sourceCodeGet), disclosing any hardcoded credentials."
+
+  # --- Function IAM allow policy write (self-grant invoke) -------------------
+  - id: gcp-gcf-set-iam-policy
+    emits: CanModifyPolicy
+    match_effective_permission: {action: "cloudfunctions.functions.setIamPolicy", resource_type: "google.cloudfunctions.Function"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<function allow policy in scope>"
+      permissions: ["cloudfunctions.functions.setIamPolicy"]
+      escalation: "Grant self roles/cloudfunctions.invoker (or run.invoker for 2nd gen) to complete a code/config escalation."
+      narrative: "{principal.name} can set the IAM policy of {function.name} (cloudfunctions.functions.setIamPolicy) and grant itself invoke."
+
+  # --- Public exposure, 1st gen (invoker on the function allow policy) --------
+  - id: gcp-gcf-public-invoke
+    emits: ExposedToInternet
+    match_record: {resource_type: "google.cloudfunctions.Function", field: "iamPolicy.bindings"}
+    where:
+      - "?function.environment == GEN_1 (1st-gen function)"
+      - "a binding on the FUNCTION's own iamPolicy grants roles/cloudfunctions.invoker to allUsers or allAuthenticatedUsers"
+      - "ingressSettings is not ALLOW_INTERNAL_ONLY"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<function>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      false_positive_note: "1st-gen ONLY. Enforcement point for 1st-gen is roles/cloudfunctions.invoker on the function resource's own IAM policy. IAM-gated HTTP functions are NOT public. Requires allUsers/allAuthenticatedUsers invoker AND non-internal ingress. allAuthenticatedUsers = any Google account, still broadly abusable."
+      narrative: "{function.name} (1st gen) is invocable from the internet (allUsers/allAuthenticatedUsers has roles/cloudfunctions.invoker, ingress not internal-only)."
+
+  # --- Public exposure, 2nd gen (invoker on backing Cloud Run service) --------
+  - id: gcp-gcf-public-invoke-run
+    emits: ExposedToInternet
+    description: "2nd-gen public invoke is governed by roles/run.invoker on the BACKING Cloud Run service's IAM policy, not the function resource."
+    match_record: {resource_type: "google.cloud.run.Service", field: "iamPolicy.bindings"}
+    where:
+      - "?function.environment == GEN_2 (2nd-gen function)"
+      - "the run.Service in scope is the backing service of ?function (serviceConfig.service)"
+      - "a binding on the BACKING Cloud Run service's iamPolicy grants roles/run.invoker to allUsers or allAuthenticatedUsers"
+      - "ingressSettings is not ALLOW_INTERNAL_ONLY"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<function>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      false_positive_note: "2nd-gen ONLY. The invoker allow-policy that governs public HTTP access lives on the backing Cloud Run SERVICE, not the cloudfunctions Function resource. Checking roles/run.invoker in the function's own iamPolicy misses the real binding (false negative). allAuthenticatedUsers = any Google account, still broadly abusable."
+      narrative: "{function.name} (2nd gen) is invocable from the internet (allUsers/allAuthenticatedUsers has roles/run.invoker on its backing Cloud Run service, ingress not internal-only)."
+
+  # --- Cross-project entry via code control on a function w/ powerful SA ------
+  - id: gcp-gcf-cross-project-code
+    emits: CanEnterProject
+    description: "A principal in project A controls code/config of a function in project B whose runtime SA has power in B."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    where:
+      - "?function.project != ?principal.project"
+      - "?sa has bindings granting privilege in ?function.project"
+    emit:
+      source_type: Identity
+      target_type: Project
+      source: "<principal>"
+      target: "<function.project>"
+      permissions: ["cloudfunctions.functions.sourceCodeSet | .update | .create", "iam.serviceAccounts.actAs?"]
+      false_positive_note: "Only cross-boundary when principal and function live in different projects AND the runtime SA is privileged in the function's project."
+      narrative: "{principal.name} can run code as {sa.name} in project {project.name} via {function.name}, entering that project."
+
+  # --- Escalation roll-up ----------------------------------------------------
+  - id: gcp-gcf-escalate-to-runtime-sa
+    emits: CanEscalateTo
+    description: "CanExecuteAs a runtime SA of strictly greater privilege."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    where:
+      - "?sa.privilege_level > ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<runtime service account>"
+      permissions: []
+      narrative: "{principal.name} can escalate to {sa.name} by executing code in a Cloud Function that runs as it."
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw config -> explicit edges). These belong in
+# /rules/explicit/gcp-gcf.yaml; recorded here for completeness. They match raw
+# Cloud Functions API records, not other edges.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-gcf-explicit-executes-as
+    emits: ExecutesAs
+    source_record: {api: "cloudfunctions.projects.locations.functions.get", field: "serviceConfig.serviceAccountEmail | serviceAccountEmail"}
+    default: "PROJECT_ID@appspot.gserviceaccount.com when unset"
+    emit: {source: "<function>", target: "<runtime service account>"}
+
+  - id: gcp-gcf-explicit-has-policy
+    emits: HasPolicy
+    source_record: {api: "cloudfunctions.projects.locations.functions.getIamPolicy", field: "bindings"}
+    emit: {source: "<function>", target: "<function ResourcePolicy>"}
+
+  - id: gcp-gcf-explicit-can-trigger
+    emits: CanTrigger
+    source_record: {api: "cloudfunctions.projects.locations.functions.get", field: "eventTrigger"}
+    where: ["eventTrigger present (Pub/Sub topic, GCS bucket, Eventarc, Firestore)"]
+    emit: {source: "<event source>", target: "<function>"}
+
+  - id: gcp-gcf-explicit-cross-project-trust
+    emits: CrossProjectTrust
+    source_record: {api: "cloudfunctions.projects.locations.functions.getIamPolicy", field: "bindings[].members"}
+    where: ["a member (user/SA) belongs to a different project than the function"]
+    emit: {source: "<function.project>", target: "<member.project | external identity>"}
+
+# Deny-policy / org-policy handling: if an IAM deny policy or org policy denies
+# an action above at the effective scope, emit the edge as BLOCKED with
+# denied_by=<deny/org policy>, so the UI explains why the path does not work.

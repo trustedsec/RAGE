@@ -1,0 +1,300 @@
+# GCP Private Service Connect (PSC) — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# PSC is GCP's private connectivity fabric. Consumers create forwarding rules
+# (purpose=PRIVATE_SERVICE_CONNECT) that point to Google-managed API bundles
+# or to producer Service Attachments, landing traffic on a private IP inside
+# the consumer VPC. The central attack-path primitives are:
+#
+#   (1) PRIVATE REACH: a PSC consumer endpoint exists AND a workload has a
+#       network foothold in the consumer subnet -> PrivateReachability to the
+#       backend (producer service or Google API surface). CONDITIONAL on
+#       network_reachability (foothold required).
+#
+#   (2) CROSS-PROJECT TRUST: a Service Attachment with ACCEPT_AUTOMATIC or an
+#       attacker project in consumerAcceptLists -> CrossProjectTrust. Any
+#       consumer project that can create a forwarding rule pointing at the
+#       Service Attachment URI gains private reach.
+#
+#   (3) CONTROL MUTATION: an identity that can create PSC forwarding rules
+#       (compute.forwardingRules.create) or modify Service Attachment
+#       connection policy (compute.serviceAttachments.update) can open new
+#       private channels or add unauthorized consumers.
+#
+# Permissions are verbatim from:
+#   https://cloud.google.com/compute/docs/access/iam
+#   https://cloud.google.com/vpc/docs/private-service-connect
+#   https://cloud.google.com/vpc/docs/access-control#privateserviceconnect
+#
+# IMPORTANT: transitive network reachability (PSC endpoint IP reachable from
+# attacker's foothold, which is itself reachable via peering/TGW/firewall
+# composition) is the FUTURE provider-agnostic network-chains linchpin. DO NOT
+# derive it here. Emit only the per-resource FACTS:
+#   - a PSC endpoint exists and points to a backend -> PrivateReachability FACT
+#   - a Service Attachment has open connection policy -> CrossProjectTrust FACT
+#   - an identity can create/modify PSC objects -> CanModifyConfiguration FACT
+# State: all reachability edges are CONDITIONAL(network_reachability) because
+# network access to the PSC endpoint IP from the attacker's foothold is a
+# required precondition that a later linchpin will compose.
+#
+# Cite can-control.yaml for Controls / CanEnterProject roll-ups (not re-derived
+# here). No transitive network chain is invented below.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 8-networking
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # (1) PRIVATE REACH — PSC consumer endpoint enables in-network private access
+  # ---------------------------------------------------------------------------
+
+  # --- PSC to Google APIs bundle (all-apis / vpc-sc) -------------------------
+  - id: gcp-psc-private-reach-google-apis
+    emits: PrivateReachability
+    description: >-
+      A PSC consumer forwarding rule targeting the all-apis or vpc-sc Google API
+      bundle gives workloads in the consumer VPC private IP access to Google APIs
+      (Cloud Storage, Secret Manager, BigQuery, etc.) without a public IP or internet
+      egress. An in-network attacker with code running on a consumer-VPC workload can
+      call any Google API the workload's SA is permitted to call over this private path.
+    match_record:
+      resource_type: "compute.googleapis.com/ForwardingRule"
+      field: "purpose"
+      value: "PRIVATE_SERVICE_CONNECT"
+    where:
+      - "forwardingRule.target matches 'all-apis' OR 'vpc-sc' (Google-managed API bundle)"
+      - "forwardingRule is in an ACTIVE / operational state"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<workload in the consumer VPC subnet of the forwarding rule>"
+      target: "<PSC consumer endpoint (ForwardingRule)>"
+      permissions: []
+      conditions: [network_reachability, service_state]
+      state_logic: >-
+        CONDITIONAL(network_reachability) — the endpoint exists and routes traffic
+        privately, but an attacker must have a foothold in the consumer VPC (or a
+        subnet that can reach the PSC endpoint IP) to exploit it. BLOCKED if the
+        forwarding rule is deleted or if a VPC firewall denies the endpoint IP.
+      derived_from:
+        - "<ForwardingRule resource: purpose=PRIVATE_SERVICE_CONNECT, target=all-apis/vpc-sc>"
+      false_positive_note: >-
+        The PSC endpoint provides the NETWORK PATH to Google APIs; the backend APIs
+        still enforce their own IAM. Do not conflate PrivateReachability (network fact)
+        with authorization to use the APIs. VPC-SC bundle endpoints may be further
+        constrained by VPC Service Controls perimeter policy — do not assume all-apis
+        surface equivalence. State is CONDITIONAL(network_reachability); an attacker
+        must have a foothold in the consumer subnet. NOTE: source_type is Compute per
+        schema, but at graph-construction time the source may be instantiated as a
+        VirtualNetwork or Subnet node if no specific workload is identified — the
+        reachability applies to any node in the consumer subnet that can reach the
+        PSC endpoint IP. Ensure graph source node resolves to a valid PrivateReachability
+        source type (Compute, Messaging).
+      narrative: >-
+        A PSC forwarding rule in {vpc.name} ({forwarding_rule.name}, target=all-apis/vpc-sc)
+        gives any workload in that VPC private IP access to Google APIs without egressing
+        to the internet. An attacker with a foothold in the consumer subnet can call Google
+        APIs over this private channel using the workload's SA token.
+
+  # --- PSC to a published producer service -----------------------------------
+  - id: gcp-psc-private-reach-producer
+    emits: PrivateReachability
+    description: >-
+      A PSC consumer forwarding rule targeting a Service Attachment (producer-published
+      service) gives workloads in the consumer VPC private IP access to the producer's
+      Internal Load Balancer backend (Cloud SQL, Cloud Run, GCE-based service, etc.).
+      An in-network attacker can reach the producer backend over this private channel
+      without traversing the public internet.
+    match_record:
+      resource_type: "compute.googleapis.com/ForwardingRule"
+      field: "purpose"
+      value: "PRIVATE_SERVICE_CONNECT"
+    where:
+      - "forwardingRule.target matches a compute.googleapis.com/ServiceAttachment URI"
+      - "ServiceAttachment.connectionStatus == ACCEPTED (for ACCEPT_MANUAL) OR connectionPreference == ACCEPT_AUTOMATIC"
+      - "forwardingRule is in an ACTIVE / operational state"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<workload in the consumer VPC subnet of the forwarding rule>"
+      target: "<PSC consumer endpoint (ForwardingRule) -> Service Attachment>"
+      permissions: []
+      conditions: [network_reachability, service_state]
+      state_logic: >-
+        CONDITIONAL(network_reachability) — the consumer endpoint exists and the
+        Service Attachment has ACCEPTED the connection; network reach to the PSC
+        endpoint IP from the attacker's foothold is still required. BLOCKED if
+        connectionStatus is PENDING or REJECTED or the forwarding rule is deleted.
+      derived_from:
+        - "<ForwardingRule resource: purpose=PRIVATE_SERVICE_CONNECT, target=serviceAttachment URI>"
+        - "<ServiceAttachment: connectionStatus=ACCEPTED or connectionPreference=ACCEPT_AUTOMATIC>"
+      false_positive_note: >-
+        ACCEPT_MANUAL connections with status != ACCEPTED are BLOCKED — do not emit.
+        The producer's backend still enforces application-layer auth (IAM, DB credentials,
+        mTLS, etc.); PrivateReachability only models the network path. State is
+        CONDITIONAL(network_reachability) in all cases — a foothold in the consumer subnet
+        is a hard prerequisite. NOTE: source_type is Compute per schema, but at
+        graph-construction time the source may be instantiated as a VirtualNetwork or
+        Subnet node if no specific workload is identified — the reachability applies to
+        any node in the consumer subnet that can reach the PSC endpoint IP. Ensure graph
+        source node resolves to a valid PrivateReachability source type (Compute, Messaging).
+      narrative: >-
+        PSC forwarding rule {forwarding_rule.name} in {consumer_vpc.name} routes to
+        Service Attachment {service_attachment.name} (producer project: {producer_project}).
+        Any workload in the consumer VPC can reach the producer's Internal LB backend
+        privately via the PSC endpoint IP {forwarding_rule.IPAddress}.
+
+  # ---------------------------------------------------------------------------
+  # (2) CROSS-PROJECT TRUST — Service Attachment connection policy
+  # ---------------------------------------------------------------------------
+
+
+  # ---------------------------------------------------------------------------
+  # (3) CONTROL MUTATION — creating or modifying PSC objects opens connectivity
+  # ---------------------------------------------------------------------------
+
+  # --- Create a new PSC consumer forwarding rule (open new private channel) --
+  - id: gcp-psc-create-endpoint-opens-reach
+    emits: CanModifyConfiguration
+    description: >-
+      An identity with compute.forwardingRules.create and compute.subnetworks.use on
+      the target subnet can create a new PSC consumer forwarding rule pointing at any
+      Service Attachment the consumer project is authorized to connect to. This opens
+      a new private channel to the producer service that did not previously exist.
+      compute.addresses.create is only required when reserving a static IP; PSC endpoints
+      with ephemeral IPs do not require it.
+    match_effective_permission:
+      action: "compute.forwardingRules.create"
+      resource_type: "compute.googleapis.com/ForwardingRule"
+    where:
+      - "?principal also has compute.subnetworks.use on the PSC-enabled consumer subnet"
+      - "the target Service Attachment admits the consumer project (ACCEPT_AUTOMATIC OR project in consumerAcceptLists)"
+    emit:
+      source_type: Identity
+      target_type: PrivateEndpoint
+      source: "<principal>"
+      target: "<PSC consumer VPC / subnet>"
+      permissions:
+        - "compute.forwardingRules.create"
+        - "compute.subnetworks.use"
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE if principal holds compute.forwardingRules.create and compute.subnetworks.use
+        at the effective scope and the Service Attachment admits the consumer project.
+        CONDITIONAL(iam_permission) if either permission is uncertain; POTENTIAL if the
+        Service Attachment admission status is unknown.
+      derived_from:
+        - "<effective permission: compute.forwardingRules.create on consumer project>"
+      false_positive_note: >-
+        compute.forwardingRules.create without compute.subnetworks.use on the PSC-eligible
+        subnet is insufficient — GCP requires both. Check subnetwork purpose=PRIVATE_SERVICE_CONNECT
+        on the subnet. compute.addresses.create is only required when creating PSC endpoints
+        with reserved/static IPs; dynamic IP PSC endpoints do not require this permission.
+        If the target Service Attachment is ACCEPT_MANUAL and the consumer project is NOT
+        in consumerAcceptLists, the connection will be PENDING, not ACCEPTED, so the
+        PrivateReachability fact is not realized -> downgrade to POTENTIAL.
+      narrative: >-
+        {principal.name} can create a PSC consumer forwarding rule
+        (compute.forwardingRules.create + compute.subnetworks.use) in {consumer_vpc.name},
+        opening a new private channel to the target producer Service Attachment without
+        requiring internet egress.
+
+  # --- Modify Service Attachment acceptlist (add unauthorized consumer) -------
+  - id: gcp-psc-modify-acceptlist-cross-project
+    emits: CanModifyConfiguration
+    description: >-
+      An identity with compute.serviceAttachments.update can modify the
+      consumerAcceptLists of a Service Attachment (or change connectionPreference to
+      ACCEPT_AUTOMATIC), adding unauthorized consumer projects and granting them
+      private access to the producer's Internal LB backend.
+    match_effective_permission:
+      action: "compute.serviceAttachments.update"
+      resource_type: "compute.googleapis.com/ServiceAttachment"
+    emit:
+      source_type: Identity
+      target_type: PrivateEndpoint
+      source: "<principal>"
+      target: "<Service Attachment>"
+      permissions:
+        - "compute.serviceAttachments.update"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if ?principal holds compute.serviceAttachments.update at the effective scope;
+        CONDITIONAL(iam_permission) if the effective permission is uncertain (e.g. conditional
+        IAM binding not yet evaluated).
+      derived_from:
+        - "<effective permission: compute.serviceAttachments.update on producer project>"
+      false_positive_note: >-
+        compute.serviceAttachments.update is included in roles/compute.networkAdmin and
+        roles/compute.admin; a narrower custom role may or may not include it — honor
+        effective permission evaluation. Updating the acceptlist grants cross-project
+        network access but does NOT bypass the producer backend's IAM or app-layer auth.
+      narrative: >-
+        {principal.name} can modify {service_attachment.name}'s consumerAcceptLists
+        (compute.serviceAttachments.update), adding an attacker-controlled consumer project
+        and opening private access to the producer backend for that project.
+
+  # --- Create a new Service Attachment (publish new PSC service) ----
+  - id: gcp-psc-create-service-attachment
+    emits: CanModifyConfiguration
+    description: >-
+      An identity with compute.serviceAttachments.create can publish a new Internal
+      Load Balancer backend as a Private Service Connect service attachment, making it
+      reachable by any PSC consumer that has the Service Attachment URI and can create
+      a forwarding rule. This is a high-value capability for lateral movement or
+      service hijacking attacks: the attacker can intercept traffic intended for a
+      legitimate service or exfiltrate data through a honeypot endpoint. The published
+      service is visible to all projects in ACCEPT_AUTOMATIC mode (default) or to
+      explicitly listed projects in ACCEPT_MANUAL mode.
+    match_effective_permission:
+      action: "compute.serviceAttachments.create"
+      resource_type: "compute.googleapis.com/ServiceAttachment"
+    emit:
+      source_type: Identity
+      target_type: PrivateEndpoint
+      source: "<principal>"
+      target: "<producer VPC/project>"
+      permissions:
+        - "compute.serviceAttachments.create"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if principal holds compute.serviceAttachments.create at the effective scope.
+        The newly published service is immediately reachable by any consumer with the
+        Service Attachment URI (if ACCEPT_AUTOMATIC) or by explicitly approved consumer
+        projects (if ACCEPT_MANUAL with acceptlist).
+      derived_from:
+        - "<effective permission: compute.serviceAttachments.create on producer project>"
+      false_positive_note: >-
+        compute.serviceAttachments.create is included in roles/compute.networkAdmin and
+        roles/compute.admin; check effective permission. Creating a Service Attachment
+        alone does not grant data access to the Internal LB backend — the backend's own
+        IAM and application-layer auth still apply. However, publishing a new service is
+        a meaningful stepping stone for network-layer interception or persistence.
+      narrative: >-
+        {principal.name} can create a new PSC Service Attachment in the {producer_project}
+        (compute.serviceAttachments.create), publishing an Internal Load Balancer backend
+        as a private service reachable by authorized consumer projects, enabling lateral
+        movement or service hijacking attacks.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - org policy constraints/compute.disablePrivateServiceConnectCreationForConsumers
+#    -> BLOCKED for gcp-psc-create-endpoint-opens-reach.
+#  - Service Attachment connectionPreference=ACCEPT_MANUAL with consumer project
+#    NOT in consumerAcceptLists and connectionStatus=PENDING/REJECTED
+#    -> gcp-psc-private-reach-producer emits BLOCKED.
+#  - VPC firewall rule denying traffic to the PSC endpoint IP on the consumer side
+#    -> BLOCKED for all PrivateReachability edges (network_reachability condition unmet).
+#  - iam deny policy blocking compute.forwardingRules.create
+#    -> BLOCKED for gcp-psc-create-endpoint-opens-reach.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization records (raw config -> explicit edges) needed by the
+# collector for PSC. These should go in /rules/explicit/gcp-psc.yaml:
+#   - LocatedIn(ForwardingRule -> Subnet)          from forwardingRule.subnetwork
+#   - RoutesTo(ForwardingRule -> ServiceAttachment) from forwardingRule.target
+#   - AttachedTo(ForwardingRule -> VirtualNetwork)  from forwardingRule.network
+#   - CrossProjectTrust(ServiceAttachment.project -> consumerAcceptLists.projectIdOrNum)
+#   - HasPolicy(ServiceAttachment -> ResourcePolicy) from connectionPreference + consumerAcceptLists

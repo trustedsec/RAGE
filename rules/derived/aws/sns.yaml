@@ -1,0 +1,495 @@
+# AWS SNS — Derived attack-path rules (Phase 10 — messaging / event systems)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml.
+#
+# DESIGN: SNS is a fan-out pub/sub broker. The attack-graph primitives it
+# contributes are:
+#   (a) sns:Publish -> fan-out -> trigger bound Lambda/SQS consumers
+#       (CanWriteData + topic CanTrigger binding -> CanTrigger -> CanExecuteAs)
+#   (b) sns:Subscribe to an attacker endpoint -> receive all messages
+#       (CanReadData / data exfiltration)
+#   (c) Topic resource policy granting cross-account Publish/Subscribe
+#       (CrossAccountTrust / ExposedToInternet)
+#   (d) sns:SetTopicAttributes (Policy) / sns:AddPermission -> rewrite policy
+#       (CanModifyPolicy -> self-grant escalation)
+#   (e) sns:Subscribe creates a new Lambda/SQS subscription trigger
+#       (CanSchedule -> persistence / new CanTrigger path)
+#
+# ROLE OF THE LINCHPINS:
+#   * messaging-chains rule 1 (messaging-publish-triggers-consumer): already
+#     collapses CanWriteData(?p, ?src) + CanTrigger(?src, ?consumer) =>
+#     CanTrigger(?p, ?consumer). This file emits the two SNS-specific FACT
+#     edges the linchpin consumes:
+#       CanWriteData(principal -> topic)  from aws-sns-publish-can-write-data
+#       CanTrigger(topic -> consumer)     from aws-sns-subscription-trigger
+#     and the linchpin does the CanTrigger collapse. DO NOT re-derive it here.
+#   * messaging-chains rule 2 (messaging-trigger-executes-as): collapses
+#     CanTrigger(?p, ?consumer) + ExecutesAs(?consumer, ?id) => CanExecuteAs.
+#     This file does NOT re-derive CanExecuteAs from Trigger+ExecutesAs.
+#   * messaging-chains rule 4 (messaging-resource-policy-cross-boundary-trust):
+#     collapses a cross-account messaging resource policy => CrossAccountTrust.
+#     This file emits the resource-policy node facts and the linchpin fires.
+#     DO NOT re-derive CrossAccountTrust from the policy text here.
+#   * can-control.yaml (escalate-via-execute-as, enter-account-via-assume):
+#     rolls CanExecuteAs -> CanEscalateTo and CrossAccountTrust -> CanEnterAccount.
+#     DO NOT re-derive these here.
+#   * credential-chains.yaml: ContainsSecret + CanReadSecret -> impersonation.
+#     This file emits ContainsSecret; credential-chains owns the roll-up.
+#
+# SNS-SPECIFIC RULES ADDED ON TOP OF THE LINCHPINS:
+#   1) aws-sns-publish-can-write-data: FACT — principal has sns:Publish -> CanWriteData
+#   2) aws-sns-subscription-trigger: FACT — confirmed active subscription -> CanTrigger(topic -> consumer)
+#   3) aws-sns-subscribe-exfiltrate: sns:Subscribe to external endpoint -> CanReadData on topic
+#   4) aws-sns-topic-exposed-internet: wildcard Publish policy -> ExposedToInternet
+#   5) aws-sns-modify-topic-policy: sns:SetTopicAttributes / sns:AddPermission -> CanModifyPolicy
+#   6) aws-sns-create-subscription-schedule: sns:Subscribe creates new trigger -> CanSchedule
+#   7) aws-sns-topic-contains-secret: topic used without DataProtectionPolicy -> ContainsSecret (POTENTIAL)
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 10-messaging
+applies_to: [aws]
+
+rules:
+
+  # --- 1) FACT: sns:Publish -> CanWriteData on the topic --------------------
+  # This is the normalized SEND fact that messaging-chains rule 1
+  # (messaging-publish-triggers-consumer) consumes to derive
+  # CanTrigger(principal -> consumer). Emitting CanWriteData(principal, topic)
+  # is this file's primary contribution to the messaging trigger chain.
+  - id: aws-sns-publish-can-write-data
+    emits: CanWriteData
+    description: "A principal with effective sns:Publish on an SNS topic can send messages to it, potentially triggering all bound subscribers."
+    match:
+      - [ ?principal, HasPermission, ?topic ]
+    where:
+      - "node_type(?topic) == Topic"
+      - "node_provider(?topic) == aws"
+      - "?principal has EFFECTIVE sns:Publish on ?topic (permission evaluator confirms; not denied by topic policy, SCP, or permission boundary)"
+    emit:
+      source_type: Identity
+      target_type: Topic  # Topic is in the Messaging class; CanWriteData.target schema lists [Storage, Data] but messaging-chains linchpin explicitly targets Messaging nodes for CanWriteData (same schema gap as SQS Queue — peer Phase-10 service).
+      source: ?principal
+      target: ?topic
+      permissions: ["sns:Publish"]
+      conditions: [iam_permission, resource_policy, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal's effective permissions (identity policy +
+        resource policy evaluation) allow sns:Publish on the topic ARN and no
+        SCP/permission-boundary deny overrides it. CONDITIONAL(resource_policy)
+        when the topic policy includes a Condition (e.g. aws:SourceVpc,
+        aws:SourceAccount, aws:SourceArn) that the principal must satisfy.
+        BLOCKED when an explicit deny (topic policy Deny, SCP, or permission
+        boundary) overrides.
+      confidence: 0.97
+      derived_from: ["?principal HasPermission ?topic (sns:Publish effective)"]
+      false_positive_note: >-
+        Verify the effective permission (identity policy PLUS topic resource
+        policy): a topic policy explicit Deny on sns:Publish overrides any
+        identity-policy Allow. Honor aws:SourceVpce / aws:SourceVpc / aws:SourceAccount
+        conditions — a Publish allowed only from a specific VPC endpoint is
+        CONDITIONAL(condition_expression), not ACTIVE for an arbitrary caller.
+        Cross-account publish to a topic in another account requires BOTH the
+        caller's identity policy to allow sns:Publish on the remote topic ARN
+        AND the topic's resource policy to allow it — if either is missing,
+        do not emit. An SCP denying sns:Publish at the account level -> BLOCKED.
+      narrative: >-
+        {principal.name} can publish messages to SNS topic {topic.name}
+        (sns:Publish). Every active subscriber receives an attacker-controlled
+        payload; messaging-chains rule 1 derives CanTrigger to each bound
+        consumer from this CanWriteData fact.
+
+  # --- 2) FACT: confirmed SNS subscription -> CanTrigger(topic -> consumer) --
+  # Models the event-source binding (subscription) so the messaging-chains
+  # linchpin can fire: CanWriteData(?p, topic) + CanTrigger(topic, consumer) =>
+  # CanTrigger(?p, consumer) [messaging-chains rule 1]. This rule emits the
+  # binding fact per subscription. Consumers: Lambda (ServerlessFunction) and
+  # SQS Queue; HTTP/email subscriptions are Webhook/GenericMessaging nodes
+  # (modeled separately if warranted but not a CanExecuteAs surface by itself).
+  - id: aws-sns-subscription-trigger
+    emits: CanTrigger
+    description: "A confirmed active SNS subscription binds the topic to its consumer; every Publish invokes the consumer with the message payload."
+    match:
+      - [ ?topic, HasPolicy, ?subscription ]
+    where:
+      - "node_type(?topic) == Topic"
+      - "node_provider(?topic) == aws"
+      - "node_type(?subscription) == EventRule  # AWS::SNS::Subscription"
+      - "?subscription.Protocol in [lambda, sqs]  # Lambda and SQS are the compute/execution-relevant paths"
+      - "?subscription.SubscriptionArn is confirmed (not PendingConfirmation, not Deleted)"
+      - "?consumer is the node corresponding to ?subscription.Endpoint (lambda function ARN or SQS queue ARN)"
+    emit:
+      source_type: Topic
+      target_type: Compute
+      source: ?topic
+      target: ?consumer
+      permissions: []
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        ACTIVE when the subscription SubscriptionArn is confirmed and not in
+        PendingConfirmation or Deleted state, AND the consumer (Lambda function
+        or SQS queue) is enabled/active. CONDITIONAL(trigger_exists) when the
+        subscription exists but the consumer is disabled, throttled, or the
+        event-source-mapping consuming the SQS queue is disabled.
+        CONDITIONAL(condition_expression) when a non-empty FilterPolicy is set
+        on the subscription — not all messages will be delivered; an attacker
+        must craft a message whose attributes satisfy the filter.
+        POTENTIAL(trigger_exists) for a pending (unconfirmed) subscription.
+        Note: for SQS subscribers, the actual execution identity is on the SQS
+        consumer (Lambda ESM, ECS poller) — this edge models the SNS-to-SQS
+        delivery binding; the SQS-to-consumer binding is the SQS adapter's job.
+      confidence: 0.95
+      derived_from: ["?topic HasPolicy ?subscription (confirmed active)"]
+      false_positive_note: >-
+        CRITICAL: only emit ACTIVE for subscriptions where SubscriptionArn is a
+        real confirmed ARN (not the literal string "PendingConfirmation").
+        Pending subscriptions have not been confirmed by the endpoint and will
+        NOT receive messages — downgrade to POTENTIAL(trigger_exists) at most.
+        FilterPolicy: when a non-empty FilterPolicy is present, an attacker who
+        cannot produce a message with matching MessageAttributes cannot trigger
+        the consumer through normal delivery — downgrade to
+        CONDITIONAL(condition_expression). Conservative default: treat any
+        non-empty FilterPolicy as CONDITIONAL unless the FilterPolicy is verified
+        to be trivially satisfiable by an arbitrary Publish call. FIFO topics
+        (standard Lambda subscription not supported directly): do not emit
+        CanTrigger(fifo_topic -> lambda) without a SQS FIFO intermediary.
+      narrative: >-
+        SNS topic {topic.name} has a confirmed subscription to {consumer.name}
+        (Protocol {subscription.Protocol}); every sns:Publish call fans out to
+        {consumer.name}, invoking it with the message as payload. Combined with
+        CanWriteData(publisher, topic) via messaging-chains rule 1, this derives
+        CanTrigger(publisher, {consumer.name}).
+
+  # --- 3) sns:Subscribe to attacker endpoint -> receive all messages ---------
+  # An attacker who can call sns:Subscribe and confirm an HTTP/S, email, or SQS
+  # endpoint they control will receive every published message. This is
+  # CanReadData on the topic (all message content, including any embedded
+  # credentials). Combined with ContainsSecret (rule 7), credential-chains
+  # owns the impersonation roll-up.
+  - id: aws-sns-subscribe-exfiltrate
+    emits: CanReadData
+    description: "sns:Subscribe lets an attacker add their own endpoint as a subscriber and receive all messages published to the topic, including embedded secrets."
+    match:
+      - [ ?principal, HasPermission, ?topic ]
+    where:
+      - "node_type(?topic) == Topic"
+      - "node_provider(?topic) == aws"
+      - "?principal has EFFECTIVE sns:Subscribe on ?topic"
+    emit:
+      source_type: Identity
+      target_type: Topic  # Topic is a Messaging subtype; CanReadData.target schema lists [Storage, Data] but messaging-chains linchpin explicitly consumes CanReadData against Messaging nodes (same schema gap as SQS Queue — peer Phase-10 service).
+      source: ?principal
+      target: ?topic
+      permissions: ["sns:Subscribe"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the principal has effective sns:Subscribe on the topic and
+        can confirm a subscription (sns:ConfirmSubscription is implicit — the
+        subscriber confirms via the token SNS sends to the endpoint). No
+        additional IAM permission is required for confirmation once Subscribe is
+        called. CONDITIONAL(resource_policy) when the topic policy restricts
+        Subscribe to specific protocols or conditions. BLOCKED when a topic policy
+        explicit Deny or SCP overrides the Allow.
+      confidence: 0.90
+      derived_from: ["?principal HasPermission ?topic (sns:Subscribe effective)"]
+      false_positive_note: >-
+        An SNS subscription for protocols that require confirmation (HTTP/S, email,
+        SQS) needs the endpoint to respond to the confirmation token SNS sends.
+        An attacker must control the endpoint to complete confirmation; if they
+        cannot confirm, the subscription stays pending and delivers no messages.
+        Model this as CONDITIONAL when the endpoint reachability is unverified.
+        Email-JSON / SMS subscriptions deliver to attacker-controlled addresses /
+        phone numbers (lower security impact than Lambda/SQS execution but still
+        data exfiltration). The topic policy may require a specific Protocol —
+        honor that constraint. This CanReadData feeds credential-chains
+        (read-secret-yields-identity) when the topic has ContainsSecret; the
+        credential-chains roll-up is CITED, not re-derived here.
+      narrative: >-
+        {principal.name} can subscribe an attacker-controlled endpoint to SNS
+        topic {topic.name} (sns:Subscribe), receiving all published messages.
+        If the topic carries sensitive data (ContainsSecret), credential-chains
+        derives further impersonation capability.
+
+  # --- 4) Wildcard Publish policy -> ExposedToInternet -----------------------
+  # A topic policy granting sns:Publish to Principal "*" (or AWS "*") allows
+  # anyone on the internet to publish and trigger all consumers. This is a
+  # direct ExposedToInternet fact on the topic.
+  - id: aws-sns-topic-exposed-internet
+    emits: ExposedToInternet
+    description: "An SNS topic access policy granting sns:Publish to Principal '*' is internet-accessible — anyone can publish and trigger all subscribers."
+    match:
+      - [ ?topic_policy, HasPolicy, ?topic ]
+    where:
+      - "node_type(?topic) == Topic"
+      - "node_provider(?topic) == aws"
+      - "node_type(?topic_policy) == ResourcePolicy"
+      - "?topic_policy has a statement granting sns:Publish (or sns:*) to Principal '*' or Principal {AWS: '*'} with no aws:PrincipalOrgID / aws:SourceAccount / aws:SourceArn condition that restricts to a specific account"
+    emit:
+      source_type: Topic  # Topic is a Messaging subtype; ExposedToInternet.source schema lists [Compute, Data, PublicEndpoint, LoadBalancer, Storage] but an SNS topic with a wildcard policy IS an internet-exposed endpoint — same schema gap as SQS Queue in the peer Phase-10 rules.
+      target_type: AnonymousIdentity
+      source: ?topic
+      target: "<AnonymousIdentity>"
+      permissions: ["sns:Publish"]
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the topic policy unconditionally grants sns:Publish to
+        Principal '*' (no account/org restricting condition). CONDITIONAL(condition_expression)
+        when the wildcard is scoped by a condition the internet principal might satisfy
+        (e.g. aws:SourceIp to a broad CIDR). BLOCKED when an SCP denying sns:Publish
+        for wildcard principals or aws:PrincipalOrgID conditions eliminate external access.
+      confidence: 0.92
+      derived_from: ["?topic_policy HasPolicy ?topic (sns:Publish to Principal '*')"]
+      false_positive_note: >-
+        Carefully inspect condition keys. A Principal '*' with aws:PrincipalOrgID
+        is NOT internet-accessible — it is org-scoped. aws:SourceAccount restricts
+        to a specific account; aws:SourceArn restricts to a specific resource.
+        Only emit ExposedToInternet when the grant is genuinely reachable by an
+        unauthenticated external caller. A wildcard-Principal sns:Subscribe grant
+        (rather than sns:Publish) is data-exfiltration exposure, not Publish
+        exposure — emit CanReadData for the Subscribe case, not ExposedToInternet.
+      narrative: >-
+        SNS topic {topic.name} has a resource policy granting sns:Publish to
+        Principal '*', making it reachable from the public internet. Any internet
+        caller can publish messages that fan out to all subscribers.
+
+  # --- 5) sns:SetTopicAttributes / sns:AddPermission -> CanModifyPolicy ------
+  # These actions can rewrite or extend the topic access policy, enabling
+  # self-grant of Publish/Subscribe or cross-account trust expansion. This is
+  # a direct privilege-escalation primitive on the policy document.
+  - id: aws-sns-modify-topic-policy
+    emits: CanModifyPolicy
+    description: "sns:SetTopicAttributes (Policy attribute) or sns:AddPermission rewrites or extends the SNS topic access policy, enabling self-grant of Publish/Subscribe or cross-account trust."
+    match:
+      - [ ?principal, HasPermission, ?topic ]
+    where:
+      - "node_type(?topic) == Topic"
+      - "node_provider(?topic) == aws"
+      - "?principal has EFFECTIVE sns:SetTopicAttributes OR sns:AddPermission on ?topic"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: ?principal
+      target: "<topic ResourcePolicy of ?topic>"
+      permissions: ["sns:SetTopicAttributes", "sns:AddPermission"]
+      conditions: [iam_permission, resource_policy, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal has effective sns:SetTopicAttributes on the
+        topic (can rewrite the full Policy attribute) or sns:AddPermission (can
+        append any statement, including cross-account Publish/Subscribe grants).
+        CONDITIONAL(resource_policy) if the topic policy Condition or SCP
+        requires additional constraints. BLOCKED when SCP or permission-boundary
+        denies both actions.
+      confidence: 0.95
+      derived_from: ["?principal HasPermission ?topic (sns:SetTopicAttributes or sns:AddPermission effective)"]
+      false_positive_note: >-
+        sns:AddPermission can only ADD statements — it cannot remove existing
+        Deny statements or change the Effect of existing statements. An attacker
+        who only has sns:AddPermission can self-grant Publish or cross-account
+        access but cannot remove a Deny that blocks them. sns:SetTopicAttributes
+        with the Policy attribute is the stronger form (full rewrite).
+        Distinguish: sns:AddPermission is scoped to adding Allow statements for
+        specific AWS accounts; sns:SetTopicAttributes (Policy) is a full policy
+        PUT. When only sns:AddPermission is available, model the capability
+        accordingly. Both are high value as they enable cross-account publish
+        grants (new CrossAccountTrust) or Subscribe grants (new CanReadData
+        for the attacker's account). An SCP denying sns:SetTopicAttributes
+        blocks the full rewrite but may not block AddPermission — check both.
+      narrative: >-
+        {principal.name} can modify the access policy of SNS topic {topic.name}
+        (sns:SetTopicAttributes / sns:AddPermission), enabling self-grant of
+        Publish or Subscribe rights, or granting cross-account access to the topic.
+
+  # --- 5b) sns:SetTopicAttributes (non-policy attrs) -> CanModifyConfiguration --
+  # sns:SetTopicAttributes can modify KmsMasterKeyId, DeliveryPolicy,
+  # SignatureVersion, and other topic attributes distinct from the access policy.
+  # Disabling SSE-KMS (clearing KmsMasterKeyId) or weakening DeliveryPolicy are
+  # data-exposure and availability attack surfaces. This complements the
+  # CanModifyPolicy rule and addresses the configuration mutation capability.
+  - id: aws-sns-modify-topic-configuration
+    emits: CanModifyConfiguration
+    description: "sns:SetTopicAttributes can modify topic configuration including KmsMasterKeyId (SSE), DeliveryPolicy, SignatureVersion, etc., enabling data-exposure and delivery attacks."
+    match:
+      - [ ?principal, HasPermission, ?topic ]
+    where:
+      - "node_type(?topic) == Topic"
+      - "node_provider(?topic) == aws"
+      - "?principal has EFFECTIVE sns:SetTopicAttributes on ?topic"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: ?principal
+      target: ?topic
+      permissions: ["sns:SetTopicAttributes"]
+      conditions: [iam_permission, resource_policy, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal has effective sns:SetTopicAttributes on the
+        topic (can modify all topic attributes including KmsMasterKeyId,
+        DeliveryPolicy, SignatureVersion). CONDITIONAL(resource_policy) if
+        the topic policy or SCP requires additional constraints. BLOCKED when
+        SCP or permission-boundary denies the action.
+      confidence: 0.94
+      derived_from: ["?principal HasPermission ?topic (sns:SetTopicAttributes effective)"]
+      false_positive_note: >-
+        sns:SetTopicAttributes is a superset capability: it covers BOTH policy
+        modification (CanModifyPolicy) and configuration mutation
+        (CanModifyConfiguration). This rule targets the non-policy attributes
+        (KmsMasterKeyId, DeliveryPolicy, SignatureVersion, DisplayName, etc.)
+        that are also attack surfaces. KmsMasterKeyId can be cleared, disabling
+        SSE-KMS encryption and exposing messages in plaintext. DeliveryPolicy
+        can be weakened to skip retry or increase failure rates. These are
+        lower-value attack surfaces than policy rewrite but still represent
+        capability to modify the topic. Avoid double-emitting both edges for
+        the same principal/topic when both CanModifyPolicy and
+        CanModifyConfiguration fire from the same sns:SetTopicAttributes
+        permission — deduplication is expected; emit once per (CanModifyPolicy,
+        principal, policy) and once per (CanModifyConfiguration, principal,
+        topic).
+      narrative: >-
+        {principal.name} can modify SNS topic {topic.name} configuration
+        (sns:SetTopicAttributes), including disabling SSE-KMS encryption
+        (KmsMasterKeyId), weakening delivery retry policy, and other
+        configuration changes that can enable data-exposure attacks.
+
+  # --- 6) sns:Subscribe creates a new trigger binding -> CanSchedule ---------
+  # An attacker who can subscribe a Lambda or SQS queue as a new subscriber
+  # creates a persistent event-source binding (an EventRule — AWS::SNS::Subscription).
+  # This is modeled as CanSchedule(principal -> <new subscription EventRule>) so
+  # messaging-chains rule 1 optional path fires (the principal can CREATE the
+  # binding). CanSchedule targets [Scheduler, EventRule, Workflow] — a SNS
+  # subscription is an EventRule node.
+  - id: aws-sns-create-subscription-schedule
+    emits: CanSchedule
+    description: "sns:Subscribe lets an attacker create a new subscription (EventRule binding) on the topic, routing future publishes to a chosen Lambda or SQS endpoint."
+    match:
+      - [ ?principal, HasPermission, ?topic ]
+    where:
+      - "node_type(?topic) == Topic"
+      - "node_provider(?topic) == aws"
+      - "?principal has EFFECTIVE sns:Subscribe on ?topic"
+    emit:
+      source_type: Identity
+      target_type: EventRule  # An SNS subscription is modeled as EventRule (AWS::SNS::Subscription); CanSchedule targets [Scheduler, EventRule, Workflow].
+      source: ?principal
+      target: "<new SNS subscription (EventRule) on ?topic>"
+      permissions: ["sns:Subscribe"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the principal has effective sns:Subscribe on the topic.
+        Confirmation is required for HTTP/S endpoints (the endpoint must respond
+        to the SNS confirmation POST) and for SQS queues (auto-confirmed by SNS
+        if sqs:SendMessage is allowed by the queue policy for the topic ARN).
+        CONDITIONAL(service_state) when the subscription target does not yet
+        have the required resource-policy permission (lambda:AddPermission /
+        sqs:SendMessage from the topic) to complete confirmation.
+      confidence: 0.85
+      derived_from: ["?principal HasPermission ?topic (sns:Subscribe effective)"]
+      false_positive_note: >-
+        Adding a Lambda subscription requires the Lambda function's resource-based
+        policy to grant lambda:InvokeFunction to sns.amazonaws.com for the source
+        topic ARN. An attacker without lambda:AddPermission on the target Lambda
+        cannot complete the Lambda subscription — the subscription confirms but
+        SNS cannot invoke the function. Track whether the attacker also holds
+        lambda:AddPermission. For SQS subscriptions, the SQS queue policy must
+        allow sqs:SendMessage from the topic ARN — without it, the subscription
+        is confirmed but delivery is rejected. CanSchedule models the ability to
+        CREATE the binding; the binding's usefulness for CanExecuteAs requires
+        the consumer to already execute as an identity of interest (messaging-chains
+        rule 2) — that roll-up is the linchpin's job, CITED not re-derived here.
+      narrative: >-
+        {principal.name} can subscribe a chosen endpoint (Lambda or SQS) to SNS
+        topic {topic.name} (sns:Subscribe), creating a persistent trigger binding
+        (SNS subscription EventRule) that routes all future publishes to that
+        endpoint. This is the Phase-10 "create a trigger" primitive; messaging-chains
+        derives further execution consequences.
+
+  # --- 7) Topic without DataProtectionPolicy and message-pattern heuristic -> ContainsSecret (POTENTIAL)
+  # SNS messages frequently embed credentials, tokens, or connection strings.
+  # In the absence of a DataProtectionPolicy that masks sensitive fields, a
+  # subscriber receives plaintext. This is modeled as POTENTIAL because the
+  # content of messages is not statically observable from the topic configuration.
+  - id: aws-sns-topic-contains-secret
+    emits: ContainsSecret
+    description: "An SNS topic without a DataProtectionPolicy may carry messages embedding secrets; any subscriber can read them (POTENTIAL — content heuristic, not confirmed)."
+    match:
+      - [ ?topic_policy, HasPolicy, ?topic ]
+    where:
+      - "node_type(?topic) == Topic"
+      - "node_type(?topic_policy) == ResourcePolicy"
+      - "node_provider(?topic) == aws"
+      - "no DataProtectionPolicy is set on ?topic (sns:GetDataProtectionPolicy returns empty/null)"
+      - "heuristic: topic is used by an application that processes sensitive workloads (e.g. payments, auth, config) OR static message-sample analysis detects credential-shaped strings"
+    emit:
+      source_type: Messaging
+      target_type: Secret
+      source: ?topic
+      target: "<GenericSecret (potential embedded credentials in published messages)>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        POTENTIAL by default — message content is not statically observable from
+        the topic configuration; the presence of embedded secrets depends on what
+        applications publish. Upgrade to ACTIVE only when message samples or
+        static analysis of publisher code confirms credential-shaped payloads.
+        CONDITIONAL when a DataProtectionPolicy is set but does not cover all
+        sensitive field patterns (partial masking). Set to BLOCKED/suppressed when
+        a comprehensive DataProtectionPolicy covers all known secret patterns.
+      confidence: 0.50
+      derived_from: ["?topic has no DataProtectionPolicy (sns:GetDataProtectionPolicy)"]
+      false_positive_note: >-
+        This is a POTENTIAL edge (content heuristic) — do not emit as ACTIVE
+        without positive evidence (message-content analysis, publisher-code static
+        analysis, or explicit annotation). A DataProtectionPolicy that masks all
+        sensitive patterns (e.g. CREDIT_CARD_NUMBER, ACCESS_KEY, PASSWORD) is a
+        real control — downgrade to BLOCKED. Topics used exclusively for status
+        notifications or infrastructure events (no credential-shaped data) should
+        have this suppressed. The edge feeds credential-chains only when CanReadData
+        is also present on the topic (a subscriber can receive the messages).
+      narrative: >-
+        SNS topic {topic.name} has no DataProtectionPolicy; published messages may
+        carry embedded secrets (API keys, tokens, connection strings) that any
+        subscriber can receive. Combined with CanReadData on the topic,
+        credential-chains can derive further impersonation capability.
+
+# ---------------------------------------------------------------------------
+# EXPLICIT normalization rules for SNS (edge facts from raw config):
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: aws-sns-topic-resource-policy
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::SNS::Topic", field: "Attributes.Policy"}
+    emit:
+      source_type: ResourcePolicy
+      source: "<topic ResourcePolicy node>"
+      target: "<SNS topic node>"
+      api_source: "sns:GetTopicAttributes"
+      evidence_field: "Attributes.Policy"
+      narrative: "{topic.name} has an access policy (ResourcePolicy node for sns:GetTopicAttributes Policy attribute)."
+
+  - id: aws-sns-confirmed-subscription
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::SNS::Subscription", field: "SubscriptionArn"}
+    where: ["SubscriptionArn != 'PendingConfirmation'"]
+    emit:
+      source_type: Topic
+      source: "<SNS topic node>"
+      target_type: EventRule
+      target: "<subscription node>"
+      api_source: "sns:ListSubscriptionsByTopic"
+      evidence_field: "SubscriptionArn, Protocol, Endpoint, FilterPolicy"
+      narrative: "{topic.name} has a confirmed {subscription.Protocol} subscription to {subscription.Endpoint} (SubscriptionArn {subscription.SubscriptionArn})."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP denying sns:Publish at the account/OU level -> aws-sns-publish-can-write-data BLOCKED.
+#  - An SCP denying sns:Subscribe or sns:SetTopicAttributes -> the respective explicit/derived rules BLOCKED.
+#  - A topic policy Deny on sns:Publish for the principal overrides any identity-policy Allow -> BLOCKED.
+#  - A non-empty FilterPolicy on a subscription that the attacker payload cannot satisfy ->
+#    aws-sns-subscription-trigger CONDITIONAL(condition_expression).
+#  - A pending (unconfirmed) subscription -> aws-sns-subscription-trigger POTENTIAL(trigger_exists), never ACTIVE.
+#  - A comprehensive DataProtectionPolicy covering all sensitive fields -> aws-sns-topic-contains-secret BLOCKED.
+#  - ExposedToInternet downgraded to CONDITIONAL when the wildcard Publish grant is scoped
+#    by aws:PrincipalOrgID, aws:SourceAccount, or aws:SourceVpce conditions.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,682 @@
+# AWS RDS / Aurora — Derived attack-path rules (Phase 6 — Storage & Databases)
+# ---------------------------------------------------------------------------
+# RDS / Aurora is a fully-managed relational database service. The security
+# signature that makes it dominant in Phase 6:
+#
+#   (1) CREDENTIAL GRAB (highest value): rds:ModifyDBInstance / ModifyDBCluster
+#       resets the master DB password without knowing the current password — a
+#       single control-plane call yields full superuser DB access. Equivalent
+#       to Azure Storage listKeys in the storage-database theme. Also:
+#       secretsmanager:GetSecretValue on the ManagedMasterUserPassword secret
+#       (MasterUserSecretArn) yields the master credential without mutation.
+#
+#   (2) DATA READ / EXFIL:
+#       - rds-db:connect (IAM DB auth) -> authenticated token -> DB connect
+#       - rds-data:ExecuteStatement (Aurora Serverless Data API) -> SQL execution
+#       - rds:ModifyDBSnapshotAttribute(restore=all) -> public snapshot ->
+#         CanExfiltrate + ExposedToInternet
+#       - rds:ModifyDBSnapshotAttribute(restore=<accountId>) -> CanExfiltrate
+#
+#   (3) PUBLIC EXPOSURE:
+#       - PubliclyAccessible: true + permissive VPC SG -> ExposedToInternet
+#
+# LINCHPIN CITATIONS (do not re-derive here):
+#   * credential-chains.yaml — read-secret-yields-identity
+#     (ContainsSecret + CanReadSecret -> CanReadData via DB master credential)
+#   * credential-chains.yaml — decrypt-gates-secret-read
+#     (KMS-encrypted MasterUserSecret gate resolution)
+#   * can-control.yaml — escalate-via-execute-as / enter-account-via-assume
+#
+# PERMISSIONS: exact names from the AWS Service Authorization Reference for
+#   Amazon RDS (rds:*), RDS IAM Authentication (rds-db:*), and RDS Data API
+#   (rds-data:*). No permissions are invented.
+#
+# STATE CONVENTIONS (RULE-FORMAT.md): a derived edge is never stronger than
+# its weakest contributor. CONDITIONAL contributors cap at CONDITIONAL.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # PRIMARY: CREDENTIAL GRAB — master password reset
+  # ===========================================================================
+
+  # --- 1) rds:ModifyDBInstance master password reset -> CanReadData -----------
+  # THE Phase-6 RDS privesc primitive. rds:ModifyDBInstance (or ModifyDBCluster
+  # for Aurora) accepts MasterUserPassword=<new_value> without requiring the
+  # current password. A principal with this effective permission resets the master
+  # DB password to an attacker-known value, then connects as the DB superuser.
+  # This is the RDS analog of Azure Storage listKeys / Cosmos DB listKeys:
+  # a single control-plane API call yields full data-plane superuser access.
+  #
+  # There is no CanReadSecret chain here because the caller sets a new password
+  # rather than reading an existing one. The result is direct CanReadData on the
+  # database as the master user.
+  - id: aws-rds-modify-instance-resets-password
+    emits: CanReadData
+    description: "rds:ModifyDBInstance or rds:ModifyDBCluster with MasterUserPassword resets the master DB password to an attacker-known value, granting superuser DB access without knowing the current password."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?db ]
+    where:
+      - "node_type(?db) == RelationalDatabase"
+      - "?db.provider_type in ['AWS::RDS::DBInstance', 'AWS::RDS::DBCluster']"
+      - "?principal has EFFECTIVE rds:ModifyDBInstance (or rds:ModifyDBCluster for clusters) on ?db ARN"
+      - "no IAM condition restricts rds:ModifyDBInstance to deny MasterUserPassword parameter changes (no rds:DatabaseClass, rds:DatabaseEngine, or StringLike conditions that would specifically block password changes)"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?db
+      permissions: ["rds:ModifyDBInstance", "rds:ModifyDBCluster"]
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        ACTIVE when rds:ModifyDBInstance (or rds:ModifyDBCluster for Aurora clusters)
+        is confirmed EFFECTIVE on the DB ARN — identity-based policy, no SCP denial,
+        and no permission boundary block on the action. CONDITIONAL(service_state)
+        when the DB is in a non-AVAILABLE state (stopping, starting, maintenance, or
+        storage-optimization) — ModifyDBInstance is accepted but ApplyImmediately
+        matters: if ApplyImmediately=false the password change is deferred to the next
+        maintenance window (emit ACTIVE for the capability; note the deferral). BLOCKED
+        when an SCP or permission boundary explicitly denies rds:ModifyDBInstance.
+        Note: IAM conditions on rds:ModifyDBInstance typically restrict engine type
+        or size, not the specific MasterUserPassword parameter; unless the policy
+        explicitly denies the parameter change (uncommon), treat the reset as feasible.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanModifyConfiguration ?db (rds:ModifyDBInstance / rds:ModifyDBCluster effective permission)"
+      false_positive_note: >-
+        This rule emits CanReadData because resetting the master password IS gaining
+        data access — after the reset the attacker connects as superuser. However, it
+        is a DESTRUCTIVE mutation: it disrupts the legitimate master user's access and
+        is highly detectable in CloudTrail (ModifyDBInstance or ModifyDBCluster call).
+        ApplyImmediately=false defers the change to the maintenance window — for the
+        CanReadData edge, emit ACTIVE (the capability exists) but note the deferral in
+        the evidence. Do NOT downgrade to CONDITIONAL for this common IAM pattern unless
+        a specific IAM condition explicitly blocks MasterUserPassword changes. Confirm
+        the DB is AVAILABLE (not STOPPED, CREATING, or in MODIFYING state for another
+        operation). For RDS Custom (OS-accessible), the password reset path is the same
+        but the attacker also gains OS-level access (model separately).
+      narrative: >-
+        {principal.name} can reset the master DB password for {db.name}
+        (rds:ModifyDBInstance / rds:ModifyDBCluster) without knowing the current
+        password, then connect as the database superuser to read, modify, or dump all
+        data. This is the highest-value single-permission RDS escalation primitive.
+
+  # ===========================================================================
+  # SECONDARY: CREDENTIAL READ — Secrets Manager master password
+  # ===========================================================================
+
+  # --- 2) ManageMasterUserPassword secret -> CanReadData ----------------------
+  # When a DB instance or cluster was created/modified with ManageMasterUserPassword
+  # enabled, the master password lives in a Secrets Manager secret at
+  # MasterUserSecretArn. A principal with secretsmanager:GetSecretValue on that
+  # ARN can read the master credential and connect as the DB superuser.
+  #
+  # The canonical chain is:
+  #   ContainsSecret(db, secret)                          [explicit]
+  #   + CanReadSecret(principal, secret)                  [secretsmanager rule]
+  #   + CredentialsFor(secret, db_master_identity)        [explicit]
+  #   => CanImpersonate(principal, db_master_identity)    [credential-chains]
+  #   => CanReadData(principal, db)                       [THIS rule — collapse]
+  #
+  # This rule collapses the chain into a direct CanReadData emit because:
+  #   (a) "db master identity" in RDS is not an IAM identity (CanImpersonate
+  #       target set requires ServiceAccount/MachineIdentity/etc.) — the DB master
+  #       user is a database-internal concept, not a CSP IAM principal.
+  #   (b) Reading the secret directly enables DB connection as superuser,
+  #       which IS data access.
+  #
+  # Cite credential-chains read-secret-yields-identity for the conceptual chain;
+  # emit CanReadData as the realized capability on the database.
+  - id: aws-rds-master-secret-yields-db-access
+    emits: CanReadData
+    description: "Reading the RDS-managed master password secret (secretsmanager:GetSecretValue on MasterUserSecretArn) yields superuser DB access — the master credential authenticates as the DB admin user."
+    match:
+      - [ ?db,        ContainsSecret, ?secret ]
+      - [ ?principal, CanReadSecret,  ?secret ]
+    where:
+      - "node_type(?db) == RelationalDatabase"
+      - "?db.provider_type in ['AWS::RDS::DBInstance', 'AWS::RDS::DBCluster']"
+      - "?secret.evidence_field == 'MasterUserSecret.SecretArn'"
+      - "node_class(?secret) == Secret"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?db
+      permissions: ["secretsmanager:GetSecretValue"]
+      conditions: [iam_permission, resource_policy, key_permission, service_state]
+      state_logic: >-
+        Inherit weakest(ContainsSecret, CanReadSecret): ACTIVE when both are ACTIVE —
+        the DB has a MasterUserSecretArn (ContainsSecret confirmed explicit) AND the
+        principal's CanReadSecret on that secret is ACTIVE (secretsmanager:GetSecretValue
+        confirmed effective, no SCP or resource-policy denial, KMS decrypt satisfied).
+        CONDITIONAL(key_permission) when the CanReadSecret is CONDITIONAL because the
+        secret is wrapped by a CMK and the principal lacks or has unresolved kms:Decrypt
+        — decrypt-gates-secret-read in credential-chains.yaml handles the upgrade when
+        decrypt is confirmed. CONDITIONAL(service_state) when the DB is STOPPED or
+        unavailable for connections even though the secret is readable (the attacker can
+        read the password but cannot yet connect — emit CONDITIONAL(service_state)).
+        BLOCKED when CanReadSecret is BLOCKED (explicit deny on secretsmanager:GetSecretValue
+        or kms:Decrypt).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?db ContainsSecret ?secret"
+        - "?principal CanReadSecret ?secret"
+        - "credential-chains:read-secret-yields-identity (conceptual roll-up — cited, not re-derived; DB master user is a DB-internal identity, not an IAM principal)"
+      false_positive_note: >-
+        ContainsSecret must be evidenced by the presence of MasterUserSecret.SecretArn
+        in DescribeDBInstances/DescribeDBClusters output — only emit when the field is
+        populated (ManageMasterUserPassword was enabled). A DB with a manually managed
+        master password has no MasterUserSecretArn -> ContainsSecret does not fire ->
+        this rule does not apply. The credential read yields superuser access ONLY if
+        the DB is in an AVAILABLE state and network-reachable (PubliclyAccessible or
+        the principal has a VPC foothold). The secret rotation by RDS means the
+        password changes automatically; an attacker who reads the secret but cannot
+        connect immediately may encounter a rotated credential (typically 7-day default
+        rotation). Do not downgrade the edge state for rotation — it is not a blocking
+        control. KMS-encrypted secrets (CONDITIONAL(key_permission)) are handled by
+        credential-chains decrypt-gates-secret-read; do not re-derive the upgrade here.
+      narrative: >-
+        {principal.name} can read the Secrets Manager secret {secret.name} that holds
+        the master DB password for {db.name} (secretsmanager:GetSecretValue), then
+        connect as the database superuser. No control-plane mutation needed — this is a
+        pure credential-read path.
+
+  # ===========================================================================
+  # DATA ACCESS: IAM database authentication
+  # ===========================================================================
+
+  # --- 3) rds-db:connect -> IAM DB auth token -> CanReadData ------------------
+  # IAM database authentication: a DB instance or cluster with
+  # IAMDatabaseAuthenticationEnabled: true allows principals with rds-db:connect
+  # (on a resource ARN of the form
+  # arn:aws:rds-db:<region>:<account>:dbuser:<db-resource-id>/<db-user-name>)
+  # to generate a 15-minute authentication token (using the AWS SDK
+  # generate-db-auth-token construct) in lieu of a static password.
+  # The token is then used as the DB password in a standard connection.
+  # This is CanReadData: the principal can authenticate to the DB engine.
+  # The privilege level depends on the mapped DB user (superuser vs. read-only).
+  - id: aws-rds-iam-db-auth-connect
+    emits: CanReadData
+    description: "rds-db:connect on a DB user ARN grants IAM database authentication — the principal can generate a 15-minute token to connect as the mapped DB user without a static password."
+    match:
+      - [ ?principal, HasPermission, ?db ]
+    where:
+      - "node_type(?db) == RelationalDatabase"
+      - "?db.provider_type in ['AWS::RDS::DBInstance', 'AWS::RDS::DBCluster']"
+      - "?db.properties.IAMDatabaseAuthenticationEnabled == true"
+      - "?principal has EFFECTIVE rds-db:connect on ?db ARN (or on a matching db-user resource ARN scoped to ?db)"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?db
+      permissions: ["rds-db:connect"]
+      conditions: [iam_permission, condition_expression, service_state, network_reachability]
+      state_logic: >-
+        ACTIVE when rds-db:connect is confirmed EFFECTIVE (IAM principal policy grants
+        rds-db:connect on a resource ARN matching ?db's db-resource-id for at least one
+        DB user) AND IAMDatabaseAuthenticationEnabled is true on ?db AND the DB is
+        AVAILABLE. CONDITIONAL(service_state) when the DB is STOPPED or in maintenance.
+        CONDITIONAL(network_reachability) when the DB is VPC-private (not
+        PubliclyAccessible) and the principal has no confirmed VPC foothold — the
+        credential is obtainable but unusable without connectivity. CONDITIONAL(condition_expression)
+        when the rds-db:connect resource ARN scopes to a non-privileged DB user (analyst
+        should note the user's privilege level). BLOCKED when an SCP or permission
+        boundary denies rds-db:connect.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?db (rds-db:connect effective permission + IAMDatabaseAuthenticationEnabled confirmed)"
+      false_positive_note: >-
+        Two prerequisites beyond the IAM permission: (1) IAMDatabaseAuthenticationEnabled
+        must be true on the DB instance/cluster — if it is false, the generated token is
+        rejected by the DB engine. (2) The DB engine must EXIST as a DB user with the same
+        name as the caller (IAM DB auth maps the IAM identity or the resource-ARN db-user
+        segment to a DB-internal user; if the DB user does not exist, authentication fails).
+        The resource ARN format is:
+        arn:aws:rds-db:<region>:<account>:dbuser:<db-resource-id>/<db-user-name>
+        A wildcard (*) in the db-user-name position lets the principal connect as ANY DB
+        user including the master user. A specific db-user-name scopes to one user.
+        Network reachability gates actual exploitation for VPC-private DBs: the IAM permission
+        alone is not sufficient to connect. Score CONDITIONAL(network_reachability) for
+        private DBs unless a VPC foothold is confirmed.
+      narrative: >-
+        {principal.name} has rds-db:connect permission on {db.name}'s IAM DB auth
+        resource ARN, allowing it to generate a 15-minute authentication token and
+        connect to {db.name} as the mapped DB user. If the mapped user is a superuser or
+        has broad GRANT privileges, this yields full database access.
+
+  # ===========================================================================
+  # DATA ACCESS: RDS Data API (Aurora Serverless)
+  # ===========================================================================
+
+  # --- 4) rds-data:ExecuteStatement -> CanReadData (Aurora Serverless & Data API) --
+  # The RDS Data API allows Aurora clusters to accept SQL queries over HTTPS
+  # (not the traditional DB wire protocol) authenticated purely by IAM.
+  # Originally limited to Aurora Serverless v1/v2, as of late 2024 AWS extended
+  # the Data API to general-purpose provisioned Aurora clusters (aurora-mysql,
+  # aurora-postgresql) with HttpEndpointEnabled=true. A principal with
+  # rds-data:ExecuteStatement on the cluster ARN can execute arbitrary SQL.
+  # The Data API bypasses the need for a DB client, VPN, or network foothold —
+  # it is a pure IAM-authenticated data-plane path.
+  # This is the highest-value no-network-foothold RDS data access path.
+  - id: aws-rds-data-api-execute
+    emits: CanReadData
+    description: "rds-data:ExecuteStatement on an Aurora cluster (Serverless v1/v2 or provisioned with HttpEndpointEnabled) allows IAM-authenticated SQL execution via the RDS Data API — no DB client, VPC foothold, or static password required."
+    match:
+      - [ ?principal, HasPermission, ?db ]
+    where:
+      - "node_type(?db) == RelationalDatabase"
+      - "?db.provider_type == 'AWS::RDS::DBCluster'"
+      - "?db.properties.Engine in ['aurora-mysql', 'aurora-postgresql', 'aurora']"
+      - "(?db.properties.EngineMode == 'serverless' OR ?db.properties.ServerlessV2ScalingConfiguration is not null OR (?db.properties.EngineMode is null AND ?db.properties.Engine in ['aurora-mysql', 'aurora-postgresql']))"
+      - "?db.properties.HttpEndpointEnabled == true  # Data API must be explicitly enabled"
+      - "?principal has EFFECTIVE rds-data:ExecuteStatement on ?db ARN"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?db
+      permissions: ["rds-data:ExecuteStatement"]
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        ACTIVE when rds-data:ExecuteStatement is confirmed EFFECTIVE on the cluster ARN,
+        the cluster's HttpEndpointEnabled is true, and the cluster is in AVAILABLE state
+        (Aurora Serverless auto-pauses when idle; a paused cluster resumes automatically
+        on the first Data API call, so pause state does NOT block the capability —
+        emit ACTIVE and note auto-resume). Provisioned Aurora clusters with HttpEndpointEnabled
+        are always available unless explicitly stopped. CONDITIONAL(iam_permission) when an
+        SCP may restrict rds-data:ExecuteStatement but hasn't been resolved.
+        CONDITIONAL(key_permission) when the cluster's associated Secrets Manager secret
+        (if present) is KMS-encrypted and the principal lacks or has unresolved kms:Decrypt
+        on the wrapping key — the CMK decrypt gate applies to both serverless and provisioned
+        Data API configurations that use secrets. BLOCKED when an SCP or permission
+        boundary explicitly denies rds-data:ExecuteStatement.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?db (rds-data:ExecuteStatement effective permission + HttpEndpointEnabled confirmed)"
+      false_positive_note: >-
+        The RDS Data API is available for Aurora Serverless v1 (EngineMode=serverless),
+        Aurora Serverless v2 (EngineMode=provisioned with ServerlessV2ScalingConfiguration),
+        and provisioned Aurora clusters (aurora-mysql, aurora-postgresql) as of late 2024.
+        Standard RDS (non-Aurora) does NOT support the Data API. HttpEndpointEnabled must
+        be explicitly true (off by default for Aurora Serverless v2 and provisioned Aurora;
+        always verify the property). For all Aurora Data API configurations that use a
+        Secrets Manager secret containing database credentials, the principal must have
+        kms:Decrypt on any wrapping CMK — CONDITIONAL(key_permission) applies in that case.
+        Aurora Serverless v1 clusters that are paused auto-resume on the first Data API call
+        (up to several seconds delay); this is not a blocking gate. Provisioned Aurora
+        clusters with Data API enabled are always available unless explicitly stopped.
+        Scope the rule to Aurora engines (aurora-mysql, aurora-postgresql) only.
+      narrative: >-
+        {principal.name} can submit SQL queries to {db.name} via the RDS Data API
+        (rds-data:ExecuteStatement + Data API enabled), reading and modifying data
+        accessible to the mapped DB user — no VPC foothold or DB client required, only
+        IAM authentication.
+
+  # ===========================================================================
+  # EXFILTRATION: snapshot sharing (public and cross-account)
+  # ===========================================================================
+
+  # --- 5) ModifyDBSnapshotAttribute(restore=all) -> public snapshot exfil -----
+  # rds:ModifyDBSnapshotAttribute with AttributeName=restore and
+  # ValuesToAdd=[all] makes the DB snapshot publicly restorable by ANY AWS
+  # account. Any account can then call rds:RestoreDBInstanceFromDBSnapshot to
+  # spin up a full copy of the database and access all data. This is both
+  # CanExfiltrate (data leaves the boundary) and ExposedToInternet (the snapshot
+  # is accessible to anonymous/external parties).
+  #
+  # The equivalent for cluster snapshots is ModifyDBClusterSnapshotAttribute.
+  #
+  # Emits TWO edges:
+  #  - CanExfiltrate: capability for principal to make snapshot publicly shareable
+  #  - ExposedToInternet: the snapshot itself becomes publicly accessible
+  - id: aws-rds-snapshot-public-exfil
+    emits: CanExfiltrate
+    description: "rds:ModifyDBSnapshotAttribute(AttributeName=restore, ValuesToAdd=[all]) makes a DB snapshot publicly restorable by any AWS account — full database exfiltration with no network access required."
+    match:
+      - [ ?principal, HasPermission, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?snapshot.provider_type in ['AWS::RDS::DBSnapshot', 'AWS::RDS::DBClusterSnapshot']"
+      - "?principal has EFFECTIVE rds:ModifyDBSnapshotAttribute (or rds:ModifyDBClusterSnapshotAttribute) on ?snapshot ARN"
+      - "ValuesToAdd=[all] (public snapshot, not account-scoped)"
+    emit:
+      - source_type: Identity
+        target_type: Snapshot
+        source: ?principal
+        target: ?snapshot
+        edge_type: CanExfiltrate
+        permissions: ["rds:ModifyDBSnapshotAttribute", "rds:ModifyDBClusterSnapshotAttribute"]
+        conditions: [iam_permission, scp_or_org_policy, key_permission]
+        state_logic: >-
+          ACTIVE when rds:ModifyDBSnapshotAttribute (or rds:ModifyDBClusterSnapshotAttribute
+          for cluster snapshots) is confirmed EFFECTIVE on the snapshot ARN — no SCP denial,
+          no permission boundary block. CONDITIONAL(key_permission) when the snapshot is
+          encrypted with a CMK: any account attempting to restore the public snapshot must
+          also be granted kms:Decrypt on the CMK — without that, the restore fails.
+          However, the ATTACKER'S capability to SHARE the snapshot is still ACTIVE (the
+          key condition gates the RESTORER, not the sharer). Emit ACTIVE for the sharing
+          capability; note the CMK key-grant requirement as a downstream gate on the
+          restoring account. BLOCKED when an SCP or permission boundary denies
+          rds:ModifyDBSnapshotAttribute. An SCP that denies rds:ModifyDBSnapshotAttribute
+          entirely would block this — emit BLOCKED when confirmed.
+        confidence: "min(contributing_confidences) * 0.95"
+        derived_from:
+          - "?principal HasPermission ?snapshot (rds:ModifyDBSnapshotAttribute effective permission + ValuesToAdd=[all])"
+  # --- 5c) RestoreDBInstanceFromDBSnapshot / RestoreDBClusterFromSnapshot -------
+  # rds:RestoreDBInstanceFromDBSnapshot (or rds:RestoreDBClusterFromSnapshot for
+  # clusters) allows a principal to restore a DB snapshot into their own account,
+  # becoming the master user of the restored database. When combined with cross-account
+  # or public snapshot sharing (via snapshot attributes), a principal can restore a
+  # snapshot they do not own and gain full superuser access to all data in that snapshot.
+  # This is CanReadData on the snapshot's data — a secondary escalation path when
+  # combined with ExposedToInternet (public snapshot) or CrossAccountTrust on the snapshot.
+  - id: aws-rds-restore-snapshot-yields-db-access
+    emits: CanReadData
+    description: "rds:RestoreDBInstanceFromDBSnapshot or rds:RestoreDBClusterFromSnapshot with a shared or public snapshot allows a principal to restore a full database copy as the master user — gaining superuser access to all data."
+    match:
+      - [ ?principal, HasPermission, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?snapshot.provider_type in ['AWS::RDS::DBSnapshot', 'AWS::RDS::DBClusterSnapshot']"
+      - "?principal has EFFECTIVE rds:RestoreDBInstanceFromDBSnapshot (or rds:RestoreDBClusterFromSnapshot) on the snapshot ARN"
+      - "?snapshot has CrossAccountTrust OR ExposedToInternet (public or cross-account snapshot sharing confirmed)"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["rds:RestoreDBInstanceFromDBSnapshot", "rds:RestoreDBClusterFromSnapshot"]
+      conditions: [iam_permission, scp_or_org_policy, key_permission]
+      state_logic: >-
+        ACTIVE when rds:RestoreDBInstanceFromDBSnapshot (or rds:RestoreDBClusterFromSnapshot)
+        is confirmed EFFECTIVE on the snapshot ARN AND the snapshot is publicly restorable
+        (ExposedToInternet to AnonymousIdentity) or shared to the principal's account
+        (CrossAccountTrust confirmed). CONDITIONAL(key_permission) when the snapshot is
+        encrypted with a CMK that is not shared to the restoring account — the principal
+        can restore but cannot decrypt the restored DB without kms:Decrypt on the CMK.
+        BLOCKED when an SCP or permission boundary denies rds:RestoreDBInstanceFromDBSnapshot.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?snapshot (rds:RestoreDBInstanceFromDBSnapshot / RestoreDBClusterFromSnapshot)"
+        - "?snapshot ExposedToInternet OR CrossAccountTrust"
+      false_positive_note: >-
+        Restore capability is only exploitable if the snapshot is publicly restorable
+        (ExposedToInternet with AnonymousIdentity) or specifically shared to the attacker's
+        account (CrossAccountTrust). A private snapshot in the same account that the principal
+        owns does not merit CanReadData via restore — the principal already has access.
+        Restore creates a NEW database instance/cluster as a copy; the restoring principal
+        becomes the master user of the restored DB. KMS-encrypted snapshots are CONDITIONAL
+        if the CMK is not shared. Restore may take several minutes; the edge is realized
+        when the restore completes and the DB is AVAILABLE.
+      narrative: >-
+        {principal.name} can restore the RDS snapshot {snapshot.name} into their own
+        account as the master user (rds:RestoreDBInstanceFromDBSnapshot /
+        rds:RestoreDBClusterFromSnapshot), gaining full superuser access to all data
+        in the snapshot. This is a complete data exfiltration path when combined with
+        public or cross-account snapshot sharing.
+
+  # --- 5b) RestoreDBInstanceFromDBSnapshot / RestoreDBClusterFromSnapshot -----
+  # NOTE: Rule aws-rds-snapshot-cross-account-exfil (previously rule 6) has been
+  # collapsed into aws-rds-snapshot-public-exfil (rule 5) above. Both use the same
+  # permission (rds:ModifyDBSnapshotAttribute), differing only in the runtime parameter
+  # ValuesToAdd (all vs. specific accountId). ValuesToAdd is an attacker-chosen call-time
+  # parameter, not a static graph property — the rule engine cannot filter on it.
+  # A principal with rds:ModifyDBSnapshotAttribute can perform BOTH public (all) and
+  # targeted (specific accountId) sharing. The ExposedToInternet edge now covers the
+  # public case; targeted sharing is reflected in the explicit CrossAccountTrust
+  # normalization rules (aws-rds-snapshot-authorized-account / cluster).
+  # -----
+
+  # ===========================================================================
+  # PUBLIC EXPOSURE
+  # ===========================================================================
+
+  # ===========================================================================
+  # IDENTITY ATTACHMENT
+  # ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP or permission boundary denying rds:ModifyDBInstance or
+#     rds:ModifyDBCluster -> rule 1 BLOCKED.
+#   - An SCP denying secretsmanager:GetSecretValue on the MasterUserSecretArn ->
+#     the CanReadSecret contribution BLOCKED -> rule 2 BLOCKED.
+#   - An SCP denying rds-db:connect -> rule 3 BLOCKED.
+#   - An SCP denying rds-data:ExecuteStatement -> rule 4 BLOCKED.
+#   - An SCP or permission boundary denying rds:ModifyDBSnapshotAttribute ->
+#     rules 5/5c BLOCKED. No native per-parameter condition key
+#     (e.g. rds:SnapshotVisibility) restricts only the public-share case;
+#     any rds:ModifyDBSnapshotAttribute permission enables both public and
+#     targeted snapshot sharing.
+#   - PubliclyAccessible=false OR restrictive VPC SG on engine port ->
+#     ExposedToInternet BLOCKED or CONDITIONAL(network_reachability) respectively.
+#   - iam:PassedToService condition excluding rds.amazonaws.com -> attached-role
+#     rules POTENTIAL(role_compatibility), not ACTIVE.
+#   - DB in STOPPED state -> rules 1, 3, 4 CONDITIONAL(service_state).
+#   - KMS-encrypted MasterUserSecret without kms:Decrypt on the wrapping key ->
+#     rule 2 CONDITIONAL(key_permission) until credential-chains
+#     decrypt-gates-secret-read resolves the gate.
+#   - KMS-encrypted snapshot without restorer's kms:Decrypt on the CMK ->
+#     restore capability CONDITIONAL(key_permission).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/aws-rds.yaml (ExecutesAs, ContainsSecret, ExposedToInternet
+# flag, CrossAccountTrust from snapshot attribute sharing).
+explicit_rules:
+
+  - id: aws-rds-executes-as-instance-role
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::RDS::DBInstance"
+      field: "AssociatedRoles[].RoleArn"
+    emit:
+      source_type: RelationalDatabase
+      target_type: MachineIdentity
+      source: "<RDS DB Instance (RelationalDatabase)>"
+      target: "<RoleArn from AssociatedRoles>"
+      api_source: "rds:DescribeDBInstances"
+      evidence_field: "AssociatedRoles[].RoleArn"
+      narrative: "{db.name} executes as {role.name} (associated IAM role — used by S3 import/export, Lambda integration, and monitoring)."
+
+  - id: aws-rds-executes-as-cluster-role
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::RDS::DBCluster"
+      field: "AssociatedRoles[].RoleArn"
+    emit:
+      source_type: RelationalDatabase
+      target_type: MachineIdentity
+      source: "<Aurora DB Cluster (RelationalDatabase)>"
+      target: "<RoleArn from AssociatedRoles>"
+      api_source: "rds:DescribeDBClusters"
+      evidence_field: "AssociatedRoles[].RoleArn"
+      narrative: "{cluster.name} (Aurora) executes as {role.name} (cluster-level associated IAM role)."
+
+  - id: aws-rds-executes-as-monitoring-role
+    emits: ExecutesAs
+    applies_to: [aws]
+    description: "A DB instance's MonitoringRoleArn is used by Enhanced Monitoring to publish metrics to CloudWatch Logs. An attacker with rds:ModifyDBInstance can attach a higher-privilege role."
+    match_record:
+      resource_type: "AWS::RDS::DBInstance"
+      field: "MonitoringRoleArn"
+    emit:
+      source_type: RelationalDatabase
+      target_type: MachineIdentity
+      source: "<RDS DB Instance (RelationalDatabase)>"
+      target: "<RoleArn from MonitoringRoleArn>"
+      api_source: "rds:DescribeDBInstances"
+      evidence_field: "MonitoringRoleArn"
+      narrative: "{db.name} executes as {role.name} via Enhanced Monitoring (MonitoringRoleArn — used to publish metrics to CloudWatch Logs)."
+
+  - id: aws-rds-executes-as-cluster-monitoring-role
+    emits: ExecutesAs
+    applies_to: [aws]
+    description: "An Aurora DB cluster's MonitoringRoleArn is used by Enhanced Monitoring to publish metrics to CloudWatch Logs. An attacker with rds:ModifyDBCluster can attach a higher-privilege role."
+    match_record:
+      resource_type: "AWS::RDS::DBCluster"
+      field: "MonitoringRoleArn"
+    emit:
+      source_type: RelationalDatabase
+      target_type: MachineIdentity
+      source: "<Aurora DB Cluster (RelationalDatabase)>"
+      target: "<RoleArn from MonitoringRoleArn>"
+      api_source: "rds:DescribeDBClusters"
+      evidence_field: "MonitoringRoleArn"
+      narrative: "{cluster.name} (Aurora) executes as {role.name} via Enhanced Monitoring (MonitoringRoleArn — used to publish metrics to CloudWatch Logs)."
+
+  - id: aws-rds-contains-master-secret
+    emits: ContainsSecret
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::RDS::DBInstance"
+      field: "MasterUserSecret.SecretArn"
+    emit:
+      source_type: RelationalDatabase
+      target_type: Secret
+      source: "<RDS DB Instance (RelationalDatabase)>"
+      target: "<Secrets Manager secret at MasterUserSecret.SecretArn>"
+      api_source: "rds:DescribeDBInstances"
+      evidence_field: "MasterUserSecret.SecretArn"
+      narrative: "{db.name} stores its master DB password in Secrets Manager secret {secret.name} (ManageMasterUserPassword integration)."
+
+  - id: aws-rds-cluster-contains-master-secret
+    emits: ContainsSecret
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::RDS::DBCluster"
+      field: "MasterUserSecret.SecretArn"
+    emit:
+      source_type: RelationalDatabase
+      target_type: Secret
+      source: "<Aurora DB Cluster (RelationalDatabase)>"
+      target: "<Secrets Manager secret at MasterUserSecret.SecretArn>"
+      api_source: "rds:DescribeDBClusters"
+      evidence_field: "MasterUserSecret.SecretArn"
+      narrative: "{cluster.name} (Aurora) stores its master DB password in Secrets Manager secret {secret.name} (ManageMasterUserPassword integration)."
+
+  - id: aws-rds-snapshot-authorized-account
+    emits: [CrossAccountTrust, ExposedToInternet]
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::RDS::DBSnapshot"
+      field: "DBSnapshotAttributes[?AttributeName=='restore'].AttributeValues[]"
+    emit:
+      - source_type: Snapshot
+        target_type: Account
+        source: "<RDS DB Snapshot>"
+        target: "<AccountId from AttributeValues>"
+        edge_type: CrossAccountTrust
+        api_source: "rds:DescribeDBSnapshotAttributes"
+        evidence_field: "DBSnapshotAttributes[restore].AttributeValues"
+        narrative: "RDS snapshot {snapshot.name} is authorized for restore by AWS account {account.id} (cross-account snapshot sharing)."
+      - source_type: Snapshot
+        target_type: AnonymousIdentity
+        source: "<RDS DB Snapshot>"
+        target: "<AnonymousIdentity>"
+        edge_type: ExposedToInternet
+        api_source: "rds:DescribeDBSnapshotAttributes"
+        evidence_field: "DBSnapshotAttributes[restore].AttributeValues contains 'all'"
+        state_logic: "ACTIVE when DBSnapshotAttributes[restore].AttributeValues contains the literal string 'all', indicating the snapshot is publicly restorable."
+        narrative: "RDS snapshot {snapshot.name} is publicly restorable (AuthorizedAccountIds contains 'all') — any AWS account can restore a full copy of the database."
+
+  - id: aws-rds-cluster-snapshot-authorized-account
+    emits: [CrossAccountTrust, ExposedToInternet]
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::RDS::DBClusterSnapshot"
+      field: "DBClusterSnapshotAttributes[?AttributeName=='restore'].AttributeValues[]"
+    emit:
+      - source_type: Snapshot
+        target_type: Account
+        source: "<RDS DB Cluster Snapshot>"
+        target: "<AccountId from AttributeValues>"
+        edge_type: CrossAccountTrust
+        api_source: "rds:DescribeDBClusterSnapshotAttributes"
+        evidence_field: "DBClusterSnapshotAttributes[restore].AttributeValues"
+        narrative: "Aurora cluster snapshot {snapshot.name} is authorized for restore by AWS account {account.id} (cross-account snapshot sharing)."
+      - source_type: Snapshot
+        target_type: AnonymousIdentity
+        source: "<RDS DB Cluster Snapshot>"
+        target: "<AnonymousIdentity>"
+        edge_type: ExposedToInternet
+        api_source: "rds:DescribeDBClusterSnapshotAttributes"
+        evidence_field: "DBClusterSnapshotAttributes[restore].AttributeValues contains 'all'"
+        state_logic: "ACTIVE when DBClusterSnapshotAttributes[restore].AttributeValues contains the literal string 'all', indicating the cluster snapshot is publicly restorable."
+        narrative: "Aurora cluster snapshot {snapshot.name} is publicly restorable (AuthorizedAccountIds contains 'all') — any AWS account can restore a full copy of the cluster database."
+
+  - id: aws-rds-can-modify-db-instance
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "rds:ModifyDBInstance"
+      resource_type: "AWS::RDS::DBInstance"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: "<principal>"
+      target: "<DB instance node>"
+      permissions: ["rds:ModifyDBInstance"]
+      narrative: "{principal.name} can modify {db.name} configuration including master password reset (rds:ModifyDBInstance)."
+
+  - id: aws-rds-can-modify-db-cluster
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "rds:ModifyDBCluster"
+      resource_type: "AWS::RDS::DBCluster"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: "<principal>"
+      target: "<cluster node>"
+      permissions: ["rds:ModifyDBCluster"]
+      narrative: "{principal.name} can modify Aurora cluster {cluster.name} configuration including master password reset (rds:ModifyDBCluster)."
+
+  - id: aws-rds-public-instance
+    emits: ExposedToInternet
+    applies_to: [aws]
+    description: "A DB instance or Aurora cluster with PubliclyAccessible=true and a permissive VPC security group is reachable from the public internet on the DB engine port."
+    match_record:
+      resource_type: ["AWS::RDS::DBInstance", "AWS::RDS::DBCluster"]
+      where:
+        - "properties.PubliclyAccessible == true"
+        - "associated SecurityGroup allows inbound on TCP <db_engine_port> from 0.0.0.0/0 or ::/0"
+        - "db_engine_port ∈ {3306 (mysql, aurora-mysql), 5432 (postgres, aurora-postgresql), 1433 (sqlserver), 1521 (oracle)}"
+    emit:
+      source_type: RelationalDatabase
+      target_type: AnonymousIdentity
+      source: "<RDS DB Instance or Aurora Cluster>"
+      target: "<AnonymousIdentity>"
+      api_source: "rds:DescribeDBInstances / rds:DescribeDBClusters + ec2:DescribeSecurityGroups"
+      evidence_field: "PubliclyAccessible && associated SecurityGroup inbound rules"
+      narrative: "{db.name} is reachable from the public internet (PubliclyAccessible=true and VPC security group open on the DB engine port). An attacker with valid DB credentials (obtained by any control-plane attack path) can connect and access data without needing a VPC foothold."
+
+  - id: aws-rds-attach-role-to-db
+    emits: CanAttachIdentity
+    applies_to: [aws]
+    description: "iam:PassRole + rds:AddRoleToDBInstance (or AddRoleToDBCluster) attaches an IAM role to the DB instance/cluster, enabling that role's permissions to be used by built-in engine integrations (S3 import/export, Lambda, monitoring)."
+    match_effective_permission:
+      actions: ["iam:PassRole", "rds:AddRoleToDBInstance", "rds:AddRoleToDBCluster"]
+      resource_type: ["AWS::RDS::DBInstance", "AWS::RDS::DBCluster"]
+      combined_with:
+        edge_type: CanPassIdentity
+        source: "<principal>"
+        target: "<IAM Role compatible with rds.amazonaws.com service principal>"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: "<principal with both iam:PassRole and rds:AddRoleToDBInstance/Cluster>"
+      target: "<DB instance or cluster node>"
+      permissions: ["iam:PassRole", "rds:AddRoleToDBInstance", "rds:AddRoleToDBCluster"]
+      narrative: "{principal.name} can attach an IAM role to the RDS database {db.name} (iam:PassRole + rds:AddRoleToDBInstance / AddRoleToDBCluster). The attached role will be used by built-in engine integrations (S3 import/export, Aurora Lambda invocation). Privilege impact requires a separate DB access path to trigger the role's use from SQL."

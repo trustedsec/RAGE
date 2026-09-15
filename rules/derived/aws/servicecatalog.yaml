@@ -1,0 +1,710 @@
+# AWS Service Catalog — Derived attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# Service Catalog is a CI/CD runner where the "buildspec" is a CloudFormation
+# template and the "runner identity" is the Launch Role Constraint. The central
+# security primitive:
+#
+#   A product with a LaunchRole constraint is provisioned by an end-user who holds
+#   only servicecatalog:ProvisionProduct. Service Catalog calls sts:AssumeRole on
+#   the launch role and deploys the product's CFN template AS that role. The end-user
+#   needs no CloudFormation or IAM permissions; they inherit the launch role's full
+#   capabilities for the duration of the stack operation.
+#
+# Phase-9 pattern (same structure as cloudformation.yaml, codebuild.yaml):
+#   CanModifyCode(p -> product) + ExecutesAs(product -> launchRole)
+#     => CanExecuteAs(p -> launchRole)   [cicd-chains: cicd-modify-buildspec-executes-as]
+#   CanTrigger(p -> product)  + ExecutesAs(product -> launchRole)
+#     => CanExecuteAs(p -> launchRole)   [cicd-chains: cicd-trigger-runner-executes-as]
+#
+# These rules emit the SERVICE-SPECIFIC FACTS that feed the linchpins:
+#   1. CanExecuteAs via ProvisionProduct/UpdateProvisionedProduct (direct delegation)
+#   2. CanModifyCode via CreateProvisioningArtifact (template injection)
+#   3. CanModifyCode via S3 template supply-chain write
+#   4. CanAttachIdentity via UpdateConstraint (launch role swap)
+#   5. CanAttachIdentity via CreateConstraint (launch role addition)
+#   6. CanEnterAccount via cross-account portfolio share + ProvisionProduct
+#
+# Linchpin citations (CITE, DO NOT DUPLICATE):
+#   cicd-chains.yaml            — cicd-modify-buildspec-executes-as (rule 1): consumes
+#                                  CanModifyCode(?p -> ?product) + ExecutesAs(?product -> ?role)
+#                                  => CanExecuteAs(?p -> ?role). Rule 2 here emits CanModifyCode
+#                                  so cicd-chains propagates to CanExecuteAs; do not
+#                                  re-derive CanExecuteAs in the template-injection rules.
+#                                — cicd-trigger-runner-executes-as (rule 2): consumes
+#                                  CanTrigger(?p -> ?product) + ExecutesAs(?product -> ?role).
+#                                  Rule 1 here re-derives CanExecuteAs directly for the
+#                                  ProvisionProduct case (attacker controls parameters, not
+#                                  the template itself, so it is a WEAKER injection that
+#                                  does not cleanly fit CanModifyCode; see note in rule 1).
+#   can-execute-as.yaml         — execute-as-via-code-modify, execute-as-via-config-identity-swap
+#                                  roll CanModifyCode/CanAttachIdentity into CanExecuteAs.
+#                                  Do not re-derive CanExecuteAs from CanAttachIdentity here.
+#   can-control.yaml            — escalate-via-execute-as produces CanEscalateTo from
+#                                  CanExecuteAs; enter-account-via-assume from cross-account.
+#   cloudformation.yaml         — the underlying stack's ExecutesAs and CanModifyCode edges
+#                                  (UpdateStack, CreateChangeSet, S3 template) already cover
+#                                  the CFN layer; Service Catalog rules cover the SC API layer.
+#   credential-chains.yaml      — credential exposure after CanExecuteAs (execute-then-read-secret).
+#
+# PERMISSIONS — exact action names from the AWS Service Authorization Reference:
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsservicecatalog.html
+#   and https://docs.aws.amazon.com/IAM/latest/UserGuide/list_awsiam.html (iam:PassRole).
+#
+# FALSE-POSITIVE DISCIPLINE:
+#   1. Only emit CanExecuteAs paths when a LaunchRole constraint is present on the product.
+#      Products with no constraint execute as the caller's own identity — no escalation.
+#   2. Honor iam:PassedToService == servicecatalog.amazonaws.com for UpdateConstraint /
+#      CreateConstraint paths; a role passable only to cloudformation.amazonaws.com does
+#      NOT satisfy the constraint-creation PassRole requirement.
+#   3. S3 template write is CONDITIONAL(run_path) unless the principal can also trigger
+#      ProvisionProduct / UpdateProvisionedProduct.
+#   4. A new product version created by CreateProvisioningArtifact is only used if it
+#      becomes the active/default version; downgrade to CONDITIONAL(version_active) otherwise.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-pipelines
+applies_to: [aws]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1. ProvisionProduct / UpdateProvisionedProduct => CanExecuteAs (delegation)
+  # ---------------------------------------------------------------------------
+  # servicecatalog:ProvisionProduct is the unique Service Catalog primitive: the
+  # end-user holds NO privileged permissions but the launch role runs the CFN stack
+  # on their behalf. This is NOT a standard CanModifyCode path (the user does not
+  # control the template itself — just the input parameters). It IS a direct
+  # CanExecuteAs because any custom resource Lambda, UserData, or Fn::If branch
+  # the user can influence through parameters runs AS the launch role.
+  #
+  # The authoritative reference for this escalation is the AWS Service Catalog
+  # launch constraint documentation:
+  #   https://docs.aws.amazon.com/servicecatalog/latest/adminguide/constraints-launch.html
+  # and the commonly documented "launch role privilege escalation" in cloud security
+  # research (Bishop Fox, Rhino Security Labs, AWS security blog posts).
+  #
+  # NOTE ON CICD-CHAINS: this rule emits CanExecuteAs directly (not via CanModifyCode)
+  # because the ProvisionProduct path is a WEAKER injection than template-modification:
+  # the attacker controls only PARAMETERS, not the template. cicd-chains
+  # cicd-modify-buildspec-executes-as requires full template control (CanModifyCode).
+  # We emit CanExecuteAs directly at CONDITIONAL(parameter_controlled_resource) to
+  # reflect that parameter-driven execution is context-dependent. Rules 2–3 below emit
+  # CanModifyCode for full template control and defer to cicd-chains.
+  - id: aws-sc-provision-product-executes-as
+    emits: CanExecuteAs
+    description: >-
+      servicecatalog:ProvisionProduct or UpdateProvisionedProduct on a product
+      bound to a LaunchRole constraint executes the product's CFN template as the
+      launch role, even when the provisioning principal holds no CloudFormation or
+      IAM permissions of their own. Any parameter-driven custom resource or
+      UserData the user controls runs as the launch role.
+    match:
+      - [ ?principal, CanTrigger, ?product ]
+      - [ ?product,   ExecutesAs, ?launch_role ]
+    where:
+      - "node_type(?product) == BuildWorker  # AWS::ServiceCatalog::CloudFormationProduct"
+      - "?product has a LaunchRole constraint with RoleArn = ?launch_role (from servicecatalog:DescribeConstraint.ConstraintParameters.RoleArn)"
+      - "?principal has EFFECTIVE servicecatalog:ProvisionProduct OR servicecatalog:UpdateProvisionedProduct on ?product (via portfolio association)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?launch_role
+      permissions: ["servicecatalog:ProvisionProduct", "servicecatalog:UpdateProvisionedProduct"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        CONDITIONAL(parameter_controlled_resource) by default: the principal holds only
+        ProvisionProduct / UpdateProvisionedProduct without template control. Escalation
+        requires the product template to contain a parameter-driven resource (custom
+        resource Lambda ServiceToken, UserData, or other attacker-influenceable path) that
+        the provisioning user can reach. A product template with no attacker-influenceable
+        resource path and rigid parameter validation is not trivially exploitable via
+        parameters alone.
+        BLOCKED when an SCP or permission boundary denies servicecatalog:ProvisionProduct
+        or servicecatalog:UpdateProvisionedProduct at the effective scope; or when no
+        LaunchRole constraint is present (then only the caller's own identity is used —
+        no escalation).
+      confidence: 0.8
+      derived_from:
+        - "?principal CanTrigger ?product"
+        - "?product ExecutesAs ?launch_role (LaunchRole constraint)"
+        - "cicd-chains.yaml cicd-trigger-runner-executes-as (trigger + ExecutesAs pattern)"
+      false_positive_note: >-
+        The most critical false-positive risk: products WITHOUT a LaunchRole constraint
+        execute as the CALLER's own identity — no escalation, do not emit this edge. Always
+        confirm a LaunchRole constraint is present (ConstraintType == LAUNCH,
+        ConstraintParameters.RoleArn non-empty). A LocalRoleName constraint uses a role in
+        the END-USER's account; verify that role's privilege before treating this as a
+        high-confidence escalation. The CONDITIONAL state reflects that bare ProvisionProduct
+        access is only CanExecuteAs when the template has an attacker-controllable execution
+        path — a template with fully controlled parameters (static values, validation patterns
+        that block injection) and no custom resources is not trivially exploitable; keep
+        CONDITIONAL, not ACTIVE, until a parameter-driven execution path is confirmed.
+        ServiceActionAssociation-based execution (ExecuteProvisionedProductServiceAction) is
+        a separate path against the SSM Automation role — not modeled here.
+      narrative: >-
+        {principal.name} can provision product {product.name}
+        (servicecatalog:ProvisionProduct / UpdateProvisionedProduct). {product.name} has a
+        Launch Role Constraint binding it to {launch_role.name}; Service Catalog assumes
+        {launch_role.name} to execute the product's CloudFormation template. Any
+        attacker-influenced parameter path (custom resource, UserData, Fn::If branch) in
+        the template runs as {launch_role.name}, granting {launch_role.name}'s permissions
+        to {principal.name}.
+
+  # ---------------------------------------------------------------------------
+  # 2. CreateProvisioningArtifact => CanModifyCode (template injection)
+  # ---------------------------------------------------------------------------
+  # servicecatalog:CreateProvisioningArtifact lets a portfolio admin add a new product
+  # version (a new CFN template). When that version is used for a subsequent
+  # ProvisionProduct or UpdateProvisionedProduct, the attacker's template runs as the
+  # launch role. This is the Service Catalog analogue of cloudformation:UpdateStack —
+  # a direct template replacement. cicd-chains cicd-modify-buildspec-executes-as then
+  # collapses this CanModifyCode + ExecutesAs into CanExecuteAs.
+  #
+  # For ACTIVE state (new version becomes the default), UpdateProvisioningArtifact is
+  # required to explicitly set the version as active; CONDITIONAL(version_active) applies
+  # when the version is not yet the default.
+  - id: aws-sc-create-artifact-modifies-code
+    emits: CanModifyCode
+    description: >-
+      servicecatalog:CreateProvisioningArtifact adds a new product version carrying an
+      attacker-controlled CFN template. The next ProvisionProduct or UpdateProvisionedProduct
+      using that version executes the attacker's template as the launch role bound to the
+      product. cicd-chains propagates this CanModifyCode + ExecutesAs into CanExecuteAs.
+    match:
+      - [ ?principal, CanModifyCode, ?product ]
+    where:
+      - "node_type(?product) == BuildWorker  # AWS::ServiceCatalog::CloudFormationProduct"
+      - "?principal has EFFECTIVE servicecatalog:CreateProvisioningArtifact on ?product"
+      - "?product has a LaunchRole constraint (RoleArn non-empty)"
+    optional:
+      - [ ?principal, CanTrigger, ?product ]   # also has ProvisionProduct -> ACTIVE (run path closed); else CONDITIONAL
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?product
+      permissions: ["servicecatalog:CreateProvisioningArtifact", "servicecatalog:UpdateProvisioningArtifact?"]
+      conditions: [iam_permission, version_active, run_path]
+      state_logic: >-
+        ACTIVE when ?principal has EFFECTIVE servicecatalog:CreateProvisioningArtifact
+        on ?product AND matched(optional[0]): the principal can ALSO trigger provisioning
+        (ProvisionProduct / UpdateProvisionedProduct), closing the run path, AND the new
+        version becomes the active/default version (set as default via
+        servicecatalog:UpdateProvisioningArtifact or Active=true at creation).
+        CONDITIONAL(run_path) when the principal cannot directly trigger provisioning —
+        another principal must call ProvisionProduct to realize the escalation.
+        CONDITIONAL(version_active) when the new version is not yet set as the default
+        (requires a subsequent UpdateProvisioningArtifact to activate it or an explicit
+        version ID at ProvisionProduct time). UpdateProvisioningArtifact is required
+        for ACTIVE state.
+        BLOCKED when an SCP or permission boundary denies servicecatalog:CreateProvisioningArtifact
+        at the effective scope, or when the product has no LaunchRole constraint.
+      confidence: 0.92
+      derived_from:
+        - "servicecatalog:CreateProvisioningArtifact EFFECTIVE permission on ?product"
+        - "?product LaunchRole constraint present (RoleArn non-empty)"
+        - "cicd-chains.yaml cicd-modify-buildspec-executes-as (consumes this CanModifyCode + ExecutesAs)"
+      false_positive_note: >-
+        Only emit when the product has a LaunchRole constraint. Without a launch role,
+        the new template version runs as the caller's own identity — no privilege gain.
+        A new version that is not set as active (Guidance=DEPRECATED, or not the default)
+        will only be used if a provisioner explicitly requests it by version ID —
+        downgrade to CONDITIONAL(version_active) until confirmed as the active version.
+        servicecatalog:UpdateProvisioningArtifact is required to set the version active;
+        when absent, this edge stays CONDITIONAL(version_active). cicd-chains
+        cicd-modify-buildspec-executes-as rolls this CanModifyCode + the product's
+        ExecutesAs(launch role) into CanExecuteAs — do NOT re-derive CanExecuteAs here.
+      narrative: >-
+        {principal.name} can add a new product version to {product.name}
+        (servicecatalog:CreateProvisioningArtifact), supplying an attacker-controlled
+        CloudFormation template. When that version is used for a future ProvisionProduct
+        or UpdateProvisionedProduct, the template executes as the launch role bound to
+        {product.name}. cicd-chains propagates this to CanExecuteAs.
+
+  # ---------------------------------------------------------------------------
+  # 3. S3 template write => CanModifyCode (supply-chain path)
+  # ---------------------------------------------------------------------------
+  # Each product version's template is stored as an S3 object referenced by
+  # DescribeProvisioningArtifact.Info.LoadTemplateFromURL. If an attacker can overwrite
+  # that S3 object (s3:PutObject), the next ProvisionProduct or UpdateProvisionedProduct
+  # call against that version loads the attacker's template. Analogous to
+  # aws-cfn-template-s3-write-modifies-code in cloudformation.yaml.
+  - id: aws-sc-s3-template-write-modifies-code
+    emits: CanModifyCode
+    description: >-
+      Write access to the S3 object backing a Service Catalog product version's template
+      (LoadTemplateFromURL): the next ProvisionProduct or UpdateProvisionedProduct loads
+      the attacker's template and executes it as the launch role. cicd-chains propagates
+      this CanModifyCode + ExecutesAs into CanExecuteAs.
+    match:
+      - [ ?principal, CanWrite,                    ?template_object ]
+      - [ ?product,   ContainsResourceReference,   ?template_object ]
+    where:
+      - "node_type(?template_object) == ObjectStorage  # S3 bucket/key from LoadTemplateFromURL"
+      - "node_type(?product) == BuildWorker            # AWS::ServiceCatalog::CloudFormationProduct"
+      - "?product version Info.LoadTemplateFromURL references ?template_object.s3_uri (no version-ID pin)"
+      - "?product has a LaunchRole constraint (RoleArn non-empty)"
+    optional:
+      - [ ?principal, CanTrigger, ?product ]   # also has ProvisionProduct / UpdateProvisionedProduct -> ACTIVE; else CONDITIONAL
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?product
+      permissions: ["s3:PutObject"]
+      conditions: [run_path, iam_permission]
+      state_logic: >-
+        CONDITIONAL(run_path) by default — overwriting the S3 template object does NOT
+        immediately execute; a ProvisionProduct or UpdateProvisionedProduct call must
+        load the updated URL.
+        ACTIVE when matched(optional[0]): the principal can ALSO trigger provisioning
+        (servicecatalog:ProvisionProduct / UpdateProvisionedProduct), closing the run path.
+        POTENTIAL(run_path) when the product version URL pins a specific S3 object version
+        ID (i.e., the URL includes ?versionId=...) — overwriting the latest object does
+        not change what Service Catalog loads; do not emit CONDITIONAL in that case.
+        Inherit weakest with the CanWrite edge on ?template_object (an S3 bucket policy
+        or SCP blocking s3:PutObject makes this BLOCKED).
+      confidence: 0.85
+      derived_from:
+        - "?principal CanWrite ?template_object"
+        - "?product ContainsResourceReference ?template_object (LoadTemplateFromURL)"
+        - "?product LaunchRole constraint present"
+        - "cicd-chains.yaml cicd-modify-buildspec-executes-as (consumes this CanModifyCode + ExecutesAs)"
+      false_positive_note: >-
+        The S3 write alone is NOT an immediate code-injection; a provisioning trigger must
+        follow. A product version URL that includes a specific S3 version ID (versionId
+        query param) is NOT affected by overwriting the latest object version — downgrade
+        to POTENTIAL(run_path) or omit. Verify the LoadTemplateFromURL value from
+        DescribeProvisioningArtifact.Info does NOT contain a versionId pin. Only emit
+        when the product has a LaunchRole constraint. cicd-chains collapses this
+        CanModifyCode + ExecutesAs into CanExecuteAs — do not re-derive CanExecuteAs here.
+      narrative: >-
+        {principal.name} can overwrite the S3 template object {template_object.name}
+        referenced by product {product.name}'s version (s3:PutObject on
+        {template_object.name}). The next ProvisionProduct or UpdateProvisionedProduct
+        call against that version loads the attacker's template, which executes as the
+        launch role bound to {product.name}.
+
+  # ---------------------------------------------------------------------------
+  # 4. UpdateConstraint + PassRole => CanModifyConfiguration + ExecutesAs swap
+  # ---------------------------------------------------------------------------
+  # servicecatalog:UpdateConstraint allows changing the RoleArn on an existing
+  # LaunchRole constraint. With iam:PassRole for the new (more privileged) role,
+  # an attacker can re-point any product's launch role to a high-privilege role.
+  # The next ProvisionProduct then executes as the new role. This is the Service
+  # Catalog analogue of aws-lambda-attach-role-via-config in lambda.yaml.
+  # can-execute-as.yaml execute-as-via-config-identity-swap rolls
+  # CanModifyConfiguration + CanPassIdentity into CanExecuteAs.
+  #
+  # FIX: Emit CanModifyConfiguration (product's execution binding) rather than
+  # CanAttachIdentity. This matches the linchpin pattern in can-execute-as.yaml
+  # execute-as-via-config-identity-swap, which requires CanModifyConfiguration
+  # (not CanAttachIdentity) + CanPassIdentity to derive CanExecuteAs.
+  - id: aws-sc-update-constraint-attaches-identity
+    emits: CanModifyConfiguration
+    description: >-
+      servicecatalog:UpdateConstraint + iam:PassRole(servicecatalog.amazonaws.com) on a
+      LaunchRole constraint: replace the launch role bound to a product with a more
+      privileged role. The next ProvisionProduct executes as the new launch role.
+      can-execute-as execute-as-via-config-identity-swap propagates with CanPassIdentity
+      to derive CanExecuteAs.
+    match:
+      - [ ?principal, CanPassIdentity, ?new_role ]
+      - [ ?product,   ExecutesAs,      ?old_role ]
+      - [ ?principal, HasPermission,   ?product ]
+    where:
+      - "node_type(?product) == BuildWorker  # AWS::ServiceCatalog::CloudFormationProduct"
+      - "?product has a LaunchRole constraint with RoleArn = ?old_role"
+      - "?principal has EFFECTIVE servicecatalog:UpdateConstraint on the constraint associated with ?product"
+      - "?new_role trust policy allows servicecatalog.amazonaws.com as a trusted service"
+      - "iam:PassRole for ?new_role permits iam:PassedToService == servicecatalog.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?product
+      permissions: ["servicecatalog:UpdateConstraint", "iam:PassRole"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when (a) servicecatalog:UpdateConstraint is in EFFECTIVE policy for
+        the constraint, (b) iam:PassRole for ?new_role is granted with
+        iam:PassedToService including servicecatalog.amazonaws.com or unconditioned,
+        AND (c) ?new_role trust policy allows servicecatalog.amazonaws.com.
+        POTENTIAL(role_compatibility) when ?new_role trust policy does not yet include
+        servicecatalog.amazonaws.com — the constraint update will succeed in changing
+        the RoleArn but Service Catalog will fail to assume the role at provision time.
+        BLOCKED when SCP or permission boundary denies servicecatalog:UpdateConstraint
+        or iam:PassRole at the effective scope.
+      confidence: 0.9
+      derived_from:
+        - "?principal CanPassIdentity ?new_role"
+        - "?product ExecutesAs ?old_role"
+        - "servicecatalog:UpdateConstraint EFFECTIVE on the constraint"
+        - "can-execute-as.yaml execute-as-via-config-identity-swap (CanModifyConfiguration + CanPassIdentity => CanExecuteAs)"
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to cloudformation.amazonaws.com,
+        lambda.amazonaws.com, or ec2.amazonaws.com does NOT satisfy the
+        servicecatalog.amazonaws.com requirement. Verify the PassedToService condition is
+        either absent (unconditioned) or explicitly includes servicecatalog.amazonaws.com.
+        Downgrade to POTENTIAL(role_compatibility) when the trust policy or PassedToService
+        condition is ambiguous or unresolved. can-execute-as
+        execute-as-via-config-identity-swap handles the roll-up with CanPassIdentity;
+        do not re-derive CanExecuteAs here.
+      narrative: >-
+        {principal.name} can update the Launch Role Constraint on product {product.name}
+        (servicecatalog:UpdateConstraint + iam:PassRole for {new_role.name} to
+        servicecatalog.amazonaws.com), modifying the product's execution binding from
+        {old_role.name} to {new_role.name}. The next ProvisionProduct call executes as
+        {new_role.name}. This CanModifyConfiguration + CanPassIdentity chain derives
+        CanExecuteAs via can-execute-as execute-as-via-config-identity-swap.
+
+  # ---------------------------------------------------------------------------
+  # 5. CreateConstraint + PassRole => CanModifyConfiguration (launch role binding)
+  # ---------------------------------------------------------------------------
+  # servicecatalog:CreateConstraint allows adding a LaunchRole constraint to a product
+  # that currently has none (or an attacker-chosen role to a new portfolio association).
+  # With iam:PassRole for a privileged role, this is equivalent to adding an execution
+  # identity to a CI/CD runner that previously ran as the caller's own identity.
+  #
+  # FIX: Emit CanModifyConfiguration (product's execution binding) rather than
+  # CanAttachIdentity. This matches the linchpin pattern in can-execute-as.yaml
+  # execute-as-via-config-identity-swap, which requires CanModifyConfiguration
+  # (not CanAttachIdentity) + CanPassIdentity to derive CanExecuteAs.
+  - id: aws-sc-create-constraint-attaches-identity
+    emits: CanModifyConfiguration
+    description: >-
+      servicecatalog:CreateConstraint + iam:PassRole(servicecatalog.amazonaws.com):
+      add a LaunchRole constraint to a product in a portfolio, binding a chosen privileged
+      role. All subsequent ProvisionProduct calls then execute as that launch role.
+      can-execute-as execute-as-via-config-identity-swap propagates with CanPassIdentity
+      to derive CanExecuteAs.
+    match:
+      - [ ?principal, CanPassIdentity, ?new_role ]
+      - [ ?principal, HasPermission,   ?portfolio ]
+      - [ ?product,   MemberOf,        ?portfolio ]
+    where:
+      - "node_type(?portfolio) == GenericManagement  # AWS::ServiceCatalog::Portfolio"
+      - "node_type(?product) == BuildWorker  # AWS::ServiceCatalog::CloudFormationProduct"
+      - "?principal has EFFECTIVE servicecatalog:CreateConstraint on ?portfolio (scoped to portfolio ARN)"
+      - "?new_role trust policy allows servicecatalog.amazonaws.com as a trusted service"
+      - "iam:PassRole for ?new_role permits iam:PassedToService == servicecatalog.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?product
+      permissions: ["servicecatalog:CreateConstraint", "iam:PassRole"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when (a) servicecatalog:CreateConstraint is in EFFECTIVE policy for
+        ?portfolio and its products, (b) iam:PassRole for ?new_role is granted with
+        iam:PassedToService including servicecatalog.amazonaws.com or unconditioned,
+        AND (c) ?new_role trust policy allows servicecatalog.amazonaws.com.
+        POTENTIAL(role_compatibility) when ?new_role trust policy is ambiguous.
+        BLOCKED when SCP or permission boundary denies servicecatalog:CreateConstraint
+        or iam:PassRole at the effective scope.
+      confidence: 0.88
+      derived_from:
+        - "?principal CanPassIdentity ?new_role"
+        - "servicecatalog:CreateConstraint EFFECTIVE on ?portfolio"
+        - "can-execute-as.yaml execute-as-via-config-identity-swap (CanModifyConfiguration + CanPassIdentity => CanExecuteAs)"
+      false_positive_note: >-
+        Honor iam:PassedToService: same discipline as aws-sc-update-constraint-attaches-identity
+        above. Only emit when the product is (or can be placed) in a portfolio the attacker
+        can create constraints on. A product with an EXISTING LaunchRole constraint may reject
+        a second constraint of the same type (a portfolio can hold one launch constraint per
+        product — adding a second may require removing the first, which needs
+        servicecatalog:DeleteConstraint). When a prior constraint exists, prefer
+        aws-sc-update-constraint-attaches-identity. can-execute-as handles the roll-up
+        to CanExecuteAs via execute-as-via-config-identity-swap; do not re-derive here.
+      narrative: >-
+        {principal.name} can create a Launch Role Constraint (servicecatalog:CreateConstraint
+        + iam:PassRole for {new_role.name} to servicecatalog.amazonaws.com) on product
+        {product.name} in portfolio {portfolio.name}, modifying the product's execution
+        binding to {new_role.name}. All subsequent ProvisionProduct calls for {product.name}
+        then execute as {new_role.name}. This CanModifyConfiguration + CanPassIdentity chain
+        derives CanExecuteAs via can-execute-as execute-as-via-config-identity-swap.
+
+  # ---------------------------------------------------------------------------
+  # 6. Cross-account portfolio share + ProvisionProduct => CanEnterAccount
+  # ---------------------------------------------------------------------------
+  # When a portfolio is shared with another AWS account (PortfolioShare.Type == ACCOUNT
+  # or ORGANIZATION), principals in the receiving account can import the portfolio and
+  # provision its products. The launch role resides in the SHARING account (account A),
+  # and Service Catalog assumes it on behalf of the receiving-account principal. This
+  # creates a CanEnterAccount path: an end-user in account B can cause resources to be
+  # created in account A with the launch role's permissions.
+  #
+  # can-control.yaml enter-account-via-assume does not cover this case directly (the
+  # end-user never calls sts:AssumeRole; the service does). This rule emits CanEnterAccount
+  # explicitly for the Service Catalog cross-account delegation pattern.
+  #
+  # FIX: CrossAccountTrust source must be ResourcePolicy (the PortfolioShare artifact),
+  # not GenericManagement (the portfolio). The portfolio is the TARGET. The ResourcePolicy
+  # node represents the PortfolioShare sharing relationship.
+  - id: aws-sc-cross-account-provision-enters-account
+    emits: CanEnterAccount
+    description: >-
+      A principal in account B provisioning a product from a portfolio shared by account A
+      (servicecatalog:ProvisionProduct) causes resources to be deployed in account A as the
+      account-A launch role. The receiving-account principal effectively gains a foothold in
+      account A via the launch role's permissions.
+    match:
+      - [ ?portfolio_share, CrossAccountTrust,  ?target_account ]
+      - [ ?principal,       CanTrigger,         ?product ]
+      - [ ?product,         ExecutesAs,         ?launch_role ]
+    where:
+      - "node_type(?portfolio_share) == ResourcePolicy  # AWS::ServiceCatalog::PortfolioShare"
+      - "node_type(?target_account) == Account          # the sharing (source) account — account A"
+      - "?portfolio_share represents the share of ?portfolio to ?target_account"
+      - "?product is in ?portfolio"
+      - "?principal.account != ?target_account       # principal is in a different account (account B)"
+      - "?launch_role.account == ?target_account     # launch role resides in account A"
+      - "?principal has EFFECTIVE servicecatalog:ProvisionProduct OR servicecatalog:UpdateProvisionedProduct on ?product via the imported portfolio"
+      - "?product has a LAUNCH (not LocalRoleName) constraint, i.e., ConstraintType == LAUNCH and ConstraintParameters.RoleArn is in ?target_account"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?principal
+      target: ?target_account
+      permissions: ["servicecatalog:ProvisionProduct", "servicecatalog:UpdateProvisionedProduct"]
+      conditions: [trust_relationship, iam_permission]
+      state_logic: >-
+        ACTIVE when (a) the CrossAccountTrust / PortfolioShare between ?portfolio_share and
+        ?target_account is confirmed (DescribePortfolioShares shows the share AND the
+        receiving account has accepted it via ImportPortfolio), (b) ?principal has
+        EFFECTIVE servicecatalog:ProvisionProduct or UpdateProvisionedProduct on ?product
+        in the imported portfolio, AND (c) ?product has a LaunchRole constraint with a
+        role in ?target_account (not a LocalRoleName which resolves in the receiving account).
+        CONDITIONAL(trust_relationship) when the portfolio share has been created but
+        the receiving account has not yet accepted/imported it (ImportPortfolio not called).
+        CONDITIONAL(parameter_controlled_resource) when the product template has no
+        attacker-influenceable execution path (same gate as rule 1).
+        BLOCKED when an SCP in either account denies the relevant servicecatalog or CFN
+        actions; or when no LaunchRole constraint is present or when the constraint is
+        LocalRoleName (role in receiving account, not cross-account).
+      confidence: 0.82
+      derived_from:
+        - "?portfolio_share CrossAccountTrust ?target_account (PortfolioShare)"
+        - "?principal CanTrigger ?product"
+        - "?product ExecutesAs ?launch_role (LaunchRole constraint in ?target_account)"
+        - "can-control.yaml enter-account-via-assume (cross-account foothold pattern)"
+      false_positive_note: >-
+        The FOOTHOLD is in ?target_account (account A, where the launch role resides and
+        where CFN deploys resources). The provisioning principal in account B does NOT
+        directly assume the launch role — Service Catalog does. Emit CanEnterAccount
+        (source=?principal in account B, target=?target_account A) to reflect that the
+        principal's actions cause resource deployment in account A. Do NOT emit CanAssume
+        (the principal never calls sts:AssumeRole on the launch role; it is opaque to them).
+        CRITICAL: A LocalRoleName constraint resolves a role in the RECEIVING account
+        (account B), not the sharing account (account A) — omit CanEnterAccount in that
+        case; there is no cross-account foothold via the launch role. Only emit when the
+        LaunchRole constraint's RoleArn is confirmed to be in ?target_account (not
+        LocalRoleName). For Org-wide shares (OrganizationNode), any principal across all
+        Org member accounts with ProvisionProduct access qualifies; prefer emitting
+        CanEnterAccount per account rather than CanEnterOrganization unless the share is
+        confirmed Org-wide AND every account's principals are accessible to the modeled attacker.
+      narrative: >-
+        {principal.name} (account B) can provision product {product.name} from a portfolio
+        shared by account {target_account.name} (account A, via {portfolio_share.name}).
+        Service Catalog assumes the launch role {launch_role.name} (residing in account A)
+        to deploy the product's CloudFormation resources there. {principal.name} gains a
+        foothold in account A through the launch role's permissions, without ever holding
+        sts:AssumeRole on {launch_role.name}.
+
+  # ---------------------------------------------------------------------------
+  # 7. ExecuteProvisionedProductServiceAction => CanExecuteAs (SSM Automation execution)
+  # ---------------------------------------------------------------------------
+  # servicecatalog:ExecuteProvisionedProductServiceAction triggers an SSM Automation
+  # document as a separate execution role (not the product's launch role). A principal
+  # who can execute a service action (and who can associate it if needed via
+  # servicecatalog:AssociateServiceActionWithProvisioningArtifact) can run arbitrary
+  # SSM Automation steps as the SSM automation role. This is a distinct escalation path
+  # from the product's launch role (rule 1).
+  #
+  # Related: servicecatalog:DisassociateServiceActionFromProvisioningArtifact allows
+  # removing undesired service actions, but this is not modeled (it is defensive, not
+  # escalation-focused).
+  - id: aws-sc-service-action-executes-as
+    emits: CanExecuteAs
+    description: >-
+      servicecatalog:ExecuteProvisionedProductServiceAction on an associated SSM Automation
+      service action executes the automation document as the service action's automation role.
+      A principal who can trigger a provisioned product and execute its service actions
+      runs arbitrary SSM Automation as the automation role.
+    match:
+      - [ ?principal, CanTrigger,      ?provisioned_product ]
+      - [ ?service_action, ExecutesAs, ?automation_role ]
+    where:
+      - "node_type(?service_action) == GenericManagement  # AWS::ServiceCatalog::ServiceAction (SSM Automation wrapper)"
+      - "?service_action is associated with ?provisioned_product (or ?provisioned_product's product)"
+      - "?principal has EFFECTIVE servicecatalog:ExecuteProvisionedProductServiceAction on ?provisioned_product"
+    optional:
+      - [ ?principal, CanModifyCode, ?service_action ]    # attacker can modify the service action / automation document -> ACTIVE
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?automation_role
+      permissions: ["servicecatalog:ExecuteProvisionedProductServiceAction"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when ?principal has EFFECTIVE servicecatalog:ExecuteProvisionedProductServiceAction
+        on the provisioned product AND can trigger it (CanTrigger), and the service action
+        is associated and configured.
+        CONDITIONAL(service_state) when the service action association exists but the
+        automation role trust or configuration is unverified.
+        BLOCKED when an SCP or permission boundary denies
+        servicecatalog:ExecuteProvisionedProductServiceAction at the effective scope,
+        or when the service action is not associated with the product.
+      confidence: 0.75
+      derived_from:
+        - "?principal CanTrigger ?provisioned_product"
+        - "?service_action ExecutesAs ?automation_role"
+        - "cicd-chains.yaml cicd-trigger-runner-executes-as (trigger + ExecutesAs pattern)"
+      false_positive_note: >-
+        This path executes SSM Automation as a separate identity from the product's launch
+        role (rule 1). The automation role is NOT the product's launch role. Verify the
+        service action is associated with the product via DescribeProvisioningArtifact or
+        ListProvisioningArtifactParameters (ServiceActions field). If the principal can
+        also modify the service action's definition or the SSM document it wraps
+        (servicecatalog:UpdateServiceAction, ssm:UpdateDocument, or write to the document S3
+        location), upgrade to ACTIVE — the principal controls the automation steps.
+      narrative: >-
+        {principal.name} can trigger provisioned product {provisioned_product.name}
+        (servicecatalog:ExecuteProvisionedProductServiceAction) and execute its associated
+        service action {service_action.name}. {service_action.name} runs the SSM Automation
+        document as {automation_role.name}, granting {automation_role.name}'s permissions
+        to {principal.name}. This is a separate execution path from the product's launch role.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP or permission boundary denying servicecatalog:ProvisionProduct,
+#    servicecatalog:UpdateProvisionedProduct, servicecatalog:CreateProvisioningArtifact,
+#    servicecatalog:CreateConstraint, servicecatalog:UpdateConstraint, or iam:PassRole
+#    at the effective scope -> emit the contributing edge with state: BLOCKED and
+#    denied_by=<SCP arn/statement id>.
+#  - iam:PassRole with iam:PassedToService NOT including servicecatalog.amazonaws.com
+#    -> CanPassIdentity is POTENTIAL(role_compatibility); rules 4 and 5 inherit that state.
+#  - A product with no LaunchRole constraint (constraint list empty or ConstraintType != LAUNCH)
+#    -> rules 1, 2, 3 must not emit (provisioning runs as the caller's own identity).
+#  - A product version URL with an S3 versionId pin -> rule 3 is POTENTIAL(run_path), not CONDITIONAL.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules for this service (add to /rules/explicit/aws-servicecatalog.yaml):
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: aws-sc-executes-as
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::ServiceCatalog::LaunchRoleConstraint"
+      field: "ConstraintParameters.RoleArn"
+    emit:
+      source_type: Compute
+      source: "<product node (BuildWorker) associated with this constraint>"
+      target: "<IAM role from RoleArn (Role/MachineIdentity)>"
+      api_source: "servicecatalog:ListConstraintsForPortfolio + servicecatalog:DescribeConstraint"
+      evidence_field: "ConstraintParameters.RoleArn"
+      narrative: "Service Catalog product {product.name} executes CFN stacks as launch role {role.name} (LaunchRole constraint RoleArn)."
+
+  - id: aws-sc-can-trigger-provision
+    emits: CanTrigger
+    applies_to: [aws]
+    match_effective_permission:
+      action: "servicecatalog:ProvisionProduct"
+      resource_type: "AWS::ServiceCatalog::CloudFormationProduct"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<product node (BuildWorker) in the accessible portfolio>"
+      permissions: ["servicecatalog:ProvisionProduct"]
+      narrative: "{principal.name} can provision product {product.name} (servicecatalog:ProvisionProduct)."
+
+  - id: aws-sc-can-trigger-update
+    emits: CanTrigger
+    applies_to: [aws]
+    match_effective_permission:
+      action: "servicecatalog:UpdateProvisionedProduct"
+      resource_type: "AWS::ServiceCatalog::CloudFormationProvisionedProduct"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<product node (BuildWorker) backing the provisioned product>"
+      permissions: ["servicecatalog:UpdateProvisionedProduct"]
+      narrative: "{principal.name} can update provisioned product {provisioned_product.name} (servicecatalog:UpdateProvisionedProduct), re-running the product's template as the launch role."
+
+  - id: aws-sc-can-pass-role-to-sc
+    emits: CanPassIdentity
+    applies_to: [aws]
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+      condition: "iam:PassedToService == servicecatalog.amazonaws.com"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<IAM role in scope>"
+      permissions: ["iam:PassRole"]
+      narrative: "{principal.name} can pass {role.name} to Service Catalog (iam:PassRole for servicecatalog.amazonaws.com)."
+
+  - id: aws-sc-template-s3-reference
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::ServiceCatalog::CloudFormationProduct"
+      field: "ProvisioningArtifacts[].Info.LoadTemplateFromURL"
+    emit:
+      source: "<product node (BuildWorker)>"
+      target: "<S3 bucket/key from LoadTemplateFromURL (ObjectStorage)>"
+      api_source: "servicecatalog:DescribeProvisioningArtifact"
+      evidence_field: "Info.LoadTemplateFromURL"
+      narrative: "Service Catalog product {product.name} version {version.name} loads its template from S3 at {url}."
+
+  - id: aws-sc-portfolio-share-cross-account
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::ServiceCatalog::PortfolioShare"
+      field: "PrincipalId"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<ResourcePolicy node representing the PortfolioShare artifact>"
+      target: "<target Account or Organization node>"
+      api_source: "servicecatalog:DescribePortfolioShares"
+      evidence_field: "PortfolioShareDetails.PrincipalId (account ID or Org ID) + Type"
+      narrative: "Service Catalog portfolio share {portfolio_share.name} creates a cross-account trust from the sharing account to {target.name}, allowing {target.name}'s principals to import and provision the portfolio's products."
+
+  - id: aws-sc-service-action-executes-as
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::ServiceCatalog::ServiceAction"
+      field: "Definition.Parameters.AssumeRole"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: "<service action node (GenericManagement)>"
+      target: "<IAM role from Definition.Parameters.AssumeRole (Role/MachineIdentity)>"
+      api_source: "servicecatalog:DescribeServiceAction"
+      evidence_field: "Definition.Parameters.AssumeRole (SSM Automation execution role)"
+      narrative: "Service Catalog service action {service_action.name} executes its SSM Automation document as role {role.name} (Definition.Parameters.AssumeRole)."
+
+  - id: aws-sc-can-execute-service-action
+    emits: CanTrigger
+    applies_to: [aws]
+    match_effective_permission:
+      action: "servicecatalog:ExecuteProvisionedProductServiceAction"
+      resource_type: "AWS::ServiceCatalog::ProvisionedProduct"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<provisioned product node (BuildWorker) or its associated service action>"
+      permissions: ["servicecatalog:ExecuteProvisionedProductServiceAction"]
+      narrative: "{principal.name} can execute a service action on provisioned product {provisioned_product.name} (servicecatalog:ExecuteProvisionedProductServiceAction)."

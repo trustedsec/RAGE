@@ -1,0 +1,161 @@
+# Normalizing AWS ACM Private CA (acm-pca) into explicit edges.
+# The adapter emits raw CA records (DescribeCertificateAuthority, GetPolicy,
+# ListPermissions, RAM shares) and effective-permission decisions; these rules
+# translate them into common explicit edges conforming to schema/edges.yaml.
+#
+# A private CA is modeled as a SigningKey (Secret-class) node — it is an issuer
+# whose private key signs arbitrary certificates. There is NO execution role and
+# NO ExecutesAs. Getting a usable cert requires IssueCertificate (mint) AND
+# GetCertificate (retrieve the PEM); we normalize each capability separately and
+# let the derived rules combine them.
+
+rules:
+
+  # --- CA as a signing-key node (structural anchor) -------------------------
+  - id: aws-acmpca-ca-has-policy
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::ACMPCA::CertificateAuthority", field: "Policy"}
+    where: ["CA has a resource-based policy (GetPolicy returned a document)"]
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<certificate-authority node>"
+      target: "<CA resource-policy node>"
+      api_source: "acm-pca:GetPolicy"
+      evidence_field: "Policy"
+      narrative: "{ca.name} has a resource-based policy governing who may issue certificates."
+
+  # --- Issue certificate = sign as the CA -----------------------------------
+  # IssueCertificate signs a caller-supplied CSR with the CA's private key.
+  # Emitted only if the principal's EFFECTIVE permissions include the action on
+  # this CA's scope (permission evaluator), honoring the acm-pca:TemplateArn
+  # condition key. This is the credential-minting primitive -> CanSignAs.
+  - id: aws-acmpca-can-sign-as
+    emits: CanSignAs
+    applies_to: [aws]
+    match_effective_permission:
+      action: "acm-pca:IssueCertificate"
+      resource_type: "AWS::ACMPCA::CertificateAuthority"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<certificate-authority node (SigningKey)>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["acm-pca:IssueCertificate"]
+      evidence_field: "acm-pca:TemplateArn (allowed template)"
+      narrative: "{principal.name} can issue certificates signed by CA {ca.name} (acm-pca:IssueCertificate)."
+
+  # --- Retrieve the signed certificate PEM ----------------------------------
+  - id: aws-acmpca-can-read-certificate
+    emits: CanRead
+    applies_to: [aws]
+    match_effective_permission:
+      action: "acm-pca:GetCertificate"
+      resource_type: "AWS::ACMPCA::CertificateAuthority"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<certificate-authority node>"
+      permissions: ["acm-pca:GetCertificate"]
+      narrative: "{principal.name} can retrieve certificates issued by CA {ca.name} (acm-pca:GetCertificate)."
+
+  # --- Read CA cert / CSR (public material — recon) -------------------------
+  - id: aws-acmpca-can-read-ca-material
+    emits: CanRead
+    applies_to: [aws]
+    match_effective_permission:
+      action: "acm-pca:GetCertificateAuthorityCertificate"
+      resource_type: "AWS::ACMPCA::CertificateAuthority"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<certificate-authority node>"
+      permissions: ["acm-pca:GetCertificateAuthorityCertificate", "acm-pca:GetCertificateAuthorityCsr"]
+      narrative: "{principal.name} can read the certificate/CSR of CA {ca.name} (public material — recon, not the private key)."
+
+  # --- Modify the CA resource policy (self-grant issuance) ------------------
+  - id: aws-acmpca-can-modify-policy
+    emits: CanModifyPolicy
+    applies_to: [aws]
+    match_effective_permission:
+      action: "acm-pca:PutPolicy"
+      resource_type: "AWS::ACMPCA::CertificateAuthority"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<certificate-authority node>"
+      permissions: ["acm-pca:PutPolicy", "acm-pca:DeletePolicy"]
+      narrative: "{principal.name} can rewrite the resource policy of CA {ca.name} (acm-pca:PutPolicy) to grant itself/others issuance."
+
+  # --- Modify CA configuration / status -------------------------------------
+  - id: aws-acmpca-can-modify-configuration
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "acm-pca:UpdateCertificateAuthority"
+      resource_type: "AWS::ACMPCA::CertificateAuthority"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<certificate-authority node>"
+      permissions: ["acm-pca:UpdateCertificateAuthority"]
+      narrative: "{principal.name} can change configuration/status of CA {ca.name} (acm-pca:UpdateCertificateAuthority), e.g. re-enable a disabled CA."
+
+  # --- Full administrative control over the CA ------------------------------
+  - id: aws-acmpca-can-administer
+    emits: CanAdminister
+    applies_to: [aws]
+    match_effective_permission:
+      action: "acm-pca:*"
+      resource_type: "AWS::ACMPCA::CertificateAuthority"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<certificate-authority node>"
+      permissions: ["acm-pca:*"]
+      narrative: "{principal.name} has full administrative control over CA {ca.name} (acm-pca:*)."
+
+  # --- Cross-account issuance trust (resource policy) -----------------------
+  - id: aws-acmpca-resource-policy-cross-account
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::ACMPCA::CertificateAuthority", field: "Policy"}
+    where:
+      - "a Policy statement names a principal in a different account"
+      - "statement Action includes acm-pca:IssueCertificate"
+    emit:
+      # CrossAccountTrust.source must be Account/Role/ResourcePolicy. The CA node is a
+      # SigningKey (Secret-class) and is NOT a valid source, so the trust is sourced
+      # from the CA's ResourcePolicy node (the HasPolicy target modeled as a
+      # ResourcePolicy) — the resource policy is what actually names the external
+      # principal.
+      source: "<CA resource-policy node>"
+      target: "<external principal / account>"
+      api_source: "acm-pca:GetPolicy"
+      evidence_field: "Policy.Statement[].Principal / Action"
+      narrative: "{ca.name} resource policy grants acm-pca:IssueCertificate to {external.name} in account {account}."
+
+  # --- Cross-account issuance trust (RAM share) -----------------------------
+  - id: aws-acmpca-ram-share-cross-account
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::RAM::ResourceShare", field: "resourceArns"}
+    where:
+      - "shared resource ARN is an acm-pca certificate-authority"
+      - "share principal is a different account/OU"
+    emit:
+      # A RAM share is a resource-policy-equivalent grant, not the signing key.
+      # CrossAccountTrust.source = [Account, Role, ResourcePolicy]; the SigningKey CA
+      # node is not a valid source. Source the trust from the RAM-share /
+      # resource-policy node (ResourcePolicy class) that carries the cross-account grant.
+      source: "<CA RAM-share / resource-policy node>"
+      target: "<external principal / account>"
+      api_source: "ram:GetResourceShareAssociations | ram:ListResources"
+      evidence_field: "resourceArns / principals"
+      narrative: "{ca.name} is shared via AWS RAM to account {account}, enabling cross-account certificate issuance."

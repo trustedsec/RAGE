@@ -1,0 +1,193 @@
+# GCP IAM Deny Policies — Derived attack-path rules (Phase 2 — identity stragglers)
+# ===========================================================================
+# IAM deny policies are GUARDRAIL artifacts. They block principals from using
+# specific permissions regardless of allow grants (deny wins, evaluated first).
+# Their attack relevance is almost entirely GUARDRAIL REMOVAL: a principal with
+# iam.denypolicies.update or iam.denypolicies.delete over a deny policy can
+# weaken or eliminate it, upgrading every BLOCKED edge that deny policy was
+# suppressing back to its underlying state.
+#
+# MODELING CONTRACT (mirrors /rules/derived/gcp/orgpolicy.yaml exactly):
+#   * This file emits ONLY CanModifyPolicy(Identity -> ConditionalPolicy) —
+#     the fact that a principal can edit or delete the deny policy.
+#   * We DO NOT re-emit the downstream unblocked edges. The BLOCKED ->
+#     CONDITIONAL(guardrail_removed) state upgrade is performed ONCE, generically,
+#     by hierarchy-chains.yaml guardrail-removal-upgrades-blocked (rule 3).
+#     Every rule below cites it in derived_from. Emitting the unblocked edge here
+#     would DOUBLE-COUNT the path.
+#   * We DO NOT re-implement org/folder/project setIamPolicy, Contains descent,
+#     or CanEnter* roll-ups — those live in identity-escalation.yaml and
+#     hierarchy-chains.yaml. We CITE, not duplicate.
+#
+# POLICY NODE TYPE:
+#   Deny policies are modeled as Policy nodes with subtype ConditionalPolicy
+#   (closest schema fit for a condition-bearing, non-SCP, non-org-policy deny
+#   artifact). The schema's ConditionalPolicy subtype is "Condition-bearing
+#   binding / Conditional Access / deny assignment" — GCP IAM deny policy is
+#   the GCP realization of this concept.
+#
+# PERMISSION CORRECTNESS (verbatim from cloud.google.com/iam/docs/deny-access):
+#   iam.denypolicies.create   — create a deny policy at a scope
+#   iam.denypolicies.update   — modify rules in an existing deny policy
+#   iam.denypolicies.delete   — remove a deny policy entirely
+#   iam.denypolicies.get      — read a single deny policy
+#   iam.denypolicies.list     — list deny policies at a scope
+#   roles/iam.denyAdmin       — full management (create + update + delete + get + list)
+#   roles/iam.denyReviewer    — read-only (get + list)
+#
+# SCOPE: deny policies attach at organization, folder, or project only; they
+#   inherit DOWN the resource hierarchy to all descendants.
+#
+# LINCHPIN CITATIONS (do NOT duplicate these — cite only):
+#   hierarchy-chains.yaml rule 3 (guardrail-removal-upgrades-blocked):
+#     performs the state upgrade of every BLOCKED edge whose blocked_by == the
+#     deny policy node, re-emitting it as CONDITIONAL(guardrail_removed).
+#   hierarchy-chains.yaml rule 1 (admin-inherits-down-contains):
+#     propagates control of a parent boundary down to all descendants.
+#   identity-escalation.yaml (gcp-set-iam-policy-*):
+#     setIamPolicy self-grant at project/folder/org — not repeated here.
+# ===========================================================================
+
+provider: gcp
+phase: 2-identity-authorization
+applies_to: [gcp]
+
+rules:
+
+  # --- Deny-policy update/delete -> guardrail removal -----------------------
+  # THE primary rule. A principal that effectively holds iam.denypolicies.update
+  # or iam.denypolicies.delete at the scope where a deny policy is attached can
+  # weaken or eliminate that deny policy, lifting every BLOCKED edge it suppresses.
+  # hierarchy-chains.yaml guardrail-removal-upgrades-blocked does the actual
+  # state-upgrade of those BLOCKED edges; this rule only emits the prerequisite
+  # CanModifyPolicy fact.
+  - id: gcp-iam-deny-modify-deny-policy
+    emits: CanModifyPolicy
+    description: "Principal with iam.denypolicies.update or .delete can remove/weaken a deny policy, upgrading the edges it was blocking."
+    match:
+      - [ ?scope, HasPolicy, ?deny_policy ]
+      # HasPolicy flows from AdministrativeBoundary (scope) to ConditionalPolicy (deny_policy).
+      # Principal ?principal is bound only in the where clause via effective-permission evaluator
+      # (see evaluator_hook_dependency note below).
+    where:
+      - "node_class(?principal) == Identity"
+      - "node_type(?scope) in [Organization, Folder, Project]  # attachment scope"
+      - "node_type(?deny_policy) == ConditionalPolicy"
+      - "?deny_policy.provider_type == 'google.iam.DenyPolicy'"
+      - "?principal has EFFECTIVE iam.denypolicies.update OR iam.denypolicies.delete at ?scope (via IAM allow policy at ?scope or an ancestor scope)"
+      - "?deny_policy.rules[] contains at least one denyRule that blocks >=1 modeled edge in the graph (state_of(e)==BLOCKED and blocked_by(e)==?deny_policy)"
+    emit:
+      source_type: Identity
+      target_type: ConditionalPolicy
+      source: ?principal
+      target: ?deny_policy
+      permissions: ["iam.denypolicies.update", "iam.denypolicies.delete"]
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE when iam.denypolicies.update or .delete is unconditionally effective
+        at ?scope (the IAM allow binding grants it without a CEL condition, or the
+        condition evaluates TRUE at collection time) AND the deny policy is present
+        and blocks >=1 modeled edge. CONDITIONAL(iam_permission) if the allow
+        binding granting the modify permission is itself gated by a CEL condition
+        that may not always hold (e.g. time-bound, resource-tag gated).
+        BLOCKED when ?principal is denied iam.denypolicies.update AND
+        iam.denypolicies.delete by a SEPARATE deny policy (blocked_by != ?deny_policy)
+        at ?scope — the attacker cannot remove the guardrail they are themselves
+        blocked by. Circular deny chains must be resolved first (see false_positive_note).
+        The downstream BLOCKED->CONDITIONAL(guardrail_removed) state upgrade of
+        gated edges is NOT emitted here; it is performed by hierarchy-chains.yaml
+        guardrail-removal-upgrades-blocked, keyed on blocked_by(?deny_policy).
+      confidence: "min(contributing_confidences)"
+      evaluator_hook_dependency: >-
+        Principal ?principal is not explicitly bound by a graph edge in the match
+        clause; instead, it is introduced by the effective-permission evaluator
+        (pseudo-triple '?principal has EFFECTIVE iam.denypolicies.update OR
+        iam.denypolicies.delete at ?scope') in the where clause. This is
+        architecturally consistent with the design contract (evaluator acts as a
+        match-clause primitive), but makes the rule dependent on an evaluator hook
+        rather than a pure graph-pattern match. Implementors should not attempt to
+        treat this rule as a pure graph-pattern rule; the evaluator must resolve
+        the EFFECTIVE permission at ?scope before unification.
+      derived_from:
+        - "?scope HasPolicy ?deny_policy (ConditionalPolicy, google.iam.DenyPolicy)"
+        - "?principal has EFFECTIVE iam.denypolicies.update or .delete at ?scope (via evaluator hook)"
+        - "?deny_policy blocks >=1 modeled edge (state_of(e)==BLOCKED, blocked_by(e)==?deny_policy)"
+        - "guardrail-removal-upgrades-blocked (hierarchy-chains.yaml rule 3) performs the BLOCKED->CONDITIONAL(guardrail_removed) state upgrade for each gated edge"
+      false_positive_note: >-
+        Emit ONLY when the deny policy actually blocks >=1 modeled edge
+        (blocked_by(e)==?deny_policy for some edge e in the graph). A deny policy
+        whose deniedPermissions do not correspond to any modeled edge type
+        suppresses nothing in the graph — do not emit. Honor exception principals:
+        if ?principal is listed in exceptionPrincipals of the deny rule that
+        would block it, that specific deny rule does NOT block ?principal's
+        own capability edges (though ?principal can still modify the policy to
+        unblock OTHER principals). Check effective scope: a project-scoped deny
+        policy unblocks only that project's subtree; an org-scoped policy
+        unblocks the entire org hierarchy. iam.denypolicies.update allows
+        weakening (add exception, remove rules); .delete removes entirely —
+        both grant the guardrail-removal capability, so use OR logic. Note that
+        iam.denypolicies.create allows a principal to create a NEW deny policy
+        that denies iam.denypolicies.update/.delete to all other admins except
+        itself (a persistence/defense-evasion primitive); this is deliberately
+        excluded from the graph model, so analysts should be aware of this gap.
+        Do NOT fire when the only block is by a DIFFERENT deny policy (blocked_by must
+        match THIS policy node). CRITICALLY: Do NOT emit an ACTIVE CanModifyPolicy
+        when the principal's own modify permission (iam.denypolicies.update AND
+        iam.denypolicies.delete) is BLOCKED by a SEPARATE deny policy — emit BLOCKED
+        instead. Note that iam.denypolicies.update and .delete are themselves
+        deny-eligible permissions — a deny policy can recursively block manage of
+        other deny policies. Circular deny chains (A denies B, B denies A) must be
+        resolved to determine which is the root cause. Check for BLOCKED denial by a
+        DIFFERENT deny policy (blocked_by != ?deny_policy) at ?scope; if found,
+        downgrade this CanModifyPolicy to BLOCKED(deny_assignment), and let the
+        recursive deny chain be resolved first.
+      narrative: >-
+        {principal.name} holds iam.denypolicies.update or iam.denypolicies.delete
+        at {scope.name} (via roles/iam.denyAdmin or equivalent) and can remove or
+        weaken {deny_policy.name}, lifting the blocks it imposes on
+        {gated_edge_summary}. Once removed, those edges are upgraded from BLOCKED
+        to CONDITIONAL(guardrail_removed) by the generic guardrail-removal rule
+        (hierarchy-chains.yaml). When the deny policy is attached at an Organization
+        or Folder scope, its removal unblocks edges across the ENTIRE descendant
+        subtree; the hierarchy-chains.yaml admin-inherits-down-contains rule
+        (rule 1) performs the generic transitive descent to all descendants.
+
+# ===========================================================================
+# BLOCKED-edge guidance for collectors and analysts:
+#
+# When a principal P is found in a deny rule's deniedPrincipals AND:
+#   * the deniedPermissions cover an action that produces a modeled edge
+#     (e.g. iam.serviceAccountKeys.create, resourcemanager.projects.setIamPolicy,
+#      iam.serviceAccounts.getAccessToken, secretmanager.versions.access, etc.)
+#   * P is NOT in the deny rule's exceptionPrincipals
+#   * the deny rule's denialCondition either has no condition, or the condition
+#     evaluates TRUE (or cannot be evaluated — deny applies on uncertainty)
+#
+# -> set the corresponding capability edge to state: BLOCKED, with
+#    blocked_by = <this deny policy node>.
+#
+# When a principal P holds iam.denypolicies.update or .delete at the scope:
+# -> gcp-iam-deny-modify-deny-policy emits CanModifyPolicy(P -> deny_policy)
+# -> hierarchy-chains.yaml guardrail-removal-upgrades-blocked re-emits every
+#    BLOCKED edge (blocked_by == deny_policy) as CONDITIONAL(guardrail_removed).
+#
+# Note: iam.denypolicies.* permissions are THEMSELVES deny-eligible. A deny
+# policy can block P from managing other deny policies. Check for this before
+# emitting CanModifyPolicy: if P is denied iam.denypolicies.update AND .delete
+# by a DIFFERENT deny policy, the CanModifyPolicy edge is BLOCKED (no upgrade).
+#
+# EXPLICIT NORMALIZATION dependency (see /rules/explicit/ — no separate file
+# needed for iam-deny; base edges produced by general IAM normalization pass):
+#   * HasPolicy(scope -> ConditionalPolicy)       from deny-policy list/get API
+#   * CanModifyPolicy(Identity -> ConditionalPolicy) from effective-permission
+#     evaluator finding iam.denypolicies.update or .delete at scope
+#
+# ANTI-DUPLICATION:
+#   * Org/folder/project Contains descent, CanEnter{Project,Organization}, and
+#     setIamPolicy self-grant are already modeled — do NOT re-emit them here.
+#     See /rules/derived/gcp/identity-escalation.yaml (gcp-set-iam-policy-*) and
+#     hierarchy-chains.yaml rules 1 & 2.
+#   * The BLOCKED -> CONDITIONAL(guardrail_removed) upgrade for every gated edge
+#     is emitted ONCE by hierarchy-chains.yaml rule 3 (guardrail-removal-upgrades-
+#     blocked). This file NEVER re-emits an unblocked downstream edge.
+# ===========================================================================

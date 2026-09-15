@@ -1,0 +1,540 @@
+# AWS EMR — derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Permissions are the exact
+# identifiers from the Amazon EMR Authorization Reference (list_amazonemr.html).
+#
+# DOMINANT PRIMITIVE (Phase 11 theme):
+#   An EMR cluster runs AS its EC2 instance profile (JobFlowRole); an EMR Serverless
+#   job run assumes its executionRoleArn. Whoever can submit a step
+#   (elasticmapreduce:AddJobFlowSteps) or create a cluster/job with a chosen role
+#   (RunJobFlow / emr-serverless:StartJobRun + iam:PassRole) executes arbitrary code
+#   AS that role -> CanExecuteAs. This is the CanModifyCode + ExecutesAs ->
+#   CanExecuteAs pattern from can-execute-as.yaml (cited, not re-derived for the
+#   escalation roll-up) and the iam:PassRole + create-workload pattern from the
+#   Phase-11 linchpin.
+#
+# LINCHPIN CITATIONS (do not re-derive their roll-ups):
+#   can-execute-as.yaml   — execute-as-via-code-modify: collapses CanModifyCode +
+#                           ExecutesAs -> CanExecuteAs (handles Data-class nodes
+#                           like AnalyticsService; see node_class guard update).
+#   cicd-chains.yaml      — cicd-modify-buildspec-executes-as: the same collapse for
+#                           runner-style compute (BuildWorker/ContainerTask/etc.).
+#   credential-chains.yaml — execute-then-read-secret: CanExecuteAs -> CanReadSecret
+#                           inheritance; impersonate-is-escalation for downstream
+#                           credential pivots.
+#   can-control.yaml      — escalate-via-execute-as: collapses CanExecuteAs ->
+#                           CanEscalateTo when target role is more privileged.
+#
+# SCOPE NOTES:
+#   - AddJobFlowSteps does NOT require iam:PassRole (step runs as the cluster's
+#     EXISTING instance profile). Never add PassRole as a precondition for it.
+#   - RunJobFlow DOES require iam:PassRole for BOTH ServiceRole (elasticmapreduce.
+#     amazonaws.com) and JobFlowRole / instance profile (ec2.amazonaws.com).
+#   - emr-serverless:StartJobRun ALWAYS requires iam:PassRole for executionRoleArn
+#     (emr-serverless.amazonaws.com).
+#   - Cluster must be in WAITING or RUNNING state for AddJobFlowSteps to apply.
+#   - IMDSv2 with hop-limit 1 is a partial control; do not BLOCK ExposesCredential
+#     solely on it — downgrade to CONDITIONAL(condition_expression) instead.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 11-data-analytics-ml
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # EFFECTIVE-PERMISSION BASED NORMALIZATION (CanModifyCode, CanPassIdentity*)
+  # (*CanPassIdentity rules are in /rules/explicit/aws-emr.yaml per findings)
+  # ===========================================================================
+
+  # --- CanModifyCode: AddJobFlowSteps on a running cluster -------------------
+  - id: aws-emr-add-steps-code
+    emits: CanModifyCode
+    description: "elasticmapreduce:AddJobFlowSteps lets a principal inject arbitrary executable steps into a running cluster."
+    match_effective_permission: {action: "elasticmapreduce:AddJobFlowSteps", resource_type: "AWS::EMR::Cluster"}
+    where:
+      - "cluster state is WAITING or RUNNING"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<EMR Cluster (AnalyticsService)>"
+      permissions: ["elasticmapreduce:AddJobFlowSteps"]
+      conditions: [iam_permission, service_state]
+      false_positive_note: >-
+        AddJobFlowSteps does NOT require iam:PassRole — the step runs as the cluster's
+        existing instance profile. Only valid when the cluster is in WAITING or RUNNING
+        state; emit CONDITIONAL(service_state) otherwise. IAM condition keys
+        (aws:RequestedRegion, aws:ResourceTag) may narrow scope — honor them.
+      narrative: >-
+        {principal.name} can submit executable steps to EMR cluster {cluster.name}
+        (elasticmapreduce:AddJobFlowSteps); steps run as the cluster's existing
+        instance profile (JobFlowRole) without requiring iam:PassRole.
+
+  # --- CanModifyCode: RunJobFlow (creates new cluster with chosen code+role) --
+  - id: aws-emr-run-job-flow-code
+    emits: CanModifyCode
+    description: "elasticmapreduce:RunJobFlow lets a principal create a new cluster with attacker-chosen bootstrap actions, AMI, and steps."
+    match_effective_permission: {action: "elasticmapreduce:RunJobFlow", resource_type: "AWS::EMR::Cluster"}
+    where:
+      - "principal also has iam:PassRole for the ServiceRole (elasticmapreduce.amazonaws.com) AND the JobFlowRole (ec2.amazonaws.com instance profile)"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<new EMR Cluster (AnalyticsService)>"
+      permissions: ["elasticmapreduce:RunJobFlow", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      false_positive_note: >-
+        Requires iam:PassRole for BOTH the ServiceRole (trust: elasticmapreduce.amazonaws.com)
+        AND the JobFlowRole / instance profile (trust: ec2.amazonaws.com). If either
+        PassRole is denied or iam:PassedToService excludes the relevant service principal,
+        cluster creation fails -> emit CONDITIONAL(role_compatibility). Model the
+        CanPassIdentity edges for these roles separately (see below); this CanModifyCode
+        rule reflects the code-injection capability (bootstrap scripts, initial steps).
+      narrative: >-
+        {principal.name} can create a new EMR cluster (elasticmapreduce:RunJobFlow +
+        iam:PassRole for service and instance roles), choosing the bootstrap actions,
+        steps, and AMI — effectively injecting arbitrary code that runs at cluster launch.
+
+  # --- CanModifyCode: emr-serverless:StartJobRun with chosen application code --
+  - id: aws-emr-serverless-start-job-code
+    emits: CanModifyCode
+    description: "emr-serverless:StartJobRun lets a principal submit a Spark/Hive job with attacker-controlled application code."
+    match_effective_permission: {action: "emr-serverless:StartJobRun", resource_type: "AWS::EMRServerless::Application"}
+    where:
+      - "principal has iam:PassRole for the executionRoleArn (emr-serverless.amazonaws.com)"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<EMR Serverless Application (AnalyticsService)>"
+      permissions: ["emr-serverless:StartJobRun", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      false_positive_note: >-
+        emr-serverless:StartJobRun ALWAYS requires iam:PassRole for the executionRoleArn
+        scoped to emr-serverless.amazonaws.com. A principal without that PassRole
+        grant cannot submit a job. Emit CONDITIONAL(role_compatibility) when the
+        PassedToService condition or ARN scope for the execution role is unknown.
+        The application code (entryPoint, scriptLocation) may reference an S3 object
+        the principal controls; if the S3 path is attacker-writable this is CanModifyCode;
+        if the attacker provides an inline/external script URI, same effect.
+      narrative: >-
+        {principal.name} can submit an EMR Serverless job run with attacker-chosen
+        application code (emr-serverless:StartJobRun + iam:PassRole for executionRoleArn);
+        the job executes as the passed execution role.
+
+  # --- CanModifyCode: emr-containers:StartJobRun on EKS virtual cluster --------
+  - id: aws-emr-on-eks-start-job-code
+    emits: CanModifyCode
+    description: "emr-containers:StartJobRun lets a principal submit a Spark/Hive job with attacker-controlled application code on an EKS-hosted EMR virtual cluster."
+    match_effective_permission: {action: "emr-containers:StartJobRun", resource_type: "AWS::EMRContainers::VirtualCluster"}
+    where:
+      - "principal has iam:PassRole for the executionRoleArn (emr-containers.amazonaws.com)"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<EMR on EKS Virtual Cluster (AnalyticsService)>"
+      permissions: ["emr-containers:StartJobRun", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      false_positive_note: >-
+        emr-containers:StartJobRun ALWAYS requires iam:PassRole for the executionRoleArn
+        scoped to emr-containers.amazonaws.com. A principal without that PassRole
+        grant cannot submit a job. Emit CONDITIONAL(role_compatibility) when the
+        PassedToService condition or the role's EKS OIDC trust binding is unknown.
+        The application code (entryPoint, scriptLocation) may reference an S3 object
+        the principal controls; if the S3 path is attacker-writable this is CanModifyCode.
+      narrative: >-
+        {principal.name} can submit an EMR on EKS job run with attacker-chosen
+        application code (emr-containers:StartJobRun + iam:PassRole for executionRoleArn);
+        the job executes as the passed execution role via the EKS pod identity binding.
+
+  # ===========================================================================
+  # DERIVED RULES — CanExecuteAs (cite can-execute-as.yaml for roll-up)
+  # ===========================================================================
+
+  # --- PRIMARY: CanExecuteAs via AddJobFlowSteps on existing cluster ----------
+  - id: aws-emr-execute-as-add-steps
+    emits: CanExecuteAs
+    description: "Submit a step to a running EMR cluster via AddJobFlowSteps; the step executes as the cluster's instance profile role without iam:PassRole."
+    match:
+      - [ ?principal, CanModifyCode, ?cluster ]
+      - [ ?cluster,   ExecutesAs,    ?role ]
+    where:
+      - "node_type(?cluster) == AnalyticsService"
+      - "?cluster provider_type == AWS::EMR::Cluster"
+      - "cluster state is WAITING or RUNNING"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["elasticmapreduce:AddJobFlowSteps"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the cluster is in WAITING or RUNNING state (service_state satisfied)
+        and the principal has EFFECTIVE elasticmapreduce:AddJobFlowSteps on the cluster.
+        CONDITIONAL(service_state) when the cluster state is unknown or BOOTSTRAPPING.
+        Inherit weakest with the contributing CanModifyCode / ExecutesAs: a BLOCKED
+        CanModifyCode (SCP/permission-boundary deny on AddJobFlowSteps) => BLOCKED.
+      confidence: "min(contributing_confidences) * 0.97"
+      derived_from: [ "<CanModifyCode(aws-emr-add-steps-code) edge_id>", "<ExecutesAs(aws-emr-executes-as-instance-profile) edge_id>" ]
+      false_positive_note: >-
+        AddJobFlowSteps does NOT require iam:PassRole — do not add that as a precondition.
+        The submitted step runs as the cluster's existing instance profile (JobFlowRole).
+        Only valid on clusters in WAITING or RUNNING state. Do not emit for clusters where
+        AddJobFlowSteps is blocked by an SCP or permission boundary. This dedupes with
+        can-execute-as execute-as-via-code-modify on (CanExecuteAs, ?principal, ?role) —
+        same collapse, EMR-specific framing; do not double-count weight. Escalation roll-up
+        to CanEscalateTo is can-control escalate-via-execute-as — CITE, do not re-derive.
+      narrative: >-
+        {principal.name} can submit steps to EMR cluster {cluster.name}
+        (elasticmapreduce:AddJobFlowSteps); submitted steps execute as the cluster's
+        instance profile role {role.name} — no iam:PassRole required. This is the primary
+        EMR escalation path.
+
+  # --- CanExecuteAs via RunJobFlow + PassRole (new cluster) -------------------
+  - id: aws-emr-execute-as-run-job-flow
+    emits: CanExecuteAs
+    description: "Create a new EMR cluster with a privileged JobFlowRole via RunJobFlow + iam:PassRole; arbitrary bootstrap/step code executes as that role."
+    match:
+      - [ ?principal, CanModifyCode,    ?cluster ]
+      - [ ?principal, CanPassIdentity,  ?role ]
+    where:
+      - "node_type(?cluster) == AnalyticsService"
+      - "?cluster provider_type == AWS::EMR::Cluster"
+      - "CanModifyCode here is aws-emr-run-job-flow-code (RunJobFlow + PassRole for new cluster creation)"
+      - "CanPassIdentity here is aws-emr-pass-job-flow-role (PassRole for JobFlowRole instance profile)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["elasticmapreduce:RunJobFlow", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when the principal has EFFECTIVE RunJobFlow AND iam:PassRole for the
+        ServiceRole (elasticmapreduce.amazonaws.com) AND the JobFlowRole (ec2.amazonaws.com)
+        — all iam:PassedToService conditions satisfied. CONDITIONAL(role_compatibility)
+        when PassedToService for either role is unknown/unresolved. BLOCKED if any
+        contributing edge is BLOCKED (SCP/boundary deny on RunJobFlow or PassRole).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanModifyCode(aws-emr-run-job-flow-code) edge_id>", "<CanPassIdentity(aws-emr-pass-job-flow-role) edge_id>" ]
+      false_positive_note: >-
+        Requires BOTH PassRole grants (ServiceRole for the EMR control plane AND
+        JobFlowRole for EC2 instance profile). Honor iam:PassedToService and role-ARN
+        scope — a role passable only to lambda.amazonaws.com cannot become a
+        JobFlowRole. This is the create-then-execute path (more infrastructure overhead
+        than AddJobFlowSteps but does not require an existing cluster). The escalation
+        roll-up to CanEscalateTo is can-control escalate-via-execute-as — CITE,
+        do not re-derive.
+      narrative: >-
+        {principal.name} can create a new EMR cluster (elasticmapreduce:RunJobFlow +
+        iam:PassRole for service role and JobFlowRole {role.name}); the bootstrap
+        actions and steps of that new cluster execute arbitrary code as {role.name}.
+
+  # --- CanExecuteAs via EMR Serverless StartJobRun + PassRole -----------------
+  - id: aws-emr-serverless-execute-as
+    emits: CanExecuteAs
+    description: "Submit an EMR Serverless job run with attacker-controlled application code and a passed privileged executionRole via emr-serverless:StartJobRun + iam:PassRole."
+    match:
+      - [ ?principal, CanModifyCode,   ?app ]
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "node_type(?app) == AnalyticsService"
+      - "?app provider_type == AWS::EMRServerless::Application"
+      - "CanModifyCode here is aws-emr-serverless-start-job-code (StartJobRun on Serverless)"
+      - "CanPassIdentity here is aws-emr-serverless-pass-exec-role (emr-serverless.amazonaws.com)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["emr-serverless:StartJobRun", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when principal has EFFECTIVE emr-serverless:StartJobRun on the application
+        AND iam:PassRole for ?role (PassedToService = emr-serverless.amazonaws.com).
+        CONDITIONAL(role_compatibility) when PassedToService is unknown. BLOCKED if
+        SCP or permission boundary denies either action.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanModifyCode(aws-emr-serverless-start-job-code) edge_id>", "<CanPassIdentity(aws-emr-serverless-pass-exec-role) edge_id>" ]
+      false_positive_note: >-
+        PassRole is ALWAYS required for EMR Serverless — unlike classic EMR
+        AddJobFlowSteps. Do not emit ACTIVE when iam:PassRole is missing or denied.
+        Honor emr-serverless.amazonaws.com in the PassedToService condition.
+        Escalation roll-up is can-control escalate-via-execute-as — CITE, do not re-derive.
+      narrative: >-
+        {principal.name} can submit an EMR Serverless job run with attacker-chosen
+        application code (emr-serverless:StartJobRun) and pass privileged execution role
+        {role.name} (iam:PassRole); the Spark/Hive job executes arbitrary code as
+        {role.name} via the EMR credential relay endpoint.
+
+  # --- CanExecuteAs via EMR on EKS StartJobRun + PassRole ----------------------
+  - id: aws-emr-on-eks-execute-as
+    emits: CanExecuteAs
+    description: "Submit an EMR on EKS job run with attacker-controlled application code and a passed privileged execution role via emr-containers:StartJobRun + iam:PassRole."
+    match:
+      - [ ?principal, CanModifyCode,   ?cluster ]
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "node_type(?cluster) == AnalyticsService"
+      - "?cluster provider_type == AWS::EMRContainers::VirtualCluster"
+      - "CanModifyCode here is derived from emr-containers:StartJobRun (EMR on EKS job code submission)"
+      - "CanPassIdentity here is aws-emr-on-eks-pass-job-role (PassRole for emr-containers.amazonaws.com)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["emr-containers:StartJobRun", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when principal has EFFECTIVE emr-containers:StartJobRun on the virtual
+        cluster AND iam:PassRole for ?role (PassedToService = emr-containers.amazonaws.com)
+        AND the role's trust allows the EKS OIDC provider. CONDITIONAL(role_compatibility)
+        when PassedToService or IRSA binding is unknown. BLOCKED if SCP or permission
+        boundary denies either action.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanModifyCode(emr-containers:StartJobRun) edge_id>", "<CanPassIdentity(aws-emr-on-eks-pass-job-role) edge_id>" ]
+      false_positive_note: >-
+        PassRole is ALWAYS required for EMR on EKS. The role's trust must allow the
+        EKS cluster's OIDC provider (IRSA); without this, the pod cannot assume the role.
+        Honor emr-containers.amazonaws.com in the PassedToService condition.
+        Escalation roll-up is can-control escalate-via-execute-as — CITE, do not re-derive.
+      narrative: >-
+        {principal.name} can submit an EMR on EKS job run with attacker-chosen
+        application code (emr-containers:StartJobRun) and pass privileged execution role
+        {role.name} (iam:PassRole); the Spark/Hive job executes arbitrary code as
+        {role.name} via the EKS pod identity/OIDC token exchange.
+
+  # --- CanExecuteAs via EMR Studio notebook injection --------------------------
+  - id: aws-emr-studio-notebook-inject
+    emits: CanExecuteAs
+    description: "Write to EMR Studio workspace S3 backing to inject code into notebooks; notebook execution runs as Studio service role or attached cluster's JobFlowRole."
+    match:
+      - [ ?principal, CanWrite,        ?s3object ]
+      - [ ?studio,    ContainsResourceReference, ?s3object ]
+    where:
+      - "node_type(?studio) == AnalyticsService"
+      - "?studio provider_type == AWS::EMR::Studio"
+      - "?s3object is part of the Studio DefaultS3Location"
+      - "?studio or a linked ?cluster has an ExecutesAs edge to ?studioRole or ?jobflowRole"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: "?studioRole or ?jobflowRole"
+      permissions: ["s3:PutObject"]
+      conditions: [iam_permission, trigger_exists]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) when the principal can write to the Studio workspace
+        S3 location — code execution requires a user to open/execute a notebook from the
+        Studio workspace. POTENTIAL(trigger_exists) if the notebook execution trigger
+        cannot be confirmed. ACTIVE if the principal can both write the notebook AND
+        invoke it (admin or workspace owner).
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<CanWrite(s3:PutObject) edge_id>", "<ContainsResourceReference(aws-emr-studio-workspace-s3-url) edge_id>", "<ExecutesAs(studio or linked cluster) edge_id>" ]
+      false_positive_note: >-
+        This is a conditional code-injection path. The principal can write arbitrary
+        code (notebooks, Python scripts, .jar files) to the Studio workspace S3 location,
+        but execution requires a user to open/execute the notebook. If the Studio is
+        unused or if the attached clusters are all in TERMINATED state, downgrade to
+        POTENTIAL. The code runs as the Studio service role (for control-plane operations)
+        or the linked cluster's JobFlowRole (for notebook execution on a running cluster).
+      narrative: >-
+        {principal.name} can write to the S3 location backing EMR Studio {studio.name}
+        (s3:PutObject on {s3_location}); an attacker can inject malicious code into
+        notebooks stored there. When a user opens/executes such a notebook from the Studio
+        workspace, the code runs as {role.name} (Studio service role or linked cluster's
+        instance profile role).
+
+  # --- CanCreateWorkloadAs: RunJobFlow + PassRole creates cluster bound to role --
+  - id: aws-emr-create-cluster-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new EMR cluster bound to a passable privileged JobFlowRole via RunJobFlow + iam:PassRole."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE elasticmapreduce:RunJobFlow"
+      - "?role passable to elasticmapreduce.amazonaws.com / ec2.amazonaws.com (JobFlowRole trust)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["elasticmapreduce:RunJobFlow", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when principal has EFFECTIVE RunJobFlow AND the iam:PassRole PassedToService
+        / ARN scope admits elasticmapreduce.amazonaws.com for the service role and
+        ec2.amazonaws.com for the instance profile. CONDITIONAL(role_compatibility) when
+        PassedToService or trust constraints are unknown/unresolved.
+        POTENTIAL(role_compatibility) when the principal has RunJobFlow but PassRole is
+        not yet proven. BLOCKED if either action is blocked by SCP/boundary.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanPassIdentity(aws-emr-pass-job-flow-role) edge_id>" ]
+      false_positive_note: >-
+        Distinguish from aws-emr-execute-as-run-job-flow: CanCreateWorkloadAs is the
+        capability to create and bind the workload (create + PassRole); CanExecuteAs is
+        the realized execution of attacker code as ?role. This edge captures the
+        create/bind step; the execute path flows through CanModifyCode on the new cluster.
+        Honor iam:PassedToService — a role passable only to lambda.amazonaws.com cannot
+        be a JobFlowRole and this edge must be POTENTIAL/CONDITIONAL.
+      narrative: >-
+        {principal.name} can create a new EMR cluster bound to {role.name} as the
+        instance profile (elasticmapreduce:RunJobFlow + iam:PassRole); the cluster
+        runs as {role.name} and any submitted steps execute with those credentials.
+
+  # ===========================================================================
+  # CREDENTIAL EXPOSURE
+  # ===========================================================================
+
+  # --- ExposesCredential: cluster IMDS leaks instance profile creds -----------
+  - id: aws-emr-exposes-instance-profile-cred
+    emits: ExposesCredential
+    description: "Every EC2 node in an EMR cluster exposes the instance profile (JobFlowRole) credentials via the EC2 Instance Metadata Service (IMDS); any code running on the cluster can retrieve them."
+    match:
+      - [ ?cluster, ExecutesAs, ?role ]
+    where:
+      - "node_type(?cluster) == AnalyticsService"
+      - "?cluster provider_type == AWS::EMR::Cluster"
+    emit:
+      source_type: AnalyticsService
+      target_type: Identity
+      source: ?cluster
+      target: ?role
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the cluster is in RUNNING/WAITING state. CONDITIONAL(condition_expression)
+        when IMDSv2 with HttpPutResponseHopLimit=1 is enforced on all cluster instances
+        (reduces but does not eliminate risk — hop-limit enforcement is per-instance and
+        does not apply retroactively). Do NOT mark BLOCKED solely on IMDSv2: containerized
+        or privileged steps may still bypass the hop-limit; analysts should verify
+        instance metadata options explicitly.
+      derived_from: [ "<ExecutesAs(aws-emr-executes-as-instance-profile) edge_id>" ]
+      false_positive_note: >-
+        This is a structural fact: the IMDS credential-exposure is inherent to EMR
+        EC2 clusters. It is not an escalation by itself — it becomes an attack step
+        when combined with a CanModifyCode/AddJobFlowSteps edge (code gets on the cluster
+        and reads IMDS). Do not BLOCK solely on IMDSv2 — downgrade to
+        CONDITIONAL(condition_expression) only when IMDSv2 hop-limit=1 is confirmed on
+        all nodes. EMR Serverless does NOT use IMDS; this rule does not apply to
+        Serverless job runs.
+      narrative: >-
+        EMR cluster {cluster.name} exposes the credentials of its instance profile role
+        {role.name} via IMDS (http://169.254.169.254) on every EC2 node; any code
+        executing on the cluster (including submitted steps) can retrieve those credentials
+        without additional permissions.
+
+  # ===========================================================================
+  # DATA ACCESS / EXFILTRATION
+  # ===========================================================================
+
+  # --- CanReadData: instance profile role can read S3 data lake ---------------
+  - id: aws-emr-can-read-s3-data
+    emits: CanReadData
+    description: "An EMR cluster whose instance profile has s3:GetObject on a data lake bucket can read all objects in that bucket."
+    match:
+      - [ ?cluster, ExecutesAs, ?role ]
+    where:
+      - "node_type(?cluster) == AnalyticsService"
+      - "?cluster provider_type == AWS::EMR::Cluster"
+      - "?role has EFFECTIVE s3:GetObject on one or more ObjectStorage (S3 bucket) nodes"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: ?role
+      target: "<S3 bucket / ObjectStorage accessible by ?role>"
+      permissions: ["s3:GetObject"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when ?role has EFFECTIVE s3:GetObject on the target bucket (accounting for
+        bucket policy, IAM policy, S3 Block Public Access, and any KMS key on the bucket).
+        CONDITIONAL(key_permission) when the bucket is encrypted with a CMEK the role
+        cannot decrypt. BLOCKED if an explicit SCP/deny prevents s3:GetObject.
+      derived_from: [ "<ExecutesAs(aws-emr-executes-as-instance-profile) edge_id>", "<HasPermission(?role -> s3:GetObject) edge_id>" ]
+      false_positive_note: >-
+        Only emit when the effective permission evaluation (accounting for bucket policy,
+        SCP, permission boundary) confirms s3:GetObject on the specific bucket. Do not
+        emit for all S3 buckets in the account without policy evidence. S3 Block Public
+        Access and bucket ACLs may restrict access even when the IAM role policy allows it.
+        Scope the target ObjectStorage node to the specific bucket ARN in scope for
+        ?role's effective permissions.
+      narrative: >-
+        EMR cluster {cluster.name} (via instance profile {role.name}) can read data from
+        S3 bucket {bucket.name} (s3:GetObject); Spark/Hive/Presto queries against this
+        cluster can access all data in that bucket.
+
+  # --- CanExfiltrate: instance profile role can write to S3 destination -------
+  - id: aws-emr-exfiltrate-via-unload
+    emits: CanExfiltrate
+    description: "An EMR cluster whose instance profile has s3:PutObject on an attacker-controlled S3 bucket can exfiltrate data via Spark df.write or Hive INSERT OVERWRITE DIRECTORY."
+    match:
+      - [ ?cluster, ExecutesAs, ?role ]
+    where:
+      - "node_type(?cluster) == AnalyticsService"
+      - "?cluster provider_type == AWS::EMR::Cluster"
+      - "?role has EFFECTIVE s3:PutObject on a destination bucket (potentially cross-account or external)"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: ?role
+      target: "<destination S3 bucket (ObjectStorage)>"
+      permissions: ["s3:PutObject"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when ?role has EFFECTIVE s3:PutObject on the destination bucket AND the
+        destination bucket is reachable (no VPC endpoint restriction preventing writes
+        from the cluster's VPC). CONDITIONAL(resource_policy) if a bucket policy must
+        also grant s3:PutObject from the cluster's account/role to take effect.
+      derived_from: [ "<ExecutesAs(aws-emr-executes-as-instance-profile) edge_id>", "<HasPermission(?role -> s3:PutObject) edge_id>" ]
+      false_positive_note: >-
+        Only emit when the destination bucket is cross-account (exfiltration to an
+        attacker-controlled external bucket) OR when the same-account bucket is a
+        high-value target. Writes to the cluster's own logging/output bucket are not
+        exfiltration. Confirm that the bucket policy grants PutObject from the instance
+        profile's account/role; cross-account writes require both the IAM role policy
+        AND the destination bucket policy to permit the write.
+      narrative: >-
+        EMR cluster {cluster.name} (via instance profile {role.name}) can write/export
+        data to S3 bucket {bucket.name} (s3:PutObject); an attacker with code execution
+        on the cluster can use Spark df.write or Hive INSERT OVERWRITE DIRECTORY to
+        exfiltrate data lake contents to that destination.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP or permission boundary denying elasticmapreduce:AddJobFlowSteps,
+#     elasticmapreduce:RunJobFlow, emr-serverless:StartJobRun, or iam:PassRole at
+#     the effective scope -> emit the corresponding edge with state: BLOCKED and
+#     denied_by=<SCP arn/statement>.
+#   - A condition denying iam:PassedToService for the relevant service principal
+#     (elasticmapreduce.amazonaws.com, emr-serverless.amazonaws.com, ec2.amazonaws.com)
+#     blocks the create/pass edges -> CONDITIONAL(role_compatibility) or BLOCKED.
+#   - IMDSv2 with hop-limit=1 enforced on all cluster nodes -> downgrade
+#     aws-emr-exposes-instance-profile-cred to CONDITIONAL(condition_expression),
+#     NOT BLOCKED (hop-limit bypass risk remains with privileged containers).
+#   - A terminated/terminating cluster blocks aws-emr-execute-as-add-steps
+#     -> CONDITIONAL(service_state).
+#
+# LINCHPIN CITATIONS (these rules emit the FACTS; the linchpins produce the roll-ups):
+#   can-execute-as.yaml   — execute-as-via-code-modify produces CanExecuteAs
+#                           from CanModifyCode + ExecutesAs for any Compute node;
+#                           execute-as-via-config-identity-swap handles the
+#                           CanModifyConfiguration + CanPassIdentity path.
+#   cicd-chains.yaml      — cicd-modify-buildspec-executes-as mirrors this pattern
+#                           for pipeline/runner compute; cite for orchestrated EMR
+#                           Step Functions / MWAA DAG invocations.
+#   credential-chains.yaml — execute-then-read-secret collapses CanExecuteAs ->
+#                           CanReadSecret inheritance when the instance profile has
+#                           secretsmanager:GetSecretValue; impersonate-is-escalation
+#                           handles credential pivots from ExposesCredential.
+#   can-control.yaml      — escalate-via-execute-as produces CanEscalateTo when
+#                           the instance profile / executionRole outranks the principal.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service (raw config -> explicit edges) now live
+# in /rules/explicit/aws-emr.yaml (created per adversarial review findings).

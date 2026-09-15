@@ -1,0 +1,325 @@
+# AWS IAM Roles Anywhere — Derived attack-path rules (Phase 14 — identity federation)
+# ===========================================================================
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (TrustsExternalIdentity, ExternalIdentityMapsTo, CredentialValidFor, Contains)
+# already lives in /rules/explicit/aws-rolesanywhere.yaml; these rules turn those
+# normalized trust facts + the rolesanywhere:* / iam:PassRole management perms
+# into the Phase-14 TAKEOVER (CanFederateAs) and the config-privesc (CanModifyTrust).
+#
+# WHAT ROLES ANYWHERE IS (docs: rolesanywhere/latest/userguide/introduction.html,
+# .../trust-model.html): an external workload presents an X.509 CLIENT CERTIFICATE
+# chaining to a CA registered as a TRUST ANCHOR, calls rolesanywhere:CreateSession
+# (request signed by the cert private key), and IAM Roles Anywhere calls STS
+# (sts:AssumeRole + sts:TagSession + sts:SetSourceIdentity) to mint temporary
+# credentials for an IAM role a PROFILE permits. It is the X.509 analogue of AWS
+# OIDC/SAML web-identity federation (aws-assume-role-web-identity in
+# ../identity-escalation.yaml) — an EXTERNAL identity becomes an INTERNAL role by
+# satisfying a TRUST CONDITION.
+#
+# THE STATE GATE IS THE TRUST CONDITION (per federation-chains.yaml). The role
+# trust policy trusts Principal.Service=rolesanywhere.amazonaws.com and MAY
+# condition on aws:SourceArn (trust-anchor ARN) and cert-attribute PrincipalTags
+# (aws:PrincipalTag/x509Subject/CN, /x509Issuer/CN, /x509SAN/*). Docs (account
+# trust boundary): "Certificates issued by any trust anchor in the account can be
+# used to assume any target role in that same account, UNLESS you specify
+# conditions in the role's trust policy." So:
+#   * NO cert-subject condition (or a wildcard/broad one), or NO aws:SourceArn pin
+#     => any cert from a registered anchor matches => ACTIVE.
+#   * PINNED x509Subject/CN | SAN | issuer the attacker cannot present
+#     => CONDITIONAL(trust_condition) — real only once the attacker obtains/mints a
+#     matching cert (see forge-cert path below).
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE:
+#   * federation-chains.yaml (Phase-14 linchpin, written first) —
+#       - federation-maps-to-identity ALSO collapses our normalized
+#         ExternalIdentityMapsTo + TrustsExternalIdentity into CanFederateAs; rule 1
+#         here is the AWS-SPECIFIC realization keyed to the Roles Anywhere trust
+#         (CreateSession, cert-attribute conditions). It dedupes with
+#         federation-maps-to-identity on (CanFederateAs, ?ext, ?role).
+#       - federate-then-enter-account: the CanFederateAs -> CanEnterAccount foothold
+#         is DEFERRED to it (not re-emitted here).
+#       - federate-inherits-capabilities: acting AS the role (inherit its outbound
+#         capabilities / CanImpersonate roll-up) is DEFERRED to it.
+#       - forge-cert-yields-federation: the cross-phase "attacker holds CanSignAs on
+#         the trust-anchor CA (Phase-5 aws:acmpca acm-pca:IssueCertificate) -> mint a
+#         matching cert -> federate in" chain is DEFERRED to it. This file only
+#         supplies the normalized trust facts; the anchor->CA linkage is the
+#         trust_anchor_ca property on the TrustsExternalIdentity edge (which
+#         forge-cert-yields-federation reads to resolve trust_anchor_of == ?ca). No
+#         structural Contains edge is emitted — Contains.source is [AdministrativeBoundary],
+#         so a Policy-node trust anchor cannot be a Contains source (see the explicit
+#         file's note at aws-rolesanywhere.yaml).
+#   * ../identity-escalation.yaml (Phase 2, AWS) —
+#       - aws-assume-role-web-identity: the OIDC/SAML sibling of rule 1 (CITED — same
+#         collapse, different presented-credential type).
+#       - aws-update-assume-role-policy: loosening the ROLE trust policy itself
+#         (iam:UpdateAssumeRolePolicy) is already CanModifyTrust there — NOT
+#         re-derived; rules 2/3 here cover the Roles-Anywhere-specific
+#         CreateTrustAnchor/CreateProfile config surface.
+#       - aws-pass-role: iam:PassRole normalization the profile rules consume.
+#   * credential-chains.yaml —
+#       - read-secret-yields-identity / impersonate-is-escalation consume our
+#         CredentialValidFor (via the cert) and the federation's CanImpersonate;
+#         escalation is NOT re-derived here.
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml), honored by every emit;
+# typed source_type/target_type per RULE-FORMAT.md, within these sets:
+#   CanFederateAs:  source [Identity, FederatedIdentity, WorkloadIdentity]
+#                   target [Role, ServiceAccount, MachineIdentity]
+#   CanModifyTrust: source [Identity]  target [Role, TrustPolicy, ServiceAccount, MachineIdentity]
+# ===========================================================================
+
+provider: aws
+phase: 14-identity-federation
+applies_to: [aws]
+
+rules:
+
+  # --- 1) Present a cert accepted by the trust -> federate in as the role -----
+  # THE Roles Anywhere takeover. A realized ExternalIdentityMapsTo(cert-subject ->
+  # role) backed by a role trust that admits rolesanywhere.amazonaws.com yields
+  # CanFederateAs when the trust CONDITION is attacker-satisfiable. No config
+  # change and no static AWS key needed — the attacker calls CreateSession with a
+  # cert the trust accepts. The AWS-specific realization of
+  # federation-chains.yaml federation-maps-to-identity (dedupes with it).
+  - id: aws-rolesanywhere-federate-in
+    emits: CanFederateAs
+    description: "A cert holder whose subject satisfies a Roles Anywhere role trust can CreateSession to obtain that role's temporary credentials."
+    match:
+      - [ ?ext, ExternalIdentityMapsTo, ?role ]
+    where:
+      - "node_type(?ext) in [ExternalIdentity, FederatedIdentity]  # the client-cert subject"
+      - "node_type(?role) == Role"
+      - "exists TrustsExternalIdentity(?role -> ?ext) with condition C  # role trust trusts rolesanywhere.amazonaws.com, anchored on the trust-anchor CA"
+    optional:
+      # Presence of a BROAD/UNPINNED trust condition (attacker can present a matching
+      # cert now) is what makes this ACTIVE. This is NOT a separate graph edge — the
+      # backing trust is already matched (correctly oriented) in the where-clause as
+      # TrustsExternalIdentity(?role -> ?ext). It is a CONDITION read off that edge's
+      # recorded condition: broad/unpinned (no x509Subject/CN|SAN|issuer pin, and/or no
+      # aws:SourceArn pin so ANY registered anchor qualifies) => attacker can present a
+      # matching cert now => ACTIVE; absent/pinned => CONDITIONAL(trust_condition).
+      - "condition: trust_condition_is_broad(TrustsExternalIdentity(?role -> ?ext))  # attacker_controllable(?ext) == true"
+    emit:
+      source_type: FederatedIdentity
+      target_type: Role
+      source: ?ext
+      target: ?role
+      permissions: ["sts:AssumeRole", "sts:TagSession", "sts:SetSourceIdentity"]
+      conditions: [trust_condition]
+      state_logic: >-
+        if the role trust condition is BROAD/UNPINNED so an attacker-obtainable cert
+        matches — NO aws:PrincipalTag/x509Subject/CN (or /x509SAN/* or /x509Issuer/CN)
+        condition, OR a wildcard one, AND/OR no aws:SourceArn pin (docs: any trust
+        anchor in the account can then drive any such role) — OR the attacker
+        demonstrably holds a matching cert: ACTIVE. If the trust PINS a specific cert
+        subject/SAN/issuer the attacker cannot present: CONDITIONAL(trust_condition) —
+        realizable only once the attacker obtains a matching cert (e.g. via the
+        forge-cert path in federation-chains.yaml forge-cert-yields-federation, or a
+        leaked private key). Inherit weakest with the backing TrustsExternalIdentity /
+        ExternalIdentityMapsTo: a disabled trust anchor / disabled profile / revoked
+        cert (on an imported CRL) => the adapter drops the trust => this rule does not
+        fire; an explicit STS deny/SCP => BLOCKED.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?ext ExternalIdentityMapsTo ?role", "?role TrustsExternalIdentity ?ext (backing Roles Anywhere trust, condition C)" ]
+      false_positive_note: >-
+        The entire judgment is in the trust CONDITION — do NOT emit ACTIVE for a
+        well-pinned role trust. A trust policy conditioning on a specific
+        aws:PrincipalTag/x509Subject/CN, a specific x509SAN/URI (e.g. a SPIFFE ID), or
+        a specific x509Issuer/CN the attacker cannot mint is a legitimate control =>
+        CONDITIONAL(trust_condition). ACTIVE only when the cert-attribute condition is
+        ABSENT/broad OR the aws:SourceArn pin is missing so any registered anchor's
+        certs qualify (per the account-level trust boundary in the docs), OR the
+        attacker controls a matching cert. Do NOT treat the mere existence of a Roles
+        Anywhere federation as compromise. If ?role is not actually reachable via an
+        ENABLED profile + ENABLED trust anchor, the mapping should not exist. A revoked
+        cert (imported CRL) never federates. Defers the CanFederateAs -> CanEnterAccount
+        foothold and the CanImpersonate/inheritance roll-up to federation-chains.yaml
+        (federate-then-enter-account / federate-inherits-capabilities) — not re-emitted
+        here.
+      narrative: >-
+        {ext.name} holds an X.509 certificate accepted by {role.name}'s Roles Anywhere
+        trust (validated by trust anchor {anchor.name}); because that trust's condition
+        is {trust_condition_summary}, it can call rolesanywhere:CreateSession and obtain
+        {role.name}'s temporary credentials with no static AWS key.
+
+  # --- 2) Add an attacker-controlled trust anchor -> self-grant federation ----
+  # CONFIG PRIVESC. A principal that can create/update a trust anchor registers a
+  # CA whose private key IT controls (an external CA cert it generated, or an ACM
+  # PCA it can issue from). Any role in the account whose trust admits
+  # rolesanywhere.amazonaws.com with no aws:SourceArn pin is then assumable by a
+  # cert the attacker mints from that new anchor -> CanModifyTrust. This is the
+  # Roles-Anywhere-specific write that aws-update-assume-role-policy does not cover
+  # (that rule rewrites the ROLE trust; this one adds the ANCHOR).
+  - id: aws-rolesanywhere-config-add-trust-anchor
+    emits: CanModifyTrust
+    description: "Registering an attacker-controlled CA as a trust anchor lets the attacker mint certs that federate into any role trusting the Roles Anywhere service principal."
+    match:
+      # Real driving edges the rule consumes (no self-referential placeholder):
+      # (a) the principal's effective admin over the Roles Anywhere config surface
+      #     (the normalized management-permission fact for CreateTrustAnchor/
+      #     UpdateTrustAnchor — §4/§6 of the provider doc), and
+      # (b) a target role that already trusts the Roles Anywhere service principal
+      #     (the normalized inbound-trust fact from the explicit adapter).
+      - [ ?principal, CanAdminister, ?raConfig ]
+      - [ ?role, TrustsExternalIdentity, ?ext ]
+    where:
+      - "node_type(?raConfig) == ManagementService  # the Roles Anywhere config resource (trust-anchor surface)"
+      - "?principal has EFFECTIVE rolesanywhere:CreateTrustAnchor OR rolesanywhere:UpdateTrustAnchor on ?raConfig (+ rolesanywhere:EnableTrustAnchor if disabled)"
+      - "node_type(?role) == Role"
+      - "the ?role -> ?ext TrustsExternalIdentity fact names Principal.Service == rolesanywhere.amazonaws.com with NO aws:SourceArn pin (so the newly-registered anchor qualifies) and a cert-attribute condition the attacker can satisfy with a self-minted cert"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: ?principal
+      target: ?role
+      permissions: ["rolesanywhere:CreateTrustAnchor", "rolesanywhere:UpdateTrustAnchor", "rolesanywhere:EnableTrustAnchor?"]
+      conditions: [trust_condition, iam_permission]
+      state_logic: >-
+        ACTIVE when a target role trusts the service principal with NO aws:SourceArn
+        pin (any anchor qualifies) AND either no cert-subject condition or one the
+        attacker can satisfy with a cert minted from its own CA (attacker chooses the
+        subject/SAN). CONDITIONAL(trust_condition) when every candidate role pins
+        aws:SourceArn to an EXISTING anchor (the new anchor won't match) or pins a cert
+        subject/issuer the attacker cannot mint. BLOCKED if an SCP denies
+        rolesanywhere:CreateTrustAnchor/UpdateTrustAnchor. Also needs a profile
+        mapping the target role (see rule 3) unless one already exists — otherwise
+        POTENTIAL(profile_required).
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "?principal CanAdminister ?raConfig (effective rolesanywhere:CreateTrustAnchor|UpdateTrustAnchor decision)", "?role TrustsExternalIdentity ?ext (role trusts rolesanywhere.amazonaws.com, no aws:SourceArn pin)" ]
+      note: >-
+        Registering the anchor is only half the takeover: the attacker also needs a
+        PROFILE that lists the target role (rule 3) and the role's trust must admit the
+        new anchor. Where a permissive profile already lists the role, this alone
+        completes the self-grant.
+      false_positive_note: >-
+        Do NOT emit ACTIVE against roles that pin aws:SourceArn to a specific existing
+        trust anchor — a newly registered anchor's ARN will not match, so a self-minted
+        cert is rejected (keep CONDITIONAL(trust_condition)). An external-CA trust
+        anchor requires the attacker to hold that CA's private key; an ACM PCA anchor
+        requires CanSignAs on the PCA (Phase-5 aws:acmpca) — if the attacker cannot
+        actually issue from the referenced CA, downgrade. Requires no iam:PassRole for
+        the anchor itself, but the paired profile (rule 3) does. This models trust
+        ADDITION, distinct from aws-update-assume-role-policy (which rewrites an
+        existing role trust) — cite, do not double-count.
+      narrative: >-
+        {principal.name} can register a certificate authority it controls as a Roles
+        Anywhere trust anchor (rolesanywhere:CreateTrustAnchor); it can then mint a
+        client certificate and federate into {role.name} (which trusts the Roles
+        Anywhere service principal), self-granting access to {role.name}.
+
+  # --- 3) Add/widen a profile mapping a privileged role -> self-grant ---------
+  # CONFIG PRIVESC. A principal that can create/update a profile adds the target
+  # role to a profile its cert can use (or widens an existing profile's role list /
+  # loosens its session policy). REQUIRES iam:PassRole for each role placed on the
+  # profile (Roles Anywhere passes the role to itself) — honored as a gate.
+  - id: aws-rolesanywhere-config-add-profile
+    emits: CanModifyTrust
+    description: "Creating/updating a Roles Anywhere profile that lists a privileged role (with iam:PassRole) maps the attacker's cert to that role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "node_type(?role) == Role"
+      - "?principal has EFFECTIVE rolesanywhere:CreateProfile OR rolesanywhere:UpdateProfile (+ EnableProfile? if disabled)"
+      - "iam:PassRole for ?role permits it (Roles Anywhere assumes/passes the profile roles; honor any iam:PassedToService condition)"
+      - "?role trust policy trusts rolesanywhere.amazonaws.com and its cert-attribute/aws:SourceArn condition is satisfiable by a cert the attacker can present (via an existing or attacker-added trust anchor — rule 2)"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: ?principal
+      target: ?role
+      permissions: ["rolesanywhere:CreateProfile", "rolesanywhere:UpdateProfile", "iam:PassRole"]
+      conditions: [trust_condition, iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when the principal can pass ?role (iam:PassRole admits it) AND can
+        create/update a profile listing ?role AND ?role's trust admits a cert the
+        attacker can present (existing anchor with a broad/unpinned trust, or an
+        attacker-added anchor from rule 2). CONDITIONAL(trust_condition) when the role
+        trust pins a cert subject/anchor the attacker cannot satisfy. POTENTIAL/BLOCKED
+        when iam:PassRole is missing/denied for ?role (no profile mapping possible) or
+        an SCP denies rolesanywhere:CreateProfile/UpdateProfile — honor iam:PassRole
+        strictly.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "?principal CanPassIdentity ?role", "<effective rolesanywhere:CreateProfile|UpdateProfile decision>" ]
+      false_positive_note: >-
+        REQUIRES iam:PassRole for ?role — a profile cannot list a role the caller
+        cannot pass. Honor any iam:PassedToService condition on the PassRole grant; if
+        it excludes Roles Anywhere the mapping fails => downgrade. The profile only
+        yields federation if ?role's trust ALSO admits the attacker's cert — a profile
+        listing a role whose trust pins a subject/anchor the attacker cannot present
+        stays CONDITIONAL(trust_condition). This is the profile-write half of the
+        config self-grant; pair with rule 2 when the attacker also needs to add a
+        matching anchor. The session policy on the profile only CAPS the resulting
+        session — it cannot grant more than the role already has.
+      narrative: >-
+        {principal.name} can create or update a Roles Anywhere profile that lists
+        {role.name} (rolesanywhere:CreateProfile/UpdateProfile + iam:PassRole),
+        mapping a certificate it can present to {role.name} — self-granting federation
+        into {role.name}.
+
+# ===========================================================================
+# WORKED EXAMPLES
+#
+# UNPINNED ROLE TRUST (rule 1 -> federation-chains foothold):
+#   explicit adapter normalizes a role trust that names rolesanywhere.amazonaws.com
+#   with sts:AssumeRole/TagSession/SetSourceIdentity and NO cert-attribute condition,
+#   plus a profile listing it:
+#     [x509-ext(FederatedIdentity) ExternalIdentityMapsTo workload-role(Role)]
+#     backed by [workload-role TrustsExternalIdentity x509-ext], condition: none
+#       => aws-rolesanywhere-federate-in: [x509-ext CanFederateAs workload-role] ACTIVE
+#          (any cert from the registered trust anchor CA is accepted).
+#   + home_boundary(workload-role) = Account 111122223333
+#       => federation-chains.yaml federate-then-enter-account:
+#          [x509-ext CanEnterAccount 111122223333] ACTIVE (DEFERRED — not emitted here).
+#
+# HEADLINE ACTIVE — ACCOUNT TRUST BOUNDARY (rule 1, highest-value unauth path, doc §10/§14.1):
+#   The unauthenticated-attacker takeover the AWS docs caveat isolates: a role trust
+#   that trusts rolesanywhere.amazonaws.com and OMITS BOTH aws:SourceArn AND every
+#   cert-attribute (x509Subject/CN | x509SAN/* | x509Issuer/CN) condition. Per the doc
+#   (§10, providers/aws/rolesanywhere.md:115 — "Certificates issued by any trust anchor
+#   in the account can be used to assume any target role in that same account, unless
+#   you specify conditions in the role's trust policy"):
+#     [any-x509-ext(FederatedIdentity) ExternalIdentityMapsTo unpinned-role(Role)]
+#     backed by [unpinned-role TrustsExternalIdentity any-x509-ext], condition: NONE
+#     (no aws:SourceArn pin => ANY registered trust anchor in the account qualifies)
+#       => aws-rolesanywhere-federate-in: [any-x509-ext CanFederateAs unpinned-role] ACTIVE
+#          A cert from ANY anchor CA registered anywhere in the account federates in;
+#          the attacker needs only a cert that chains to some account anchor and a
+#          profile listing the role. state_logic ACTIVE gate = missing aws:SourceArn
+#          (see false_positive_note). This is the broadest Roles Anywhere exposure —
+#          any anchor -> any unpinned role.
+#
+# PINNED ROLE TRUST (rule 1 stays CONDITIONAL):
+#   same, but Condition StringEquals aws:PrincipalTag/x509Subject/CN == "prod-worker"
+#     => aws-rolesanywhere-federate-in: [x509-ext CanFederateAs workload-role]
+#        CONDITIONAL(trust_condition) — real only if the attacker can present a cert
+#        whose Subject CN is prod-worker (obtain that cert, or forge one — see below).
+#
+# FORGE-CERT (cross-phase Phase-5, DEFERRED to federation-chains.yaml rule 4):
+#   [p CanSignAs corp-pca(SigningKey)]                 (aws:acmpca acm-pca:IssueCertificate)
+#   + TrustsExternalIdentity(workload-role -> x509-ext).trust_anchor_ca == corp-pca
+#       (property on the explicit edge; forge-cert-yields-federation reads it to
+#        resolve trust_anchor_of(anchor -> x509-ext) == corp-pca — NOT a Contains edge)
+#   + [ra-profile ... workload-role] with NO cert-subject pin
+#     => forge-cert-yields-federation: [x509-ext CanFederateAs workload-role] ACTIVE
+#        (mint a cert with an arbitrary Subject/SAN the trust accepts). CITED, not here.
+#
+# CONFIG SELF-GRANT (rule 2 + rule 3):
+#   [p CanPassIdentity admin-role]  +  p has rolesanywhere:CreateProfile
+#   + admin-role trust admits rolesanywhere.amazonaws.com (broad)
+#     => aws-rolesanywhere-config-add-profile: [p CanModifyTrust admin-role] ACTIVE
+#   if no role in the account has a broad-enough trust, p uses rule 2 to add its own
+#   trust anchor first, then a profile mapping a role whose trust has no aws:SourceArn
+#   pin => the two rules compose into full self-granted federation.
+#
+# BLOCKED-edge guidance:
+#  - An SCP/boundary denying sts:AssumeRole for rolesanywhere.amazonaws.com, or
+#    rolesanywhere:CreateSession, or the rolesanywhere:CreateTrustAnchor/CreateProfile
+#    management actions, or iam:PassRole at the effective scope -> emit the edge with
+#    state: BLOCKED and denied_by=<SCP arn/statement>.
+#  - A disabled trust anchor / disabled profile, or a cert on an imported CRL -> the
+#    adapter drops the trust -> these rules do not fire.
+#  - A correctly PINNED cert subject/SAN/issuer (or aws:SourceArn) the attacker cannot
+#    present -> CONDITIONAL(trust_condition), never ACTIVE. State never exceeds the
+#    weakest contributor (RULE-FORMAT.md).
+# ===========================================================================

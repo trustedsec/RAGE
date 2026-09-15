@@ -1,0 +1,305 @@
+# Normalizing AWS IAM Identity Center (SSO) into explicit edges.
+# ---------------------------------------------------------------------------
+# The collector gathers raw records from sso-admin:List*/Describe*,
+# identitystore:List*/Describe*, and iam:ListRoles (filtered to AWSReservedSSO_*)
+# in each member account. These rules translate those raw facts into explicit
+# edges the derived rules in rules/derived/aws/sso.yaml consume.
+#
+# ANTI-DUPLICATION:
+#   - HasPolicy, MemberOf, TrustsExternalIdentity, and CanAssume edges normalized
+#     here are MATCHED by the derived rules; do not re-emit them there.
+#   - CrossAccountTrust is semantically "a trust/resource policy names a principal
+#     in another account"; the PermissionSet -> Account assignment record does not
+#     describe a trust — the actual trust is in the AWSReservedSSO_* role trust
+#     policy captured by aws-sso-provisioned-role-trusts-sso-oidc (TrustsExternalIdentity).
+#     Do NOT emit CrossAccountTrust here; the assignment/provisioning is structural,
+#     and CanAssume (below) captures the security meaning.
+#   - MemberOf (user -> group) feeds the existing can-control /
+#     identity-escalation CanGrantPermission chains — no separate derivation needed.
+#   - CanAssume (user/group -> provisioned role) feeds can-control's
+#     enter-account-via-assume (and thence CanEnterAccount) and identity-escalation.
+#     The CanAssume itself is produced here from account assignment records;
+#     trust-verification is the trust policy check on the AWSReservedSSO_* role.
+#   - CanEscalateTo is NOT emitted from this file; it is derived by can-control's
+#     escalate-via-execute-as or by identity-escalation's aws-assume-role chain.
+# ---------------------------------------------------------------------------
+
+rules:
+
+  # --- HasPolicy: managed policy attached to permission set -------------------
+  - id: aws-sso-permset-has-managed-policy
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SSO::PermissionSet"
+      field: "ManagedPolicies"
+    emit:
+      source_type: Role
+      target_type: Policy
+      source: "<PermissionSet node (Role)>"
+      target: "<IAMPolicy node for each AttachedManagedPolicies[].Arn>"
+      api_source: "sso-admin:ListManagedPoliciesInPermissionSet"
+      evidence_field: "AttachedManagedPolicies[].Arn"
+      narrative: >-
+        Permission set {permset.name} has managed policy {policy.name} attached;
+        every assigned principal receives these permissions in each assigned account.
+
+  # --- HasPolicy: inline policy on permission set ----------------------------
+  - id: aws-sso-permset-has-inline-policy
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SSO::PermissionSet"
+      field: "InlinePolicy"
+    where:
+      - "InlinePolicy is non-empty"
+    emit:
+      source_type: Role
+      target_type: Policy
+      source: "<PermissionSet node (Role)>"
+      target: "<IAMPolicy node (inline, keyed by PermissionSet ARN + 'inline')>"
+      api_source: "sso-admin:GetInlinePolicyForPermissionSet"
+      evidence_field: "InlinePolicy (JSON document)"
+      narrative: >-
+        Permission set {permset.name} has an inline policy; the effective permissions
+        for all assignees include this policy document.
+
+  # --- HasPolicy: permissions boundary on permission set ---------------------
+  - id: aws-sso-permset-has-boundary
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SSO::PermissionSet"
+      field: "PermissionsBoundary"
+    where:
+      - "PermissionsBoundary is present and non-empty"
+    emit:
+      source_type: Role
+      target_type: PermissionBoundary
+      source: "<PermissionSet node (Role)>"
+      target: "<PermissionBoundary node keyed by ManagedPolicyArn or CustomerManagedPolicyReference>"
+      api_source: "sso-admin:GetPermissionsBoundaryForPermissionSet"
+      evidence_field: "PermissionsBoundary.ManagedPolicyArn | PermissionsBoundary.CustomerManagedPolicyReference.Name"
+      narrative: >-
+        Permission set {permset.name} has a permissions boundary ({boundary.name});
+        effective permissions for all assignees are capped by this boundary.
+
+# --- MemberOf: Identity Store user -> group membership ----------------------
+  - id: aws-sso-user-member-of-group
+    emits: MemberOf
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::IdentityStore::GroupMembership"
+      field: "MemberId.UserId"
+    emit:
+      source_type: Identity
+      target_type: Group
+      source: "<Identity Store User node (HumanIdentity)>"
+      target: "<Identity Store Group node (Group)>"
+      api_source: "identitystore:ListGroupMembershipsForMember"
+      evidence_field: "GroupMemberships[].GroupId"
+      narrative: >-
+        {user.name} is a member of Identity Store group {group.name} and inherits
+        all account assignments the group holds.
+
+  # --- TrustsExternalIdentity: provisioned SSO role trusts SSO OIDC endpoint --
+  # Note: The trust principal may be either the global endpoint (signin.aws.amazon.com)
+  # or a regional endpoint (e.g., oidc.sso.us-east-1.amazonaws.com). Both variants
+  # represent the same IAM Identity Center OIDC service; emit a single stable
+  # FederatedIdentity node for the service regardless of endpoint variant.
+  - id: aws-sso-provisioned-role-trusts-sso-oidc
+    emits: TrustsExternalIdentity
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::IAM::Role"
+      field: "AssumeRolePolicyDocument"
+    where:
+      - "role name starts_with 'AWSReservedSSO_'"
+      - "trust policy Principal Federated includes 'signin.aws.amazon.com' OR matches 'oidc.sso.*.amazonaws.com'"
+    emit:
+      source_type: Role
+      target_type: FederatedIdentity
+      source: "<AWSReservedSSO_* role node (Role)>"
+      target: "<FederatedIdentity node representing the IAM Identity Center OIDC endpoint>"
+      api_source: "iam:ListRoles + iam:GetRole (AssumeRolePolicyDocument) in each member account"
+      evidence_field: "AssumeRolePolicyDocument.Statement[].Principal.Federated"
+      narrative: >-
+        Provisioned SSO role {role.name} in account {account.name} trusts
+        the IAM Identity Center OIDC endpoint (signin.aws.amazon.com or regional
+        oidc.sso.REGION.amazonaws.com) to issue credentials to principals
+        authenticated through the SSO portal/CLI.
+
+  # --- CanAssume: SSO-assigned user/group can assume provisioned role ----------
+  # Normalized from the cross-product of:
+  #   sso-admin:ListAccountAssignments  (assignment records: principal, permset, account)
+  #   iam:GetRole on the AWSReservedSSO_* role in the member account (trust validation)
+  # The collated fact: an assigned identity STORE principal (user or group member)
+  # has an implicit EFFECTIVE sso:GetRoleCredentials permission on the provisioned
+  # role — modeled as CanAssume so can-control's enter-account-via-assume fires.
+  - id: aws-sso-assigned-principal-can-assume-role
+    emits: CanAssume
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SSO::Assignment"
+      field: "PrincipalId"
+    where:
+      - "AWSReservedSSO_<PermSetName>_<hash> role exists in the AccountId account"
+      - "trust policy of that role allows 'signin.aws.amazon.com' (or regional OIDC endpoint)"
+      - "the assigned principal (User or Group members) has an active SSO session"
+    emit:
+      source_type: HumanIdentity
+      target_type: Role
+      source: "<Identity Store User (HumanIdentity) or Group-member User inheriting the assignment>"
+      target: "<AWSReservedSSO_* provisioned Role in the assigned Account>"
+      api_source: >-
+        sso-admin:ListAccountAssignments (AccountId, PermissionSetArn, PrincipalId, PrincipalType)
+        + iam:GetRole (AssumeRolePolicyDocument) on the AWSReservedSSO_* role
+      evidence_field: "AccountAssignment.AccountId + PermissionSetArn + PrincipalId"
+      narrative: >-
+        {principal.name} is assigned to permission set {permset.name} in account
+        {account.name}; {principal.name} can call sso:GetRoleCredentials to obtain
+        session credentials for the provisioned role {provisioned_role.name},
+        which has the permission set's policies.
+
+  # --- TrustsExternalIdentity: trusted token issuer OIDC configuration --------
+  # Model the SSO instance's trust in an external OIDC issuer as a ResourcePolicy
+  # node (representing the issuer trust configuration), which TrustsExternalIdentity
+  # from the ResourcePolicy to the FederatedIdentity. This maintains conformance
+  # with TrustsExternalIdentity's declared source set [Role, ServiceAccount,
+  # ApplicationIdentity, ManagedIdentity, ResourcePolicy].
+  - id: aws-sso-trusted-token-issuer-trust
+    emits: TrustsExternalIdentity
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SSO::TrustedTokenIssuer"
+      field: "TrustedTokenIssuerConfiguration.OidcJwtConfiguration.IssuerUrl"
+    emit:
+      source_type: ResourcePolicy
+      target_type: FederatedIdentity
+      source: "<ResourcePolicy node representing the SSO instance's trusted issuer configuration (keyed by instance ARN + '/trusted-issuer/' + IssuerUrl)>"
+      target: "<FederatedIdentity node representing the external OIDC issuer at IssuerUrl>"
+      api_source: "sso-admin:ListTrustedTokenIssuers + sso-admin:DescribeTrustedTokenIssuer"
+      evidence_field: "TrustedTokenIssuerConfiguration.OidcJwtConfiguration.IssuerUrl"
+      narrative: >-
+        IAM Identity Center instance {instance.name}'s trusted issuer configuration
+        (ResourcePolicy) trusts external OIDC issuer {issuer_url} as a trusted token
+        issuer; tokens from this issuer are accepted for context-aware access evaluation.
+
+  # --- CanAddMember: Add user to SSO group → inherit group assignments --------
+  # identitystore:CreateGroupMembership allows adding a user to a group in the
+  # Identity Store. If that group has privileged account assignments, the added user
+  # immediately inherits them. This is an explicit normalization of the capability.
+  - id: aws-sso-create-group-membership
+    emits: CanAddMember
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::IdentityStore::Group"
+      field: "GroupId"
+    where:
+      - "caller has identitystore:CreateGroupMembership permission on this group ARN"
+    emit:
+      source_type: Identity
+      target_type: Group
+      source: "<Principal with identitystore:CreateGroupMembership on the group>"
+      target: "<Identity Store Group node>"
+      api_source: "identitystore:ListGroups + iam:ListPolicies / GetUserPolicy / GetRolePolicy for permission evaluation"
+      evidence_field: "Group.GroupId"
+      narrative: >-
+        {principal.name} has identitystore:CreateGroupMembership on group {group.name}
+        and can add any user to that group, causing the new member to inherit all
+        account assignments the group holds.
+
+  # --- CanModifyPolicy: Delete permissions boundary from permission set -------
+  # A permissions boundary on a permission set caps the effective permissions of
+  # every assignee. Removing it (sso-admin:DeletePermissionsBoundaryFromPermissionSet)
+  # allows the full underlying policies to take effect, widening every assignee.
+  - id: aws-sso-delete-permissions-boundary
+    emits: CanModifyPolicy
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SSO::PermissionSet"
+      field: "PermissionsBoundary"
+    where:
+      - "PermissionsBoundary is present (exists)"
+      - "caller has sso-admin:DeletePermissionsBoundaryFromPermissionSet permission on this PermissionSet ARN"
+    emit:
+      source_type: Identity
+      target_type: PermissionBoundary
+      source: "<Principal with sso-admin:DeletePermissionsBoundaryFromPermissionSet on the PermissionSet>"
+      target: "<PermissionBoundary node>"
+      api_source: "sso-admin:ListPermissionSets + sso-admin:GetPermissionsBoundaryForPermissionSet + iam:ListPolicies for permission evaluation"
+      evidence_field: "PermissionSet.PermissionsBoundary.ManagedPolicyArn | PermissionSet.PermissionsBoundary.CustomerManagedPolicyReference"
+      narrative: >-
+        {principal.name} has sso-admin:DeletePermissionsBoundaryFromPermissionSet on
+        permission set {permset.name} and can remove the permissions boundary ({boundary.name}),
+        uncapping the effective permissions of all principals assigned to that permission set.
+
+  # --- CanRetrieveToken: SSO user retrieves role credentials ----------------
+  # The sso:GetRoleCredentials action allows an SSO-assigned user to retrieve
+  # session credentials for the provisioned IAM role. This is distinct from
+  # sts:AssumeRoleWithWebIdentity (which happens under the hood) and represents
+  # the explicit credential retrieval step in the user's attack chain.
+  - id: aws-sso-user-retrieves-role-credentials
+    emits: CanRetrieveToken
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SSO::Assignment"
+      field: "PrincipalId"
+    where:
+      - "AWSReservedSSO_<PermSetName>_<hash> role exists in the AccountId account"
+      - "the assigned principal (User or Group members) can call sso:GetRoleCredentials"
+    emit:
+      source_type: HumanIdentity
+      target_type: Role
+      source: "<Identity Store User (HumanIdentity) or Group-member User inheriting the assignment>"
+      target: "<AWSReservedSSO_* provisioned Role in the assigned Account>"
+      api_source: "sso-admin:ListAccountAssignments + iam:GetRole (for trust verification)"
+      evidence_field: "AccountAssignment.AccountId + PermissionSetArn + PrincipalId"
+      narrative: >-
+        {principal.name} assigned to permission set {permset.name} in account
+        {account.name} can call sso:GetRoleCredentials to retrieve session
+        credentials for the provisioned role {provisioned_role.name}.
+
+  # --- TrustsExternalIdentity: Update trusted token issuer (modifies endpoint) ---
+  # sso-admin:UpdateTrustedTokenIssuer allows modifying an existing trusted token
+  # issuer's configuration (IssuerUrl, claim pins, etc.). An attacker can replace
+  # the endpoint URL with an attacker-controlled OIDC issuer without needing to
+  # register a new issuer (no callback/verification delays). This is a direct
+  # modification of the trust relationship.
+  - id: aws-sso-update-trusted-token-issuer
+    emits: TrustsExternalIdentity
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::SSO::TrustedTokenIssuer"
+      field: "TrustedTokenIssuerConfiguration.OidcJwtConfiguration.IssuerUrl"
+    where:
+      - "caller has sso-admin:UpdateTrustedTokenIssuer permission on this TrustedTokenIssuer ARN"
+    emit:
+      source_type: ResourcePolicy
+      target_type: FederatedIdentity
+      source: "<ResourcePolicy node representing the SSO instance's trusted issuer configuration (keyed by issuer ARN)>"
+      target: "<FederatedIdentity node representing the (attacker-controlled) OIDC issuer endpoint>"
+      api_source: "sso-admin:ListTrustedTokenIssuers + sso-admin:DescribeTrustedTokenIssuer + iam:ListPolicies for permission evaluation"
+      evidence_field: "TrustedTokenIssuer.TrustedTokenIssuerConfiguration.OidcJwtConfiguration.IssuerUrl"
+      narrative: >-
+        {principal.name} has sso-admin:UpdateTrustedTokenIssuer on trusted issuer
+        {issuer.name} and can modify its endpoint (IssuerUrl) to point to an
+        attacker-controlled OIDC endpoint, enabling immediate token forgery without
+        new trust confirmation delays.
+
+# ---------------------------------------------------------------------------
+# FUTURE RULES — planned but not yet implemented:
+# ---------------------------------------------------------------------------
+#
+# 1. aws-sso-application-auth-method
+#    sso-admin:PutApplicationAuthenticationMethod and sso-admin:PutApplicationGrant
+#    allow configuring OIDC/JWT auth on an SSO-managed application. An attacker with
+#    these permissions can register a JWT-Bearer grant that accepts tokens from an
+#    attacker-controlled issuer, then obtain application-scoped tokens using forged JWTs.
+#    This is a federation expansion primitive (CanModifyPolicy or CanModifyTrust on
+#    the application node). Match: SSO Application record; emit CanModifyPolicy or
+#    CanModifyTrust(principal -> application) when auth method is configured.
+#
+# Grounding docs:
+# - sso-admin:UpdateTrustedTokenIssuer: https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsiamidentitycentersuccessor.html
+# - sso-admin:PutApplicationAuthenticationMethod / PutApplicationGrant: https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsiamidentitycentersuccessor.html

@@ -1,0 +1,331 @@
+# Azure Managed Identities — explicit normalization rules.
+# Translate raw collected Microsoft.ManagedIdentity config and Entra Graph data
+# into common explicit edges consumed by derived rules.
+#
+# TWO normalization areas:
+#   1. ExecutesAs / AttachedTo  — which compute resources are bound to which MI.
+#      (Note: VM-side and Function-side ExecutesAs also appear in their own
+#       explicit rule files; this file is the MI-centric view normalizing FROM the
+#       MI resource, for completeness and reverse-query support.)
+#   2. Federation trust facts   — federated identity credentials on user-assigned
+#      MIs and app registrations normalize to TrustsExternalIdentity +
+#      ExternalIdentityMapsTo so federation-chains.yaml can collapse them into
+#      CanFederateAs without service-specific logic.
+#
+# Collection APIs:
+#   az identity list / az identity show                   (MI ARM resource)
+#   az identity federated-credential list                 (federated creds)
+#   az role assignment list --assignee <mi-principalId>   (MI RBAC grants)
+#   az ad sp show --id <mi-principalId>                   (MI Entra SP object)
+
+rules:
+
+  # ===========================================================================
+  # STRUCTURAL: MI metadata and attachment
+  # ===========================================================================
+
+  # --- User-assigned MI ARM resource node ---
+  - id: azure-mi-resource-node
+    emits: LocatedIn
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ManagedIdentity/userAssignedIdentities"
+      field: "id"
+    emit:
+      source_type: ManagedIdentity
+      target_type: AdministrativeBoundary
+      source: "<managed identity node>"
+      target: "<resource group containing the MI>"
+      api_source: "az identity list / az identity show"
+      evidence_field: "id"
+      narrative: "{mi.name} (user-assigned managed identity) is located in resource group {rg.name}."
+
+  # --- ExecutesAs: host resource bound to a system-assigned MI ---------------
+  # The host resource's identity block is the authoritative source. Emitting
+  # from the MI side is redundant with per-host explicit rules (vm.yaml,
+  # functions.yaml, etc.) but provides the reverse-lookup path for MI-centric
+  # queries.
+  - id: azure-mi-system-assigned-executes-as
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "*"   # any ARM resource type
+      field: "identity.type"
+      value_contains: "SystemAssigned"
+    emit:
+      source_type: Compute
+      target_type: ManagedIdentity
+      source: "<host compute resource>"
+      target: "<system-assigned MI principal (identity.principalId on the host)>"
+      api_source: "ARM resource GET (identity block)"
+      evidence_field: "identity.principalId"
+      narrative: "{host.name} runs as its system-assigned managed identity (principalId: {identity.principalId})."
+
+  # --- ExecutesAs + AttachedTo: host resource bound to user-assigned MIs -----
+  - id: azure-mi-user-assigned-executes-as
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "*"
+      field: "identity.userAssignedIdentities"
+    emit:
+      source_type: Compute
+      target_type: ManagedIdentity
+      source: "<host compute resource>"
+      target: "<each user-assigned MI in identity.userAssignedIdentities (keyed by MI resource id)>"
+      api_source: "ARM resource GET (identity.userAssignedIdentities)"
+      evidence_field: "identity.userAssignedIdentities"
+      note: >-
+        Each key in identity.userAssignedIdentities is the full ARM resource ID of a
+        user-assigned MI. Resolve to the MI node; the associated clientId / principalId
+        are nested values in the map entry. Emit one ExecutesAs edge per MI.
+      narrative: "{host.name} runs as user-assigned managed identity {mi.name}."
+
+  - id: azure-mi-user-assigned-attached-to
+    emits: AttachedTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "*"
+      field: "identity.userAssignedIdentities"
+    emit:
+      source_type: ManagedIdentity
+      target_type: Compute
+      source: "<user-assigned MI (resolved from identity.userAssignedIdentities key)>"
+      target: "<host compute resource>"
+      api_source: "ARM resource GET (identity.userAssignedIdentities)"
+      evidence_field: "identity.userAssignedIdentities"
+      note: >-
+        AttachedTo is structural (walkable:false). One edge per (MI, host) pair.
+        Used for reverse queries: 'which hosts share this MI?' This surfaces shared
+        blast radius in the UI.
+      narrative: "User-assigned MI {mi.name} is attached to {host.name}."
+
+  # ===========================================================================
+  # FEDERATION TRUST: federated identity credentials on user-assigned MIs
+  # ===========================================================================
+  # Federated credentials allow external OIDC issuers (GitHub Actions, Azure
+  # Pipelines, Kubernetes service accounts, other Azure AD tenants) to obtain
+  # an MI bearer token without any on-host foothold. Each credential entry
+  # specifies: issuer (OIDC discovery URL), subject (OIDC sub claim to pin),
+  # audiences (expected aud claim). The trust is only as strong as the subject
+  # pin — a broad/unpinned subject is ACTIVE; a specific subject is CONDITIONAL.
+
+  # --- TrustsExternalIdentity: the MI trust anchor declares what it accepts --
+  - id: azure-mi-federated-cred-trust-anchor
+    emits: TrustsExternalIdentity
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials"
+      field: "issuer"
+    emit:
+      source_type: ManagedIdentity
+      target_type: FederatedIdentity
+      source: "<user-assigned MI that owns this federatedIdentityCredential>"
+      target: "<ExternalIdentity / FederatedIdentity node representing the issuer+subject>"
+      api_source: "az identity federated-credential list --identity-name <name> -g <rg>"
+      evidence_field: "issuer, subject, audiences"
+      note: >-
+        The trust condition is carried as properties on this edge:
+          trust_condition.issuer   = federatedIdentityCredential.issuer
+          trust_condition.subject  = federatedIdentityCredential.subject (may be blank/broad)
+          trust_condition.audiences = federatedIdentityCredential.audiences
+        The subject field determines ACTIVE vs CONDITIONAL per federation-chains
+        federation-maps-to-identity (unpinned/broad subject => ACTIVE, specific
+        subject => CONDITIONAL(trust_condition)). Well-known broad patterns:
+          GitHub Actions:   broad if `sub` not scoped to repo:org/repo:ref:...
+          AKS WI:           broad if `sub` is just a namespace:SA pair (widely achievable)
+          Azure Pipelines:  typically scoped (project+org); usually CONDITIONAL
+      narrative: >-
+        Managed identity {mi.name} trusts external OIDC identity from issuer
+        {issuer} with subject constraint '{subject}' and audience(s) {audiences}.
+        An identity satisfying this condition can obtain a bearer token for {mi.name}
+        without any on-host foothold.
+
+  # --- ExternalIdentityMapsTo: the resolved external identity maps to the MI -
+  - id: azure-mi-federated-cred-maps-to
+    emits: ExternalIdentityMapsTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials"
+      field: "subject"
+    emit:
+      source_type: FederatedIdentity
+      target_type: ManagedIdentity
+      source: "<ExternalIdentity / FederatedIdentity node for this issuer+subject>"
+      target: "<user-assigned MI>"
+      api_source: "az identity federated-credential list"
+      evidence_field: "issuer, subject"
+      note: >-
+        Paired with azure-mi-federated-cred-trust-anchor. Together these two explicit
+        edges provide the TrustsExternalIdentity + ExternalIdentityMapsTo pair that
+        federation-chains.yaml (federation-maps-to-identity) collapses into
+        CanFederateAs(?ext -> ?mi). The condition breadth on the subject field
+        determines ACTIVE vs CONDITIONAL(trust_condition) per federation-chains rules.
+      narrative: >-
+        External identity with issuer {issuer} and subject '{subject}' maps to
+        managed identity {mi.name} via the federatedIdentityCredential trust.
+        When the trust condition is satisfied, this external identity can obtain
+        {mi.name}'s bearer token.
+
+  # ===========================================================================
+  # MI RBAC: role assignments TO the MI (the MI as an RBAC principal)
+  # ===========================================================================
+
+  # --- HasRole: ARM role assignments where the MI is the principal -----------
+  - id: azure-mi-role-assignment
+    emits: HasRole
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Authorization/roleAssignments"
+      field: "principalId"
+      condition: "principalType == 'ServicePrincipal' and principalId matches a MI principalId"
+    emit:
+      source_type: ManagedIdentity
+      target_type: Role
+      source: "<managed identity (resolved from principalId)>"
+      target: "<role definition at the assigned scope>"
+      api_source: "az role assignment list --assignee <mi-objectId> --all-namespaces"
+      evidence_field: "principalId, roleDefinitionId, scope"
+      note: >-
+        Resolve principalId -> MI node via the Entra SP object (principalType ==
+        'ServicePrincipal', servicePrincipalType == 'ManagedIdentity'). The scope
+        on the role assignment determines whether this is same-subscription or
+        cross-subscription (cross-subscription feeds azure-mi-cross-subscription-rbac
+        in managedidentity.yaml). PIM-eligible assignments (not-active) should be
+        emitted as CONDITIONAL(iam_permission).
+      narrative: >-
+        Managed identity {mi.name} holds {role.name} at scope {scope} — any
+        bearer token for {mi.name} carries these ARM RBAC permissions.
+
+  # ===========================================================================
+  # MI ADMINISTRATIVE CONTROL (ARM resource itself)
+  # ===========================================================================
+  # These rules evaluate effective permissions on the MI ARM object and are
+  # processed by the explicit-rule engine's effective-permission evaluator.
+  # They use match_effective_permission (not graph patterns) and feed downstream
+  # derived rules and permission-based queries.
+
+  # --- Full control of the user-assigned MI ARM object -----------------------
+  - id: azure-mi-contributor
+    emits: CanAdminister
+    applies_to: [azure]
+    description: "Principal with full control of the MI ARM object (Managed Identity Contributor / Contributor / Owner at scope) can administer the user-assigned identity resource."
+    match_effective_permission:
+      action: "Microsoft.ManagedIdentity/userAssignedIdentities/*"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: ManagedIdentity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions:
+        - "Microsoft.ManagedIdentity/userAssignedIdentities/*"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal holds the wildcard action at scope.
+        BLOCKED if a deny assignment suppresses the action on the MI resource.
+      confidence: 0.95
+      narrative: >-
+        {principal.name} has full control of user-assigned MI {target.name}
+        (Microsoft.ManagedIdentity/userAssignedIdentities/*), including the ability
+        to add/remove federated credentials, modify tags, and delete the MI.
+      false_positive_note: >-
+        CanAdminister over the MI ARM object grants control of the MI resource
+        (metadata, tags, federated credentials, deletion) but does NOT by itself
+        yield the MI's bearer token — that requires a foothold on an attached
+        compute host. The Managed Identity Operator role (assign/action only) does
+        NOT qualify for CanAdminister; it qualifies only for CanPassIdentity
+        (already modeled in azure-assign-user-assigned-mi, identity-escalation.yaml).
+        Contributor/Owner at the enclosing RG/subscription inherits down via
+        hierarchy-chains admin-inherits-down-contains.
+
+  # --- Read MI metadata (low-value recon, not an escalation path) ------------
+  - id: azure-mi-read
+    emits: CanRead
+    applies_to: [azure]
+    description: "Principal with read permission on the MI ARM resource can enumerate its metadata (clientId, principalId, tenantId) — recon aiding IMDS multi-MI token requests."
+    match_effective_permission:
+      action: "Microsoft.ManagedIdentity/userAssignedIdentities/read"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: ManagedIdentity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions:
+        - "Microsoft.ManagedIdentity/userAssignedIdentities/read"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal holds the read permission at scope.
+        CONDITIONAL(iam_permission) when the assignment is PIM-eligible-not-activated.
+        BLOCKED when a deny assignment suppresses the read action.
+      confidence: 0.9
+      narrative: >-
+        {principal.name} can read the metadata of managed identity {target.name}
+        (clientId, principalId, tenantId) — recon that aids IMDS token requests
+        when multiple user-assigned MIs are attached to a host.
+      false_positive_note: >-
+        Reading MI metadata (clientId, principalId, tenantId) is a recon
+        capability that aids lateral movement (the clientId is needed to specify
+        which MI token to mint when multiple are attached). It is not itself an
+        escalation edge. CanRead is walkable but low-value (base_weight 2).
+
+  # ===========================================================================
+  # FEDERATION TRUST ON APP REGISTRATIONS (bonus: MS Graph path)
+  # ===========================================================================
+  # App registrations can also carry federated identity credentials; these are
+  # the ApplicationIdentity analog. The trust and mapping facts are the same
+  # normalized pair; only the source node type differs (ApplicationIdentity
+  # rather than ManagedIdentity). federation-chains.yaml handles the collapse.
+
+  - id: azure-app-federated-cred-trust-anchor
+    emits: TrustsExternalIdentity
+    applies_to: [azure]
+    match_record:
+      resource_type: "microsoft.graph/applications/federatedIdentityCredentials"
+      field: "issuer"
+    emit:
+      source_type: ApplicationIdentity
+      target_type: FederatedIdentity
+      source: "<app registration that owns this federatedIdentityCredential>"
+      target: "<ExternalIdentity / FederatedIdentity node for this issuer+subject>"
+      api_source: "az ad app federated-credential list --id <appId>"
+      evidence_field: "issuer, subject, audiences"
+      note: >-
+        Same semantics as azure-mi-federated-cred-trust-anchor but for app
+        registrations (ApplicationIdentity). The subject pin / breadth logic is
+        identical. The CanModifyTrust path (adding a federated credential to an app)
+        is already captured in azure-federated-credential-write
+        (identity-escalation.yaml) — this rule normalizes the TRUST FACT from the
+        already-existing credential, not the write capability.
+      narrative: >-
+        App registration {app.name} trusts external OIDC identity from issuer
+        {issuer} with subject constraint '{subject}'. An identity satisfying this
+        can obtain tokens as {app.name}'s service principal.
+
+  - id: azure-app-federated-cred-maps-to
+    emits: ExternalIdentityMapsTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "microsoft.graph/applications/federatedIdentityCredentials"
+      field: "subject"
+    emit:
+      source_type: FederatedIdentity
+      target_type: ApplicationIdentity
+      source: "<ExternalIdentity / FederatedIdentity node for this issuer+subject>"
+      target: "<app registration / its service principal>"
+      api_source: "az ad app federated-credential list"
+      evidence_field: "issuer, subject"
+      note: >-
+        Paired with azure-app-federated-cred-trust-anchor. Together these two explicit
+        edges provide the TrustsExternalIdentity + ExternalIdentityMapsTo pair that
+        federation-chains.yaml (federation-maps-to-identity) collapses into
+        CanFederateAs(?ext -> ?app). ApplicationIdentity is a subtype of Identity,
+        which is in the ExternalIdentityMapsTo target set per edges.yaml, making
+        this emit fully conformant. The cross-boundary entry via federated SP is
+        captured by hierarchy-chains enter-boundary-rollups when home_boundary differs.
+      narrative: >-
+        External identity with issuer {issuer} and subject '{subject}' maps to
+        app registration {app.name} via the federatedIdentityCredential trust.
+        When the trust condition is satisfied, this external identity can obtain
+        {app.name}'s bearer token.

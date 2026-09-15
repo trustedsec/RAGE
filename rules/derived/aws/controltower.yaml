@@ -1,0 +1,335 @@
+# AWS Control Tower & Landing Zone — Derived attack-path rules (Phase 3 — administrative hierarchy & guardrails)
+# ===========================================================================
+# Control Tower orchestrates AWS Organizations. The CORE org model — Contains
+# (Org->OU->Account), SCP guardrail nodes, sts:AssumeRole cross-account entry,
+# CanEnterAccount / CanEnterOrganization — is ALREADY derived in
+# rules/derived/aws/identity-escalation.yaml (aws-assume-role,
+# aws-update-assume-role-policy) and the provider-agnostic
+# rules/derived/can-control.yaml (enter-account-via-assume,
+# control-boundary-via-iam-admin) + rules/derived/hierarchy-chains.yaml
+# (admin-inherits-down-contains, guardrail-removal-upgrades-blocked). This file
+# adds ONLY the Control-Tower-specific surface and CITES those files.
+#
+# Two headline edges:
+#   (1) AWSControlTowerExecution — CT deploys an AdministratorAccess role into
+#       EVERY enrolled account whose trust policy allows the Organizations
+#       management account. A mgmt-account principal that holds sts:AssumeRole on
+#       role/AWSControlTowerExecution enters every governed account. Lateral
+#       superhighway.
+#   (2) Account Factory — controltower:CreateManagedAccount provisions a NEW
+#       account pre-seeded with that same admin role -> creating an account IS
+#       entering it (and reaching org membership).
+#
+# Guardrails: preventive CT controls are SCPs (ServiceControlPolicy nodes);
+# detective controls are Config rules (gate nothing). Disabling/updating a
+# control, or reparenting an account out of its OU, REMOVES a guardrail. This
+# file emits the CanModifyPolicy over the backing SCP (and CanModifyConfiguration
+# for reparent) and DOCUMENTS which edges it gates; the BLOCKED->ACTIVE upgrade
+# and Contains* subtree descent are DEFERRED to hierarchy-chains.yaml.
+#
+# State defaults ACTIVE; unmet condition -> CONDITIONAL/POTENTIAL; SCP/deny ->
+# BLOCKED. SCPs NEVER apply to the management account — do not emit BLOCKED-by-SCP
+# for mgmt-account principals.
+# ===========================================================================
+
+provider: aws
+phase: 3-administrative-hierarchy
+applies_to: [aws]
+
+rules:
+
+  # --- 1) AWSControlTowerExecution: mgmt account -> admin in every member -----
+  - id: aws-ct-execution-role-enter-account
+    emits: CanEnterAccount
+    description: "A management-account principal that can assume AWSControlTowerExecution enters every enrolled member account as administrator."
+    match:
+      - [ ?principal, CanAssume, ?ct_exec_role ]
+    where:
+      - "node_type(?ct_exec_role) == Role and ?ct_exec_role.name == 'AWSControlTowerExecution'"
+      - "account_of(?ct_exec_role) != account_of(?principal)   # cross-account: member != mgmt"
+      - "account_of(?principal) == <organization management account>   # SCPs do not apply here; the role only trusts the mgmt account"
+      - "?principal holds EFFECTIVE sts:AssumeRole on the role ARN (identity policy — trust alone is insufficient)"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?principal
+      target: "<account of ?ct_exec_role>"
+      permissions: ["sts:AssumeRole"]
+      conditions: [trust_relationship, iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal is a management-account principal AND its identity
+        policy grants sts:AssumeRole on arn:aws:iam::<member>:role/AWSControlTowerExecution
+        (trust policy already admits the mgmt account). CONDITIONAL(iam_permission)
+        when the caller's sts:AssumeRole scope is unresolved/only-wildcard; POTENTIAL
+        when the caller is not confirmed to be a mgmt-account principal. This is the
+        AWS cross-account CanAssume->CanEnterAccount case already generalized by
+        can-control.yaml enter-account-via-assume — this rule specializes it to the
+        CT role and drives the fan-out to EVERY enrolled account (one edge per
+        member carrying AWSControlTowerExecution).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanAssume edge_id (principal -> AWSControlTowerExecution)>" ]
+      false_positive_note: >-
+        The role's trust policy admits the mgmt account, but assuming it STILL
+        requires the caller's own identity policy to grant sts:AssumeRole on the role
+        ARN — do not emit ACTIVE from the trust edge alone. Only management-account
+        principals qualify (SCPs cannot restrict them, and members are not trusted).
+        Emit one CanEnterAccount per enrolled account that has the role; skip accounts
+        where the role was removed/renamed. Cite can-control.yaml
+        enter-account-via-assume — do not duplicate the generic assume->enter roll-up.
+      narrative: >-
+        {principal.name} (management account) can assume AWSControlTowerExecution in
+        account {account.name}, obtaining AdministratorAccess there — a foothold in
+        every Control-Tower-enrolled account.
+
+  # --- 2) AWSControlTowerExecution session bypasses preventive guardrails -----
+  # DOCUMENTATION-ONLY annotation. This rule does NOT emit a graph edge: rule 1
+  # already produces the CanEnterAccount, and re-emitting it here would add no
+  # distinct edge (dead emit). The distinct effect — that SCPs exempting the
+  # AWSControlTowerExecution role do NOT block edges for a session obtained via
+  # that role — is NOT currently consumed by hierarchy-chains.yaml
+  # guardrail-removal-upgrades-blocked, whose only branches are CanModifyPolicy
+  # (?guardrail) and CanModifyConfiguration (reparent); it has no
+  # 'exempted-principal' branch (aws:PrincipalArn == AWSControlTowerExecution).
+  # Rather than materialize an inert/duplicate edge, we record the bypass as a
+  # POTENTIAL annotation on the contributing CanEnterAccount for analyst review.
+  # If hierarchy-chains later grows an exempted-principal branch, upgrade this to
+  # emit the concrete BLOCKED->underlying upgrade there and cite it here.
+  - id: aws-ct-execution-role-guardrail-bypass
+    emits: null              # no graph edge — POTENTIAL annotation on rule 1's CanEnterAccount
+    kind: annotation
+    description: "Documentation-only: Control Tower SCPs that exempt AWSControlTowerExecution mean a session obtained via that role is not subject to those preventive guardrails. No distinct edge is emitted; annotates rule 1's CanEnterAccount."
+    match:
+      - [ ?principal, CanEnterAccount, ?account ]
+    where:
+      - "the CanEnterAccount was obtained via AWSControlTowerExecution (rule aws-ct-execution-role-enter-account)"
+      - "at least one CT preventive control SCP attached to ?account's OU contains a condition exempting the AWSControlTowerExecution role (aws:PrincipalArn)"
+    emit:
+      source: ?principal
+      target: ?account
+      permissions: ["sts:AssumeRole"]
+      conditions: [scp_or_org_policy]
+      state_logic: >-
+        POTENTIAL, documentation-only. Does NOT re-emit CanEnterAccount (rule 1 owns
+        that edge) and does NOT create a CanModifyPolicy (nothing is modified — the
+        SCP already exempts the role). It records that BLOCKED-by-SCP edges inside
+        ?account may not actually apply to a session acting as AWSControlTowerExecution
+        when the SCP's condition exempts that role's ARN. This exempted-principal
+        escape is NOT yet consumed by hierarchy-chains.yaml
+        guardrail-removal-upgrades-blocked (which only fires on CanModifyPolicy /
+        CanModifyConfiguration), so the upgrade is not materialized in the graph —
+        it is surfaced as an analyst annotation only.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "aws-ct-execution-role-enter-account (CanEnterAccount via AWSControlTowerExecution)", "<exempting ServiceControlPolicy condition (aws:PrincipalArn == AWSControlTowerExecution)>" ]
+      false_positive_note: >-
+        The exemption is PER-SCP: only annotate for a specific SCP whose condition
+        genuinely exempts AWSControlTowerExecution (aws:PrincipalArn condition). Do
+        NOT blanket-assume every guardrail is bypassed. Mandatory controls that
+        protect CT resources may still deny even this role — respect their conditions.
+        Detective (Config-rule) controls are irrelevant here. This rule emits NO edge:
+        do not treat it as producing CanEnterAccount (that would duplicate rule 1) or
+        CanModifyPolicy (nothing is modified).
+      narrative: >-
+        {principal.name}, acting as AWSControlTowerExecution in {account.name},
+        operates outside the preventive SCP guardrails that exempt that role
+        (documentation-only; no graph edge emitted).
+
+  # --- 3) Account Factory: create a managed account = enter it ---------------
+  - id: aws-ct-account-factory-enter
+    emits: CanEnterAccount
+    description: "Creating a managed account via Account Factory yields a new account pre-seeded with an admin role the creator can assume — creation is entry."
+    match:
+      - [ ?principal, CanCreate, ?account_factory ]
+    where:
+      - "?principal holds EFFECTIVE controltower:CreateManagedAccount OR servicecatalog:ProvisionProduct on the Account Factory product"
+      - "node_type(?account_factory) in [ManagementService (LandingZone), ServiceCatalogProduct (Account Factory)]"
+      - "?principal is a management-account principal (Account Factory runs in the mgmt account)"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?principal
+      target: "<newly-provisioned Account (synthetic / future node)>"
+      permissions: ["controltower:CreateManagedAccount", "servicecatalog:ProvisionProduct", "sts:AssumeRole"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE for the creation-as-entry capability when the principal holds
+        controltower:CreateManagedAccount (or ProvisionProduct on the Account Factory
+        product) unconditionally; CONDITIONAL(iam_permission) if gated. The new
+        account ships with AWSControlTowerExecution trusting the mgmt account, so the
+        creator (a mgmt-account principal) can immediately assume into it — the
+        entry realizes via rule aws-ct-execution-role-enter-account once the account
+        exists. POTENTIAL when the target account is prospective (not yet created).
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanCreate / effective controltower:CreateManagedAccount>" ]
+      false_positive_note: >-
+        Requires the Account Factory Service Catalog portfolio to be reachable by the
+        principal (ProvisionProduct is gated by the portfolio's launch constraints)
+        OR the controltower:CreateManagedAccount API permission. Provisioning is
+        asynchronous and can fail policy validation; model the resulting account as a
+        prospective (POTENTIAL) boundary until confirmed. Do not emit for principals
+        holding only read (controltower:ListManagedAccounts) actions.
+      narrative: >-
+        {principal.name} can provision a new managed account via Account Factory
+        (controltower:CreateManagedAccount); the account ships with an assumable
+        admin role, so {principal.name} enters it on creation.
+
+  # NOTE: A former rule aws-ct-account-factory-enter-org (emits CanEnterOrganization
+  # from merely holding controltower:CreateManagedAccount) was REMOVED as an
+  # over-claim. Its where-clause already REQUIRES the principal be a management-
+  # account principal, so it is by definition already inside the management account;
+  # CanEnterOrganization ("reaches org-level control: management account, org policy
+  # admin") is therefore either trivially already-true for such a principal or an
+  # over-read of "expands org membership" into "reaches org-level control". Genuine
+  # org-level control from CT actions is gated on landing-zone lifecycle actions by
+  # rule aws-ct-landingzone-controls-org (Controls(Organization)) — cite that.
+
+  # --- 4) Disable/update a control = modify the backing SCP guardrail ---------
+  - id: aws-ct-disable-control-modifies-scp
+    emits: CanModifyPolicy
+    description: "Disabling or updating a Control Tower preventive control modifies the SCP guardrail backing it, removing its deny."
+    match:
+      - [ ?enabled_control, HasPolicy, ?scp ]
+    where:
+      - "node_type(?scp) == ServiceControlPolicy   # preventive control (detective/Config-rule controls gate nothing)"
+      - "?principal holds EFFECTIVE controltower:DisableControl OR controltower:UpdateEnabledControl on ?enabled_control (or organizations:DetachPolicy/UpdatePolicy on ?scp)"
+      - "?enabled_control is NOT a mandatory control (mandatory controls cannot be disabled)"
+      - "?principal acts from the management account or a Control Tower delegated-admin account"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?scp
+      permissions: ["controltower:DisableControl", "controltower:UpdateEnabledControl", "organizations:DetachPolicy?", "organizations:UpdatePolicy?"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal unconditionally holds controltower:DisableControl /
+        UpdateEnabledControl on a NON-mandatory control (or the underlying
+        organizations:DetachPolicy/UpdatePolicy on the SCP) from the mgmt/delegated-
+        admin account. BLOCKED/POTENTIAL when the control is mandatory (cannot be
+        disabled) or the principal lacks org-scope reach. This CanModifyPolicy over
+        the SCP is the guardrail-removal capability CONSUMED by hierarchy-chains.yaml
+        guardrail-removal-upgrades-blocked — which performs the BLOCKED->ACTIVE
+        upgrade of every edge blocked_by == ?scp. DEFER that upgrade; do NOT enumerate
+        the unblocked edges here.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<HasPolicy edge (EnabledControl -> backing SCP)>", "<effective controltower:DisableControl / UpdateEnabledControl>" ]
+      false_positive_note: >-
+        Only PREVENTIVE controls have an SCP backing — do not fire for detective
+        (Config-rule) controls; disabling those removes monitoring, not a deny, and
+        upgrades no edge. Mandatory controls cannot be disabled (they protect CT
+        resources) — emit BLOCKED/POTENTIAL, never ACTIVE, for them. The editor must
+        act from the management or delegated-admin account: a member-account principal
+        with only local IAM cannot weaken the SCP. Overlaps the Organizations SCP
+        model — dedupe on (CanModifyPolicy, principal, scp); this rule adds the CT
+        control->SCP mapping. Cite hierarchy-chains.yaml for the actual upgrade.
+      narrative: >-
+        {principal.name} can disable/modify Control Tower control {enabled_control.name}
+        (controltower:DisableControl/UpdateEnabledControl), removing the SCP guardrail
+        {scp.name} that backs it and unblocking everything that SCP denied.
+
+  # --- 5) Deregister OU / reparent = pull an account out of guardrail scope ---
+  - id: aws-ct-deregister-ou-escapes-guardrail
+    emits: CanModifyConfiguration
+    description: "Deregistering an OU from Control Tower governance (or reparenting accounts) removes the inherited SCP guardrails from those accounts."
+    match:
+      - [ ?ou, HasPolicy, ?scp ]
+    where:
+      - "node_class(?ou) == AdministrativeBoundary and node_type(?ou) == Folder   # a registered OU"
+      - "node_type(?scp) == ServiceControlPolicy   # a preventive control SCP attached at the OU"
+      - "?principal holds EFFECTIVE controltower:DeregisterOrganizationalUnit on ?ou (or organizations:MoveAccount to reparent accounts out of ?ou)"
+      - "?principal acts from the management or delegated-admin account"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: "<OU-governance / account-membership scope binding of ?ou>"
+      permissions: ["controltower:DeregisterOrganizationalUnit", "organizations:MoveAccount?"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds controltower:DeregisterOrganizationalUnit
+        (or organizations:MoveAccount for the reparent variant) at the right scope.
+        This is the 'move the resource out of the guardrail's scope' ALTERNATIVE that
+        hierarchy-chains.yaml guardrail-removal-upgrades-blocked accepts (its optional
+        CanModifyConfiguration ?scope_binding clause) — pulling accounts out of ?ou
+        lifts every edge blocked_by the SCPs inherited at ?ou. DEFER the upgrade.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<HasPolicy edge (OU -> attached SCP)>", "<effective controltower:DeregisterOrganizationalUnit / organizations:MoveAccount>" ]
+      false_positive_note: >-
+        Deregistering an OU stops CT enforcing baselines/controls on it but does NOT
+        automatically detach directly-attached SCPs — the realistic escape is
+        reparenting the ACCOUNT to a different OU whose SCP set is weaker
+        (organizations:MoveAccount), which is an Organizations action (CITE the org
+        model, do not re-derive MoveAccount here). Only a mgmt/delegated-admin
+        principal can do this. Do not fire when the destination OU carries an
+        equivalent-or-stronger guardrail (no escape achieved).
+      narrative: >-
+        {principal.name} can deregister OU {ou.name} from Control Tower governance
+        (or reparent its accounts), pulling them out of the SCP guardrails inherited
+        there and unblocking the edges those SCPs denied.
+
+  # --- 6) Landing-zone administration = control of the organization ----------
+  - id: aws-ct-landingzone-controls-org
+    emits: Controls
+    description: "Control Tower landing-zone administration is effectively organization administration."
+    match:
+      - [ ?landing_zone, LocatedIn, ?org ]
+    where:
+      - "node_type(?landing_zone) == LandingZone (ManagementService)"
+      - "node_class(?org) == AdministrativeBoundary and node_type(?org) == Organization"
+      - "?principal holds EFFECTIVE controltower:CreateLandingZone OR UpdateLandingZone OR ResetLandingZone (or broad controltower:* / EnableControl+ManageOrganizationalUnit at landing-zone scope)"
+      - "?principal is a management-account principal"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?org
+      permissions: ["controltower:UpdateLandingZone", "controltower:ResetLandingZone", "controltower:CreateLandingZone"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds landing-zone lifecycle actions
+        (Create/Update/ResetLandingZone) unconditionally from the mgmt account:
+        re-baselining the landing zone re-deploys roles/SCPs/OUs org-wide, which is
+        org control. CONDITIONAL(iam_permission) when gated. This Controls(Organization)
+        then FEEDS hierarchy-chains.yaml admin-inherits-down-contains to descend to
+        every OU and account under the org — DO NOT hand-enumerate the subtree here.
+        Overlaps can-control.yaml control-boundary-via-iam-admin for the boundary
+        roll-up; dedupe on (Controls, principal, org).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<LocatedIn edge (LandingZone -> Organization)>", "<effective controltower landing-zone actions>" ]
+      false_positive_note: >-
+        Reserve for genuine landing-zone lifecycle / org-wide control actions.
+        Single-control or single-account CT actions (EnableControl on one OU) are NOT
+        org control — those are boundary-scoped and inherit via hierarchy-chains, not
+        this rule. controltower:GetLandingZone / read actions confer nothing. Only
+        management-account principals hold these effectively. Cite, do not duplicate,
+        the org SCP/CanEnterOrganization modeling in identity-escalation.yaml.
+      narrative: >-
+        {principal.name} can create/update/reset the Control Tower landing zone
+        (controltower:UpdateLandingZone/ResetLandingZone), re-baselining roles and
+        SCP guardrails across the organization — effective control of {org.name}.
+
+# ===========================================================================
+# DEFERRED to rules/derived/hierarchy-chains.yaml (cited in derived_from above):
+#   * guardrail-removal-upgrades-blocked — consumes rule 4's CanModifyPolicy over
+#     the ServiceControlPolicy and rule 5's CanModifyConfiguration reparent to
+#     UPGRADE every BLOCKED edge (blocked_by == that SCP) to CONDITIONAL(guardrail_
+#     removed) -> its underlying ACTIVE/CONDITIONAL state.
+#   * admin-inherits-down-contains — descends rule 6's Controls(Organization) (and
+#     any Controls(OU)) down the Contains* hierarchy to every child account/resource,
+#     also emitting CanEnterAccount at each child Account.
+#
+# CITED, NOT DUPLICATED (core org model already derived):
+#   * rules/derived/aws/identity-escalation.yaml : aws-assume-role (CanAssume),
+#     aws-update-assume-role-policy (trust rewrite). The AWSControlTowerExecution
+#     assume is an instance of aws-assume-role; this file specializes the fan-out.
+#   * rules/derived/can-control.yaml : enter-account-via-assume (cross-account
+#     CanAssume -> CanEnterAccount) — rule 1 here specializes it to the CT role.
+#   * AWS Organizations SCP / Contains / MoveAccount modeling — the backing SCP
+#     nodes, OU Contains edges, and organizations:MoveAccount live in the
+#     Organizations adapter; this file references them, not re-derives them.
+#
+# BLOCKED-edge guidance:
+#   * SCPs NEVER apply to the management account — do not emit BLOCKED-by-SCP on
+#     mgmt-account principals for controltower:*/sts:AssumeRole.
+#   * A mandatory control's SCP cannot be disabled -> keep rule 4 BLOCKED/POTENTIAL.
+#   * Detective (Config-rule) controls gate no edges; disabling them upgrades nothing.
+# ===========================================================================

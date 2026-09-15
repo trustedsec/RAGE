@@ -1,0 +1,706 @@
+# Azure Storage Accounts — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Covers Microsoft.Storage/storageAccounts: Blob (ObjectStorage), File (FileStorage),
+# Queue (Queue), and Table (NoSQLDatabase) sub-services. All four share the same
+# account-level key surface; the account key is therefore the highest-value primitive
+# across every sub-service.
+#
+# ADLS Gen2 (isHnsEnabled=true) shares the same provider type and overlaps the blob
+# surface; the ADLS-specific rules (runAsSuperUser, HNS POSIX ACL notes) live in
+# /rules/derived/azure/adls.yaml. Rules below apply to ANY storageAccount unless
+# explicitly gated by isHnsEnabled.
+#
+# Attack surface (Phase 6 theme):
+#   (1) CREDENTIAL GRAB: listKeys/action -> account keys -> bypass ALL RBAC and
+#       network controls for all sub-services; generate arbitrary SAS tokens.
+#       ExposesCredential (the key IS the credential) + CanExfiltrate (the data
+#       consequence). Also: listAccountSas -> pre-generated account-level SAS token.
+#   (2) DATA READ + EXFIL: Storage Blob Data Reader dataAction -> CanReadData;
+#       blobs may ContainsSecret (cite credential-chains for the pivot).
+#       Queue reader -> CanReadData on queue (messages may carry tokens/keys).
+#   (3) PUBLIC EXPOSURE: allowBlobPublicAccess=true + container publicAccess=Blob|Container
+#       -> unauthenticated internet blob read -> ExposedToInternet.
+#
+# KEY ARM/DATA-PLANE SPLIT — critical for false-positive avoidance:
+#   listKeys is an ARM control-plane call (management.azure.com); it is NOT gated by
+#   the storage account firewall (networkAcls). Any caller with the RBAC permission
+#   can retrieve keys over ARM from any network. Data-plane actions (blobs/read, etc.)
+#   ARE gated by networkAcls. Apply network_reachability conditions ONLY to data-plane
+#   rules, never to the listKeys/listAccountSas ExposesCredential rule.
+#
+# Verified permissions (Microsoft.Storage resource-provider operations, 2026):
+#   listKeys:           Microsoft.Storage/storageAccounts/listKeys/action
+#   listAccountSas:     Microsoft.Storage/storageAccounts/listAccountSas/action
+#   blob read:          Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read
+#   blob write:         Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write
+#   queue dequeue:      Microsoft.Storage/storageAccounts/queueServices/queues/messages/read
+#   table entity read:  Microsoft.Storage/storageAccounts/tableServices/tables/entities/read
+#
+# Built-in roles (relevant subset):
+#   Storage Account Key Operator Service Role (81a9662b-bebf-436f-a333-f67b29880f12):
+#       listKeys + regenerateKey
+#   Storage Blob Data Reader     (2a2b9908-6ea1-4ae2-8e65-a410df84e7d1): blobs/read
+#   Storage Blob Data Contributor(ba92f5b4-2d11-453d-a403-e96b0029c9fe): blobs/read+write+delete
+#   Storage Blob Data Owner      (b7e6dc6d-f1e8-4753-8033-0f276bb0955b): blobs/* + runAsSuperUser
+#   Storage Queue Data Reader    (19e7f393-937e-4f77-808e-94535e297925): queue messages/read
+#   Storage Queue Data Contributor (974c5e8b-45b9-4653-ba55-5f855dd0fb88): queue messages CRUD
+#   Storage Queue Data Message Processor (8a0f0c08-91a1-4084-bc3d-661d67233fed):
+#       queue messages peek+dequeue+delete
+#   Storage Table Data Reader    (76199698-9eea-4c19-bc75-cec21354c6b6): table entities/read
+#   Storage Table Data Contributor (0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3): table entities CRUD
+#
+# Storage Account Contributor (17d1049b-9a84-46fb-8f53-869881c3d3ab) does NOT include
+# listKeys/action by default — do NOT infer key access from Storage Account Contributor.
+#
+# Linchpin citations (CITE, DO NOT DUPLICATE):
+#   credential-chains.yaml — ExposesCredential + CredentialsFor -> CanImpersonate
+#     (the account key ExposesCredential -> CredentialsFor the storage service ->
+#      read-secret-yields-identity if stored creds are present). Also
+#     execute-then-read-secret for workloads that read from blob containers and
+#     whose CanReadData transitions to CanReadSecret via ContainsSecret.
+#   can-control.yaml  — CanAdminister + CanGrantPermission -> Controls / CanEscalateTo
+#     (general ARM RBAC escalation; not storage-specific).
+#   can-execute-as.yaml — CanModifyCode + ExecutesAs -> CanExecuteAs for any
+#     compute service that reads from this storage account.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 6-storage-databases
+applies_to: [azure]
+
+rules:
+
+  # --- (1) CREDENTIAL GRAB: listKeys -> ExposesCredential -------------------
+  # Microsoft.Storage/storageAccounts/listKeys/action returns the two 512-bit
+  # shared account keys. These keys:
+  #   - Bypass ALL Azure RBAC data-plane role assignments and POSIX ACLs (on HNS)
+  #   - Authenticate to EVERY data-plane sub-service (blob, file, queue, table)
+  #     as the account itself — not as any specific Entra identity
+  #   - Allow generating arbitrary SAS tokens (any scope, permission, expiry)
+  #   - Are callable over ARM (management.azure.com) regardless of networkAcls
+  # CRITICAL GATE: when allowSharedKeyAccess=false, listKeys still RETURNS the key
+  # material (ARM call succeeds), but the storage service REJECTS all SharedKey
+  # authentication — the keys are structurally present but operationally inert for
+  # data-plane access. This rule must gate on allowSharedKeyAccess.
+  # The account key IS the credential; ExposesCredential captures the fact that
+  # the caller can retrieve it. CanExfiltrate (rule below) captures the data
+  # consequence of holding the key.
+  - id: azure-storage-listkeys-exposes-credential
+    emits: CanReadCredential
+    description: "listKeys/action returns storage account keys, bypassing all Azure RBAC and network controls for all sub-services (when SharedKey auth is enabled)."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Storage and node_type(?account) == ObjectStorage"
+      - "node_type(?account) matched provider_type == 'Microsoft.Storage/storageAccounts'"
+      - "?principal has EFFECTIVE Microsoft.Storage/storageAccounts/listKeys/action at ?account scope (Storage Account Key Operator Service Role 81a9662b-bebf-436f-a333-f67b29880f12, Contributor, Owner, or custom role with listKeys)"
+    emit:
+      source_type: Identity
+      target_type: AccessKey
+      source: ?principal
+      target: "<primary/secondary AccessKey node(s) of ?account>"
+      permissions: ["Microsoft.Storage/storageAccounts/listKeys/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if ?account.properties.allowSharedKeyAccess == false: CONDITIONAL(service_state).
+        Keys are retrieved by the ARM call (succeeds) but the storage service rejects
+        SharedKey authentication — keys exist but are inert for data-plane access.
+        Emit with confidence ~0.20 (keys present but non-functional).
+        Elif a deny assignment or deny Azure Policy explicitly covers listKeys/action
+        at the effective scope: BLOCKED; else ACTIVE.
+        CRITICAL: the storage account firewall (networkAcls / publicNetworkAccess)
+        gates the DATA-PLANE endpoint, NOT the ARM listKeys call — listKeys
+        succeeds over management.azure.com from any network regardless of
+        networkAcls.defaultAction. Do NOT apply network_reachability here.
+      confidence: >-
+        if allowSharedKeyAccess == false: 0.20 (keys exist but auth disabled);
+        else 0.97
+      derived_from: [{rule_id: "azure-storage-listkeys-permission", binding: "?principal HasPermission ?account"}]
+      false_positive_note: >-
+        listKeys is a control-plane ARM action callable regardless of the storage
+        account firewall. Do NOT apply a network_reachability condition. Storage Account
+        Contributor (17d1049b) does NOT include listKeys — verify effective permissions
+        by resolving role definition actions, not by role name. CRITICAL: if
+        allowSharedKeyAccess=false, the keys are retrieved (ARM call succeeds) but
+        storage service rejects all SharedKey authentication — emit CONDITIONAL(service_state)
+        with note that keys are structurally present but operationally inert. Emit BLOCKED
+        only when a deny assignment or deny Azure Policy deny effect covers listKeys/action
+        at the effective scope. The account keys are a ContainsCredential structural fact
+        on the account; this rule derives the ExposesCredential capability edge.
+        Also applies to ADLS Gen2 (HNS) accounts — the listKeys action is identical;
+        ADLS-specific rules in adls.yaml are additive, not exclusive.
+      narrative: >-
+        {principal.name} can call listKeys on {account.name}
+        (Microsoft.Storage/storageAccounts/listKeys/action), retrieving the primary and
+        secondary account keys{if allowSharedKeyAccess==false: ' (however, SharedKey authentication is disabled on the account, rendering the keys non-functional for data-plane access)'}.
+        These keys{if allowSharedKeyAccess!=false: ' bypass all Azure RBAC role assignments and network controls, authenticate as the storage account itself across all sub-services (blob, file, queue, table), and allow generating arbitrary SAS tokens — a complete credential exposure'else: ' are present but inert because allowSharedKeyAccess=false'}.
+
+  # --- listAccountSas -> ExposesCredential (SAS token) ----------------------
+  # Microsoft.Storage/storageAccounts/listAccountSas/action generates a pre-formed
+  # account-level SAS token. The SAS is scoped to specified services/permissions but
+  # can cover the entire account if requested. Impact is equivalent to a time-limited
+  # account key for the specified scope.
+  - id: azure-storage-listaccountsas-exposes-token
+    emits: CanReadCredential
+    description: "listAccountSas/action generates a pre-formed account-level SAS token, providing scoped but key-equivalent data-plane access."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Storage and node_type(?account) == ObjectStorage"
+      - "node_type(?account) matched provider_type == 'Microsoft.Storage/storageAccounts'"
+      - "?principal has EFFECTIVE Microsoft.Storage/storageAccounts/listAccountSas/action at ?account scope"
+    emit:
+      source_type: Identity
+      target_type: Token
+      source: ?principal
+      target: "<SAS Token node derived from ?account>"
+      permissions: ["Microsoft.Storage/storageAccounts/listAccountSas/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers listAccountSas/action: BLOCKED;
+        else ACTIVE. ARM-plane call — not gated by storage network firewall.
+        Treat as ACTIVE with slightly lower confidence than listKeys because the
+        SAS scope depends on the caller-provided parameters (could be narrowed at
+        call time); model as full-account capability for worst-case analysis.
+      confidence: "0.90"
+      derived_from: [{rule_id: "azure-storage-listaccountsas-permission", binding: "?principal HasPermission ?account"}]
+      false_positive_note: >-
+        listAccountSas is an ARM-plane call, not gated by networkAcls. The generated
+        SAS token's scope depends on the parameters supplied by the caller — it can
+        be narrowed at call time but worst-case covers all services. Model as
+        ExposesCredential -> Token. Do not conflate with user-delegation SAS
+        (generateUserDelegationKey) which is bounded by the caller's Entra effective
+        permissions. listAccountSas callers: Contributor, Owner, and custom roles
+        explicitly granting listAccountSas/action. Storage Account Key Operator Service
+        Role (81a9662b) includes listKeys and regenerateKey only, NOT listAccountSas.
+        Verify against current Microsoft.Storage role definitions.
+      narrative: >-
+        {principal.name} can call listAccountSas on {account.name}
+        (Microsoft.Storage/storageAccounts/listAccountSas/action), generating a
+        pre-formed account-level SAS token. The token can grant access to any or all
+        storage sub-services at account scope — equivalent to a time-limited account key.
+
+  # --- listKeys -> full data exfiltration (all sub-services) -----------------
+  # DELETED RULE: azure-storage-listkeys-full-exfiltrate.
+  # RATIONALE (LINCHPIN DEDUPLICATION):
+  #   This rule directly emitted CanExfiltrate by collapsing ExposesCredential +
+  #   ContainsCredential into a single shortcut edge, duplicating the canonical
+  #   credential-chains.yaml pattern. The ExposesCredential edge from
+  #   azure-storage-listkeys-exposes-credential, combined with:
+  #     (a) structural ContainsCredential(?account -> AccessKey), and
+  #     (b) CredentialsFor(?key -> storage-data-plane-identity) edge,
+  #   is SUFFICIENT for credential-chains.yaml to derive CanExfiltrate via the
+  #   read-secret-yields-identity pattern. Including this rule creates duplicate
+  #   traversal paths in the graph and undermines the canonical separation between
+  #   per-service rules and linchpin chains.
+  #
+  #   For analyst clarity, cite credential-chains in the ExposesCredential narrative
+  #   rather than re-deriving a separate CanExfiltrate rule here.
+
+  # --- (2) DATA READ: Storage Blob Data Reader -> CanReadData ----------------
+  # A principal holding the Storage Blob Data Reader (or Contributor / Owner) built-in
+  # role on the account or a container has the dataAction blobs/read. This is a direct
+  # data-plane read capability gated by network reachability (unlike listKeys).
+  # SCOPE SPLIT: RBAC grants can target either the account (all containers) or a
+  # specific container (single container). The rules below emit separate CanReadData
+  # edges for account-scoped and container-scoped grants to preserve scope accuracy.
+
+  # Account-scoped blob read (RBAC on the storage account itself)
+  - id: azure-storage-blob-data-reader-account-scope
+    emits: CanReadData
+    description: "Storage Blob Data Reader/Contributor/Owner at account scope grants data-plane read of all blob containers."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Storage and node_type(?account) == ObjectStorage"
+      - "node_type(?account) matched provider_type == 'Microsoft.Storage/storageAccounts'"
+      - "?principal has EFFECTIVE dataAction Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read at ?account scope (Storage Blob Data Reader 2a2b9908, Storage Blob Data Contributor ba92f5b4, or Storage Blob Data Owner b7e6dc6d)"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: ?principal
+      target: ?account
+      permissions: ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if networkAcls.defaultAction == Deny AND ?principal NOT in IP/VNet allowlist
+        AND no private endpoint path from ?principal to ?account: CONDITIONAL(network_reachability);
+        elif a deny assignment or deny Azure Policy covers blobs/read at effective scope: BLOCKED;
+        else ACTIVE. For HNS accounts where ?principal holds Storage Blob Data Owner
+        (runAsSuperUser), note ACL bypass in narrative but state remains ACTIVE.
+        For Storage Blob Data Reader/Contributor on HNS accounts, POSIX ACLs may
+        narrow access at specific paths — model as ACTIVE at RBAC level; ACL-based
+        path restrictions are runtime enforcement the graph cannot enumerate per-object.
+      confidence: "0.90"
+      derived_from: [{rule_id: "azure-storage-blob-read-permission", binding: "?principal HasPermission ?account"}]
+      false_positive_note: >-
+        This is a data-plane action gated by networkAcls — apply
+        CONDITIONAL(network_reachability) when the storage firewall is on and the
+        caller has no allowed network path or private endpoint. Do NOT apply a
+        network condition to listKeys rules (ARM plane). Storage Blob Data Reader
+        does NOT grant listKeys or generateUserDelegationKey — separate actions.
+        For ADLS Gen2 (HNS) accounts with POSIX ACLs: RBAC grants the read at ARM
+        level; per-directory ACL denials are runtime enforcement. Only Storage Blob
+        Data Owner (runAsSuperUser) bypasses ACLs entirely; annotate accordingly.
+        This rule fires on account-scoped grants; see azure-storage-blob-data-reader-container-scope
+        for container-scoped grants.
+      narrative: >-
+        {principal.name} holds the blobs/read dataAction on {account.name} at the
+        account scope (Storage Blob Data Reader or higher), enabling data-plane read of
+        blob content in all containers within the account. Blobs may contain embedded
+        credentials, connection strings, or secrets — see credential-chains.yaml for
+        ContainsSecret -> CredentialsFor -> CanImpersonate roll-up.
+
+  # Container-scoped blob read (RBAC on a specific blob container)
+  - id: azure-storage-blob-data-reader-container-scope
+    emits: CanReadData
+    description: "Storage Blob Data Reader/Contributor/Owner at container scope grants data-plane read of a specific blob container."
+    match:
+      - [ ?principal, HasPermission, ?container ]
+    where:
+      - "node_class(?container) == Storage and node_type(?container) == ObjectStorage"
+      - "node_type(?container) matched provider_type == 'Microsoft.Storage/storageAccounts/blobServices/containers'"
+      - "?principal has EFFECTIVE dataAction Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read at ?container scope (Storage Blob Data Reader 2a2b9908, Storage Blob Data Contributor ba92f5b4, or Storage Blob Data Owner b7e6dc6d)"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: ?principal
+      target: ?container
+      permissions: ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if networkAcls.defaultAction == Deny AND no allowed path or PE: CONDITIONAL(network_reachability);
+        elif deny assignment covers blobs/read at effective scope: BLOCKED;
+        else ACTIVE.
+      confidence: "0.90"
+      derived_from: [{rule_id: "azure-storage-blob-read-permission", binding: "?principal HasPermission ?container"}]
+      false_positive_note: >-
+        This rule fires on container-scoped grants (RBAC assigned at the container node,
+        not the account). The target is the specific container, not the account.
+        Network gate applies identically. For container-level ACL restrictions in HNS
+        accounts, model as ACTIVE at RBAC level; ACL-based denials are runtime enforcement.
+      narrative: >-
+        {principal.name} holds the blobs/read dataAction on {container.name}
+        (Storage Blob Data Reader or higher), enabling data-plane read of blob
+        content in this specific container. Blobs may contain embedded credentials or
+        secrets; see credential-chains.yaml for escalation paths.
+
+  # --- DATA WRITE: Storage Blob Data Contributor -> CanWriteData (account scope) ---
+  # A principal with blobs/write dataAction at the account scope can overwrite blob
+  # content in ANY container, creating a data poisoning path. This is distinct from
+  # container-scoped grants which are narrower. Split into two rules to preserve scope.
+  - id: azure-storage-blob-data-contributor-write-account-scope
+    emits: CanWriteData
+    description: "Storage Blob Data Contributor/Owner at account scope grants blob write access to all containers."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Storage and node_type(?account) == ObjectStorage"
+      - "node_type(?account) matched provider_type == 'Microsoft.Storage/storageAccounts'"
+      - "?principal has EFFECTIVE dataAction Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write at ?account scope (Storage Blob Data Contributor ba92f5b4 or Storage Blob Data Owner b7e6dc6d)"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: ?principal
+      target: ?account
+      permissions: ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if networkAcls.defaultAction == Deny AND caller has no allowed network path
+        or PE: CONDITIONAL(network_reachability);
+        elif deny assignment covers blobs/write at effective scope: BLOCKED;
+        else ACTIVE.
+      confidence: "0.88"
+      derived_from: [{rule_id: "azure-storage-blob-write-permission", binding: "?principal HasPermission ?account"}]
+      false_positive_note: >-
+        This rule fires on account-scoped grants only (RBAC assigned at the account node).
+        The target is the entire account. CanWriteData alone is not escalation; its attack
+        value is realized when blobs are consumed by downstream compute (Functions, Data
+        Factory, Databricks, AML) — compute service rules derive CanModifyCode from this.
+        Immutability policies (WORM) block writes when container has
+        properties.hasImmutabilityPolicy == true or locked retention policy.
+        Network gate applies as with CanReadData. See
+        azure-storage-blob-data-contributor-write-container-scope for container-scoped grants.
+      narrative: >-
+        {principal.name} can write to any blob container in {account.name}
+        (Storage Blob Data Contributor or Owner at account scope), enabling overwrite
+        of config files, scripts, ML artifacts, or pipeline inputs consumed by downstream
+        compute services.
+
+  # --- DATA WRITE: Storage Blob Data Contributor -> CanWriteData (container scope) ---
+  # A principal with blobs/write dataAction at a specific container scope can only
+  # overwrite blobs within that container — narrower blast radius than account scope.
+  - id: azure-storage-blob-data-contributor-write-container-scope
+    emits: CanWriteData
+    description: "Storage Blob Data Contributor/Owner at container scope grants blob write access to that specific container."
+    match:
+      - [ ?principal, HasPermission, ?container ]
+    where:
+      - "node_class(?container) == Storage and node_type(?container) == ObjectStorage"
+      - "node_type(?container) matched provider_type == 'Microsoft.Storage/storageAccounts/blobServices/containers'"
+      - "?principal has EFFECTIVE dataAction Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write at ?container scope (Storage Blob Data Contributor ba92f5b4 or Storage Blob Data Owner b7e6dc6d)"
+    emit:
+      source_type: Identity
+      target_type: ObjectStorage
+      source: ?principal
+      target: ?container
+      permissions: ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if networkAcls.defaultAction == Deny AND caller has no allowed network path
+        or PE: CONDITIONAL(network_reachability);
+        elif deny assignment covers blobs/write at effective scope: BLOCKED;
+        else ACTIVE.
+      confidence: "0.87"
+      derived_from: [{rule_id: "azure-storage-blob-write-permission", binding: "?principal HasPermission ?container"}]
+      false_positive_note: >-
+        This rule fires on container-scoped grants only (RBAC assigned at the container node,
+        not the account). The target is the specific container, not the account. Immutability
+        policies block writes when the container has properties.hasImmutabilityPolicy == true
+        or a locked retention policy. Network gate applies. See
+        azure-storage-blob-data-contributor-write-account-scope for account-scoped grants.
+      narrative: >-
+        {principal.name} can write to blob container {container.name}
+        (Storage Blob Data Contributor or Owner at container scope), enabling overwrite
+        of config files or artifacts within this specific container consumed by downstream
+        compute services.
+
+  # --- (2) DATA READ: Queue messages -> CanReadData --------------------------
+  # Storage Queue Data Reader / Message Processor grants the ability to read
+  # (peek/dequeue) messages from queues. Queue messages frequently carry SAS tokens,
+  # connection strings, job parameters, or structured payloads that constitute
+  # secret material. CanReadData on the queue; credential-chains handles the pivot
+  # if ContainsSecret is observed on a queue node.
+  - id: azure-storage-queue-data-reader
+    emits: CanReadData
+    description: "Storage Queue Data Reader/Message Processor grants queue message read — messages may carry SAS tokens, connection strings, or other credentials."
+    match:
+      - [ ?principal, HasPermission, ?queue ]
+    where:
+      - "node_class(?queue) == Messaging and node_type(?queue) == Queue"
+      - "node_type(?queue) matched provider_type == 'Microsoft.Storage/storageAccounts/queueServices/queues'"
+      - "?principal has EFFECTIVE dataAction Microsoft.Storage/storageAccounts/queueServices/queues/messages/read at ?queue scope (Storage Queue Data Reader 19e7f393, Storage Queue Data Contributor 974c5e8b, or Storage Queue Data Message Processor 8a0f0c08)"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: ?principal
+      target: ?queue
+      permissions: ["Microsoft.Storage/storageAccounts/queueServices/queues/messages/read"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if networkAcls.defaultAction == Deny AND no allowed path or PE: CONDITIONAL(network_reachability);
+        elif deny assignment covers messages/read at effective scope: BLOCKED;
+        else ACTIVE.
+      confidence: "0.85"
+      derived_from: [{rule_id: "azure-storage-queue-read-permission", binding: "?principal HasPermission ?queue"}]
+      false_positive_note: >-
+        Queue data access is a data-plane action gated by networkAcls. The attack
+        value is elevated when queue messages carry SAS tokens, temporary credentials,
+        or job payloads with embedded connection strings — ContainsSecret/ContainsCredential
+        on the queue node drives the credential-chains roll-up. Do not confuse
+        the account-level queue service RBAC scope with blob RBAC — separate role
+        assignments. Network gate applies.
+      narrative: >-
+        {principal.name} can read messages from queue {queue.name}
+        (Storage Queue Data Reader or equivalent), which may contain SAS tokens,
+        connection strings, or other credential material. See credential-chains.yaml
+        for ContainsSecret -> CredentialsFor -> CanImpersonate roll-up when messages
+        carry credentials.
+
+  # --- (2) DATA WRITE: Queue messages -> CanWriteData -------------------------
+  # Storage Queue Data Contributor (974c5e8b) and Storage Queue Data Message Processor
+  # (8a0f0c08) grant ability to add/send messages to queues. This enables message
+  # poisoning: a principal can craft malicious messages and inject them into queues
+  # consumed by downstream compute (Functions, Logic Apps, Data Factory) running with
+  # SYSTEM identity. The compute service rules derive CanExecuteAs from CanWriteData
+  # on a queue when a trigger consumes messages. This is a documented high-impact
+  # escalation path: queue write -> poison messages -> trigger Functions/Logic Apps
+  # -> CanExecuteAs the SYSTEM identity.
+  - id: azure-storage-queue-data-writer
+    emits: CanWriteData
+    description: "Storage Queue Data Contributor/Message Processor grants queue message write — enabling message poisoning of queues consumed by Functions/Logic Apps with SYSTEM identity."
+    match:
+      - [ ?principal, HasPermission, ?queue ]
+    where:
+      - "node_class(?queue) == Messaging and node_type(?queue) == Queue"
+      - "node_type(?queue) matched provider_type == 'Microsoft.Storage/storageAccounts/queueServices/queues'"
+      - "?principal has EFFECTIVE dataAction Microsoft.Storage/storageAccounts/queueServices/queues/messages/add at ?queue scope (Storage Queue Data Contributor 974c5e8b or Storage Queue Data Message Processor 8a0f0c08)"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: ?principal
+      target: ?queue
+      permissions: ["Microsoft.Storage/storageAccounts/queueServices/queues/messages/add"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if networkAcls.defaultAction == Deny AND no allowed path or PE: CONDITIONAL(network_reachability);
+        elif deny assignment covers messages/add at effective scope: BLOCKED;
+        else ACTIVE.
+      confidence: "0.86"
+      derived_from: [{rule_id: "azure-storage-queue-write-permission", binding: "?principal HasPermission ?queue"}]
+      false_positive_note: >-
+        CanWriteData on a queue alone is not escalation; attack value is realized when
+        the queue is a trigger source for downstream compute (Functions, Logic Apps, Data
+        Factory, Databricks). Compute service rules derive CanModifyCode/CanExecuteAs from
+        a CanWriteData-capable principal injecting crafted messages. Message poisoning is
+        a documented attack path when the downstream consumer runs with elevated identity
+        (e.g., SYSTEM role). This is distinct from queue read; message/add dataAction is
+        the specific write capability. Network gate applies identically to queue read.
+      narrative: >-
+        {principal.name} can write messages to queue {queue.name}
+        (Storage Queue Data Contributor or Message Processor), enabling injection of
+        crafted messages that may trigger and poison downstream compute services
+        (Functions, Logic Apps) consuming this queue.
+
+  # --- (2) DATA READ: Table entities -> CanReadData --------------------------
+  # Storage Table Data Reader grants the ability to read table entity data. Tables
+  # may store application configuration, user data, or credential material. Lower
+  # escalation value than blob/queue unless table rows contain secrets.
+  - id: azure-storage-table-data-reader
+    emits: CanReadData
+    description: "Storage Table Data Reader grants table entity read — table data may contain application credentials or sensitive configuration."
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_class(?table) == Data and node_type(?table) == NoSQLDatabase"
+      - "node_type(?table) matched provider_type == 'Microsoft.Storage/storageAccounts/tableServices/tables'"
+      - "?principal has EFFECTIVE dataAction Microsoft.Storage/storageAccounts/tableServices/tables/entities/read at ?table scope (Storage Table Data Reader 76199698 or Storage Table Data Contributor 0a9a7e1f)"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?table
+      permissions: ["Microsoft.Storage/storageAccounts/tableServices/tables/entities/read"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if networkAcls.defaultAction == Deny AND no allowed path or PE: CONDITIONAL(network_reachability);
+        elif deny assignment covers entities/read at scope: BLOCKED;
+        else ACTIVE.
+      confidence: "0.82"
+      derived_from: [{rule_id: "azure-storage-table-read-permission", binding: "?principal HasPermission ?table"}]
+      false_positive_note: >-
+        Lower base confidence than blob read — table data is less frequently the
+        direct source of credential pivots, but applications do store configuration
+        and auth tokens in table storage. Apply ContainsSecret/ContainsCredential
+        on the table node when evidence indicates credential storage; credential-chains
+        then handles the escalation. Network gate applies identically to blob/queue.
+      narrative: >-
+        {principal.name} can read entity data from table {table.name}
+        (Storage Table Data Reader or Contributor). Table rows may contain
+        application credentials or configuration used for lateral movement.
+
+  # --- (2) DATA READ: Azure Files (SMB shares) -> CanReadData ----------------
+  # Storage File Data SMB Share Reader and related roles grant read access to files
+  # in Azure File Shares via SMB/NFS protocol. File shares are a distinct attack
+  # surface supporting credential capture, Kerberos ticket harvesting, and lateral
+  # movement through shared files. SMB data access is gated by network reachability
+  # (SMB/445 or NFS/2049 endpoint).
+  - id: azure-storage-file-data-reader
+    emits: CanReadData
+    description: "Storage File Data SMB Share Reader/Contributor grants SMB file share read access — enabling lateral movement and credential capture via shared files."
+    match:
+      - [ ?principal, HasPermission, ?share ]
+    where:
+      - "node_class(?share) == Storage and node_type(?share) == FileStorage"
+      - "node_type(?share) matched provider_type == 'Microsoft.Storage/storageAccounts/fileServices/shares'"
+      - "?principal has EFFECTIVE dataAction Microsoft.Storage/storageAccounts/fileServices/shares/files/read at ?share scope (Storage File Data SMB Share Reader, Storage File Data SMB Share Contributor, or Storage File Data Privileged Reader)"
+    emit:
+      source_type: Identity
+      target_type: FileStorage
+      source: ?principal
+      target: ?share
+      permissions: ["Microsoft.Storage/storageAccounts/fileServices/shares/files/read"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if networkAcls.defaultAction == Deny AND no allowed SMB/NFS path or PE: CONDITIONAL(network_reachability);
+        elif deny assignment covers files/read at effective scope: BLOCKED;
+        else ACTIVE. File share access is SMB/445 or NFS/2049 endpoint; data-plane
+        firewall rules gate access identically to blob data.
+      confidence: "0.87"
+      derived_from: [{rule_id: "azure-storage-file-read-permission", binding: "?principal HasPermission ?share"}]
+      false_positive_note: >-
+        Azure Files support both SMB (Windows/Linux mount via 445) and NFS (Linux-native,
+        2049). RBAC dataActions apply to both protocols. File shares may contain
+        cached credentials, script files with embedded keys, or shared config (.env, .ini).
+        Apply ContainsSecret / ContainsCredential on the share node when evidence
+        indicates credential storage; credential-chains then handles the escalation.
+        Network gate applies identically to blob/queue: firewall rules block data-plane
+        SMB access but not ARM control-plane calls. Storage File Data Privileged Reader
+        bypasses Windows file-level ACLs (NTFS permissions) and NFS v4.1 ACLs on Azure
+        Files shares — this is distinct from HNS POSIX ACLs, which apply only to ADLS Gen2
+        blob storage, not to Azure Files.
+      narrative: >-
+        {principal.name} can read files from share {share.name}
+        (Storage File Data SMB Share Reader or higher), enabling access to shared
+        files that may contain cached credentials, scripts, or configuration material
+        used for lateral movement.
+
+  # --- generateUserDelegationKey -> CanReadCredential (user-delegation SAS) ---
+  # Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action
+  # allows minting user-delegation SAS tokens. These tokens are distinct from account
+  # keys: they are bounded by the caller's effective Entra permissions and cannot
+  # exceed those permissions. This is a CanReadCredential capability because the
+  # principal can CREATE/OBTAIN a credential (the SAS token) that:
+  #   (a) is a credential object usable by the minting principal or shareable callers
+  #   (b) persists beyond the principal's session
+  #   (c) can be shared with external parties, creating a cross-boundary credential
+  # The confidence is lower than listKeys (0.75 vs 0.97) because the resulting SAS
+  # scope is bounded by the principal's own RBAC scope, but it is still a credential
+  # exposure and a documented attack path.
+  - id: azure-storage-generate-user-delegation-key
+    emits: CanReadCredential
+    description: "generateUserDelegationKey/action returns user-delegation key material (not a pre-formed SAS token) — the caller can sign arbitrary user-delegation SAS URLs offline within the key's validity window."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Storage and node_type(?account) == ObjectStorage"
+      - "node_type(?account) matched provider_type == 'Microsoft.Storage/storageAccounts'"
+      - "?principal has EFFECTIVE Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action at ?account scope"
+    emit:
+      source_type: Identity
+      target_type: AccessKey
+      source: ?principal
+      target: "<user-delegation AccessKey node (signing key material) derived from ?account>"
+      permissions: ["Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers generateUserDelegationKey/action: BLOCKED;
+        else ACTIVE. ARM-plane call — not gated by storage network firewall.
+        The minted token is bounded by the principal's effective Entra RBAC scope;
+        cannot exceed the principal's own data-plane permissions. However, the token
+        is a separable credential object that can be shared externally.
+      confidence: "0.75"
+      derived_from: [{rule_id: "azure-storage-generate-user-delegation-key-permission", binding: "?principal HasPermission ?account"}]
+      false_positive_note: >-
+        generateUserDelegationKey is an ARM control-plane action callable regardless of
+        storage networkAcls. Do NOT apply network_reachability. The REST API returns a
+        UserDelegationKey JSON object containing the raw signing key material (Value field,
+        base64-encoded). The caller uses this key material client-side to sign
+        user-delegation SAS URLs; the action does NOT return a pre-formed SAS token.
+        The returned key is BOUNDED BY the minting principal's effective Entra RBAC
+        permissions — any SAS signed with it cannot grant access beyond the principal's
+        own RBAC scope. This is distinct from listKeys (unscoped) and listAccountSas
+        (account-scoped). Confidence is ~0.75 because the key scope is inherently
+        restricted. The attack value is realized when the principal signs and shares
+        SAS URLs with external parties or stores the key material insecurely. The key
+        can be used OFFLINE to sign arbitrary SAS URLs within the key's validity window
+        (SignedExpiry), which is a higher impact than a single pre-formed token.
+      narrative: >-
+        {principal.name} can call generateUserDelegationKey on {account.name}
+        (Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action),
+        minting user-delegation SAS tokens for blob access. These tokens are bounded by
+        {principal.name}'s effective Entra permissions but can be shared with external
+        parties or stored insecurely, creating a delegable credential exposure.
+
+  # --- (3) PUBLIC EXPOSURE: anonymous blob read -> ExposedToInternet ---------
+  # When allowBlobPublicAccess=true at the account level AND a container has
+  # publicAccess=Blob or publicAccess=Container, any internet user can read blob
+  # content without any credential (Entra OR key/SAS). This is the clearest
+  # anonymous data exposure pattern in Azure Storage.
+  #
+  # CRITICAL guard: if allowBlobPublicAccess=false at the account, the storage
+  # service IGNORES container-level publicAccess and returns 409 for anonymous
+  # requests — do NOT emit in that case.
+  #
+  # STATE LOGIC CORRECTION: when publicNetworkAccess==Enabled and
+  # networkAcls.defaultAction==Allow, the endpoint IS publicly accessible — emit
+  # ACTIVE with NO network_reachability condition. Only emit CONDITIONAL when the
+  # network firewall explicitly blocks public internet access.
+  - id: azure-storage-public-blob-container
+    emits: ExposedToInternet
+    description: "Storage account with public blob access enabled and a public container exposes blob data to unauthenticated internet access."
+    match:
+      - [ ?account, Contains, ?container ]
+    where:
+      - "node_class(?account) == Storage and node_type(?account) == ObjectStorage"
+      - "node_type(?account) matched provider_type == 'Microsoft.Storage/storageAccounts'"
+      - "?account.properties.allowBlobPublicAccess == true"
+      - "node_type(?container) == ObjectStorage"
+      - "node_type(?container) matched provider_type == 'Microsoft.Storage/storageAccounts/blobServices/containers'"
+      - "?container.properties.publicAccess in ['Blob', 'Container']"
+    emit:
+      source_type: ObjectStorage
+      target_type: AnonymousIdentity
+      source: ?container
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        if ?account.properties.publicNetworkAccess == Disabled: DO NOT EMIT
+        (storage account explicitly blocks all public network access regardless of
+        blob public access settings).
+        Elif ?account.properties.allowBlobPublicAccess == false: DO NOT EMIT
+        (container publicAccess is ignored by the storage service when account flag is false).
+        Elif networkAcls.defaultAction == Deny AND public internet IP not in IP allowlist:
+        CONDITIONAL(network_reachability) — the container property allows anonymous access
+        but the network firewall blocks public internet traffic to the storage endpoint.
+        Elif publicNetworkAccess == Enabled AND networkAcls.defaultAction == Allow:
+        ACTIVE (no network_reachability condition — the endpoint is publicly accessible by design).
+        For publicAccess=Container: ACTIVE (anonymous list-and-read);
+        for publicAccess=Blob: ACTIVE (anonymous blob read, requires knowing blob URL).
+      confidence: "0.93"
+      derived_from: [{rule_id: "azure-storage-account-contains-container", binding: "?account Contains ?container"}, {rule_id: "azure-storage-container-public-access-property", binding: "?container HasPolicy <publicAccess>"}, {rule_id: "azure-storage-allow-public-access-property", binding: "?account HasPolicy <allowBlobPublicAccess>"}]
+      false_positive_note: >-
+        CRITICAL: ?account.properties.allowBlobPublicAccess == false OVERRIDES any
+        container-level publicAccess — the storage service returns 409 for anonymous
+        requests on such accounts. Do NOT emit ExposedToInternet when the account
+        flag is false even if the container property says Blob or Container.
+        publicNetworkAccess=Disabled completely blocks public access regardless of
+        container publicAccess → do not emit. A network firewall (defaultAction=Deny
+        with no public IP rule) blocks the public endpoint → emit CONDITIONAL(network_reachability).
+        CRITICAL FIX: do NOT include network_reachability in conditions[] when the account
+        is intentionally public (publicNetworkAccess=Enabled, networkAcls.defaultAction=Allow).
+        The endpoint is publicly reachable BY DESIGN; emit ACTIVE with no conditions.
+        publicAccess=Container allows directory listing (broader than Blob-only) — note
+        in narrative. This is anonymous data exposure; target AnonymousIdentity, not a
+        tenant or subscription boundary node. Azure Storage Accounts created after
+        November 2023 default to allowBlobPublicAccess=false — verify the actual property.
+      narrative: >-
+        {container.name} in {account.name} is publicly readable from the internet
+        without authentication: the account has allowBlobPublicAccess=true and the
+        container publicAccess={container.properties.publicAccess}. Any internet user
+        can read{if publicAccess=='Container': ' and list'} blobs in this container
+        without any credential.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - Azure deny assignment covering listKeys/action at effective scope ->
+#     azure-storage-listkeys-exposes-credential and azure-storage-listkeys-full-exfiltrate
+#     emit state BLOCKED.
+#   - Azure deny assignment covering blobs/read dataAction ->
+#     azure-storage-blob-data-reader BLOCKED.
+#   - Azure deny assignment covering blobs/write dataAction ->
+#     azure-storage-blob-data-contributor-write BLOCKED.
+#   - networkAcls.defaultAction=Deny with no allowed path ->
+#     data-plane rules (blob read/write, queue, table) -> CONDITIONAL(network_reachability).
+#     listKeys/listAccountSas rules are NOT affected (ARM plane).
+#   - allowBlobPublicAccess=false ->
+#     azure-storage-public-blob-container DO NOT EMIT regardless of container property.
+#   - Immutability policy (WORM) locked on a container ->
+#     azure-storage-blob-data-contributor-write BLOCKED for that container.
+#
+# Explicit normalization (azure-storage.yaml in /rules/explicit/) must produce:
+#   - HasPermission records for listKeys/action, listAccountSas/action, and
+#     blob/queue/table dataActions from ARM RBAC role assignment resolution.
+#   - ContainsCredential(account -> AccessKey) structural records.
+#   - Contains(account -> container/share/queue/table) structural records.
+#   - Property records: allowBlobPublicAccess, publicAccess, networkAcls,
+#     publicNetworkAccess, isHnsEnabled (gate for adls.yaml).
+#
+# Linchpin cross-references (DO NOT RE-DERIVE here):
+#   credential-chains.yaml:
+#     - ExposesCredential(?account -> AccessKey) + CredentialsFor(AccessKey -> identity)
+#       -> read-secret-yields-identity: CanImpersonate if the key is registered as a
+#       credential for a service principal (rare but documented pattern for storage-
+#       backed app authentication).
+#     - execute-then-read-secret: a workload with CanReadData on a blob container that
+#       ContainsSecret(-> secret) inherits CanReadSecret via this chain.
+#     - decrypt-gates-secret-read: if a blob is encrypted with a customer-managed key
+#       (CMK via Key Vault), CanReadData is CONDITIONAL(key_permission); that gate is
+#       resolved by decrypt-gates-secret-read when the principal also holds CanDecrypt
+#       on the Key Vault key.
+#   can-control.yaml:
+#     - escalate-via-execute-as / control-boundary-via-iam-admin handle the roll-up
+#       from listKeys ExposesCredential to CanEscalateTo when the storage key yields
+#       credentials for a more-privileged identity.
+# ---------------------------------------------------------------------------

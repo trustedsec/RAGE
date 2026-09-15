@@ -1,0 +1,390 @@
+# GCP App Engine — Compute/execution attack-path rules (Phase 4)
+# ---------------------------------------------------------------------------
+# App Engine hosts HTTP apps as services -> versions -> instances. A deployed
+# version runs AS a service account (default PROJECT_ID@appspot.gserviceaccount.com,
+# historically granted the Editor basic role). The escalation crux: whoever can
+# deploy a version (appengine.versions.create) or route traffic to an
+# attacker-controlled version (appengine.services.update) gets code execution as
+# that runtime SA.
+#
+# Permissions below are the EXACT GCP IAM identifiers (appengine.<resource>.<verb>)
+# from the IAM permissions reference / App Engine roles docs. The evaluator must
+# confirm the effective action at project scope before emitting. State defaults
+# ACTIVE unless a listed condition is unmet (CONDITIONAL/POTENTIAL) or an IAM
+# deny policy / org policy applies (BLOCKED).
+#
+# Edge types used are ONLY those in schema/edges.yaml.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 4-compute-serverless
+applies_to: [gcp]
+
+rules:
+
+  # --- Explicit: version/instance runs AS the runtime SA (anchor) -----------
+  - id: gcp-appengine-executes-as
+    emits: ExecutesAs
+    description: "An App Engine instance (Compute) runs as its configured (or default appspot) service account, inherited from the version's serviceAccount binding."
+    match_record: {resource_type: "google.appengine.Instance", field: "serviceAccount"}
+    where:
+      - "?instance is an App Engine Instance (Compute); ?sa = the owning version.serviceAccount if set, else the default PROJECT_ID@appspot.gserviceaccount.com"
+    emit:
+      source_type: Compute
+      source: "<App Engine instance>"
+      target: "<runtime service account>"
+      permissions: []
+      conditions: [service_state]
+      false_positive_note: >
+        ExecutesAs is anchored on the Instance node (Compute) per schema; the
+        Version node is a config carrier only (ApplicationPlatform, not a valid
+        ExecutesAs source). The default appspot SA is NOT always Editor: org policy
+        iam.automaticIamGrantsForDefaultServiceAccounts or newer projects disable
+        the automatic grant. Resolve the SA's ACTUAL role bindings to score
+        escalation strength; do not assume project-admin.
+      narrative: "App Engine instance {instance.name} runs as {sa.name}; code executing there acts with that SA's permissions."
+
+  # --- Explicit: deploy new version = modify executable content -------------
+  - id: gcp-appengine-versions-create
+    emits: CanModifyCode
+    match_effective_permission: {action: "appengine.versions.create", resource_type: "google.appengine.Application"}
+    optional_permission: ["cloudbuild.builds.create", "storage.objects.create"]
+    modeling_note: >
+      Node-type convention for App Engine: the deploy target (application/version)
+      is modeled as ApplicationPlatform and treated as Compute-like for CanModifyCode
+      purposes; schema/edges.yaml CanModifyCode.target does not yet list
+      ApplicationPlatform. ExecutesAs is anchored on the Instance (Compute) node.
+      This is the single consistent convention applied across ExecutesAs,
+      CanModifyCode, CanModifyConfiguration, and ExposedToInternet in this file
+      (ExposedToInternet uses the PublicEndpoint node, which IS schema-valid).
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<App Engine application>"
+      permissions: ["appengine.versions.create"]
+      conditions: [iam_permission]
+      state_logic: >
+        ACTIVE if source deploy also has Cloud Build + GCS staging perms OR the
+        deploy is a prebuilt container/image (no build needed); else
+        CONDITIONAL(iam_permission) pending build/storage perms.
+      escalation: "Deploy a version containing attacker code (reverse shell / token exfil) that runs as the runtime SA."
+      false_positive_note: >
+        Full 'gcloud app deploy' of source needs roles/cloudbuild.builds.editor +
+        roles/storage.objectAdmin to build and stage. Without them a source deploy
+        may fail -> emit CONDITIONAL. Container/traffic-split paths avoid this.
+      narrative: "{principal.name} can deploy a new App Engine version (appengine.versions.create), injecting code that runs as the runtime service account."
+
+  # --- Explicit: traffic split / serving config change ----------------------
+  - id: gcp-appengine-services-update
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "appengine.services.update", resource_type: "google.appengine.Application"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<App Engine application>"
+      permissions: ["appengine.services.update"]
+      conditions: [iam_permission]
+      escalation: "Split/migrate serving traffic onto an attacker-controlled (or weaker existing) version, executing its code as the runtime SA without invoke perms."
+      false_positive_note: >
+        services.update alone does not yield execution: it only routes traffic.
+        Escalation requires an attacker-controllable or independently exploitable
+        version to receive that traffic (trigger_exists analog). Absent such a
+        version this edge is config-control only, not code execution. The derived
+        gcp-appengine-execute-as-traffic rule must carry CONDITIONAL(trigger_exists)
+        when no attacker-controlled/weaker version is present.
+      narrative: "{principal.name} can change App Engine serving/traffic config (appengine.services.update) and route traffic to a chosen version."
+
+  - id: gcp-appengine-versions-update
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "appengine.versions.update", resource_type: "google.appengine.Application"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<App Engine application>"
+      permissions: ["appengine.versions.update"]
+      conditions: [iam_permission]
+      false_positive_note: >
+        appengine.versions.update changes serving/scaling config only; it CANNOT
+        rebind the runtime SA on an existing version nor inject new code by itself.
+        Real code execution requires pairing with appengine.versions.create. Do not
+        feed this edge into CanExecuteAs derivations on its own.
+      narrative: "{principal.name} can modify an App Engine version's serving/scaling config (appengine.versions.update); this alone cannot rebind the runtime SA or inject code."
+
+  - id: gcp-appengine-applications-update
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "appengine.applications.update", resource_type: "google.appengine.Application"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<App Engine application>"
+      permissions: ["appengine.applications.update"]
+      escalation: "Change app-level config incl. default service account and ingress firewall; swapping the default SA can widen ExecutesAs."
+      narrative: "{principal.name} can update App Engine app-level config (appengine.applications.update), including default SA and ingress rules."
+
+  # --- Explicit: full App Engine admin --------------------------------------
+  - id: gcp-appengine-app-admin
+    emits: CanAdminister
+    match_effective_permission: {action: "appengine.applications.update", resource_type: "google.appengine.Application"}
+    where:
+      - "principal effectively holds the appAdmin set: appengine.services.update, appengine.versions.create, appengine.versions.update, appengine.versions.delete, appengine.instances.delete"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<App Engine application>"
+      permissions: ["appengine.applications.update", "appengine.services.update", "appengine.versions.create", "appengine.versions.update", "appengine.instances.delete"]
+      narrative: "{principal.name} has full control of App Engine app {app.name} (roles/appengine.appAdmin), able to deploy, reconfigure, and route traffic."
+
+  # --- Explicit: actAs to attach a chosen runtime SA (PassRole analog) -------
+  - id: gcp-appengine-actas-passidentity
+    emits: CanPassIdentity
+    match_effective_permission: {action: "iam.serviceAccounts.actAs", resource_type: "google.iam.ServiceAccount"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      note: "actAs alone is not execution; pairs with appengine.versions.create/update setting version.serviceAccount -> CanExecuteAs."
+      false_positive_note: "actAs is per-SA. A principal able to actAs only the appspot SA cannot attach an arbitrary stronger SA to a version."
+      narrative: "{principal.name} can attach {sa.name} as the runtime identity of an App Engine version it deploys (iam.serviceAccounts.actAs)."
+
+  # --- Explicit: interactive debug/SSH on Flexible instances ----------------
+  - id: gcp-appengine-instances-enable-debug
+    emits: CanExecuteCommand
+    match_effective_permission: {action: "appengine.instances.enableDebug", resource_type: "google.appengine.Instance"}
+    where:
+      - "version.env is flexible (vm:true); Standard-env instances have no SSH/debug shell"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<App Engine flexible instance>"
+      permissions: ["appengine.instances.enableDebug"]
+      conditions: [service_state]
+      false_positive_note: "enableDebug yields a shell ONLY on Flexible-environment instances. Do not emit for Standard-env versions."
+      narrative: "{principal.name} can open an interactive debug/SSH shell on App Engine Flexible instance {instance.name} (appengine.instances.enableDebug)."
+
+  # --- Explicit: public HTTP exposure ---------------------------------------
+  - id: gcp-appengine-exposed-internet
+    emits: ExposedToInternet
+    description: "A serving App Engine version is reachable at its appspot.com URL (modeled as a PublicEndpoint node) unless ingress-restricted."
+    match_record: {resource_type: "google.appengine.Version", field: "servingStatus"}
+    where:
+      - "version.servingStatus == SERVING"
+      - "no restrictive appengine.firewall ingress rule denies public source ranges AND app not IAP-gated"
+      - "source is the appspot.com URL PublicEndpoint node for the service/version (schema ExposedToInternet.source includes PublicEndpoint), NOT the Version/ApplicationPlatform node"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<appspot.com URL PublicEndpoint>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      state_logic: >
+        ACTIVE if default ingress firewall (allow *) and no IAP; else
+        BLOCKED if a deny-all ingress rule or IAP restricts access.
+      false_positive_note: "Ingress firewall deny-all rules or IAP protection remove public reachability -> downgrade to CONDITIONAL or emit BLOCKED with denied_by=<ingress rule/IAP>."
+      narrative: "App Engine version {version.name} is publicly reachable at its appspot.com URL PublicEndpoint with no ingress restriction."
+
+  # --- Explicit: metadata-server token exposure -----------------------------
+  - id: gcp-appengine-instance-token
+    emits: CanRetrieveToken
+    description: "Code running in an App Engine instance can read the runtime SA token from the GCE metadata server."
+    match:
+      - [ ?instance, ExecutesAs, ?sa ]
+    emit:
+      source: "<App Engine instance>"
+      target: "<runtime service account>"
+      permissions: []
+      note: "Intrinsic: 169.254.169.254 /computeMetadata/v1/.../token. Realizes usable SA creds once code exec is achieved."
+      narrative: "Code on App Engine instance {instance.name} can retrieve an access token for {sa.name} from the metadata server."
+
+  # =========================================================================
+  # DERIVED: CanExecuteAs (canonical Phase 4 escalation)
+  # =========================================================================
+
+  # Deploy attacker code -> runs as runtime SA.
+  - id: gcp-appengine-execute-as-deploy
+    emits: CanExecuteAs
+    description: "Deploy a new App Engine version (attacker code) that executes as the runtime SA."
+    match:
+      - [ ?principal, CanModifyCode, ?app ]
+      - [ ?instance,  ExecutesAs,    ?sa ]
+    where:
+      - "?instance belongs to a version of ?app (or a new version the principal creates on ?app)"
+      - "?sa.privilege_level >= ?principal.privilege_level   # escalation only"
+    optional:
+      - [ ?principal, CanModifyConfiguration, ?app ]   # traffic-split to force serving; present -> ACTIVE
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<runtime service account>"
+      permissions: ["appengine.versions.create"]
+      state_logic: >
+        if matched(optional[0]) or new version auto-serves or trigger_exists(?app): ACTIVE
+        else: CONDITIONAL(trigger_exists)   # deployed but not receiving traffic yet
+      conditions_from: [ ?app, ?sa ]
+      confidence: "min(contributing) * 0.95"
+      derived_from: [ "<CanModifyCode edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: >
+        Escalation strength depends on the runtime SA's ACTUAL roles (Editor not
+        guaranteed). If deploy is CONDITIONAL on build/storage perms, propagate
+        that condition.
+      narrative: "{principal.name} can deploy an App Engine version (appengine.versions.create) that runs as {sa.name}, executing attacker code with that SA's permissions."
+
+  # Traffic-split onto an attacker-controllable existing version.
+  - id: gcp-appengine-execute-as-traffic
+    emits: CanExecuteAs
+    description: "Route App Engine traffic to a version that runs as a privileged SA (no invoke perm needed)."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?app ]
+      - [ ?instance,  ExecutesAs,             ?sa ]
+    where:
+      - "?instance belongs to a version whose code the principal controls OR an existing exploitable version"
+      - "?sa.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<runtime service account>"
+      permissions: ["appengine.services.update"]
+      state_logic: >
+        if an attacker-controlled/weaker version exists to receive traffic
+        (the principal can deploy or already controls one): ACTIVE
+        else: CONDITIONAL(trigger_exists)   # traffic routing is inert without a controllable target version
+      conditions: [iam_permission]
+      derived_from: [ "<CanModifyConfiguration edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: >
+        appengine.services.update only routes traffic; execution-as the SA is
+        realized only when a controllable or exploitable version exists to serve.
+        Without one, downgrade to CONDITIONAL(trigger_exists).
+      narrative: "{principal.name} can split App Engine traffic (appengine.services.update) to a controlled version, executing its code as {sa.name}."
+
+  # actAs + deploy with a chosen (stronger) SA.
+  - id: gcp-appengine-execute-as-actas
+    emits: CanExecuteAs
+    description: "Deploy a version with a custom, more-privileged runtime SA via actAs."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+      - [ ?principal, CanModifyCode,   ?app ]
+    where:
+      - "?sa is role-compatible as an App Engine runtime SA (same project)"
+      - "?sa.privilege_level >= ?principal.privilege_level"
+      - "the ?sa bound by CanPassIdentity is the SAME ?sa attached to the deployed version; the deploy path can set version.serviceAccount = ?sa"
+      - "?principal's iam.serviceAccounts.actAs grant is scoped to THIS ?sa (per-SA actAs), not merely to the appspot SA"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<chosen service account>"
+      permissions: ["iam.serviceAccounts.actAs", "appengine.versions.create"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >
+        CONDITIONAL(iam_permission) until per-SA actAs on ?sa is confirmed AND the
+        deploy path can set version.serviceAccount=?sa; ACTIVE only once both hold.
+      derived_from: [ "<CanPassIdentity edge_id>", "<CanModifyCode edge_id>" ]
+      false_positive_note: >
+        iam.serviceAccounts.actAs is per-SA. A principal able to actAs only the
+        appspot SA cannot attach an arbitrary stronger ?sa to a version. Confirm the
+        actAs grant covers exactly the ?sa bound by CanPassIdentity and that the
+        deploy actually sets version.serviceAccount=?sa before asserting CanExecuteAs.
+      narrative: "{principal.name} can deploy an App Engine version bound to {sa.name} (per-SA actAs + appengine.versions.create) and execute code as that SA, provided actAs is scoped to {sa.name}."
+
+  # Debug shell on a Flexible instance -> execute as its SA.
+  - id: gcp-appengine-execute-as-debug
+    emits: CanExecuteAs
+    description: "Interactive debug/SSH on a Flexible instance yields code exec as the instance runtime SA."
+    match:
+      - [ ?principal, CanExecuteCommand, ?instance ]
+      - [ ?instance,  ExecutesAs,        ?sa ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<runtime service account>"
+      permissions: ["appengine.instances.enableDebug"]
+      derived_from: [ "<CanExecuteCommand edge_id>", "<ExecutesAs edge_id>" ]
+      narrative: "{principal.name} can open a debug shell on Flexible instance {instance.name} and run commands as {sa.name}."
+
+  # Roll-up: escalation when runtime SA is strictly more privileged.
+  - id: gcp-appengine-escalate-rollup
+    emits: CanEscalateTo
+    description: "App Engine execution-as a more-privileged SA rolls up to an escalation edge."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    where:
+      - "?sa.privilege_level > ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<runtime service account>"
+      derived_from: [ "<CanExecuteAs edge_id>" ]
+      narrative: "{principal.name} can escalate to {sa.name} via App Engine code execution."
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw App Engine config -> explicit edges).
+# These belong conceptually in rules/explicit/gcp/appengine.yaml; recorded here
+# for co-location. They map collector output to the explicit edges consumed by
+# the derived rules above.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-appengine-norm-executesas
+    emits: ExecutesAs
+    from_api: "apps.services.versions.instances.list"
+    field: "serviceAccount"
+    default: "PROJECT_ID@appspot.gserviceaccount.com"
+    note: >
+      Anchor ExecutesAs on the Instance node (Compute), not the Version
+      (ApplicationPlatform), per schema/edges.yaml (ExecutesAs.source=[Compute]).
+      The instance inherits its serviceAccount from the owning version; absent
+      serviceAccount => default appspot SA. Link instance node -> ServiceAccount node.
+      Each serving instance of a version yields one ExecutesAs edge; the Version
+      remains a config carrier feeding CanModifyCode/CanModifyConfiguration.
+
+  - id: gcp-appengine-norm-trigger
+    emits: CanTrigger
+    from_api: "apps.services.versions.get + Cloud Scheduler jobs.list / cron.yaml / Cloud Tasks queues"
+    field: "handlers / scheduler targets"
+    where:
+      - "a Cloud Scheduler job, cron.yaml entry, or Cloud Tasks queue targets an App Engine handler (App Engine HTTP target) on the version/service"
+    note: >
+      Per schema/edges.yaml CanTrigger.source is [Identity, Messaging, Storage,
+      Network] and target is [Compute]; anchor the source on the scheduler/cron
+      job's invoking Identity (its SA) or the Network path, and the target on the
+      App Engine Instance (Compute) that runs the handler. Resolves the
+      trigger_exists(?app) condition consumed by gcp-appengine-execute-as-deploy /
+      -traffic so a deployed-but-idle attacker version can be driven to execute.
+
+  - id: gcp-appengine-norm-envvar-secret
+    emits: ExposesCredential
+    from_api: "apps.services.versions.get"
+    field: "envVariables"
+    where: ["env var value looks like a secret/credential (heuristic) OR references a known secret"]
+    note: "App Engine env vars frequently embed credentials; readable via appengine.versions.get / codeViewer."
+
+  - id: gcp-appengine-norm-ingress
+    emits: ExposedToInternet
+    from_api: "apps.firewall.ingressRules.list"
+    field: "rules"
+    where: ["effective ingress allows public source ranges (default rule action ALLOW, source *)"]
+    note: >
+      Feeds ExposedToInternet from the appspot.com URL PublicEndpoint node
+      (schema-valid ExposedToInternet.source), not the Version/ApplicationPlatform
+      node; a deny-all default ingress rule or IAP blocks it.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - IAM deny policy denying any appengine.* action at project scope -> emit the
+#    corresponding edge BLOCKED with denied_by=<deny policy>.
+#  - Org policy iam.automaticIamGrantsForDefaultServiceAccounts=disabled means
+#    the appspot SA lacks Editor -> ExecutesAs still emitted but escalation
+#    strength scored from the SA's real bindings (may be non-escalating).
+#  - App Engine ingress firewall deny-all OR IAP -> ExposedToInternet BLOCKED
+#    with denied_by=<ingress rule / IAP>.
+#  - VPC Service Controls perimeter can block the runtime SA's downstream API
+#    calls -> downstream CanExecuteAs pivots BLOCKED at the perimeter.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,353 @@
+# AWS CloudHSM — Derived attack-path rules (Phase 5 — credential access / KMS)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (CanAdminister on the cluster, ContainsCredential/CredentialsFor for HSM users,
+# Contains/LocatedIn/AttachedTo) lives in /rules/explicit/aws-cloudhsm.yaml;
+# these rules combine those facts to derive credential-access capabilities.
+#
+# CENTRAL CAVEAT — the IAM/HSM authorization split:
+#   IAM (cloudhsm:*) governs ONLY the cluster lifecycle. It grants NO ability to
+#   decrypt, sign, or export any key. Every cryptographic operation requires an
+#   HSM user credential (Crypto User / Crypto Officer) authenticated INSIDE the
+#   cluster over the CloudHSM SDK/CLI, plus network reachability to the HSM ENIs
+#   (TCP 2223-2225 in the customer VPC). Therefore key-use edges are NEVER ACTIVE
+#   from IAM alone: they are CONDITIONAL(network_reachability) gated on possession
+#   of the HSM CU login credential (+ VPC reachability).
+#
+#   IMPORTANT — the gate is NOT key_permission. The key_permission condition_type
+#   (edges.yaml) means a KMS/Key Vault decrypt/use IAM grant. CloudHSM's gate is
+#   possession of an HSM CU login, which is explicitly NOT an IAM permission, so
+#   these rules condition on network_reachability and express the credential-
+#   possession requirement via the CredentialsFor premise + false_positive_note
+#   (not by overloading key_permission).
+#
+#   NODE MODEL — an HSM user (CU/CO/PCO/AU) is an Identity(MachineIdentity); the
+#   CU/CO login/PIN is a separate Secret/Credential node. CredentialsFor therefore
+#   runs (login Credential) -> (hsm_user Identity), and Controls runs
+#   (hsm_user Identity) -> (key). The key-use edges emit with source = the HSM user
+#   Identity (CanDecrypt.source [Identity, Compute]; CanSignAs/CanExportKey.source
+#   [Identity]) — never the Compute client host directly.
+#
+# Phase-5 pivot: CanExecuteAs -> (harvest CU cred) -> CredentialsFor(CU) ->
+#   CanDecrypt/CanSignAs on HSM keys. CloudHSM itself exposes NO GetSecretValue-
+#   style CanReadSecret; the readable secret (if any) belongs to whatever store
+#   holds the CU login (Secrets Manager / SSM / host env), not to CloudHSM.
+#
+# State defaults: no crypto-user credential + no reachability => key-use edges are
+# CONDITIONAL(network_reachability)/POTENTIAL, never ACTIVE. A non-EXTRACTABLE key
+# yields BLOCKED for the export rule. (An SCP cannot BLOCK a key-use edge — it is not
+# an IAM action; only key deletion or CU-credential rotation removes it.)
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 5-secrets-credentials-kms
+applies_to: [aws]
+
+rules:
+
+  # --- Client host leaks a Crypto User credential ---------------------------
+  - id: aws-cloudhsm-host-exposes-cu
+    emits: ExposesCredential
+    description: "A CloudHSM client host with a configured CU login leaks it to any code it runs."
+    match:
+      - [ ?host, ContainsCredential, ?cu_cred ]
+    where:
+      - "node_class(?host) == Compute"
+      - "?cu_cred is a CloudHSM Crypto User (or CO/PCO) credential (env CLOUDHSM_PIN / PKCS#11 pin / cloudhsm_mgmt_util config)"
+    emit:
+      source: ?host
+      target: ?cu_cred
+      permissions: []
+      conditions: []
+      state_logic: "ACTIVE (the credential material is present on the host); the downstream key-use edges remain CONDITIONAL on reachability"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<ContainsCredential edge_id>" ]
+      false_positive_note: >-
+        Only emit when the credential material is actually present (hard-coded pin,
+        pin file, mgmt_util config). A host that merely has the SDK installed but
+        pulls the pin at runtime from Secrets Manager does NOT expose it here — the
+        exposure belongs to that secret store, and this becomes a CanReadSecret on
+        the store instead. This edge is not escalation by itself; value comes when
+        it chains into CanDecrypt/CanSignAs.
+      narrative: >-
+        {host.name} has a CloudHSM Crypto User login configured on it, exposing
+        {cu_cred.name} to any code running on the host.
+
+  # NOTE: CredentialsFor(CU login credential -> HSM user identity) is emitted
+  # DIRECTLY by the explicit rule aws-cloudhsm-cred-authenticates-hsm-user in
+  # /rules/explicit/aws-cloudhsm.yaml. No derived rule re-derives it here: the
+  # previous aws-cloudhsm-cu-cred-for-key-use was removed because (a) it was
+  # redundant with that explicit CredentialsFor edge, and (b) its premise
+  # [?cu_cred, ContainsResourceReference, ?hsm_user] was source/target
+  # non-conformant — ContainsResourceReference.source is [Data, Storage, Compute],
+  # so a Secret/Credential-class ?cu_cred can never be a valid source of it.
+
+  # --- CU credential -> decrypt with an HSM key ------------------------------
+  - id: aws-cloudhsm-decrypt-with-cu
+    emits: CanDecrypt
+    description: "Holding a CloudHSM Crypto User credential (with VPC reach) lets a principal decrypt with the HSM key."
+    match:
+      - [ ?principal, CredentialsFor, ?hsm_user ]
+      - [ ?hsm_user,  Controls,       ?key ]
+    where:
+      - "node_class(?key) == EncryptionKey"
+      - "node_class(?hsm_user) == Identity"
+      - "?hsm_user is a CloudHSM Crypto User (CU) that owns or shares ?key"
+    optional:
+      - [ ?principal, CanNetworkReach, ?cluster ]
+    emit:
+      target_type: EncryptionKey
+      source: ?hsm_user
+      target: ?key
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        never ACTIVE from IAM; if matched(optional[0]) (VPC reachability to the HSM
+        on TCP 2223-2225) AND the CU owns/shares ?key: CONDITIONAL(network_reachability)
+        else POTENTIAL(network_reachability)
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<CredentialsFor edge_id>", "<Controls(hsm_user,key) edge_id>", "<CanNetworkReach edge_id?>" ]
+      false_positive_note: >-
+        NEVER emit ACTIVE. Decrypt is a data-plane operation requiring possession of
+        the CU login credential AND reachability to the HSM ENIs; IAM cloudhsm:* alone
+        grants nothing. The gate is HSM-CU-credential possession (the CredentialsFor
+        premise), which is NOT an IAM key grant — do not label it key_permission
+        (that condition_type means a KMS/Key Vault decrypt/use grant, which CloudHSM
+        does not have). Only the CU that owns or is shared the key can use it — a
+        CO/PCO credential does NOT qualify (CO manages users, cannot do crypto). If
+        reachability is unproven, downgrade to POTENTIAL. An SCP cannot block this
+        (it is not an IAM action); only key deletion or credential rotation removes it.
+      narrative: >-
+        CloudHSM Crypto User {hsm_user.name} (authenticated via credential
+        {principal.name}) can decrypt data with HSM key {key.name} once it can reach
+        the cluster (TCP 2223-2225).
+
+  # --- CU credential -> sign with an HSM private key -------------------------
+  - id: aws-cloudhsm-sign-with-cu
+    emits: CanSignAs
+    description: "A CloudHSM CU credential (with VPC reach) can sign with the HSM private key."
+    match:
+      - [ ?principal, CredentialsFor, ?hsm_user ]
+      - [ ?hsm_user,  Controls,       ?key ]
+    where:
+      - "node_class(?key) == SigningKey"
+      - "node_class(?hsm_user) == Identity"
+      - "?hsm_user is a CloudHSM Crypto User (CU) that owns or shares ?key"
+    optional:
+      - [ ?principal, CanNetworkReach, ?cluster ]
+    emit:
+      source_type: Identity
+      source: ?hsm_user
+      target: ?key
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        never ACTIVE from IAM; if matched(optional[0]) AND CU owns/shares ?key:
+        CONDITIONAL(network_reachability) else POTENTIAL(network_reachability)
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<CredentialsFor edge_id>", "<Controls(hsm_user,key) edge_id>", "<CanNetworkReach edge_id?>" ]
+      false_positive_note: >-
+        CanSignAs.source is [Identity] only, so the emit source is the HSM user
+        identity ?hsm_user (a MachineIdentity), reached from the client host via
+        CredentialsFor(login -> hsm_user) — never the Compute host directly. Raw
+        signing capability, not identity forgery by itself. Same gate as decrypt:
+        possession of the CU login credential (NOT an IAM key_permission) plus
+        reachability. It becomes impersonation/escalation only when ?key is the
+        private key backing a token/cert issuer for a concrete identity (see
+        aws-cloudhsm-sign-escalates) — that binding lives outside CloudHSM (ACM
+        Private CA, app JWT/SAML signer) and must be independently known. CO
+        credentials do not qualify.
+      narrative: >-
+        CloudHSM Crypto User {hsm_user.name} (authenticated via credential
+        {principal.name}) can sign blobs with HSM signing key {key.name} once it can
+        reach the cluster.
+
+  # --- Export a wrappable/extractable key out of the HSM --------------------
+  - id: aws-cloudhsm-export-wrappable-key
+    emits: CanExportKey
+    description: "A CU with wrap rights can wrap an EXTRACTABLE key out of the HSM for offline use."
+    match:
+      - [ ?principal, CredentialsFor, ?hsm_user ]
+      - [ ?hsm_user,  Controls,       ?key ]
+    where:
+      - "node_class(?key) in [EncryptionKey, SigningKey]"
+      - "node_class(?hsm_user) == Identity"
+      - "?hsm_user is a CloudHSM Crypto User (CU) with wrap/unwrap rights on ?key"
+      - "?key was created EXTRACTABLE / wrappable"
+    optional:
+      - [ ?principal, CanNetworkReach, ?cluster ]
+    emit:
+      source_type: Identity
+      source: ?hsm_user
+      target: ?key
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if ?key extractability is unknown: POTENTIAL(network_reachability); elif ?key
+        is non-EXTRACTABLE: BLOCKED (denied_by=key_attribute EXTRACTABLE=false); elif
+        matched(optional[0]) AND CU has wrap rights: CONDITIONAL(network_reachability)
+        else POTENTIAL(network_reachability)
+      confidence: "min(contributing_confidences) * 0.75"
+      derived_from: [ "<CredentialsFor edge_id>", "<Controls(hsm_user,key) edge_id>", "<CanNetworkReach edge_id?>" ]
+      false_positive_note: >-
+        CanExportKey.source is [Identity] only, so the emit source is the HSM user
+        identity ?hsm_user (a MachineIdentity), reached from the client host via
+        CredentialsFor(login -> hsm_user) — never the Compute host directly. Keys
+        created non-EXTRACTABLE CANNOT be wrapped out — emit BLOCKED, never
+        CONDITIONAL. Extractability is usually UNKNOWN to the collector (only visible
+        with CU creds via CloudHSM CLI `key list`), so default to POTENTIAL rather
+        than over-claiming. Requires wrap/unwrap authorization on the CU (possession
+        of the HSM login, NOT an IAM key_permission), not just use rights.
+      narrative: >-
+        CloudHSM CU {hsm_user.name} (authenticated via credential {principal.name})
+        can wrap key {key.name} out of the HSM for durable offline use — only if
+        {key.name} is EXTRACTABLE.
+
+  # --- Crypto Officer mints / resets a Crypto User credential ---------------
+  - id: aws-cloudhsm-co-mints-cu
+    emits: CanCreateCredentialFor
+    description: "A Crypto Officer credential can create a new CU or reset a CU password."
+    match:
+      - [ ?principal, CredentialsFor, ?co_user ]
+      - [ ?co_user,  Controls,        ?cluster ]
+    where:
+      - "node_class(?co_user) == Identity"
+      - "node_class(?cu_user) == Identity"
+      - "?co_user is a CloudHSM Crypto Officer (CO) or Primary Crypto Officer (PCO)"
+      - "?cu_user is a Crypto User in the same cluster (target of the mint/reset)"
+    optional:
+      - [ ?principal, CanNetworkReach, ?cluster ]
+    emit:
+      source_type: Identity
+      source: ?co_user
+      target: ?cu_user
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        never ACTIVE from IAM; creating/resetting a CU is a user-management (not a
+        key-use) operation, so it is NOT gated on key_permission. The real gates are
+        possession of the CO/PCO login (the CredentialsFor premise), reachability, and
+        any configured MofN quorum. If matched(optional[0]) (reachability to run
+        CloudHSM CLI `user create` / `user change-password`) AND no unmet quorum:
+        CONDITIONAL(network_reachability); if a CO quorum (M-of-N) is configured and
+        not satisfiable by the held credentials: POTENTIAL(quorum); else
+        POTENTIAL(network_reachability)
+      confidence: "min(contributing_confidences) * 0.8"
+      derived_from: [ "<CredentialsFor(principal,co_user) edge_id>", "<Controls(co_user,cluster) edge_id>", "<CanNetworkReach edge_id?>" ]
+      false_positive_note: >-
+        The only intra-HSM escalation primitive: a CO/PCO cannot use keys but CAN
+        create a CU or reset a CU password, minting a usable crypto credential. This
+        is user management, NOT crypto — do NOT gate it on key_permission (that
+        condition_type means a KMS/Key Vault decrypt/use grant and mislabels this
+        non-crypto op; consumers filtering on key_permission would be misrouted). The
+        true gates are CO/PCO credential possession (surfaced by the CredentialsFor
+        premise) and network reachability; there is no exact condition_type for
+        "has CO credential" or "MofN quorum", so those are stated here and in
+        state_logic. Privileged CO operations may require an M-of-N (MofN) quorum —
+        if quorum is configured and unsatisfiable, downgrade to POTENTIAL(quorum). No
+        IAM action grants this. CanCreateCredentialFor.source/target are both Identity;
+        the emit uses the CO Identity ?co_user (not the Credential ?principal) as
+        source and the CU Identity ?cu_user as target for conformance.
+      narrative: >-
+        CloudHSM Crypto Officer {co_user.name} (held via credential {principal.name})
+        can create or reset Crypto User {cu_user.name}, minting a usable HSM
+        credential.
+
+  # --- Roll up: signing a more-privileged identity's tokens = escalation -----
+  - id: aws-cloudhsm-sign-escalates
+    emits: CanEscalateTo
+    description: "Signing with an HSM key that issues tokens/certs for a more-privileged identity is escalation."
+    match:
+      - [ ?principal, CanSignAs,      ?key ]
+      - [ ?key,       CredentialsFor, ?identity ]
+    where:
+      - "?key is the private key backing a token/cert issuer for ?identity (ACM Private CA, JWT/SAML signer)"
+      - "?identity.privilege_level > ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: "inherits state from the contributing CanSignAs (network_reachability + CU-credential possession; never stronger than CONDITIONAL)"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanSignAs edge_id>", "<CredentialsFor(key,identity) edge_id>" ]
+      false_positive_note: >-
+        Only emit when ?key is actually bound to an identity issuer AND ?identity is
+        STRICTLY more privileged than the caller — a lateral or unbound signing key
+        is not escalation. The key->identity binding is external to CloudHSM and must
+        be independently established; do not infer it from the mere existence of a
+        signing key. Inherits the CONDITIONAL(network_reachability) gate (plus
+        CU-credential possession) from CanSignAs — NOT key_permission.
+      narrative: >-
+        {principal.name} can escalate to {identity.name} by signing its tokens/certs
+        with HSM key {key.name} (via a CloudHSM Crypto User credential).
+
+  # --- Backup copy/share/restore duplicates key material (exfil, not entry) --
+  - id: aws-cloudhsm-backup-exfiltrates-keys
+    emits: CanExfiltrate
+    description: "A principal that can copy/share/restore a cluster backup duplicates the encrypted key material out of the source cluster."
+    match:
+      - [ ?principal, CanAdminister,             ?cluster ]
+      - [ ?backup,    ContainsResourceReference, ?cluster ]
+    where:
+      - "node_class(?principal) == Identity"
+      - "node_class(?backup) == Data"
+      - "?backup is a CloudHSM cluster backup (encrypted image of the cluster's key material)"
+      - "?principal has EFFECTIVE cloudhsm:CopyBackupToRegion, cloudhsm:ModifyBackupAttributes (backup share), or cloudhsm:RestoreBackup on ?backup/?cluster"
+    emit:
+      source: ?principal
+      target: ?backup
+      permissions: ["cloudhsm:CopyBackupToRegion", "cloudhsm:ModifyBackupAttributes", "cloudhsm:RestoreBackup", "ram:CreateResourceShare?"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if ?principal has EFFECTIVE cloudhsm:CopyBackupToRegion / ModifyBackupAttributes
+        (share) / RestoreBackup on the backup: ACTIVE (the exfil/duplication action
+        succeeds); if an SCP/RAM policy denies the relevant action: BLOCKED
+        (denied_by=<SCP/RAM statement>); else CONDITIONAL(iam_permission)
+      confidence: "min(contributing_confidences) * 0.8"
+      derived_from: [ "<CanAdminister edge_id>", "<ContainsResourceReference(backup,cluster) edge_id>" ]
+      false_positive_note: >-
+        This models key-MATERIAL duplication/exfiltration, NOT a cross-account IAM
+        session: a copied/shared/restored backup reproduces the keys in a new
+        cluster, but that cluster STILL enforces HSM-user auth, so no key bytes are
+        exposed to IAM and no CanEnterAccount is emitted (see NON-EMITTED note). The
+        backup is encrypted; "exfiltration" here means removing the durable key
+        image from the source boundary, not obtaining cleartext key bytes. Only emit
+        when the principal actually holds the relevant cloudhsm:/ram: action; a bare
+        cluster admin without CopyBackupToRegion/RestoreBackup/share does not qualify.
+      narrative: >-
+        {principal.name} can copy, share, or restore backup {backup.name} of
+        CloudHSM cluster {cluster.name} (cloudhsm:CopyBackupToRegion /
+        ModifyBackupAttributes / RestoreBackup), duplicating the encrypted key
+        material out of the source cluster.
+
+# ---------------------------------------------------------------------------
+# NON-EMITTED / out-of-scope (documented so consumers don't expect them):
+#  - CanReadSecret: CloudHSM has no GetSecretValue-equivalent; CU passwords are
+#    unreadable via AWS APIs. The Phase-5 CanReadSecret belongs to whatever store
+#    (Secrets Manager / SSM / host env) holds the CU login, not to CloudHSM.
+#  - ExposedToInternet: HSMs have no public endpoint — VPC-only reachability.
+#  - CanEnterAccount / CrossAccountTrust: backup share/copy duplicates key
+#    MATERIAL (modeled as CanExfiltrate(principal -> backup) by
+#    aws-cloudhsm-backup-exfiltrates-keys) but yields NO IAM session in another
+#    account — the restored cluster still enforces HSM-user auth, so no
+#    CanEnterAccount / CrossAccountTrust is emitted.
+#  - CanModifyCode / ExecutesAs / CanPassIdentity / CanTrigger / CanInvoke:
+#    CloudHSM runs no customer code and assumes no execution role.
+#
+# BLOCKED-edge guidance:
+#  - A key created non-EXTRACTABLE blocks aws-cloudhsm-export-wrappable-key
+#    (denied_by = key_attribute EXTRACTABLE=false).
+#  - An SCP/RAM policy denying cloudhsm:CopyBackupToRegion / RestoreBackup /
+#    backup sharing blocks cross-region/cross-account key duplication (an exfil
+#    path, not modeled as an escalation edge here).
+#  - CO quorum (M-of-N) not satisfiable downgrades aws-cloudhsm-co-mints-cu to
+#    POTENTIAL(quorum).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service are written in
+# /rules/explicit/aws-cloudhsm.yaml (CanAdminister on the cluster, ExposesCredential
+# host inputs via ContainsCredential, CredentialsFor for HSM users, and the
+# Controls(hsm_user, key) ownership fact that gates key use).

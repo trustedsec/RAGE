@@ -1,0 +1,963 @@
+# Azure Service Bus — Derived + explicit normalization rules (Phase 10 — messaging)
+# ---------------------------------------------------------------------------
+# PHASE-10 SERVICE ADAPTER for azure:servicebus.
+#
+# Azure Service Bus is a fully managed enterprise message broker. Its security
+# attack surface maps to three primitives:
+#
+#   (a) SAS KEY CREDENTIAL ACCESS:
+#       Microsoft.ServiceBus/namespaces/authorizationRules/listKeys/action
+#       (and the queue-/topic-scoped equivalents) returns the primary and secondary
+#       connection strings for a Shared Access Signature rule. A connection string
+#       embeds a SharedAccessKey that grants the rule's claims (Send / Listen /
+#       Manage) on the namespace or entity at the AMQP/HTTPS data plane, bypassing
+#       Entra RBAC entirely. Modeled as:
+#           CanReadSecret(principal -> ConnectionString)   [this file]
+#           ConnectionString ContainsSecret/ExposesCredential [this file]
+#           CanWriteData(principal <- SAS Send key) [azure-sb-sas-send-writedata]
+#           CanReadData(principal <- SAS Listen key) [azure-sb-sas-receive-readdata]
+#       credential-chains read-secret-yields-identity then collapses
+#           CanReadSecret + CredentialsFor => CanImpersonate for non-SAS targets.
+#
+#   (b) PUBLISH/SEND → TRIGGER CONSUMER (Phase-10 primitive):
+#       A principal with data-plane Send rights (Service Bus Data Sender role,
+#       OR a valid SAS connection string with Send claim) can publish messages to
+#       a queue or topic.  An event-source binding (Function serviceBusTrigger,
+#       Logic App connector, Container App KEDA scaler, Event Grid subscription)
+#       routes messages from the queue/topic to a compute consumer that executes
+#       as its managed identity.  This file emits:
+#           CanWriteData(principal -> queue/topic)          [this file — send rights]
+#           CanTrigger(queue/topic -> consumer)             [this file — binding fact]
+#       messaging-chains.yaml rule 1 then collapses:
+#           CanWriteData(p, src) + CanTrigger(src, consumer) => CanTrigger(p, consumer)
+#       messaging-chains.yaml rule 2 then collapses (cited, not re-derived):
+#           CanTrigger(p, consumer) + ExecutesAs(consumer, MI) => CanExecuteAs(p, MI)
+#
+#   (c) DATA RECEIVE / EXFILTRATION:
+#       A principal with Listen rights (Service Bus Data Receiver role or SAS with
+#       Listen claim) can receive messages. Messages may carry secrets
+#       (ContainsSecret). Receiving is CanReadData; messages carrying secrets feed
+#       credential-chains. CanExfiltrate is not emitted here because Service Bus is
+#       a message channel, not a data store — exfiltration is the consequence of
+#       receiving messages that originated from another service's sensitive output.
+#
+# LINCHPINS CITED (not re-derived here):
+#   messaging-chains.yaml (Phase 10, provider-agnostic):
+#     rule 1: messaging-publish-triggers-consumer
+#             CanWriteData(p,src) + CanTrigger(src,consumer) => CanTrigger(p,consumer)
+#     rule 2: messaging-trigger-executes-as
+#             CanTrigger(p,consumer) + ExecutesAs(consumer,id) => CanExecuteAs(p,id)
+#     rule 4: messaging-resource-policy-cross-boundary-trust
+#             cross-boundary messaging grant => CrossAccountTrust/CrossProjectTrust
+#   credential-chains.yaml:
+#     read-secret-yields-identity:
+#             CanReadSecret(p,secret) + CredentialsFor(secret,id) => CanImpersonate(p,id)
+#   can-execute-as.yaml:
+#     escalate-via-execute-as / execute-as-via-code-modify (dedupe).
+#   can-control.yaml:
+#     escalate-via-execute-as: CanExecuteAs => CanEscalateTo when MI outranks principal.
+#
+# STATE DEFAULTS (per RULE-FORMAT.md):
+#   ACTIVE when all conditions met; weakest contributor propagates downward.
+#   CONDITIONAL(trigger_exists) when a publish right exists but the event-source
+#     binding is not yet confirmed live (consumer stopped, binding disabled).
+#   CONDITIONAL(service_state) when the consumer is stopped.
+#   BLOCKED when a deny assignment covers the critical action at effective scope.
+#
+# All operation strings verified against the Microsoft.ServiceBus resource-provider
+# operations reference (learn.microsoft.com/azure/service-bus-messaging/,
+# 2026-09 snapshot). No hallucinated permissions.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 10-messaging
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # 1. Administrative control over the namespace
+  # ===========================================================================
+
+  - id: azure-sb-administer
+    emits: CanAdminister
+    description: "Full control of a Service Bus namespace (Contributor / Owner at namespace scope; NOT Service Bus Data Owner which lacks ARM write)."
+    match_effective_permission:
+      action: "Microsoft.ServiceBus/namespaces/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor or Owner role (or a custom role granting Microsoft.ServiceBus/namespaces/write) at the namespace scope"
+      - "NOTE: Azure Service Bus Data Owner role does NOT include Microsoft.ServiceBus/namespaces/write (ARM control plane) and should NOT appear in this rule"
+    emit:
+      source_type: Identity
+      target_type: GenericMessaging
+      source: "<principal>"
+      target: "<Service Bus namespace>"
+      permissions:
+        - "Microsoft.ServiceBus/namespaces/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed. BLOCKED if a deny
+        assignment covers namespaces/write at the effective scope. This does NOT
+        imply Microsoft.Authorization/*/write — escalation via Service Bus is
+        through the namespace's SAS keys or by triggering consumers bound to it,
+        not through self role-assignment.
+      confidence: 0.98
+      derived_from:
+        - "effective permission: Microsoft.ServiceBus/namespaces/write"
+      false_positive_note: >-
+        namespaces/write grants control of the namespace object including queues,
+        topics, auth rules, and network rule sets. It does NOT imply
+        Microsoft.Authorization/*/write (role assignment). The Azure Service Bus Data
+        Owner role includes all data-plane actions (send, receive, manage) and the
+        listKeys action but NOT namespaces/write for ARM resource modification;
+        Contributor/Owner is required for ARM-level write. Confirm which role the
+        principal holds before asserting CanAdminister.
+      narrative: >-
+        {principal.name} has full control of Service Bus namespace {target.name}
+        (Microsoft.ServiceBus/namespaces/write), including creating/deleting queues
+        and topics, modifying auth rules, and changing network access settings.
+
+  # ===========================================================================
+  # 2. SAS key credential access — namespace level
+  # ===========================================================================
+
+  - id: azure-sb-namespace-listkeys
+    emits: CanReadSecret
+    description: "Read the primary and secondary connection strings of a namespace-level SAS authorization rule via listKeys; the connection string grants the rule's claims (Send/Listen/Manage) data-plane-wide."
+    match_effective_permission:
+      action: "Microsoft.ServiceBus/namespaces/authorizationRules/listKeys/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds the listKeys action at the namespace scope"
+      - "at least one namespace authorizationRule exists"
+    emit:
+      source_type: Identity
+      target_type: ConnectionString
+      source: "<principal>"
+      target: "<SAS connection string (ConnectionString) for the namespace auth rule>"
+      permissions:
+        - "Microsoft.ServiceBus/namespaces/authorizationRules/listKeys/action"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the listKeys action is confirmed (not merely /read) and at
+        least one authorization rule exists in the namespace. BLOCKED if a deny
+        assignment covers listKeys/action at the effective scope. Note: Reader role
+        does NOT include listKeys/action; a custom role or Contributor/Owner (or
+        the Azure Service Bus Data Owner role, which includes the management API)
+        is required. A namespace with NO auth rules yields no connection string
+        (Entra-only mode, `disableLocalAuth=true`) — do not emit if local auth is
+        disabled.
+      confidence: 0.97
+      derived_from:
+        - "effective permission: Microsoft.ServiceBus/namespaces/authorizationRules/listKeys/action"
+        - "credential-chains.yaml: read-secret-yields-identity (CanReadSecret + CredentialsFor => CanImpersonate)"
+      false_positive_note: >-
+        listKeys/action is a POST action that returns the actual key material
+        (primaryKey, secondaryKey, primaryConnectionString, secondaryConnectionString).
+        authorizationRules/read alone enumerates rule names but NOT keys — do not
+        emit CanReadSecret for read-only enumeration. If `disableLocalAuth=true`
+        (Entra-only mode), no SAS keys are active and this rule is a no-op even if
+        the listKeys action is theoretically grantable. Honor the rule's claims
+        (rights): a rule with only Manage rights grants management actions; a Send
+        rule grants publish only. Each rule's connection string is a separate
+        ConnectionString node scoped to its claims.
+      narrative: >-
+        {principal.name} can call listKeys on a Service Bus namespace auth rule
+        (authorizationRules/listKeys/action) and obtain the primary/secondary
+        connection string, which is a SAS credential granting data-plane access
+        to the entire namespace according to the rule's configured claims
+        (Send/Listen/Manage) without Entra RBAC.
+
+  # ===========================================================================
+  # 3. SAS key credential access — queue level
+  # ===========================================================================
+
+  - id: azure-sb-queue-listkeys
+    emits: CanReadSecret
+    description: "Read the connection string of a queue-level SAS authorization rule; scoped to that queue only."
+    match_effective_permission:
+      action: "Microsoft.ServiceBus/namespaces/queues/authorizationRules/listKeys/action"
+      scope_type: "resource|resourceGroup|subscription|queue"
+    where:
+      - "principal effectively holds the listKeys action at the queue or namespace scope"
+      - "at least one queue authorizationRule exists for the targeted queue"
+    emit:
+      source_type: Identity
+      target_type: ConnectionString
+      source: "<principal>"
+      target: "<SAS connection string (ConnectionString) for the queue auth rule>"
+      permissions:
+        - "Microsoft.ServiceBus/namespaces/queues/authorizationRules/listKeys/action"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the listKeys action is confirmed and at least one queue-level
+        auth rule exists. The resulting connection string is scoped to the targeted
+        queue only — it does NOT grant access to other queues or topics in the
+        namespace. BLOCKED if a deny assignment covers this action. No-op if
+        disableLocalAuth=true on the namespace.
+      confidence: 0.97
+      derived_from:
+        - "effective permission: Microsoft.ServiceBus/namespaces/queues/authorizationRules/listKeys/action"
+        - "credential-chains.yaml: read-secret-yields-identity"
+      false_positive_note: >-
+        Queue-level SAS keys are NARROWER than namespace keys; a queue-scoped
+        Send connection string grants send access only to THAT queue. Do not
+        promote a queue-scoped key to a namespace-level CanWriteData covering
+        other queues or topics. If the namespace has disableLocalAuth=true, all
+        local auth (SAS) is disabled and listKeys returns no usable credential.
+      narrative: >-
+        {principal.name} can call listKeys on a queue-level auth rule
+        (queues/authorizationRules/listKeys/action) and obtain a SAS connection
+        string scoped to that queue, granting data-plane access according to the
+        rule's claims without Entra RBAC.
+
+  # ===========================================================================
+  # 4. SAS key credential access — topic level
+  # ===========================================================================
+
+  - id: azure-sb-topic-listkeys
+    emits: CanReadSecret
+    description: "Read the connection string of a topic-level SAS authorization rule; scoped to that topic only."
+    match_effective_permission:
+      action: "Microsoft.ServiceBus/namespaces/topics/authorizationRules/listKeys/action"
+      scope_type: "resource|resourceGroup|subscription|topic"
+    where:
+      - "principal effectively holds the listKeys action at the topic or namespace scope"
+      - "at least one topic authorizationRule exists for the targeted topic"
+    emit:
+      source_type: Identity
+      target_type: ConnectionString
+      source: "<principal>"
+      target: "<SAS connection string (ConnectionString) for the topic auth rule>"
+      permissions:
+        - "Microsoft.ServiceBus/namespaces/topics/authorizationRules/listKeys/action"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the listKeys action is confirmed and at least one topic-level
+        auth rule exists. The resulting connection string is scoped to the targeted
+        topic — does NOT grant access to other topics or queues. BLOCKED if a deny
+        assignment covers this action. No-op if disableLocalAuth=true.
+      confidence: 0.97
+      derived_from:
+        - "effective permission: Microsoft.ServiceBus/namespaces/topics/authorizationRules/listKeys/action"
+        - "credential-chains.yaml: read-secret-yields-identity"
+      false_positive_note: >-
+        Topic-scoped SAS keys are narrower than namespace keys. A Send-only
+        topic key does not grant Listen. A Listen-only key does not grant publish.
+        Honor the rights array. Do not promote topic-scoped keys to namespace-wide
+        CanWriteData. disableLocalAuth=true makes this a no-op.
+      narrative: >-
+        {principal.name} can call listKeys on a topic-level auth rule
+        (topics/authorizationRules/listKeys/action) and obtain a SAS connection
+        string scoped to that topic.
+
+  # ===========================================================================
+  # 5. SAS connection string as credential (ContainsSecret + ExposesCredential)
+  # ===========================================================================
+
+  - id: azure-sb-queue-sas-contains
+    emits: ContainsSecret
+    description: "A Service Bus queue with active entity-level SAS authorization rules embeds queue-scoped connection-string credentials usable at data-plane without Entra RBAC."
+    match:
+      - [ ?queue, HasPolicy, ?authrule ]
+    where:
+      - "node_type(?queue) == Queue"
+      - "node_type(?authrule) == ResourcePolicy"
+      - "?authrule is a Microsoft.ServiceBus/namespaces/queues/authorizationRules entry with at least one active key"
+      - "queue.parent.namespace.disableLocalAuth != true"
+    emit:
+      source_type: Queue
+      target_type: ConnectionString
+      source: ?queue
+      target: "<SAS ConnectionString node for the queue auth rule>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the queue has at least one auth rule with a non-empty primary
+        or secondary key AND the parent namespace has disableLocalAuth=false. This
+        is a structural credential-existence fact at queue scope, narrower than
+        namespace-level SAS keys. BLOCKED if disableLocalAuth=true. Derives
+        CanReadSecret (via azure-sb-queue-listkeys) when paired with queue-level
+        listKeys permission.
+      confidence: 0.95
+      derived_from:
+        - "Microsoft.ServiceBus/namespaces/queues/authorizationRules (existence of active rules)"
+      false_positive_note: >-
+        Queue-level SAS keys are scoped to that queue only — they do NOT grant
+        access to other queues or topics in the namespace. This edge asserts the
+        queue STORES SAS credentials at entity scope. Exploitation requires either
+        (a) CanReadSecret via queue-level listKeys/action, or (b) the connection
+        string is embedded in a consumer's appsettings. Do not conflate the
+        existence of a queue auth rule with unauthorized access.
+      narrative: >-
+        Service Bus queue {queue.name} has active SAS authorization rules whose
+        connection strings grant data-plane access scoped to this queue; these
+        connection strings are credentials readable by any principal with the
+        queue-level listKeys action.
+
+  - id: azure-sb-topic-sas-contains
+    emits: ContainsSecret
+    description: "A Service Bus topic with active entity-level SAS authorization rules embeds topic-scoped connection-string credentials usable at data-plane without Entra RBAC."
+    match:
+      - [ ?topic, HasPolicy, ?authrule ]
+    where:
+      - "node_type(?topic) == Topic"
+      - "node_type(?authrule) == ResourcePolicy"
+      - "?authrule is a Microsoft.ServiceBus/namespaces/topics/authorizationRules entry with at least one active key"
+      - "topic.parent.namespace.disableLocalAuth != true"
+    emit:
+      source_type: Topic
+      target_type: ConnectionString
+      source: ?topic
+      target: "<SAS ConnectionString node for the topic auth rule>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the topic has at least one auth rule with a non-empty primary
+        or secondary key AND the parent namespace has disableLocalAuth=false. This
+        is a structural credential-existence fact at topic scope. BLOCKED if
+        disableLocalAuth=true. Derives CanReadSecret when paired with topic-level
+        listKeys permission (azure-sb-topic-listkeys).
+      confidence: 0.95
+      derived_from:
+        - "Microsoft.ServiceBus/namespaces/topics/authorizationRules (existence of active rules)"
+      false_positive_note: >-
+        Topic-level SAS keys are scoped to that topic only. This edge asserts
+        the topic STORES SAS credentials at entity scope. Exploitation requires
+        CanReadSecret via topic-level listKeys/action or embedded credentials.
+      narrative: >-
+        Service Bus topic {topic.name} has active SAS authorization rules whose
+        connection strings grant data-plane access scoped to this topic; these
+        connection strings are credentials readable by any principal with the
+        topic-level listKeys action.
+
+  - id: azure-sb-namespace-sas-contains
+    emits: ContainsSecret
+    description: "A Service Bus namespace with active SAS authorization rules embeds connection-string credentials usable at data-plane without Entra RBAC."
+    match:
+      - [ ?namespace, HasPolicy, ?authrule ]
+    where:
+      - "node_type(?namespace) == GenericMessaging"
+      - "node_type(?authrule) == ResourcePolicy"
+      - "?authrule is a Microsoft.ServiceBus/namespaces/authorizationRules entry with at least one active key"
+      - "namespace.disableLocalAuth != true"
+    emit:
+      source_type: GenericMessaging
+      target_type: ConnectionString
+      source: ?namespace
+      target: "<SAS ConnectionString node for the namespace auth rule>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the namespace has at least one auth rule with a non-empty
+        primary or secondary key AND disableLocalAuth is false. This is a
+        structural credential-existence fact, not a read capability. BLOCKED if
+        disableLocalAuth=true (no SAS keys usable). Derives ExposesCredential
+        (via credential-chains) when paired with the listKeys-granted
+        CanReadSecret or when the connection string is found embedded in a
+        consumer's appsettings.
+      confidence: 0.95
+      derived_from:
+        - "Microsoft.ServiceBus/namespaces/authorizationRules (existence of active rules)"
+        - "credential-chains.yaml: ExposesCredential feeds CanImpersonate via CredentialsFor"
+      false_positive_note: >-
+        This edge asserts that the namespace STORES SAS credentials, not that any
+        specific principal can read them. The path to exploitation requires either
+        (a) CanReadSecret via listKeys/action, or (b) the connection string is
+        already embedded in a consumer's appsettings (modeled as ContainsSecret on
+        the consumer by the consumer adapter). Do not conflate the existence of an
+        auth rule with unauthorized access — the rule's keys are protected by ARM
+        RBAC (listKeys action). If disableLocalAuth=true, no SAS keys are active
+        even if auth rules appear in the ARM resource list.
+      narrative: >-
+        Service Bus namespace {namespace.name} has active SAS authorization rules
+        whose connection strings grant data-plane access; these connection strings
+        are credentials that bypass Entra RBAC and are readable by any principal
+        with the listKeys action.
+
+  - id: azure-sb-exposes-credential
+    emits: ExposesCredential
+    description: "A Service Bus namespace with readable SAS keys exposes its connection-string credential to any principal with listKeys access."
+    match:
+      - [ ?principal, CanReadSecret, ?connstr ]
+      - [ ?namespace, ContainsSecret, ?connstr ]
+    where:
+      - "node_type(?namespace) == GenericMessaging"
+      - "node_type(?connstr) == ConnectionString"
+      - "?connstr is a SAS connection string for ?namespace or one of its queues/topics"
+    emit:
+      source_type: GenericMessaging
+      target_type: ConnectionString
+      source: ?namespace
+      target: ?connstr
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when CanReadSecret(principal, connstr) is ACTIVE (listKeys confirmed).
+        Inherits state from the contributing CanReadSecret. Not emitted when
+        disableLocalAuth=true.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "?principal CanReadSecret ?connstr (azure-sb-namespace-listkeys or queue/topic equivalents)"
+        - "?namespace ContainsSecret ?connstr (azure-sb-namespace-sas-contains)"
+        - "credential-chains.yaml: ExposesCredential + CredentialsFor => CanImpersonate"
+      false_positive_note: >-
+        This collapses the ContainsSecret + CanReadSecret pair into an explicit
+        ExposesCredential on the namespace node so that namespace-centric queries
+        surface the credential leak without requiring a two-hop walk. State
+        inherits from the weakest contributor. Do not emit for read-only ARM
+        enumeration (authorizationRules/read) — the key material is only returned
+        by listKeys/action.
+      narrative: >-
+        Service Bus namespace {namespace.name} exposes its SAS connection string
+        {connstr.name} to {principal.name}, who can call listKeys; the connection
+        string is a data-plane credential that bypasses Entra RBAC.
+
+  # ===========================================================================
+  # 6. SAS connection string → data-plane send or receive capability
+  #
+  # CredentialsFor cannot be used here because its target set ([Identity, Data,
+  # ServiceIdentity]) does not include Messaging nodes. Instead, we emit
+  # CanWriteData / CanReadData directly from a principal who holds a SAS
+  # connection string (via CanReadSecret), modeling the data-plane capability
+  # the credential grants. credential-chains is NOT applicable for SAS keys
+  # because SAS authenticates to a data-plane endpoint, not a named identity.
+  # ===========================================================================
+
+  - id: azure-sb-sas-send-writedata
+    emits: CanWriteData
+    description: "Holding a SAS connection string with Send rights (obtained via CanReadSecret/listKeys) grants data-plane send to the scoped namespace/queue/topic — equivalent to the Entra Data Sender role but credential-based."
+    match:
+      - [ ?principal, CanReadSecret, ?connstr ]
+    where:
+      - "node_type(?connstr) == ConnectionString"
+      - "?connstr is a Service Bus SAS connection string whose rights include Send or Manage"
+      - "?entity is the namespace, queue, or topic scoped by the connection string"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: ?principal
+      target: "<queue or topic (Queue/Topic) or namespace (GenericMessaging) scoped by ?connstr>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when CanReadSecret(?principal, ?connstr) is ACTIVE (i.e., listKeys
+        confirmed and disableLocalAuth=false) AND the connection string's rights
+        include 'Send' or 'Manage'. CONDITIONAL if the CanReadSecret contributing
+        edge is CONDITIONAL. A Manage right implicitly includes Send. BLOCKED if
+        disableLocalAuth=true (no SAS active) or if the listKeys action is denied.
+        Scoped to the entity the connection string was issued for: a queue-scoped
+        Send SAS does NOT grant send to other queues or the namespace broadly.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "?principal CanReadSecret ?connstr (azure-sb-namespace-listkeys or queue/topic equivalents)"
+        - "connection string rights array includes 'Send' or 'Manage'"
+        - "messaging-chains.yaml: messaging-publish-triggers-consumer (rule 1) consumes this CanWriteData"
+      false_positive_note: >-
+        Only emit when the rights array contains 'Send' or 'Manage'. A Listen-only
+        SAS key does NOT grant send. A Manage right includes Send implicitly
+        (Manage = Send + Listen + Manage). Honor the scope of the connection string:
+        a queue-scoped Send SAS covers only that queue; a namespace-scoped Send SAS
+        covers all queues and topics. If disableLocalAuth=true, no SAS key is active
+        and this edge must not be emitted.
+      narrative: >-
+        {principal.name} obtained a SAS connection string for {target.name} with
+        Send rights (via listKeys); this credential grants data-plane send to
+        {target.name} without Entra RBAC, equivalent to the Data Sender role.
+
+  - id: azure-sb-sas-receive-readdata
+    emits: CanReadData
+    description: "Holding a SAS connection string with Listen rights grants data-plane receive from the scoped queue/subscription — messages may carry secrets."
+    match:
+      - [ ?principal, CanReadSecret, ?connstr ]
+    where:
+      - "node_type(?connstr) == ConnectionString"
+      - "?connstr is a Service Bus SAS connection string whose rights include Listen or Manage"
+      - "?entity is the namespace, queue, or topic subscription scoped by the connection string"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: ?principal
+      target: "<queue or topic subscription (Queue) scoped by ?connstr>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when CanReadSecret(?principal, ?connstr) is ACTIVE AND the connection
+        string's rights include 'Listen' or 'Manage'. Inherits state from the
+        contributing CanReadSecret. BLOCKED if disableLocalAuth=true.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "?principal CanReadSecret ?connstr (azure-sb-namespace-listkeys or queue/topic equivalents)"
+        - "connection string rights array includes 'Listen' or 'Manage'"
+        - "credential-chains.yaml: CanReadData on a source ContainsSecret => can read secrets in messages"
+      false_positive_note: >-
+        Only emit when the rights array contains 'Listen' or 'Manage'. A Send-only
+        SAS key does NOT grant receive. Honor the scope: a topic-scoped Listen SAS
+        does not directly grant receive from a subscription (subscriptions have their
+        own entity path; verify the entityPath in the connection string).
+      narrative: >-
+        {principal.name} obtained a SAS connection string for {target.name} with
+        Listen rights (via listKeys); this credential grants data-plane receive from
+        {target.name} without Entra RBAC; messages received may carry credential
+        material (ContainsSecret chain).
+
+  # ===========================================================================
+  # 7. Data-plane send (→ CanWriteData) — Entra RBAC path
+  # ===========================================================================
+
+  - id: azure-sb-sender-role-writedata
+    emits: CanWriteData
+    description: "Azure Service Bus Data Sender role (or Data Owner) grants data-plane send to a queue or topic; the primary Phase-10 publish primitive fed to messaging-chains."
+    match_effective_permission:
+      action: "Microsoft.ServiceBus/namespaces/messages/send/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Azure Service Bus Data Sender or Data Owner role on the namespace, queue, or topic (or a custom role granting messages/send/action)"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<queue or topic (Queue or Topic node) in the namespace>"
+      permissions:
+        - "Microsoft.ServiceBus/namespaces/messages/send/action"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed at the namespace,
+        resource group, or subscription scope. BLOCKED if a deny assignment
+        covers messages/send/action. When scoped to a specific queue or topic
+        resource, only THAT entity is targeted; a namespace-scope role grants
+        send to ALL queues and topics in the namespace.
+        This CanWriteData feeds messaging-chains rule 1:
+        CanWriteData(p, src) + CanTrigger(src, consumer) => CanTrigger(p, consumer).
+      confidence: 0.97
+      derived_from:
+        - "effective permission: Microsoft.ServiceBus/namespaces/messages/send/action"
+        - "messaging-chains.yaml: messaging-publish-triggers-consumer (rule 1)"
+      false_positive_note: >-
+        The Azure Service Bus Data Sender role grants messages/send/action but NOT
+        messages/receive/action or Manage actions. If the role is at namespace
+        scope, all queues and topics in the namespace are targeted (emit one
+        CanWriteData per entity or model the namespace as the target). At queue/topic
+        scope, restrict to the specific entity. Do not conflate namespace-scope send
+        with data-owner (which also grants receive and manage).
+      narrative: >-
+        {principal.name} holds the Azure Service Bus Data Sender role
+        (messages/send/action) on {target.name} and can publish messages to this
+        queue/topic; via messaging-chains, this CanWriteData feeds into
+        CanTrigger(principal, consumer) for any consumer bound to the queue/topic.
+
+  # ===========================================================================
+  # 8. Data-plane receive (→ CanReadData) — Entra RBAC path
+  # ===========================================================================
+
+  - id: azure-sb-receiver-role-readdata
+    emits: CanReadData
+    description: "Azure Service Bus Data Receiver role (or Data Owner) grants data-plane receive from a queue or subscription; messages may carry secrets."
+    match_effective_permission:
+      action: "Microsoft.ServiceBus/namespaces/messages/receive/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Azure Service Bus Data Receiver or Data Owner role on the namespace, queue, or topic/subscription"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<queue or topic subscription (Queue node) in the namespace>"
+      permissions:
+        - "Microsoft.ServiceBus/namespaces/messages/receive/action"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed. BLOCKED if a deny
+        assignment covers messages/receive/action. Scoped analogously to send:
+        namespace-scope role covers all entities; entity-scope role covers only
+        that entity. Feeds credential-chains when the queue ContainsSecret (a
+        message carrying credential material).
+      confidence: 0.97
+      derived_from:
+        - "effective permission: Microsoft.ServiceBus/namespaces/messages/receive/action"
+        - "credential-chains.yaml: CanReadData on a source ContainsSecret => CanReadSecret => CanImpersonate"
+      false_positive_note: >-
+        Data Receiver grants receive but NOT send. Receiving messages from a
+        queue/subscription is a data-read action; escalation only occurs if the
+        messages themselves carry credentials (ContainsSecret on the queue/topic)
+        or if the receiver can use received data to pivot (rare). Do not equate
+        receive rights with trigger rights — a Receiver cannot publish messages
+        and therefore cannot trigger consumers via the messaging chain.
+      narrative: >-
+        {principal.name} holds the Azure Service Bus Data Receiver role
+        (messages/receive/action) on {target.name} and can dequeue/peek messages;
+        if messages carry credential material (ContainsSecret), credential-chains
+        rolls this into CanReadSecret and potentially CanImpersonate.
+
+  # ===========================================================================
+  # 9. Event-source binding (→ CanTrigger) — queue/subscription to consumer
+  # ===========================================================================
+
+  - id: azure-sb-queue-triggers-consumer
+    emits: CanTrigger
+    description: "A confirmed event-source binding from a Service Bus queue to a compute consumer (Azure Function serviceBusTrigger, Logic App connector, Container App KEDA scaler) — the Phase-10 binding fact."
+    match:
+      - [ ?queue, LocatedIn, ?namespace ]
+    where:
+      - "node_type(?queue) == Queue"
+      - "node_type(?namespace) == GenericMessaging"
+      - "a confirmed event-source binding exists routing ?queue to ?consumer (e.g. Function serviceBusTrigger with entityPath=?queue.name, Logic App Service Bus trigger, Container App KEDA azure-servicebus trigger)"
+      - "the binding is active/enabled (Function running and enabled, Logic App enabled, KEDA scaler active)"
+    emit:
+      source_type: Queue
+      target_type: Compute
+      source: ?queue
+      target: "<compute consumer (ServerlessFunction / ContainerService / Workflow) bound to ?queue>"
+      permissions: []
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        ACTIVE when the event-source binding is confirmed present and the consumer
+        is running/enabled (the Function app is in Running state, the Logic App
+        workflow is enabled, the Container App is running with the KEDA scaler
+        active). CONDITIONAL(trigger_exists) when the binding configuration exists
+        but the consumer is stopped or the binding is disabled. CONDITIONAL(
+        service_state) when the consumer app is stopped but CanStart is held by
+        the attacker. This edge is consumed by messaging-chains rule 1 together with
+        CanWriteData(principal, queue) to produce CanTrigger(principal, consumer).
+        messaging-chains rule 2 then collapses CanTrigger(p, consumer) +
+        ExecutesAs(consumer, MI) => CanExecuteAs(p, MI).
+      confidence: 0.95
+      derived_from:
+        - "event-source binding fact (serviceBusTrigger config / Logic App trigger / KEDA spec)"
+        - "messaging-chains.yaml: messaging-publish-triggers-consumer (rule 1) and messaging-trigger-executes-as (rule 2)"
+      false_positive_note: >-
+        Only emit ACTIVE when the binding is confirmed LIVE: the Function app is
+        Running AND the Service Bus trigger extension is enabled AND the
+        entityPath matches the queue name AND the connection setting resolves to
+        the correct namespace. A stopped Function, a disabled trigger binding, or
+        a filter predicate the attacker payload cannot satisfy downgrades to
+        CONDITIONAL. Logic App: the workflow trigger must be enabled; a disabled
+        Logic App workflow is CONDITIONAL(service_state). Container App: the KEDA
+        scaler must be active and the namespace reachable. Do NOT emit for
+        dead-letter-only flows that never invoke compute.
+      narrative: >-
+        Service Bus queue {queue.name} is bound as an event source to consumer
+        {target.name}; messages published to {queue.name} trigger {target.name} to
+        execute with an attacker-influenced payload via the event-source binding.
+
+  - id: azure-sb-topic-sub-triggers-consumer
+    emits: CanTrigger
+    description: "A confirmed event-source binding from a Service Bus topic subscription to a compute consumer — fan-out trigger fact."
+    match:
+      - [ ?subscription, LocatedIn, ?topic ]
+    where:
+      - "node_type(?subscription) == Queue"
+      - "node_type(?topic) == Topic"
+      - "a confirmed event-source binding exists routing ?subscription to ?consumer"
+      - "the binding is active/enabled"
+    emit:
+      source_type: Queue
+      target_type: Compute
+      source: ?subscription
+      target: "<compute consumer bound to ?subscription>"
+      permissions: []
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        ACTIVE when the subscription binding is confirmed live. CONDITIONAL(
+        trigger_exists) when binding exists but consumer is stopped or subscription
+        filters block the attacker's payload. Topic subscriptions may have SQL-style
+        filter rules; if the attacker payload cannot satisfy the filter predicate,
+        the trigger is BLOCKED or CONDITIONAL(condition_expression). inherit_weakest
+        with the contributing CanTrigger/CanWriteData from the topic fan-out.
+      confidence: 0.92
+      derived_from:
+        - "event-source binding fact (topic subscription binding)"
+        - "messaging-chains.yaml: messaging-publish-triggers-consumer (rule 1) — CanWriteData(p, topic) + CanTrigger(sub, consumer) => CanTrigger(p, consumer)"
+      false_positive_note: >-
+        Topic subscriptions may have SQL-filter or correlation-filter rules that
+        restrict which messages reach the subscriber. An attacker who can publish
+        to the topic but whose payload does not satisfy the subscription filter
+        will NOT trigger the consumer — downgrade to CONDITIONAL(condition_expression)
+        or BLOCKED. For CanWriteData(principal, topic), note that sending to the
+        TOPIC is sufficient (the subscription filter is evaluated server-side);
+        the attacker need only craft a payload that passes the filter.
+      narrative: >-
+        Service Bus topic subscription {subscription.name} is bound as an event
+        source to consumer {target.name}; messages published to the parent topic
+        that match the subscription filter trigger {target.name} to execute.
+
+  # ===========================================================================
+  # 10. Auto-forwarding (EXPLICIT RULE ONLY — see explicit_rules section)
+  # ===========================================================================
+  # Auto-forwarding is modeled as an explicit rule (azure-sb-forwardto-trigger)
+  # that emits Queue->Queue CanTrigger facts from the forwardTo property.
+  # The messaging-chains linchpin then propagates these into triggers on consumers
+  # bound to the downstream entity. No derived rule is needed; the explicit
+  # Queue->Queue trigger is the normalized fact that chains through.
+
+  # ===========================================================================
+  # 11. Auth rules write → CanModifyConfiguration (create rogue SAS rule)
+  # ===========================================================================
+
+  - id: azure-sb-authruleswrite-modifycfg
+    emits: CanModifyConfiguration
+    description: "Write access to Service Bus authorization rules allows creating a new Send-capable SAS rule, then calling listKeys to extract a connection string — a two-step credential escalation."
+    match_effective_permission:
+      any_of:
+        - action: "Microsoft.ServiceBus/namespaces/authorizationRules/write"
+          scope_type: "resource|resourceGroup|subscription"
+        - action: "Microsoft.ServiceBus/namespaces/queues/authorizationRules/write"
+          scope_type: "resource|resourceGroup|subscription|queue"
+        - action: "Microsoft.ServiceBus/namespaces/topics/authorizationRules/write"
+          scope_type: "resource|resourceGroup|subscription|topic"
+    where:
+      - "principal effectively holds the authorizationRules/write action at the relevant scope"
+    emit:
+      source_type: Identity
+      target_type: GenericMessaging
+      source: "<principal>"
+      target: "<Service Bus namespace (GenericMessaging)>"
+      permissions:
+        - "Microsoft.ServiceBus/namespaces/authorizationRules/write"
+        - "Microsoft.ServiceBus/namespaces/queues/authorizationRules/write"
+        - "Microsoft.ServiceBus/namespaces/topics/authorizationRules/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the write action is confirmed. The attacker can create a new
+        auth rule with arbitrary rights (Send/Listen/Manage) and then call
+        listKeys on it (if they also hold listKeys/action) or wait for the rule's
+        connection string to be used. Pairing this CanModifyConfiguration with
+        azure-sb-namespace-listkeys (CanReadSecret) gives the full two-step
+        escalation: write a Send rule, call listKeys, send messages, trigger
+        consumers. BLOCKED if a deny assignment covers authorizationRules/write.
+      confidence: 0.95
+      derived_from:
+        - "effective permission: Microsoft.ServiceBus/namespaces/authorizationRules/write (or queue/topic equivalent)"
+        - "can-execute-as.yaml: execute-as-via-config-identity-swap pattern (config change enabling CanReadSecret)"
+      false_positive_note: >-
+        authorizationRules/write alone does NOT grant the new rule's connection
+        string — the attacker still needs listKeys/action to extract it.
+        Without listKeys, the created rule's key is inaccessible from ARM read.
+        However, if the attacker already holds listKeys/action at the namespace
+        scope, creating a new rule with Send rights and calling listKeys completes
+        the credential escalation in two steps. Model this as CanModifyConfiguration
+        → CanReadSecret chain (not a direct CanReadSecret). If the namespace has
+        disableLocalAuth=true, newly created auth rules are non-functional —
+        downgrade to POTENTIAL or do not emit.
+      narrative: >-
+        {principal.name} can create or overwrite Service Bus authorization rules
+        (authorizationRules/write); by creating a new rule with Send rights and
+        calling listKeys, the attacker obtains a SAS connection string that grants
+        data-plane send access without existing Entra RBAC on the data plane.
+
+  # ===========================================================================
+  # 12. Network rules write → CanModifyConfiguration (public access bypass)
+  # ===========================================================================
+
+  - id: azure-sb-networkruleswrite-modifycfg
+    emits: CanModifyConfiguration
+    description: "Write access to the namespace network rule set allows disabling the default deny action or removing IP/VNet filters, opening the data-plane to previously blocked sources."
+    match_effective_permission:
+      action: "Microsoft.ServiceBus/namespaces/networkRuleSets/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds networkRuleSets/write at the namespace scope"
+      - "the namespace has a non-trivially restrictive network rule set (defaultAction=Deny with IP or VNet rules, OR publicNetworkAccess=Disabled)"
+    emit:
+      source_type: Identity
+      target_type: GenericMessaging
+      source: "<principal>"
+      target: "<Service Bus namespace>"
+      permissions:
+        - "Microsoft.ServiceBus/namespaces/networkRuleSets/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the write action is confirmed and the current network rule set
+        is restrictive (either defaultAction=Deny or publicNetworkAccess=Disabled).
+        The attacker can set defaultAction=Allow to open the namespace to all IPs,
+        or add their source IP to the allowed list. Only meaningful when the
+        network rules actually restrict access; if the namespace is already
+        publicly open (defaultAction=Allow), this edge adds no attack value —
+        do not emit. BLOCKED if a deny assignment covers networkRuleSets/write.
+      confidence: 0.85
+      derived_from:
+        - "effective permission: Microsoft.ServiceBus/namespaces/networkRuleSets/write"
+        - "can-execute-as.yaml: execute-as-via-config-identity-swap (CanModifyConfiguration unlocking a previously gated path)"
+      false_positive_note: >-
+        Only emit when the network rule set is meaningfully restrictive and the
+        attacker does not already have network access. If the namespace is
+        publicly open (defaultAction=Allow with no IP restrictions), modifying
+        the network rule set provides no additional attack surface. If
+        publicNetworkAccess=Disabled (private-endpoint-only mode), this write can
+        re-enable public access — high-value in that case. Do not equate
+        networkRuleSets/write with data-plane access; it only modifies the
+        network filter, not RBAC or SAS rules.
+      narrative: >-
+        {principal.name} can modify the network rule set of Service Bus namespace
+        {target.name} (networkRuleSets/write); by setting defaultAction=Allow or
+        adding their IP to the allow list, the attacker opens the data-plane AMQP
+        endpoint to their network location, bypassing network-level restrictions.
+
+  # ===========================================================================
+  # 13. Public endpoint exposure (→ ExposedToInternet)
+  # ===========================================================================
+
+  - id: azure-sb-public-endpoint
+    emits: ExposedToInternet
+    description: "A Service Bus namespace with publicNetworkAccess=Enabled and no restrictive IP filter is reachable from the internet; any holder of a valid SAS key or Entra token can connect from any IP."
+    match:
+      - [ ?namespace, LocatedIn, ?resourcegroup ]
+    where:
+      - "node_type(?namespace) == GenericMessaging"
+      - "?namespace.publicNetworkAccess == Enabled (or not set; default is Enabled)"
+      - "?namespace network rule set has defaultAction=Allow (or no restrictive IP/VNet rules)"
+    emit:
+      # source_type omitted: GenericMessaging (Messaging class) is not in
+      # ExposedToInternet.source [Compute, Data, LoadBalancer, PublicEndpoint, Storage].
+      # This is a known schema mismatch for messaging-class nodes; consistent with
+      # aws/sns.yaml which also omits source_type for ExposedToInternet on Topic nodes.
+      target_type: AnonymousIdentity
+      source: ?namespace
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when publicNetworkAccess=Enabled AND the network rule set
+        defaultAction=Allow (no IP or VNet restriction). This is NOT truly
+        anonymous — a valid SAS key or Entra token is required — but the
+        endpoint is REACHABLE from any IP, so any party holding a credential
+        can connect. If defaultAction=Deny with restrictive IP rules, CONDITIONAL(
+        network_reachability). If publicNetworkAccess=Disabled, BLOCKED.
+      confidence: 0.90
+      derived_from:
+        - "namespace.publicNetworkAccess = Enabled"
+        - "networkRuleSets.defaultAction = Allow (or no rules)"
+      false_positive_note: >-
+        Service Bus data-plane endpoints require authentication (SAS key or Entra
+        token); this is NOT an unauthenticated public exposure. The edge models
+        network REACHABILITY, not unauthenticated access. It is high-value when
+        paired with a leaked SAS connection string (CanReadSecret chain) because
+        the leaked credential is then usable from any internet source. If IP
+        firewall rules restrict access to specific CIDR ranges, downgrade to
+        CONDITIONAL(network_reachability). If publicNetworkAccess=Disabled,
+        BLOCKED regardless of the credential state.
+      narrative: >-
+        Service Bus namespace {namespace.name} is reachable from the public
+        internet (publicNetworkAccess=Enabled, defaultAction=Allow); any party
+        holding a valid SAS connection string or Entra token can connect from
+        any IP without needing VPN or private network access.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - disableLocalAuth=true blocks all SAS-based rules (azure-sb-namespace-listkeys,
+#    azure-sb-queue-listkeys, azure-sb-topic-listkeys, azure-sb-namespace-sas-contains,
+#    azure-sb-sas-cred-for-send/receive); emit those with state: BLOCKED.
+#  - A deny assignment covering listKeys/action at the effective scope -> emit
+#    CanReadSecret with state: BLOCKED and denied_by=<deny assignment>.
+#  - publicNetworkAccess=Disabled -> azure-sb-public-endpoint BLOCKED.
+#  - A stopped/disabled consumer (Function app stopped, Logic App disabled,
+#    Container App stopped) -> azure-sb-queue-triggers-consumer CONDITIONAL(service_state).
+#  - A subscription filter predicate the attacker payload cannot satisfy ->
+#    azure-sb-topic-sub-triggers-consumer CONDITIONAL(condition_expression) or BLOCKED.
+#  - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw config -> explicit edges).
+# These emit the structural facts the derived rules above consume.
+# Full implementation belongs in /rules/explicit/azure-servicebus.yaml;
+# noted here for collection design reference.
+explicit_rules:
+
+  - id: azure-sb-queue-node
+    emits: Contains
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ServiceBus/namespaces/queues"
+      field: "id"
+    emit:
+      source_type: GenericMessaging
+      target_type: Queue
+      source: "<parent namespace (GenericMessaging) node>"
+      target: "<queue (Queue) node>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.ServiceBus/namespaces/{ns}/queues"
+      evidence_field: "id"
+      narrative: "Service Bus namespace {source.name} contains queue {target.name}."
+
+  - id: azure-sb-topic-node
+    emits: Contains
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ServiceBus/namespaces/topics"
+      field: "id"
+    emit:
+      source_type: GenericMessaging
+      target_type: Topic
+      source: "<parent namespace (GenericMessaging) node>"
+      target: "<topic (Topic) node>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.ServiceBus/namespaces/{ns}/topics"
+      evidence_field: "id"
+      narrative: "Service Bus namespace {source.name} contains topic {target.name}."
+
+  - id: azure-sb-subscription-node
+    emits: Contains
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ServiceBus/namespaces/topics/subscriptions"
+      field: "id"
+    emit:
+      source_type: Topic
+      target_type: Queue
+      source: "<parent topic (Topic) node>"
+      target: "<topic subscription (Queue) node>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.ServiceBus/namespaces/{ns}/topics/{t}/subscriptions"
+      evidence_field: "id"
+      narrative: "Topic {source.name} contains subscription {target.name}."
+
+  - id: azure-sb-authrule-haspolicy-namespace
+    emits: HasPolicy
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ServiceBus/namespaces/authorizationRules"
+      field: "properties.rights"
+    where:
+      - "properties.rights is non-empty"
+    emit:
+      source_type: GenericMessaging
+      target_type: ResourcePolicy
+      source: "<namespace (GenericMessaging) node>"
+      target: "<auth rule (ResourcePolicy) node>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.ServiceBus/namespaces/{ns}/authorizationRules"
+      evidence_field: "properties.rights"
+      narrative: "Service Bus namespace {source.name} has SAS authorization rule {target.name} with rights {value}."
+
+  - id: azure-sb-forwardto-trigger
+    emits: CanTrigger
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.ServiceBus/namespaces/queues"
+      field: "properties.forwardTo"
+    where:
+      - "properties.forwardTo is non-empty"
+    emit:
+      source_type: Queue
+      target_type: Queue
+      source: "<queue (Queue) node>"
+      target: "<downstream queue/topic named in properties.forwardTo>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.ServiceBus/namespaces/{ns}/queues/{q}"
+      evidence_field: "properties.forwardTo"
+      narrative: "Queue {source.name} has auto-forwarding configured to {target.name} (forwardTo); messages flow transparently to the downstream entity."
+
+  - id: azure-sb-function-trigger-binding
+    emits: CanTrigger
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Web/sites/functions"
+      field: "properties.config.bindings"
+    where:
+      - "a binding entry has type=serviceBusTrigger and direction=in"
+      - "binding.connection resolves to a Service Bus namespace"
+      - "binding.queueName or binding.topicName + subscriptionName identifies the entity"
+    emit:
+      source_type: Queue
+      target_type: ServerlessFunction
+      source: "<queue or topic subscription (Queue) node identified by binding>"
+      target: "<Function app (ServerlessFunction) node>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Web/sites/{app}/functions"
+      evidence_field: "properties.config.bindings[serviceBusTrigger]"
+      narrative: "Service Bus queue/subscription {source.name} triggers Function app {target.name} via a serviceBusTrigger binding."

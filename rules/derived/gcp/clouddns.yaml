@@ -1,0 +1,256 @@
+# GCP Cloud DNS — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:clouddns. Emits ONLY common edge types from schema/edges.yaml.
+#
+# PHASE 8 THEME — networking.
+#
+# Attack surface summary:
+#   (1) EXPOSURE — a dangling CNAME record in a public Cloud DNS zone pointing to
+#       a deprovisioned GCP-managed resource enables subdomain takeover:
+#       ExposedToInternet (source: DNS zone node; target: AnonymousIdentity).
+#   (2) WEAKEN CONTROLS — dns.changes.create (or roles/dns.admin) on a project
+#       lets an attacker create or overwrite any record in any public managed zone
+#       in that project: CanModifyConfiguration (source: Identity; target: DNS zone).
+#       Private zones are addressed in the false_positive_note of Rule 2 (same
+#       permission set, different exploitation precondition).
+#
+# Cloud DNS has NO execution identity — do not emit ExecutesAs.
+# Cloud DNS does not support per-zone resource-based IAM policies; all effective-
+# permission evaluation targets the project (or ancestor) scope.
+#
+# TRANSITIVE REACHABILITY CONSTRAINT:
+#   Composing a spoofed DNS record → TCP connection to attacker-controlled
+#   service → credential theft is the FUTURE network-chains linchpin.
+#   DO NOT derive it here. Emit per-service FACTS only.
+#
+# LINCHPINS CITED (not duplicated):
+#   * can-control.yaml — CanAdminister -> Controls rollup applies to DNS zone
+#     nodes via the "*" target set; not re-derived here.
+#   * can-control-gcp.yaml — GCP-scoped CanEnterProject from CanExecuteAs; not
+#     applicable to Cloud DNS (no execution identity).
+#
+# SCHEMA CONFORMANCE:
+#   ExposedToInternet:
+#     source: [Compute, Data, PublicEndpoint, LoadBalancer, Storage, Messaging, DNS]
+#     target: [AnonymousIdentity]
+#     DNS (Network class) is explicitly included in the declared source set per edges.yaml
+#     line 744. Cloud DNS managed zones are Network nodes (generic_type: DNS). Emitting
+#     ExposedToInternet from a public DNS zone node (source_type: DNS) is SCHEMA-VALID.
+#     The dangling-record exposure (CNAME pointing to a deprovisioned GCP resource) is
+#     conceptually identical to a PublicEndpoint resolving to a missing target; DNS is
+#     the resolution surface enabling the takeover. No schema extension required.
+#   CanModifyConfiguration:
+#     source: [Identity]
+#     target: [Compute, Messaging, Network, "*"]
+#     DNS (Network subtype) qualifies via Network. VALID.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 8-networking
+applies_to: [gcp]
+
+rules:
+
+  # ===========================================================================
+  # RULE 1 — EXPOSURE: dangling CNAME in a public zone -> subdomain takeover
+  # ===========================================================================
+
+  - id: gcp-clouddns-dangling-cname-takeover
+    emits: ExposedToInternet
+    description: >-
+      A CNAME (or ALIAS) resource record set in a public Cloud DNS zone whose
+      target resolves to a GCP-managed FQDN suffix that no longer has a backing
+      resource in collected GCP inventory enables subdomain takeover: an external
+      attacker can claim that resource name and inherit DNS resolution for the
+      dangling hostname.
+    where:
+      - "The managed zone has visibility == 'public'"
+      - "The RRset type is CNAME (or an alias-target A/AAAA record whose value is a GCP-managed FQDN)"
+      - "The CNAME value (rrdatas[0]) ends in a known GCP-claimable suffix: *.appspot.com, *.run.app, *.cloudfunctions.net, *.a.run.app, *.googleapis.com (only storage.googleapis.com sub-domains), *.googleusercontent.com, *.web.app, *.firebaseapp.com, *.cloudstorage.googleapis.com (partial list — verify against current GCP guidance)"
+      - "The backing resource (App Engine app, Cloud Run service, Cloud Functions function, GCS bucket at that hostname, Firebase project) does NOT exist in collected GCP inventory across all projects in scope"
+    emit:
+      source_type: DNS
+      target_type: AnonymousIdentity
+      source: "<public Cloud DNS zone containing the dangling CNAME record>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      state_logic: >-
+        ACTIVE when: (1) the zone is public (visibility == public), AND (2) the CNAME
+        target maps to a known GCP-claimable FQDN suffix, AND (3) the backing resource
+        is confirmed absent from all collected GCP projects.
+        POTENTIAL when the CNAME target project is outside collection scope (absence may
+        be a collection gap rather than true deprovisioning) — downgrade to
+        POTENTIAL(service_state) in that case.
+        Do not emit for private zones (visibility == private): private zone CNAMEs are
+        not internet-resolvable and do not yield external subdomain takeover.
+      derived_from:
+        - "<dns.resourceRecordSets.list: zone + RRset type=CNAME + rrdatas value>"
+        - "<GCP resource inventory cross-reference: target resource not found in any collected project>"
+      false_positive_note: >-
+        Only emit for confirmed GCP-claimable FQDN suffixes. A CNAME pointing to a
+        customer-owned hostname (non-GCP suffix, e.g. *.example.com) is outside GCP's
+        claimable surface and must not trigger this rule. An App Engine service or Cloud
+        Run service that still exists in a project NOT in collection scope looks identical
+        to a deprovisioned resource — always downgrade to POTENTIAL when the target project
+        is uncollected. GCS bucket hostnames (BUCKET.storage.googleapis.com) are claimable
+        only if the bucket name is available; verify against GCS bucket existence checks, not
+        just project scope. Firebase Hosting hostnames (PROJECT.web.app, PROJECT.firebaseapp.com)
+        are claimable if the Firebase project is deprovisioned. Do not emit ACTIVE when
+        collection coverage is incomplete across GCP projects.
+      narrative: >-
+        DNS zone {zone.name} (project {zone.project}) contains a public CNAME record
+        {record.name} pointing to {record.cname_value}, which targets a GCP-managed
+        hostname suffix whose backing resource ({target_resource_type}) was not found in
+        collected GCP inventory. An external attacker can claim that resource name and
+        inherit public DNS resolution for {record.name}, enabling subdomain takeover
+        (content injection, cookie theft, OAuth redirect URI abuse, TLS certificate
+        acquisition via DNS-01 ACME challenge).
+
+  # ===========================================================================
+  # RULE 2 — WEAKEN CONTROLS: dns.changes.create on a project -> record mutation
+  # ===========================================================================
+
+  - id: gcp-clouddns-record-write-public
+    emits: CanModifyConfiguration
+    description: >-
+      A principal holding dns.changes.create (or an equivalent role such as
+      roles/dns.admin, roles/editor, or roles/owner) at the GCP project scope can
+      submit DNS changesets to any public managed zone in that project, overwriting
+      any resource record set — enabling hostname redirect, DNS-01 TLS certificate
+      acquisition, MX record manipulation, and OAuth redirect URI abuse.
+    match_effective_permission:
+      action: "dns.changes.create"
+      resource_scope: "projects/{project}"
+    where:
+      - "Effective permission includes dns.changes.create at the project (or ancestor folder/org) level"
+      - "The target managed zone has visibility == 'public'"
+      - "The binding is not blocked by an IAM deny policy or org policy constraint that restricts dns.changes.create"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal with effective dns.changes.create>"
+      target: "<public Cloud DNS managed zone in the project>"
+      permissions:
+        - "dns.changes.create"
+        - "dns.resourceRecordSets.create"
+        - "dns.resourceRecordSets.update"
+        - "dns.resourceRecordSets.delete"
+      state_logic: >-
+        ACTIVE when the principal's effective IAM policy at the project (or ancestor) scope
+        includes dns.changes.create and no IAM deny policy or org policy constraint blocks
+        it at any level. dns.changes.create is included in roles/dns.admin, roles/editor,
+        and roles/owner; emit for each such binding resolved to the project scope.
+        CONDITIONAL(iam_permission) when an IAM condition expression (e.g. resource tag
+        condition) is attached to the binding and the condition evaluation result is unknown
+        at collection time.
+        BLOCKED when an IAM deny policy (iam.googleapis.com/deny) contains a deny rule
+        covering dns.changes.create for this principal at any scope.
+        Private zones: emit a separate instance with the same permissions but mark state as
+        CONDITIONAL(network_reachability) — exploitation of a private-zone record mutation
+        requires the attacker to have a foothold inside a VPC authorized for the private zone's
+        privateVisibilityConfig.networks list. The CanModifyConfiguration capability itself is
+        ACTIVE (the permission exists), but exploitation is conditional on network position.
+      derived_from:
+        - "<effective IAM binding: principal -> dns.changes.create (or bundled role) at project scope>"
+        - "<dns.managedZones.list: zone visibility=public>"
+      false_positive_note: >-
+        dns.changes.create is project-scoped; a single binding grants access to ALL public
+        managed zones in the project. Emit one CanModifyConfiguration edge per (principal,
+        zone) pair within the project. Do not emit for projects where the principal has the
+        permission at a parent scope without verifying that the project is within that scope's
+        hierarchy. roles/dns.reader grants only dns.managedZones.list and
+        dns.resourceRecordSets.list — it does NOT include dns.changes.create; a reader
+        cannot mutate records. IAM conditions attached to the binding (e.g. resource tag
+        conditions restricting to specific zones) narrow the effective scope — honor them
+        and downgrade to CONDITIONAL(condition_expression) when they cannot be evaluated.
+        Private zones require a VPC foothold for exploitation; this is a network_reachability
+        condition on the exploitation path, not on the permission itself. Emit the edge for
+        private zones but set CONDITIONAL(network_reachability) rather than ACTIVE to
+        accurately reflect the exploitation barrier.
+      narrative: >-
+        {principal.name} holds dns.changes.create at project {project.name} (via
+        {binding.role}) and can submit DNS changesets to public managed zone {zone.name}.
+        This allows creating or overwriting any resource record set in the zone, enabling
+        redirect of hostnames to attacker-controlled infrastructure (phishing, OAuth redirect
+        abuse), DNS-01 TLS certificate acquisition for any name in the zone via a public CA
+        ACME challenge, or MX record manipulation for email interception. Full session
+        capture after redirect requires the FUTURE network-chains linchpin — emit only this
+        record-mutation FACT here.
+
+  # ===========================================================================
+  # RULE 3 — WEAKEN CONTROLS: dns.managedZones.update -> zone network binding modification
+  # ===========================================================================
+
+  - id: gcp-clouddns-zone-network-binding-update
+    emits: CanModifyConfiguration
+    description: >-
+      A principal holding dns.managedZones.update at the GCP project scope can modify
+      the privateVisibilityConfig.networks list for a private managed zone, expanding
+      which VPC networks can resolve the zone. This enables widening the blast radius
+      of a private-zone DNS poisoning attack by adding attacker-controlled VPC networks
+      to the zone's visibility scope (cross-project lateral movement via shared VPC).
+    match_effective_permission:
+      action: "dns.managedZones.update"
+      resource_scope: "projects/{project}"
+    where:
+      - "Effective permission includes dns.managedZones.update at the project (or ancestor folder/org) level"
+      - "The target managed zone has visibility == 'private'"
+      - "The binding is not blocked by an IAM deny policy or org policy constraint that restricts dns.managedZones.update"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal with effective dns.managedZones.update>"
+      target: "<private Cloud DNS managed zone in the project>"
+      permissions:
+        - "dns.managedZones.update"
+      state_logic: >-
+        ACTIVE when the principal's effective IAM policy at the project (or ancestor) scope
+        includes dns.managedZones.update and no IAM deny policy or org policy constraint blocks
+        it at any level. dns.managedZones.update is included in roles/dns.admin and
+        roles/editor; emit for each such binding resolved to the project scope.
+        CONDITIONAL(iam_permission) when an IAM condition expression is attached to the binding.
+        BLOCKED when an IAM deny policy (iam.googleapis.com/deny) covers dns.managedZones.update
+        for this principal at any scope.
+        Only emit for PRIVATE zones; public zones cannot have their visibility scope modified
+        (visibility is immutable once created).
+      derived_from:
+        - "<effective IAM binding: principal -> dns.managedZones.update (or bundled role) at project scope>"
+        - "<dns.managedZones.list: zone visibility=private>"
+      false_positive_note: >-
+        dns.managedZones.update is project-scoped; a single binding grants access to all private
+        managed zones in the project. Emit one CanModifyConfiguration edge per (principal, zone)
+        pair within the project. Do not emit for projects where the principal has the permission
+        at a parent scope without verifying that the project is within that scope's hierarchy.
+        Modifying privateVisibilityConfig affects DNS resolution reachability scope (which VPCs
+        can resolve the zone), not record content. This is a distinct CanModifyConfiguration
+        vector from dns.changes.create (record content mutation). Emit both edges if the
+        principal holds both permissions.
+      narrative: >-
+        {principal.name} holds dns.managedZones.update at project {project.name} and can modify
+        the network visibility configuration for private managed zone {zone.name}. This allows
+        expanding or narrowing which VPC networks can resolve the zone by modifying
+        privateVisibilityConfig.networks[]. An attacker can use this to inject the zone into
+        attacker-controlled shared VPC networks or cross-project VPCs, extending the blast
+        radius of any DNS record poisoning to additional VPCs. Combined with dns.changes.create,
+        this enables full DNS hijack of services across network boundaries.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An IAM deny policy (iam.googleapis.com/deny, denyRules[].deniedPermissions
+#     includes dns.changes.create) at any scope in the principal's resource
+#     hierarchy -> emit gcp-clouddns-record-write-public with state: BLOCKED and
+#     denied_by=<deny policy resource name>.
+#   - An org policy constraint restricting Cloud DNS zone creation or record
+#     management (e.g. a custom org policy) -> BLOCKED if it targets the specific
+#     action.
+#   - DNSSEC enabled on a zone does NOT prevent record mutation via the Cloud DNS
+#     API for a principal with dns.changes.create (DNSSEC protects resolvers from
+#     spoofed responses in transit, not from authorized API changes) — do NOT
+#     downgrade or BLOCK based on DNSSEC status alone.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules that feed structural edges (zone -> RRset
+# containment, private zone -> VPC network attachment) are in
+# /rules/explicit/gcp-clouddns.yaml.
+# ---------------------------------------------------------------------------

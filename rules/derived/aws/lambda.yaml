@@ -1,0 +1,336 @@
+# AWS Lambda — Derived attack-path rules (Phase 4 — compute/serverless)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (ExecutesAs, CanModifyCode, CanModifyConfiguration, CanInvoke, CrossAccountTrust)
+# already lives in /rules/explicit/aws-lambda.yaml; these rules combine those
+# explicit edges with IAM PassRole / trigger facts to derive execution and
+# escalation capabilities.
+#
+# Permissions are the EFFECTIVE actions the permission evaluator must confirm on
+# the given resource scope. State defaults to ACTIVE; an unmet condition yields
+# CONDITIONAL/POTENTIAL; an explicit deny/SCP/boundary yields BLOCKED.
+#
+# Core Lambda escalation invariant: any way to run attacker code in a function
+# (modify code, modify config/env/layer, or create the function) PLUS a way to
+# make it run (direct invoke OR an existing/creatable trigger) yields the
+# function's execution-role credentials -> CanExecuteAs(execution role).
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 4-compute-serverless
+applies_to: [aws]
+
+rules:
+
+  # --- Code control -> execute as execution role ----------------------------
+  - id: aws-lambda-execute-as-via-code
+    emits: CanExecuteAs
+    description: "Replace function code, then run it, to execute as the function's role."
+    match:
+      - [ ?principal, CanModifyCode, ?function ]
+      - [ ?function,  ExecutesAs,    ?role ]
+    where:
+      - "node_type(?function) == ServerlessFunction"
+    optional:
+      - [ ?principal, CanInvoke, ?function ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["lambda:UpdateFunctionCode", "lambda:InvokeFunction?"]
+      conditions: [trigger_exists]
+      state_logic: "if matched(optional[0]) or trigger_exists(?function): ACTIVE else CONDITIONAL(trigger_exists)"
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanModifyCode edge_id>", "<ExecutesAs edge_id>", "<CanInvoke edge_id?>" ]
+      false_positive_note: >-
+        Only ACTIVE if the principal can invoke (lambda:InvokeFunction) OR a trigger
+        already exists (event source mapping / S3 / EventBridge / SNS / URL);
+        otherwise CONDITIONAL(trigger_exists). Do not emit if the code action is
+        scoped to a different function than the one that ExecutesAs the target role.
+      narrative: >-
+        {principal.name} can replace the code of {function.name}
+        (lambda:UpdateFunctionCode), which executes as {role.name}; running it
+        (direct invoke or existing trigger) executes attacker code as {role.name}.
+
+  # --- Config/env/layer injection -> execute as execution role --------------
+  - id: aws-lambda-execute-as-via-config-injection
+    emits: CanExecuteAs
+    description: "Inject code via env/layer/handler config change, then run, as the role."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?function ]
+      - [ ?function,  ExecutesAs,             ?role ]
+    where:
+      - "node_type(?function) == ServerlessFunction"
+    optional:
+      - [ ?principal, CanInvoke, ?function ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["lambda:UpdateFunctionConfiguration", "lambda:InvokeFunction?"]
+      conditions: [trigger_exists]
+      state_logic: "if matched(optional[0]) or trigger_exists(?function): ACTIVE else CONDITIONAL(trigger_exists)"
+      confidence: "min(contributing_confidences) * 0.8"
+      derived_from: [ "<CanModifyConfiguration edge_id>", "<ExecutesAs edge_id>", "<CanInvoke edge_id?>" ]
+      false_positive_note: >-
+        UpdateFunctionConfiguration yields code execution mainly via attacker-controlled
+        layers (requires lambda:PublishLayerVersion / an accessible layer) or by
+        overwriting the handler/runtime; a bare env-var change is weaker (0.8 prior).
+        Requires a run path (invoke or trigger) like the code rule.
+      narrative: >-
+        {principal.name} can change the configuration of {function.name}
+        (lambda:UpdateFunctionConfiguration) to inject an attacker layer/handler,
+        then run it as {role.name}.
+
+  # --- Create a new function bound to a passable role -----------------------
+  - id: aws-lambda-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new Lambda bound to any role passable to lambda, then invoke it."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE lambda:CreateFunction (resource scope covers the new function)"
+      - "?role trust policy allows lambda.amazonaws.com"
+      - "iam:PassRole for ?role permits iam:PassedToService including lambda.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "lambda:CreateFunction", "lambda:InvokeFunction?"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: "if ?role trust policy or iam:PassedToService is unknown/unresolved: POTENTIAL(role_compatibility); elif principal also has lambda:InvokeFunction on the new function: ACTIVE; else CONDITIONAL(trigger_exists)"
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanPassIdentity edge_id>" ]
+      note: >-
+        Modeling consistency: the schema canonical_derivation for CanCreateWorkloadAs
+        is CanDeploy + CanPassIdentity + role_compatible. This rule intentionally folds
+        lambda:CreateFunction (checked in the where-clause) directly as the
+        CanDeploy-equivalent for Lambda rather than emitting a separate CanDeploy edge;
+        no CanDeploy(principal -> Lambda platform) edge exists in the Lambda explicit
+        rules, so graph consumers keying strictly off CanDeploy will not see this path.
+        No permission is hallucinated — this is a deliberate CreateFunction~CanDeploy fold.
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to ec2/ecs does NOT yield
+        Lambda execution. The role MUST trust lambda.amazonaws.com or CreateFunction
+        fails -> downgrade to POTENTIAL when trust is unknown.
+      narrative: >-
+        {principal.name} can pass {role.name} to Lambda and create a function
+        (iam:PassRole + lambda:CreateFunction), then invoke it to execute code as
+        {role.name}.
+
+  # --- Re-point an existing function's execution role -----------------------
+  - id: aws-lambda-attach-role-via-config
+    emits: CanAttachIdentity
+    description: "Swap an existing function's execution role via UpdateFunctionConfiguration."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?function ]
+      - [ ?principal, CanPassIdentity,        ?role ]
+    where:
+      - "node_type(?function) == ServerlessFunction"
+      - "?role trust policy allows lambda.amazonaws.com"
+      - "iam:PassRole for ?role permits iam:PassedToService including lambda.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?function
+      permissions: ["lambda:UpdateFunctionConfiguration", "iam:PassRole"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: "if ?role trust policy or iam:PassedToService is unknown/unresolved: POTENTIAL(role_compatibility); else ACTIVE for the attach capability itself (downstream execution still needs a run path — see note)"
+      derived_from: [ "<CanModifyConfiguration edge_id>", "<CanPassIdentity edge_id>" ]
+      false_positive_note: >-
+        Requires iam:PassRole for the NEW role scoped to lambda.amazonaws.com; when
+        the new role's trust or iam:PassedToService is unknown, downgrade to
+        POTENTIAL(role_compatibility). The attach capability itself is ACTIVE once
+        trust/PassedToService admit lambda, but re-pointing the role only yields
+        privilege once the function actually runs: this edge chains to
+        CanExecuteAs(new role) via aws-lambda-execute-as-via-config-injection only
+        after the role is attached AND a run path (direct invoke or existing/creatable
+        trigger) exists.
+      narrative: >-
+        {principal.name} can re-point {function.name} to run as {role.name}
+        (lambda:UpdateFunctionConfiguration + iam:PassRole to lambda).
+
+  # --- Execution role credentials exposed to running code -------------------
+  - id: aws-lambda-exposes-exec-role-cred
+    emits: ExposesCredential
+    description: "A function leaks its execution-role credentials to any code it runs."
+    match:
+      - [ ?function, ExecutesAs, ?role ]
+    where:
+      - "node_type(?function) == ServerlessFunction"
+    emit:
+      source: ?function
+      target: ?role
+      permissions: []
+      derived_from: [ "<ExecutesAs edge_id>" ]
+      note: >-
+        Lambda injects role creds as env vars and via the runtime credential relay
+        endpoint (AWS_CONTAINER_CREDENTIALS_FULL_URI); NOT IMDS. Any attacker code
+        in the function reads them. This edge only becomes an attack step when
+        combined with a CanModifyCode/Configuration/CanInvoke capability.
+      false_positive_note: >-
+        Not an escalation by itself; it expresses the fact that code-execution in the
+        function equals holding the role's credentials. Path value comes from a
+        contributing execution edge.
+      narrative: >-
+        {function.name} exposes the credentials of its execution role {role.name}
+        to any code running inside it.
+
+  - id: aws-lambda-retrieve-exec-role-token
+    emits: CanRetrieveToken
+    description: "Code running as the function can fetch the execution-role token."
+    match:
+      - [ ?principal, CanExecuteAs, ?role ]
+    where:
+      - "?role is a Lambda execution role (reached via a Lambda CanExecuteAs rule)"
+    emit:
+      source: ?principal
+      target: ?role
+      permissions: []
+      derived_from: [ "<CanExecuteAs edge_id>" ]
+      false_positive_note: >-
+        Redundant with CanExecuteAs for path-finding; emitted so credential-centric
+        queries surface the token-retrieval step. Same state as its CanExecuteAs input.
+      narrative: >-
+        {principal.name}, executing as {role.name} in Lambda, can retrieve the
+        execution-role session token from the runtime credential endpoint.
+
+  # --- Public function URL -> internet exposure -----------------------------
+  - id: aws-lambda-url-public
+    emits: ExposedToInternet
+    description: "Function URL with AuthType NONE + public resource policy is internet-invocable."
+    match:
+      - [ ?function, ExecutesAs, ?role ]
+    where:
+      - "node_type(?function) == ServerlessFunction"
+      - "function has a FunctionUrlConfig with AuthType == NONE"
+      - "resource-based policy allows lambda:InvokeFunctionUrl for Principal '*' with lambda:FunctionUrlAuthType == NONE"
+      - "resource-based policy ALSO allows lambda:InvokeFunction for Principal '*' (typically gated by lambda:InvokedViaFunctionUrl == true) — required for URLs created on/after Oct 2025"
+    emit:
+      target_type: AnonymousIdentity
+      source: ?function
+      target: "<AnonymousIdentity>"
+      permissions: ["lambda:InvokeFunctionUrl", "lambda:InvokeFunction"]
+      conditions: [resource_policy]
+      state_logic: "if resource policy grants BOTH lambda:InvokeFunctionUrl AND lambda:InvokeFunction to Principal '*': ACTIVE; elif only lambda:InvokeFunctionUrl is granted: CONDITIONAL(resource_policy) — a pre-Oct-2025 URL may still be public, but a post-Oct-2025 URL returns 403 without the InvokeFunction grant"
+      false_positive_note: >-
+        AuthType AWS_IAM is NOT public — only NONE plus wildcard-principal policy
+        statements are. As of October 2025 a NONE-auth function URL requires the
+        resource-based policy to grant BOTH lambda:InvokeFunctionUrl AND
+        lambda:InvokeFunction to Principal '*' (the latter usually scoped by the
+        lambda:InvokedViaFunctionUrl condition); URLs created before Oct 2025 may be
+        public with only lambda:InvokeFunctionUrl. Without the lambda:InvokeFunction
+        grant, a post-Oct-2025 URL returns 403 and is NOT internet-invocable ->
+        downgrade to CONDITIONAL/POTENTIAL rather than ACTIVE. An SCP forcing
+        lambda:FunctionUrlAuthType==AWS_IAM makes this BLOCKED. Do not emit for
+        functions with only an AWS_IAM URL.
+      narrative: >-
+        {function.name} is invocable from the public internet via a function URL
+        (AuthType NONE + public resource policy), running as {role.name}.
+
+  # --- Cross-account code control -> account entry --------------------------
+  - id: aws-lambda-cross-account-code
+    emits: CanEnterAccount
+    description: "Cross-account principal that can run code in a function enters this account."
+    match:
+      - [ ?external, CanModifyCode, ?function ]
+      - [ ?function, ExecutesAs,    ?role ]
+    where:
+      - "?external.account != ?function.account"
+      - "resource-based policy or cross-account identity grant permits the code/invoke action"
+    optional:
+      - [ ?external, CanInvoke, ?function ]
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?external
+      target: "<account of ?function>"
+      permissions: ["lambda:UpdateFunctionCode", "lambda:InvokeFunction?"]
+      conditions: [resource_policy, trigger_exists]
+      state_logic: "if resource_policy grants the cross-account code/invoke action AND (matched(optional[0]) or trigger_exists(?function)): ACTIVE else CONDITIONAL(resource_policy, trigger_exists)"
+      derived_from: [ "<CanModifyCode edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: >-
+        Requires the cross-account action to be actually granted (resource policy +
+        the caller's identity policy for cross-account invoke). SourceArn/SourceAccount
+        scoping on AddPermission narrows who qualifies — honor it.
+      narrative: >-
+        {external.name} (account {external.account}) can run code in {function.name}
+        and obtain execution-role {role.name}, gaining a foothold in
+        account {function.account}.
+
+  # --- Roll up to escalation edge -------------------------------------------
+  - id: aws-lambda-escalate-to-role
+    emits: CanEscalateTo
+    description: "Executing as a more-privileged Lambda role is privilege escalation."
+    match:
+      - [ ?principal, CanExecuteAs, ?role ]
+    where:
+      - "?role.privilege_level > ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: []
+      derived_from: [ "<CanExecuteAs edge_id>" ]
+      false_positive_note: >-
+        Only emit when the execution role is strictly more privileged than the caller;
+        a lateral same-privilege role is not escalation. Inherits state from CanExecuteAs.
+      narrative: >-
+        {principal.name} can escalate to {role.name} by executing code in a Lambda
+        function that runs as it.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP/permission boundary denying lambda:UpdateFunctionCode,
+#    lambda:UpdateFunctionConfiguration, lambda:CreateFunction, lambda:InvokeFunction,
+#    or iam:PassRole at the effective scope -> emit the edge with state: BLOCKED and
+#    denied_by=<SCP arn/statement>.
+#  - An SCP requiring lambda:FunctionUrlAuthType == AWS_IAM blocks aws-lambda-url-public.
+#  - An iam:PassRole with iam:PassedToService NOT including lambda.amazonaws.com blocks
+#    aws-lambda-create-workload-as / aws-lambda-attach-role-via-config.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service already exist in
+# /rules/explicit/aws-lambda.yaml (ExecutesAs, CanModifyCode, CanInvoke,
+# CrossAccountTrust). Additional explicit records recommended for full coverage
+# (add to that file, not here):
+explicit_rules:
+
+  - id: aws-lambda-can-modify-configuration
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "lambda:UpdateFunctionConfiguration"
+      resource_type: "AWS::Lambda::Function"
+    emit:
+      source: "<principal>"
+      target: "<function node>"
+      permissions: ["lambda:UpdateFunctionConfiguration"]
+      narrative: "{principal.name} can change configuration of {function.name} (lambda:UpdateFunctionConfiguration)."
+
+  - id: aws-lambda-url-config
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::Lambda::Function", field: "FunctionUrlConfig.AuthType"}
+    emit:
+      source: "<function node>"
+      target: "<function URL config / resource policy>"
+      api_source: "lambda:GetFunctionUrlConfig"
+      evidence_field: "FunctionUrlConfig.AuthType"
+      narrative: "{function.name} has a function URL with AuthType {value}."
+
+  - id: aws-lambda-event-source-trigger
+    emits: CanTrigger
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::Lambda::EventSourceMapping", field: "EventSourceArn"}
+    emit:
+      source: "<event source (queue/stream/topic) node>"
+      target: "<function node>"
+      api_source: "lambda:ListEventSourceMappings"
+      evidence_field: "EventSourceArn"
+      narrative: "{source.name} triggers {function.name} via an event source mapping."

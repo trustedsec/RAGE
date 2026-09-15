@@ -1,0 +1,317 @@
+# AWS EMR — Explicit (Normalization) Rules
+# ---------------------------------------------------------------------------
+# Translates raw EMR config (from DescribeCluster, GetJobRun, DescribeJobRun)
+# into explicit edges representing how workloads are bound to IAM roles.
+# Each rule maps ONE observed API field to ONE explicit edge.
+# Derived rules that combine these facts live in /rules/derived/aws/emr.yaml.
+#
+# API sources (read-only collector permissions):
+#   elasticmapreduce:DescribeCluster
+#   emrserverless:GetJobRun
+#   emrcontainers:DescribeJobRun
+#   elasticmapreduce:DescribeStep
+#   elasticmapreduce:DescribeStudio
+# ---------------------------------------------------------------------------
+
+provider: aws
+applies_to: [aws]
+
+rules:
+
+  # --- ExecutesAs: EMR Cluster → EC2 instance profile (JobFlowRole) -----------
+  - id: aws-emr-executes-as-instance-profile
+    emits: ExecutesAs
+    description: "An EMR cluster and every step/application running on it execute as the cluster's EC2 instance profile (JobFlowRole)."
+    match_record:
+      resource_type: "AWS::EMR::Cluster"
+      field: "Cluster.Ec2InstanceAttributes.IamInstanceProfile"
+    where:
+      - "cluster state is WAITING or RUNNING (not TERMINATED/TERMINATING)"
+    emit:
+      source_type: AnalyticsService
+      target_type: Identity
+      source: "<EMR Cluster>"
+      target: "<JobFlowRole (instance profile role)>"
+      state: ACTIVE
+      conditions: [service_state]
+      api_source: "elasticmapreduce:DescribeCluster"
+      evidence_field: "Cluster.Ec2InstanceAttributes.IamInstanceProfile"
+      false_positive_note: >-
+        Only emit for clusters in WAITING or RUNNING state. Emit CONDITIONAL(service_state)
+        for clusters in BOOTSTRAPPING state (instance profile bound but cluster not ready
+        to accept steps). Do not emit for TERMINATED or TERMINATING clusters.
+      narrative: >-
+        EMR cluster {cluster.name} executes as instance profile role {role.name}; every
+        Hadoop/Spark application and submitted step runs with those credentials, which are
+        retrievable from IMDS (http://169.254.169.254) on any EC2 node in the cluster.
+
+  # --- ExecutesAs: EMR Serverless Job Run → executionRoleArn ------------------
+  - id: aws-emr-serverless-executes-as-exec-role
+    emits: ExecutesAs
+    description: "An EMR Serverless job run executes as the executionRoleArn provided at StartJobRun."
+    match_record:
+      resource_type: "AWS::EMRServerless::JobRun"
+      field: "jobRun.executionRoleArn"
+    where:
+      - "job run state is RUNNING or SUBMITTED"
+    emit:
+      source_type: AnalyticsService
+      target_type: Identity
+      source: "<EMR Serverless Job Run>"
+      target: "<executionRoleArn>"
+      state: ACTIVE
+      conditions: [service_state]
+      api_source: "emrserverless:GetJobRun"
+      evidence_field: "jobRun.executionRoleArn"
+      false_positive_note: >-
+        EMR Serverless uses a credential relay mechanism (not IMDS); the role is only
+        accessible to code running inside the serverless job. The executionRoleArn is
+        explicitly required at StartJobRun — PassRole is always enforced; a missing or
+        denied PassRole prevents submission.
+      narrative: >-
+        EMR Serverless job run {jobrun.name} executes as {role.name} (executionRoleArn
+        supplied at StartJobRun); Spark/Hive applications running inside it hold those
+        credentials via the EMR credential relay endpoint.
+
+  # --- ExecutesAs: EMR on EKS Job Run → job execution role (IRSA) --------------
+  - id: aws-emr-on-eks-executes-as-job-role
+    emits: ExecutesAs
+    description: "An EMR on EKS job run executes as the IAM role bound to the virtual cluster's job execution binding (IRSA)."
+    match_record:
+      resource_type: "AWS::EMRContainers::JobRun"
+      field: "jobRun.executionRoleArn"
+    where:
+      - "virtual cluster exists and job run state is RUNNING or SUBMITTED"
+    emit:
+      source_type: AnalyticsService
+      target_type: Identity
+      source: "<EMR on EKS Job Run>"
+      target: "<job execution role (WorkloadIdentity / Role)>"
+      state: ACTIVE
+      conditions: [service_state]
+      api_source: "emrcontainers:DescribeJobRun"
+      evidence_field: "jobRun.executionRoleArn"
+      false_positive_note: >-
+        The job execution role must have a trust relationship allowing the EKS OIDC
+        provider (IRSA) for the EKS cluster namespace where the virtual cluster pods run.
+        If the IRSA binding is missing or misconfigured, the execution role is not
+        reachable from within the pod.
+      narrative: >-
+        EMR on EKS job run {jobrun.name} executes as {role.name} via the IRSA binding
+        on the EKS virtual cluster; job pods retrieve those credentials via the pod
+        identity/OIDC token exchange.
+
+  # --- CanPassIdentity: iam:PassRole for JobFlowRole (RunJobFlow) ---------------
+  - id: aws-emr-pass-job-flow-role
+    emits: CanPassIdentity
+    description: "iam:PassRole for the EMR instance profile / JobFlowRole, required by RunJobFlow."
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "principal has elasticmapreduce:RunJobFlow"
+      - "iam:PassedToService condition (if any) includes elasticmapreduce.amazonaws.com or ec2.amazonaws.com"
+      - "role trust policy allows ec2.amazonaws.com (instance profile trust)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<JobFlowRole (instance profile role)>"
+      permissions: ["iam:PassRole", "elasticmapreduce:RunJobFlow"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: >-
+        Honor iam:PassedToService and the role ARN scope. A role passable only to
+        lambda.amazonaws.com or ecs-tasks.amazonaws.com cannot serve as a JobFlowRole.
+        The instance profile's trust must allow ec2.amazonaws.com. If the PassedToService
+        condition is absent or includes a wildcard, the constraint is permissive.
+      narrative: >-
+        {principal.name} can pass {role.name} as the EMR instance profile (JobFlowRole)
+        when creating a cluster (iam:PassRole + elasticmapreduce:RunJobFlow); the cluster
+        then executes as {role.name}.
+
+  # --- CanPassIdentity: iam:PassRole for EMR Serverless executionRoleArn -------
+  - id: aws-emr-serverless-pass-exec-role
+    emits: CanPassIdentity
+    description: "iam:PassRole for the EMR Serverless executionRoleArn, required by StartJobRun."
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "principal has emr-serverless:StartJobRun"
+      - "iam:PassedToService condition (if any) includes emr-serverless.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<executionRoleArn>"
+      permissions: ["iam:PassRole", "emr-serverless:StartJobRun"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: >-
+        emr-serverless.amazonaws.com must be present in the PassedToService condition
+        (if set); a role passable only to elasticmapreduce.amazonaws.com or another
+        service cannot be an EMR Serverless executionRoleArn. Without PassRole this
+        job submission fails at the API level.
+      narrative: >-
+        {principal.name} can pass {role.name} as the EMR Serverless execution role
+        (iam:PassRole + emr-serverless:StartJobRun); a submitted job run then executes
+        as {role.name}.
+
+  # --- CanPassIdentity: iam:PassRole for EMR ServiceRole (RunJobFlow) ----------
+  - id: aws-emr-pass-service-role
+    emits: CanPassIdentity
+    description: "iam:PassRole for the EMR ServiceRole (elasticmapreduce.amazonaws.com), required by RunJobFlow."
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "principal has elasticmapreduce:RunJobFlow"
+      - "iam:PassedToService condition (if any) includes elasticmapreduce.amazonaws.com (NOT ec2.amazonaws.com)"
+      - "role trust policy allows elasticmapreduce.amazonaws.com (service principal)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<ServiceRole>"
+      permissions: ["iam:PassRole", "elasticmapreduce:RunJobFlow"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: >-
+        The ServiceRole is required separately from JobFlowRole. Both must be passable
+        for RunJobFlow to succeed. Honor iam:PassedToService — a role passable only to
+        ec2.amazonaws.com or other services cannot serve as the ServiceRole. The trust
+        policy must explicitly allow elasticmapreduce.amazonaws.com.
+      narrative: >-
+        {principal.name} can pass {role.name} as the EMR service control role (iam:PassRole +
+        elasticmapreduce:RunJobFlow); the role is used by the EMR control plane to manage
+        cluster infrastructure and resources.
+
+  # --- CanPassIdentity: iam:PassRole for EMR on EKS job role (StartJobRun) -----
+  - id: aws-emr-on-eks-pass-job-role
+    emits: CanPassIdentity
+    description: "iam:PassRole for the EMR on EKS job execution role, required by emrcontainers:StartJobRun."
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "principal has emr-containers:StartJobRun"
+      - "iam:PassedToService condition (if any) includes emr-containers.amazonaws.com"
+      - "role trust policy allows EKS OIDC provider (IRSA) for the target virtual cluster"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<EMR on EKS job execution role>"
+      permissions: ["iam:PassRole", "emr-containers:StartJobRun"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      false_positive_note: >-
+        emr-containers.amazonaws.com must be in the PassedToService condition (if set).
+        The role's trust must allow the EKS OIDC provider for the target virtual cluster's
+        namespace (IRSA binding). Without this, the pod cannot assume the role even when
+        PassRole succeeds.
+      narrative: >-
+        {principal.name} can pass {role.name} as the EMR on EKS job execution role (iam:PassRole +
+        emr-containers:StartJobRun); a submitted job run then executes as {role.name} via IRSA.
+
+  # --- ExposesCredential: cluster IMDS leaks instance profile creds -----
+  - id: aws-emr-exposes-instance-profile-cred-explicit
+    emits: ExposesCredential
+    description: "Every EC2 node in an EMR cluster exposes the instance profile (JobFlowRole) credentials via the EC2 Instance Metadata Service (IMDS); any code running on the cluster can retrieve them."
+    match_record:
+      resource_type: "AWS::EMR::Cluster"
+      field: "Cluster.Ec2InstanceAttributes.IamInstanceProfile"
+    where:
+      - "cluster state is RUNNING or WAITING"
+    emit:
+      source_type: AnalyticsService
+      target_type: Identity
+      source: "<EMR Cluster>"
+      target: "<JobFlowRole (instance profile role)>"
+      state: ACTIVE
+      conditions: [service_state]
+      api_source: "elasticmapreduce:DescribeCluster"
+      evidence_field: "Cluster.Ec2InstanceAttributes.IamInstanceProfile"
+      false_positive_note: >-
+        This is a structural fact: the IMDS credential-exposure is inherent to EMR
+        EC2 clusters. It is not an escalation by itself — it becomes an attack step
+        when combined with a CanModifyCode/AddJobFlowSteps edge (code gets on the cluster
+        and reads IMDS). Do not BLOCK solely on IMDSv2 — downgrade to
+        CONDITIONAL(condition_expression) only when IMDSv2 hop-limit=1 is confirmed on
+        all nodes. EMR Serverless does NOT use IMDS; this rule does not apply to
+        Serverless job runs.
+      narrative: >-
+        EMR cluster {cluster.name} exposes the credentials of its instance profile role
+        {role.name} via IMDS (http://169.254.169.254) on every EC2 node; any code
+        executing on the cluster (including submitted steps) can retrieve those credentials
+        without additional permissions.
+
+  # --- ExposesCredential: step arguments may leak embedded credentials --------
+  - id: aws-emr-step-args-expose-credential
+    emits: ExposesCredential
+    description: "EMR step arguments (jar args, script args) may contain hardcoded DB passwords, access keys, or connection strings visible via DescribeStep."
+    match_record:
+      resource_type: "AWS::EMR::Step"
+      field: "Step.Config.Args"
+    where:
+      - "step arguments contain patterns matching credential material (access key ID, secret, password flag, connection string)"
+    emit:
+      source_type: Compute
+      target_type: Credential
+      source: "<EMR Step (BatchJob)>"
+      target: "<embedded credential / Credential>"
+      state: ACTIVE
+      conditions: []
+      api_source: "elasticmapreduce:DescribeStep"
+      evidence_field: "Step.Config.Args"
+      false_positive_note: >-
+        Only emit when the argument pattern-matches credential material (e.g.
+        --password, --jdbc-url with embedded credentials, --access-key, etc.).
+        Generic step arguments (script paths, input URIs, output URIs) do not emit
+        this edge. A DescribeStep with no credential-shaped arguments is not a
+        credential exposure.
+      narrative: >-
+        EMR step {step.name} contains credential material in its step arguments
+        (visible via elasticmapreduce:DescribeStep to any principal with that permission
+        on the cluster).
+
+  # --- ContainsResourceReference: EMR Studio workspace S3 backing ------
+  - id: aws-emr-studio-workspace-s3-url
+    emits: ContainsResourceReference
+    description: "S3 URI backing EMR Studio workspace (DefaultS3Location); used to detect notebook-injection attack surface."
+    match_record:
+      resource_type: "AWS::EMR::Studio"
+      field: "Studio.DefaultS3Location"
+    where:
+      - "DefaultS3Location is non-empty"
+    emit:
+      source_type: Data
+      target_type: Storage
+      source: "<EMR Studio (AnalyticsService)>"
+      target: "<S3 object path at DefaultS3Location>"
+      api_source: "elasticmapreduce:DescribeStudio"
+      evidence_field: "Studio.DefaultS3Location"
+      state: ACTIVE
+      narrative: >-
+        EMR Studio {studio.name} stores notebooks and workspace data in S3 path
+        {s3_location}. Anyone who can write to this S3 location can inject arbitrary
+        code into notebooks, which run as the cluster's JobFlowRole or the Studio
+        service role.
+
+  # --- ContainsResourceReference: EMR cluster log URI ---
+  - id: aws-emr-cluster-log-uri
+    emits: ContainsResourceReference
+    description: "S3 URI where EMR cluster logs are written; record as a resource reference for data discovery."
+    match_record:
+      resource_type: "AWS::EMR::Cluster"
+      field: "Cluster.LogUri"
+    where:
+      - "LogUri is non-empty"
+    emit:
+      source_type: AnalyticsService
+      target_type: Storage
+      source: "<EMR Cluster>"
+      target: "<S3 object path at LogUri>"
+      api_source: "elasticmapreduce:DescribeCluster"
+      evidence_field: "Cluster.LogUri"
+      state: ACTIVE
+      narrative: >-
+        EMR cluster {cluster.name} writes logs to S3 path {log_uri}. The logs may
+        contain step arguments, application output, or debug information.

@@ -1,0 +1,134 @@
+# AWS DynamoDB — Explicit normalization rules (Phase 6 — Storage & Databases)
+# ---------------------------------------------------------------------------
+# Explicit edge declarations for DynamoDB. These rules normalize collection data
+# into structural and capability edges. All edges declared here have nature: explicit
+# per the schema requirement that explicit edges must reside in /rules/explicit/.
+#
+# Rules in this file:
+#   - aws-dynamodb-dax-executes-as:        DAX cluster -> IAM role (ExecutesAs)
+#   - aws-dynamodb-cross-account-table-policy: Table with cross-account resource policy
+#   - aws-dynamodb-table-contains-secret:  Tables storing secrets (heuristic + analyst)
+#   - aws-dynamodb-stream-trigger-lambda:  DynamoDB Stream -> Lambda trigger edge
+#
+# All permissions are from AWS Service Authorization Reference for Amazon DynamoDB
+# and related services.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+explicit_rules:
+
+  # ===========================================================================
+  # (1) DAX EXECUTION IDENTITY
+  # ===========================================================================
+
+  - id: aws-dynamodb-dax-executes-as
+    emits: ExecutesAs
+    applies_to: [aws]
+    description: "DAX cluster runs as an IAM role; the cluster makes all DynamoDB calls on behalf of DAX clients using that role's identity."
+    match_record:
+      resource_type: "AWS::DAX::Cluster"
+      field: "IamRoleArn"
+    emit:
+      source_type: Cache
+      target_type: MachineIdentity
+      source: "<DAX Cluster (Cache)>"
+      target: "<IamRoleArn from DAX Cluster>"
+      api_source: "dax:DescribeClusters"
+      evidence_field: "IamRoleArn"
+      narrative: "{dax_cluster.name} executes DynamoDB API calls as {role.name} (DAX cluster IAM role — used for all cache population reads)."
+
+  # ===========================================================================
+  # (2) CREDENTIAL STORAGE (DATA CLASSIFICATION)
+  # ===========================================================================
+
+  - id: aws-dynamodb-table-contains-secret
+    emits: ContainsSecret
+    applies_to: [aws]
+    description: "Tables often hold API keys, credentials, or connection strings. Emit as POTENTIAL on name/tag heuristic; ACTIVE only if analyst-confirmed or extremely strong signal."
+    match_record:
+      resource_type: "AWS::DynamoDB::Table"
+      field: "TableName"
+    where:
+      - "TableName matches heuristic (contains 'credentials', 'secrets', 'api-keys', 'tokens', 'passwords') OR analyst-confirmed ContainsSecret tag exists"
+    emit:
+      source_type: NoSQLDatabase
+      target_type: Secret
+      source: "<DynamoDB Table (NoSQLDatabase)>"
+      target: "<Secret — analyst-confirmed or strong heuristic match (table name/tags)>"
+      api_source: "dynamodb:DescribeTable (tags/name heuristic)"
+      evidence_field: "TableName, Tags"
+      conditions: [analyst_confirmation]
+      state_logic: >-
+        POTENTIAL when table name or tags match heuristics ('credentials', 'secrets',
+        'api-keys', 'tokens', 'passwords'). ACTIVE only when analyst explicitly
+        tags the table with ContainsSecret=true or confirmed secrets were found in
+        a schema/data sample. Do NOT mass-emit ACTIVE for generic matches like 'config'
+        (many config tables hold only application settings, not secrets).
+      narrative: "{table.name} stores secret material (API keys, connection strings, or credentials) as item attributes — reading this table yields credentials usable for further access."
+    false_positive_note: >-
+      Emit as POTENTIAL for name/tag heuristic matches. Avoid mass-emitting ACTIVE
+      on every DynamoDB table that has 'config' in the name (e.g., 'app-config' storing
+      UI settings, not secrets). The heuristic keywords 'credentials', 'secrets', 'api-keys',
+      'tokens', 'passwords' are strong signals but not definitive — only analyst confirmation
+      should emit ACTIVE. Combine with CanReadData + credential-chains:read-secret-yields-identity
+      linchpin for the full escalation path to CanImpersonate.
+
+  # ===========================================================================
+  # (3) CROSS-ACCOUNT TRUST (RESOURCE POLICY)
+  # ===========================================================================
+
+  - id: aws-dynamodb-cross-account-table-policy
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    description: "DynamoDB table resource policy granting principals in a foreign account direct data-plane access without role assumption."
+    match_effective_permission:
+      action: "dynamodb:GetResourcePolicy"
+      resource_type: "AWS::DynamoDB::Table"
+    where:
+      - "resource_policy Principal.AWS field references a foreign AWS account ID (different from table's account)"
+    emit:
+      source_type: NoSQLDatabase
+      target_type: Account
+      source: "<DynamoDB Table (NoSQLDatabase)>"
+      target: "<Foreign AWS Account ID from resource policy Principal.AWS>"
+      permissions: []
+      api_source: "dynamodb:GetResourcePolicy"
+      evidence_field: "Policy.Statement[].Principal.AWS"
+      narrative: "{table.name} resource policy grants principals in account {account.id} direct data-plane access without requiring sts:AssumeRole."
+    false_positive_note: >-
+      Cross-account trust on a DynamoDB table allows foreign-account principals with
+      matching identity-based permissions to read/write the table directly (unlike S3
+      which requires both resource policy AND identity policy in most cases). Verify
+      that the Principal.AWS field names an account ID (e.g., arn:aws:iam::123456789012:root)
+      and not a role/user in the same account (would be same-account access, not cross-account).
+
+  # ===========================================================================
+  # (4) TRIGGER EDGES
+  # ===========================================================================
+
+  - id: aws-dynamodb-stream-trigger-lambda
+    emits: CanTrigger
+    applies_to: [aws]
+    description: "DynamoDB Stream event source mapping causes a Lambda function to be invoked for each batch of stream records."
+    match_record:
+      resource_type: "AWS::Lambda::EventSourceMapping"
+      field: "EventSourceArn"
+    where:
+      - "EventSourceArn matches DynamoDB stream ARN pattern (:table/*/stream/*)"
+    emit:
+      source_type: Messaging
+      target_type: ServerlessFunction
+      source: "<DynamoDB Stream (Messaging) at EventSourceArn>"
+      target: "<Lambda Function (ServerlessFunction) at FunctionArn>"
+      api_source: "lambda:ListEventSourceMappings (filter EventSourceArn contains :table/*/stream/)"
+      evidence_field: "EventSourceArn, FunctionArn"
+      narrative: "{stream.name} DynamoDB stream triggers {lambda.name} via an event source mapping — item writes to the parent table produce stream records that invoke the Lambda function."
+    false_positive_note: >-
+      Emit when an EventSourceMapping exists with state='Enabled' (or check if state is
+      explicitly not disabled/failed). A disabled mapping does not trigger Lambda.
+      Combine with CanWriteData on the parent table for the stream-injection attack path:
+      a principal with CanWriteData on the table can inject malicious items that trigger
+      the Lambda, leading to code execution if the Lambda trusts stream data.

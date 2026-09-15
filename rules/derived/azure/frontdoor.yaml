@@ -1,0 +1,344 @@
+# Azure — Front Door & CDN (Microsoft.Cdn/profiles) — Phase 8 networking rules
+# ---------------------------------------------------------------------------
+# Azure Front Door (AFD) Standard/Premium is Azure's globally distributed Layer-7
+# HTTP/S load balancer and CDN. Every AFD endpoint (*.azurefd.net or a custom
+# domain) is PUBLIC by design — it receives internet traffic at Microsoft's global
+# anycast PoPs and forwards it to an origin group. Origins can be public hostnames
+# or, for AFD Premium, Private Link-backed private endpoints inside a customer VNet.
+#
+# This file emits FACTS about:
+#   (1) EXPOSURE — every enabled AFD endpoint is internet-exposed (ExposedToInternet)
+#       and forwards to its origin (RoutesTo).
+#   (2) PRIVATE CONNECTIVITY — AFD Premium Private Link origins make PaaS resources
+#       reachable from within the customer VNet without internet traversal
+#       (PrivateReachability).
+#   (3) WEAKEN CONTROLS — write access to AFD security policies (WAF detachment) or
+#       origin config (origin replacement) -> CanModifyConfiguration.
+#   (4) ADMINISTRATIVE CONTROL — full profile control -> CanAdminister.
+#
+# Transitive end-to-end CanNetworkReach (AFD + origin + NSG + route composing into
+# end-to-end reachability) is a FUTURE provider-agnostic network-chains linchpin.
+# Do NOT derive it here. Emit per-service FACTS only.
+#
+# Permissions verified against the Azure resource-provider operations reference
+# (Microsoft.Cdn, 2026-09 snapshot) and the Front Door Private Link / WAF docs.
+# Deny assignments override -> BLOCKED. SKU discriminators (AFD vs classic CDN)
+# noted per rule. can-control.yaml is CITED for CanAdminister -> Controls; not
+# duplicated here.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 8-networking
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # SECTION 1 — EXPOSURE: AFD endpoint is internet-facing by design
+  # ===========================================================================
+
+  - id: azure-frontdoor-endpoint-exposed
+    emits: ExposedToInternet
+    description: >-
+      An enabled Azure Front Door endpoint (*.azurefd.net or a custom domain) is
+      reachable from the public internet by design — AFD uses Microsoft's global
+      anycast infrastructure; no explicit public IP is required on the profile.
+      This is derived from the explicit normalization rule azure-frontdoor-endpoint-record.
+    where:
+      - "Microsoft.Cdn/profiles/{profile}/afdEndpoints/{endpoint} with properties.enabledState == 'Enabled'"
+      - "sku.name in ['Standard_AzureFrontDoor', 'Premium_AzureFrontDoor'] (AFD Standard/Premium)"
+      - "OR Microsoft.Cdn/profiles/{profile}/endpoints/{endpoint} with properties.isHttpAllowed == true or isHttpsAllowed == true (Classic CDN, sku.name in [Standard_Microsoft, Standard_Verizon, Standard_Akamai])"
+    emit:
+      source_type: PublicEndpoint
+      target_type: AnonymousIdentity
+      source: "<AFD endpoint node (Microsoft.Cdn/profiles/afdEndpoints or .../endpoints)>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when properties.enabledState == 'Enabled' (AFD Standard/Premium) or
+        isHttpAllowed/isHttpsAllowed == true (Classic CDN), and the endpoint hostname
+        resolves (properties.hostName is present and non-empty).
+        CONDITIONAL(network_reachability) if enabledState is unknown from collected data.
+        Do NOT emit for endpoints with enabledState == 'Disabled'.
+      derived_from: ["azure-frontdoor-endpoint-record"]
+      false_positive_note: >-
+        Verify SKU: Standard_AzureFrontDoor and Premium_AzureFrontDoor are AFD;
+        Standard_Microsoft / Standard_Verizon / Standard_Akamai are Classic CDN. Both
+        are internet-exposed but use different API paths and have different capabilities
+        (AFD Premium supports Private Link origins; Classic CDN does not). A WAF policy
+        linked via securityPolicies does NOT change the public exposure status — the
+        endpoint is still internet-reachable; WAF filters traffic but does not privatize
+        the entry point. Do NOT emit for disabled endpoints or for AFD origins (origins
+        are backends, not entry points; their exposure is separate).
+      narrative: >-
+        AFD endpoint {source.name} ({source.hostName}) is publicly reachable from the
+        internet via Microsoft's anycast CDN network. Any anonymous actor on the internet
+        can send HTTP/S requests to this entry point.
+
+  # ===========================================================================
+  # SECTION 2 — ROUTING: AFD forwards matched requests to origins (RoutesTo fact)
+  # ===========================================================================
+
+  - id: azure-frontdoor-routes-to-origin
+    emits: RoutesTo
+    description: >-
+      An enabled AFD routing rule (route) linking a front door endpoint to an origin
+      group with at least one enabled origin is a RoutesTo fact: the AFD route object
+      (generic_type: Route, provider_type: Microsoft.Cdn/profiles/afdEndpoints/routes)
+      routes matched internet requests to that origin resource.
+      This is derived from the explicit normalization rule azure-frontdoor-origin-record.
+    where:
+      - "Microsoft.Cdn/profiles/{p}/afdEndpoints/{ep}/routes/{route} with properties.enabledState == 'Enabled'"
+      - "the route's originGroup has at least one origin with properties.enabledState == 'Enabled'"
+      - "origin properties.hostName is non-empty (public origin) OR properties.sharedPrivateLinkResource is not null (Private Link origin)"
+    emit:
+      source_type: Route
+      target_type: PublicEndpoint
+      source: "<AFD route node (Route, provider_type: Microsoft.Cdn/profiles/afdEndpoints/routes)>"
+      target: "<origin resource node (PublicEndpoint for public hostname, PrivateEndpoint for PL origin)>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when the route is Enabled AND the origin group contains at least one
+        Enabled, healthy origin. CONDITIONAL(network_reachability) if origin health
+        cannot be confirmed from ARM data alone (health probe state requires runtime data).
+        Do NOT emit for routes with enabledState == 'Disabled' or when the linked origin
+        group has no enabled origins.
+      derived_from: ["azure-frontdoor-origin-record"]
+      false_positive_note: >-
+        The source must be modeled as a Route node (generic_type: Route), NOT a LoadBalancer.
+        Per edges.yaml, RoutesTo source set is [Route, Subnet, TransitGateway]; LoadBalancer
+        is NOT a valid RoutesTo source. The AFD route object (Microsoft.Cdn/profiles/
+        afdEndpoints/routes or Microsoft.Cdn/profiles/endpoints for Classic CDN) is the
+        correct Route-class node. Emit one RoutesTo edge per (enabled-route, enabled-origin)
+        pair. For Classic CDN the route-equivalent is the CDN endpoint itself
+        (Microsoft.Cdn/profiles/endpoints, also modeled as Route for this purpose) pointing
+        to each enabled origin. The target must match RoutesTo's target set: [Network, Subnet].
+        'Network' in edges.yaml represents the abstract Network class; concrete types like
+        PublicEndpoint and PrivateEndpoint (generic_type subtypes within the Network class)
+        are valid RoutesTo targets. An origin with enabledState == 'Disabled' is out of
+        rotation — do not emit RoutesTo for it.
+      narrative: >-
+        AFD route {source.name} (endpoint {endpoint.name}) routes matched internet requests
+        to origin {target.name} ({target.hostName}). Traffic forwarded by this routing rule
+        reaches this backend origin after AFD PoP processing.
+
+  # ===========================================================================
+  # SECTION 3 — PRIVATE CONNECTIVITY: AFD Premium Private Link origin
+  # ===========================================================================
+
+  - id: azure-frontdoor-private-link-origin
+    emits: PrivateReachability
+    description: >-
+      An AFD Premium origin configured with a sharedPrivateLinkResource makes the
+      target PaaS service reachable via a private endpoint inside the customer VNet.
+      A compute foothold in the same VNet as the PE subnet can reach the same service
+      privately (without traversing the internet).
+    where:
+      - "Microsoft.Cdn/profiles sku.name == 'Premium_AzureFrontDoor'"
+      - "origin properties.sharedPrivateLinkResource is not null"
+      - "origin properties.sharedPrivateLinkResource.requestMessage is present (PE request submitted)"
+      - "the Private Endpoint connection on the target resource has status == 'Approved'"
+      - "origin properties.enabledState == 'Enabled'"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<any Compute resource located in the same VNet as the AFD-created private endpoint subnet>"
+      target: "<private endpoint backing the AFD origin (linked resource: App Service, Storage, APIM, etc.)>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): the private endpoint exists and the PE connection
+        is Approved, but actual reachability from a specific Compute source requires that
+        source to be in the same VNet (or a Connected peered VNet with allowVirtualNetworkAccess=true)
+        as the PE subnet, with no NSG blocking it. Emit ACTIVE only when the source is
+        confirmed to be in the same subnet or VNet as the PE.
+        Do NOT emit if the PE connection status is 'Pending' or 'Rejected' — the AFD PL
+        origin is not active until the resource owner Approves the PE connection.
+      derived_from:
+        - "<AFD origin ARM record: properties.sharedPrivateLinkResource>"
+        - "<target resource private endpoint connection: properties.privateLinkServiceConnectionState.status == Approved>"
+      false_positive_note: >-
+        AFD Premium Private Link origin is ONLY available on Premium_AzureFrontDoor SKU.
+        Do NOT emit for Standard_AzureFrontDoor, Standard_Microsoft, Standard_Verizon, or
+        Standard_Akamai profiles. The PE connection approval must be verified on the TARGET
+        resource (e.g., Microsoft.Web/sites/privateEndpointConnections or
+        Microsoft.Storage/storageAccounts/privateEndpointConnections) — the AFD ARM record
+        alone does not confirm approval; confirm via a separate ARM GET on the linked resource.
+        A 'Pending' PE connection means no traffic flows (AFD holds traffic in queue or returns
+        502). PrivateReachability gates network access only; the PaaS resource's own auth
+        (RBAC, SAS, app auth) is still required for data-plane access.
+      narrative: >-
+        AFD Premium profile {afdProfile.name} routes traffic to a Private Link-backed origin
+        ({target.name}) inside VNet {vnet.name}. A compute resource in that VNet can reach
+        the same private service ({linkedService.name}) without traversing the internet, via
+        the AFD-created private endpoint.
+
+  # ===========================================================================
+  # SECTION 4 — WEAKEN CONTROLS: WAF detachment and origin replacement
+  # ===========================================================================
+
+  - id: azure-frontdoor-waf-policy-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to AFD security policies (Microsoft.Cdn/profiles/securityPolicies/write)
+      lets an attacker detach or replace the WAF policy linked to an AFD endpoint,
+      removing bot protection, rate limiting, and custom detection rules from the
+      public entry point.
+    match_effective_permission:
+      action: "Microsoft.Cdn/profiles/securityPolicies/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal>"
+      target: "<AFD security policy node (Microsoft.Cdn/profiles/securityPolicies)>"
+      permissions: ["Microsoft.Cdn/profiles/securityPolicies/write"]
+      conditions: [deny_assignment]
+      state_logic: >-
+        ACTIVE when no deny assignment exists for Microsoft.Cdn/profiles/securityPolicies/write
+        at the relevant scope (resource, resource group, or subscription) — the principal can
+        detach or replace the WAF policy on the linked AFD endpoint immediately.
+        CONDITIONAL(deny_assignment) when deny-assignment coverage cannot be confirmed from
+        collected data. Effect is realized when a new (permissive) WAF policy is linked or
+        the security policy is deleted.
+      derived_from: ["<effective permission record: Microsoft.Cdn/profiles/securityPolicies/write>"]
+      false_positive_note: >-
+        A deny assignment covering Microsoft.Cdn/profiles/securityPolicies/write at the
+        profile, resource-group, or subscription scope blocks this capability -> emit BLOCKED.
+        CDN Contributor (Microsoft.Cdn/profiles/*) includes securityPolicies/write. CDN
+        Endpoint Contributor does NOT include securityPolicies/write — verify the effective
+        role. Detaching the WAF policy weakens protections but does NOT grant the attacker
+        data-plane access to the origin; it is a precondition for exploitation of the origin,
+        not a direct escalation step. Do not conflate with CanModifyPolicy (this modifies
+        network-layer WAF config, not an Azure RBAC/IAM policy).
+      narrative: >-
+        {principal.name} can write AFD security policies on profile {target.name}
+        (Microsoft.Cdn/profiles/securityPolicies/write), enabling them to detach or
+        replace the WAF policy and remove inbound request filtering from the AFD endpoint.
+
+  - id: azure-frontdoor-origin-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to AFD origin configuration (Microsoft.Cdn/profiles/originGroups/origins/write)
+      lets an attacker replace an origin's hostname with an attacker-controlled server,
+      causing AFD to forward real user requests (with authentication headers and session
+      cookies) to attacker infrastructure.
+    match_effective_permission:
+      action: "Microsoft.Cdn/profiles/originGroups/origins/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: PublicEndpoint
+      source: "<principal>"
+      target: "<AFD origin node (Microsoft.Cdn/profiles/originGroups/origins)>"
+      permissions: ["Microsoft.Cdn/profiles/originGroups/origins/write"]
+      state_logic: >-
+        ACTIVE: the principal can replace the origin hostname immediately; AFD begins
+        routing traffic to the new hostname on the next config propagation (typically
+        < 90 seconds for AFD Standard/Premium). Effect is realized when an attacker-
+        controlled hostName is written to the origin.
+      derived_from: ["<effective permission record: Microsoft.Cdn/profiles/originGroups/origins/write>"]
+      false_positive_note: >-
+        A deny assignment covering Microsoft.Cdn/profiles/originGroups/origins/write at
+        the profile, RG, or subscription scope blocks this -> emit BLOCKED. CDN Contributor
+        (Microsoft.Cdn/profiles/*) includes origins/write. CDN Endpoint Contributor does NOT
+        include originGroups/origins/write — origin-group and origins writes are not in that
+        role; verify effective permissions carefully. For Classic CDN, the equivalent is
+        Microsoft.Cdn/profiles/endpoints/origins/write. Replacing the origin redirects live
+        production traffic, including authenticated user requests; this is a high-impact
+        misconfiguration. Honor the scope of the grant: a grant at the specific origin resource
+        scope affects only that origin, not all origins in the profile. Do not emit for
+        read-only roles (CDN Reader).
+      narrative: >-
+        {principal.name} can replace the origin hostname for {target.name}
+        (Microsoft.Cdn/profiles/originGroups/origins/write), redirecting AFD production
+        traffic — including user authentication tokens and session cookies — to an
+        attacker-controlled host.
+
+  # ===========================================================================
+  # SECTION 5 — ADMINISTRATIVE CONTROL
+  # ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# SECTION 6 — NEW: RULE SET / ROUTING RULE MODIFICATION
+# ===========================================================================
+
+  - id: azure-frontdoor-ruleset-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to AFD rule sets and rules (Microsoft.Cdn/profiles/ruleSets/rules/write)
+      lets an attacker inject response headers (including Set-Cookie), perform request
+      redirects to attacker-controlled URLs, and modify URL rewrites — all without
+      touching origins or WAF.
+    match_effective_permission:
+      action: "Microsoft.Cdn/profiles/ruleSets/rules/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: GenericNetwork
+      source: "<principal>"
+      target: "<AFD rule set / routing rule node (Microsoft.Cdn/profiles/ruleSets/rules)>"
+      permissions: ["Microsoft.Cdn/profiles/ruleSets/rules/write"]
+      state_logic: >-
+        ACTIVE: the principal can add/modify AFD routing and rewrite rules immediately.
+        Effect is realized when a rule with header injection or redirect is activated.
+      derived_from: ["<effective permission record: Microsoft.Cdn/profiles/ruleSets/rules/write>"]
+      false_positive_note: >-
+        This is NOT included in CDN Endpoint Contributor's default permission set; requires
+        CDN Contributor (Microsoft.Cdn/profiles/*) or a custom role bundling ruleSets/rules/write.
+        A deny assignment covering Microsoft.Cdn/profiles/ruleSets/rules/write at the profile,
+        RG, or subscription scope blocks this -> emit BLOCKED.
+      narrative: >-
+        {principal.name} can modify AFD routing and rewrite rules
+        (Microsoft.Cdn/profiles/ruleSets/rules/write), enabling header injection,
+        request redirects, and URL rewrites on the CDN endpoint.
+
+# ---------------------------------------------------------------------------
+# SECTION 7 — NEW: WAF POLICY OBJECT MODIFICATION (distinct from securityPolicies link)
+# ===========================================================================
+
+  - id: azure-frontdoor-waf-policy-object-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to the WAF policy object itself (Microsoft.Network/FrontDoorWebApplicationFirewallPolicies/write)
+      lets an attacker modify or delete managed rule sets and custom rules, effectively
+      neutering WAF protections without touching the AFD profile or securityPolicies link.
+    match_effective_permission:
+      action: "Microsoft.Network/FrontDoorWebApplicationFirewallPolicies/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal>"
+      target: "<AFD WAF policy object node (Microsoft.Network/FrontDoorWebApplicationFirewallPolicies)>"
+      permissions: ["Microsoft.Network/FrontDoorWebApplicationFirewallPolicies/write"]
+      conditions: [deny_assignment]
+      state_logic: >-
+        ACTIVE when no deny assignment exists for Microsoft.Network/FrontDoorWebApplicationFirewallPolicies/write
+        at the relevant scope — the principal can modify/delete WAF rules immediately.
+        CONDITIONAL(deny_assignment) when deny-assignment coverage cannot be confirmed.
+      derived_from: ["<effective permission record: Microsoft.Network/FrontDoorWebApplicationFirewallPolicies/write>"]
+      false_positive_note: >-
+        This permission targets the WAF policy object itself (Microsoft.Network/FrontDoorWebApplicationFirewallPolicies),
+        distinct from the AFD securityPolicies link (Microsoft.Cdn/profiles/securityPolicies/write).
+        A principal with FrontDoorWebApplicationFirewallPolicies/write can modify the WAF policy rules and detections
+        directly, even if they do not hold securityPolicies/write. A deny assignment covering this action at the
+        resource, RG, or subscription scope blocks this -> emit BLOCKED.
+      narrative: >-
+        {principal.name} can modify the WAF policy rules and detections
+        (Microsoft.Network/FrontDoorWebApplicationFirewallPolicies/write), enabling
+        them to disable managed rule sets or custom rules directly on the AFD WAF policy.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - Any deny assignment (Azure Blueprint / Managed Application) covering the
+#     relevant Microsoft.Cdn/profiles/* or Microsoft.Network/FrontDoorWebApplicationFirewallPolicies/*
+#     action at the profile, RG, or subscription scope -> emit the edge with state: BLOCKED
+#     and denied_by=<deny assignment id>.
+#   - Azure Policy (deny effect) blocking Microsoft.Cdn/profiles/securityPolicies/write,
+#     Microsoft.Cdn/profiles/originGroups/origins/write, Microsoft.Cdn/profiles/ruleSets/rules/write,
+#     or Microsoft.Network/FrontDoorWebApplicationFirewallPolicies/write -> BLOCKED.
+# ---------------------------------------------------------------------------

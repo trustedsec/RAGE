@@ -1,0 +1,458 @@
+# GCP Certificate Authority Service (CAS / privateca.*) — Phase 5 credential-access rules
+# ---------------------------------------------------------------------------
+# Catalog key gcp:certmanager. Emits ONLY common edges from schema/edges.yaml.
+# Permissions are the EFFECTIVE privateca.* / cloudkms.* actions the permission
+# evaluator must confirm on the given resource scope before the edge is emitted.
+# Verbatim from the CA Service permissions & roles reference
+# (cloud.google.com/certificate-authority-service/docs/reference/permissions-and-roles).
+#
+# A CA pool is a SigningKey node: an issuer whose private key signs caller-supplied
+# certificate requests. There is NO execution role and NO ExecutesAs.
+#
+# Central Phase-5 pivot (CAS instance of the credential-mint chain):
+#   privateca.certificates.create + privateca.caPools.use on a pool
+#     -> CanSignAs(identity -> CA pool)
+#   forge a cert for an arbitrary subject/SAN (GATED by the pool issuancePolicy /
+#     certificate template identityConstraints)
+#     -> CredentialsFor(Certificate -> forged Identity/ServiceAccount/Data)
+#   a downstream trust consumes CAS certs (mTLS mesh / SPIFFE / VPN-LB client-cert /
+#     device trust)
+#     -> CanImpersonate -> CanEscalateTo the forged identity.
+#
+# DOUBLE CONDITIONAL (the core CAS discipline):
+#   - condition_expression: the issuancePolicy / template must ALLOW the target
+#     subject/SAN (allowSubjectPassthrough / allowSubjectAltNamesPassthrough /
+#     permissive celExpression). A pinned policy => forgery BLOCKED/CONDITIONAL.
+#   - trust_relationship: some consumer must TRUST this CA and map the subject to a
+#     principal. A CA nobody trusts => the cert authenticates to nothing.
+#   CanSignAs may be ACTIVE (they can sign SOMETHING); CanImpersonate/CanEscalateTo
+#   stay CONDITIONAL until BOTH gates are confirmed.
+#
+# KMS-backed signing (Enterprise-tier CA over a customer Cloud KMS/HSM key):
+#   the CAS SERVICE AGENT (service-PROJECT_NUMBER@gcp-sa-privateca.iam.gserviceaccount.com),
+#   NOT the caller, signs via cloudkms.cryptoKeyVersions.useToSign. key_permission is
+#   gated on the SERVICE AGENT, never the caller. Do NOT require caller cloudkms.*.
+#
+# State discipline:
+#   - certificates.create + caPools.use present, CA ENABLED -> ACTIVE CanSignAs.
+#   - KMS-backed CA + service-agent useToSign present/unknown -> ACTIVE / CONDITIONAL.
+#   - CA DISABLED / KMS key disabled/destroyed / service-agent grant removed -> BLOCKED.
+#   - VPC-SC perimeter deny / IAM deny policy denying the action -> BLOCKED.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 5-secrets-kms
+service: certmanager
+applies_to: [gcp]
+
+rules:
+
+  # --- Issue a certificate = sign as the CA (core primitive) ----------------
+  - id: gcp-certmanager-can-sign-as
+    emits: CanSignAs
+    description: "privateca.certificates.create + caPools.use lets a principal issue a cert signed by the CA private key."
+    match_effective_permission: {action: "privateca.certificates.create", resource_type: "google.privateca.CaPool"}
+    where:
+      - "principal ALSO has EFFECTIVE privateca.caPools.use on the SAME pool (both are required; both live in roles/privateca.certificateRequester)"
+      - "the pool contains at least one ENABLED CertificateAuthority (state == ENABLED)"
+      - "CA is NOT KMS-backed with an unresolved service-agent grant — for KMS-backed CAs see gcp-certmanager-sign-cmek-gate"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<CA pool node (SigningKey)>"
+      permissions: ["privateca.certificates.create", "privateca.caPools.use"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if both privateca.certificates.create AND privateca.caPools.use resolve
+        on the pool AND the pool has an ENABLED CA;
+        BLOCKED if the CA is DISABLED, or a VPC-SC perimeter / IAM deny denies
+        certificates.create or caPools.use at the effective scope (denied_by=<perimeter/deny>).
+      confidence: "min(contributing_confidences) * 0.97"
+      derived_from: [ "<effective privateca.certificates.create grant>", "<effective privateca.caPools.use grant>" ]
+      false_positive_note: >-
+        REQUIRES BOTH certificates.create AND caPools.use on the SAME pool — a
+        principal with only certificates.create cannot issue. This edge asserts only
+        that the principal can obtain a signature (sign SOMETHING); it does NOT by
+        itself mean arbitrary-subject forgery — that is gated by the pool issuancePolicy
+        / certificate template (see gcp-certmanager-impersonate-via-forged-cert).
+        createForSelf alone (subject == caller) is not this edge's arbitrary-issuance
+        capability. CA must be ENABLED. Grant is per-pool unless held at an ancestor.
+      narrative: >-
+        {principal.name} can issue certificates signed by CA pool {capool.name}
+        (privateca.certificates.create + privateca.caPools.use /
+        roles/privateca.certificateRequester).
+
+  # --- KMS-backed CA: signing done by the CAS service agent -----------------
+  - id: gcp-certmanager-sign-cmek-gate
+    emits: CanSignAs
+    description: "Issue from a KMS-backed CA; the signature is performed by the CAS service agent, not the caller."
+    match_effective_permission: {action: "privateca.certificates.create", resource_type: "google.privateca.CaPool"}
+    where:
+      - "principal ALSO has EFFECTIVE privateca.caPools.use on the SAME pool"
+      - "the target CA is KMS-backed (Enterprise tier over a customer Cloud KMS/HSM key)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<CA pool node (SigningKey)>"
+      permissions: ["privateca.certificates.create", "privateca.caPools.use"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        ACTIVE if the CAS service agent
+        (service-PROJECT_NUMBER@gcp-sa-privateca.iam.gserviceaccount.com) holds
+        cloudkms.cryptoKeyVersions.useToSign on the CA signing key AND the key/version
+        and CA are ENABLED;
+        CONDITIONAL(key_permission) if the service-agent grant or key/CA state is unknown;
+        BLOCKED if the service agent lacks the grant OR the key is DISABLED/DESTROYED
+        OR the CA is DISABLED OR a KMS deny applies.
+      confidence: "min(contributing_confidences) * 0.93"
+      derived_from: [ "<effective privateca.certificates.create grant>", "<effective privateca.caPools.use grant>", "<service-agent KMS useToSign binding>" ]
+      false_positive_note: >-
+        GCP-SPECIFIC: the key_permission gate is on the CAS SERVICE AGENT, NOT the
+        caller. Do NOT require the caller to hold cloudkms.* — a caller with
+        certificates.create + caPools.use issues successfully while the service agent
+        keeps useToSign. Requiring caller KMS access (AWS ACM PCA style) yields false
+        negatives. Downgrade to CONDITIONAL/BLOCKED only on the SERVICE AGENT's grant
+        and the key/CA enabled state.
+      narrative: >-
+        {principal.name} can issue certificates from KMS-backed CA pool {capool.name}
+        (privateca.certificates.create + caPools.use); the CAS service agent (not the
+        caller) signs via cloudkms.cryptoKeyVersions.useToSign on the CA key — issuance
+        holds while the agent retains that grant and the key/CA is enabled.
+
+  # --- Forge an arbitrary subject/SAN -> impersonate (double-gated) ----------
+  - id: gcp-certmanager-impersonate-via-forged-cert
+    emits: CanImpersonate
+    description: "Issue a cert for an attacker-chosen subject/SAN that a downstream trust accepts, impersonating that identity."
+    match:
+      - [ ?principal, CanSignAs, ?capool ]
+    where:
+      - "node_type(?capool) == CaPool (SigningKey)"
+      - "the pool issuancePolicy / bound certificate template ALLOWS the attacker to set the target subject/SAN: identityConstraints.allowSubjectPassthrough OR allowSubjectAltNamesPassthrough is true, OR the celExpression admits it, OR no restricting template is bound"
+      - "a downstream trust consumes CAS-issued certs and maps the forged subject/SAN to ?target (mTLS mesh / SPIFFE-SPIRE / VPN-LB client-cert store / device or workload cert bound to a GCP identity)"
+      - "node_type(?target) in [ServiceAccount, MachineIdentity, ApplicationIdentity]"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<forged identity the consuming trust authenticates>"
+      permissions: ["privateca.certificates.create", "privateca.caPools.use"]
+      conditions: [iam_permission, condition_expression, trust_relationship]
+      state_logic: >-
+        Inherits the CanSignAs state (ACTIVE / CONDITIONAL(key_permission) for KMS-
+        backed / BLOCKED). Then:
+        ACTIVE only if the issuancePolicy/template confirmed permits the target
+        subject/SAN AND a consuming trust is identified;
+        CONDITIONAL(condition_expression) if the issuance policy is unknown/unconfirmed;
+        CONDITIONAL(trust_relationship) if no CAS-cert consumer is identified;
+        BLOCKED if the policy pins the subject (allowSubjectPassthrough=false + no
+        passthrough SAN + restrictive template/celExpression) or the CanSignAs input is BLOCKED.
+      confidence: "min(contributing_confidences) * 0.8"
+      derived_from: [ "<CanSignAs edge_id>", "<pool issuancePolicy / certificate template evidence>", "<downstream CAS-cert trust evidence>" ]
+      false_positive_note: >-
+        DOUBLY CONDITIONAL. (1) Forgery gate: a pool with allowSubjectPassthrough=false
+        / allowSubjectAltNamesPassthrough=false and a restrictive celExpression or bound
+        certificate template PINS the subject — the principal can obtain a cert but NOT
+        for an arbitrary identity; keep CONDITIONAL(condition_expression) until the
+        policy is confirmed permissive. (2) Trust gate: a CAS cert authenticates to
+        nothing unless some system trusts the CA and maps the subject to a principal;
+        default CONDITIONAL(trust_relationship). createForSelf (subject == caller) is
+        NOT impersonation. Only emit a concrete ?target when a consuming trust maps the
+        forgeable subject to it; otherwise emit POTENTIAL or omit.
+      narrative: >-
+        {principal.name} can issue a certificate from {capool.name} for subject/SAN
+        naming {target.name} (issuance policy permits the subject), which a downstream
+        trust consumes to authenticate — impersonating {target.name}.
+
+  # --- The forgeable/issued cert is a credential for its subject -------------
+  - id: gcp-certmanager-cert-credentials-for
+    emits: CredentialsFor
+    description: "A cert signed by the CA authenticates as the subject/SAN it names to a consuming trust."
+    match:
+      - [ ?principal, CanSignAs, ?capool ]
+    where:
+      - "node_type(?capool) == CaPool (SigningKey)"
+      - "the forgeable/issued certificate names a subject/SAN that a consuming trust maps to ?target (identity / service account / data-plane endpoint)"
+      - "node_type(?target) in [Identity, ServiceAccount, ServiceIdentity, Data]"
+    emit:
+      source: "<certificate node (or the forgeable cert the CA would sign)>"
+      target: "<identity / service account / data store the subject/SAN authenticates>"
+      permissions: []
+      conditions: [condition_expression, trust_relationship]
+      state_logic: >-
+        ACTIVE when a concrete cert with the subject/SAN exists AND a consuming trust
+        maps it to ?target;
+        CONDITIONAL(condition_expression, trust_relationship) when this is a forgeable
+        (not-yet-issued) cert gated by the issuance policy and/or the consuming trust is
+        unconfirmed;
+        POTENTIAL when the subject/SAN -> target mapping is unresolved.
+      confidence: "0.7 (heuristic subject->identity mapping) — raise to 0.95 when the consuming trust explicitly maps the SAN (e.g. SPIFFE ID / bound workload identity)"
+      derived_from: [ "<CanSignAs edge_id>", "<subject/SAN -> target trust-mapping evidence>" ]
+      false_positive_note: >-
+        ASSERTION about what a cert authenticates, not an observed session. Zero base
+        weight: value comes only when paired with CanSignAs and a real trust consumer.
+        Only emit a concrete ?target when a consumer maps the subject/SAN to it; if the
+        mapping is unknown, emit POTENTIAL rather than a guessed identity. Do NOT emit
+        CredentialsFor for a cert whose subject is the caller itself (createForSelf).
+      narrative: >-
+        A certificate signed by {capool.name} naming {target.name} in its subject/SAN
+        is a credential for {target.name} wherever that CA is trusted.
+
+  # --- setIamPolicy on the CA pool -> self-grant issuance -------------------
+  - id: gcp-certmanager-set-iam-self-grant
+    emits: CanGrantPermission
+    description: "caPools.setIamPolicy lets a caller bind itself certificateRequester and then issue."
+    match_effective_permission: {action: "privateca.caPools.setIamPolicy", resource_type: "google.privateca.CaPool"}
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<principal (self)>"
+      permissions: ["privateca.caPools.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if caPools.setIamPolicy resolves on the pool; BLOCKED under an IAM deny /
+        org policy / VPC-SC perimeter denying it. Chains to CanSignAs via a self-bound
+        roles/privateca.certificateRequester (which bundles certificates.create +
+        caPools.use).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<effective privateca.caPools.setIamPolicy grant>" ]
+      false_positive_note: >-
+        Escalation primitive: the caller can add a binding granting itself
+        roles/privateca.certificateRequester (or admin) on the pool, then issue. The
+        subsequent forgery is still gated by the pool issuancePolicy; the KMS gate still
+        applies to KMS-backed CAs. setIamPolicy is per-pool unless held at an ancestor.
+      narrative: >-
+        {principal.name} can set the IAM policy of CA pool {capool.name}
+        (privateca.caPools.setIamPolicy) and grant itself certificateRequester, then
+        issue certificates.
+
+  # --- caPools.setIamPolicy -> raw policy write (CanModifyPolicy) ------------
+  - id: gcp-certmanager-set-iam-policy
+    emits: CanModifyPolicy
+    description: "caPools.setIamPolicy writes the pool's IAM allow policy (grant self/others any access)."
+    match_effective_permission: {action: "privateca.caPools.setIamPolicy", resource_type: "google.privateca.CaPool"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<CA pool allow policy in scope>"
+      permissions: ["privateca.caPools.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE if setIamPolicy resolves; BLOCKED under IAM/org/VPC-SC deny."
+      confidence: "min(contributing_confidences) * 0.97"
+      derived_from: [ "<effective privateca.caPools.setIamPolicy grant>" ]
+      false_positive_note: >-
+        Overlaps gcp-certmanager-set-iam-self-grant (the escalation roll-up); this
+        records the raw policy-write capability on the pool's ResourcePolicy. De-dupe on
+        edge_id if both are consumed.
+      narrative: >-
+        {principal.name} can modify the IAM allow policy of CA pool {capool.name}
+        (privateca.caPools.setIamPolicy).
+
+  # --- caPools.update -> loosen issuance policy (arbitrary-subject forgery) --
+  - id: gcp-certmanager-loosen-issuance-policy
+    emits: CanModifyConfiguration
+    description: "caPools.update rewrites the issuance policy / identity constraints, enabling arbitrary-subject forgery."
+    match_effective_permission: {action: "privateca.caPools.update", resource_type: "google.privateca.CaPool"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<CA pool node>"
+      permissions: ["privateca.caPools.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE for the config-write capability if caPools.update resolves; BLOCKED under
+        IAM/org/VPC-SC deny. Its escalation VALUE is realized only when combined with an
+        issuance path: setting identityConstraints.allowSubjectPassthrough /
+        allowSubjectAltNamesPassthrough true (or a permissive celExpression) lifts a
+        constrained CanSignAs to arbitrary-subject forgery.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<effective privateca.caPools.update grant>" ]
+      false_positive_note: >-
+        Config-write, not issuance by itself. Only becomes forgery when the caller also
+        has (or can self-grant) certificates.create + caPools.use. privateca.certificate
+        Templates.update is the equivalent write against a bound template. Not escalation
+        on its own. privateca.certificateAuthorities.update (re-enable a DISABLED CA) is a
+        related config change that restores a BLOCKED issuance path.
+      narrative: >-
+        {principal.name} can update the issuance policy of CA pool {capool.name}
+        (privateca.caPools.update), loosening identity constraints to permit
+        arbitrary-subject certificate forgery.
+
+  # --- CanSignAs completes an execute-as chain (Phase-4 -> Phase-5) ---------
+  - id: gcp-certmanager-sign-via-execute-as
+    emits: CanSignAs
+    description: "A principal that can execute as a workload SA holding certificateRequester can issue certs."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    where:
+      - "?sa has EFFECTIVE privateca.certificates.create AND privateca.caPools.use on ?capool (per-pool or inherited)"
+      - "node_type(?capool) == CaPool (SigningKey)"
+      - "the pool has an ENABLED CA"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<CA pool ?sa can issue from>"
+      permissions: ["privateca.certificates.create", "privateca.caPools.use"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        Inherits state from the CanExecuteAs input; then ACTIVE if ?sa holds both
+        issuance permissions and the CA is ENABLED (non-KMS-backed OR service agent holds
+        useToSign); CONDITIONAL(key_permission) if KMS-backed and the service-agent grant
+        is unknown; BLOCKED if denied by VPC-SC/IAM deny/KMS or the CA is DISABLED.
+      confidence: "min(contributing_confidences) * 0.93"
+      derived_from: [ "<CanExecuteAs edge_id>", "<?sa privateca.certificates.create + caPools.use grants>" ]
+      false_positive_note: >-
+        Requires the WORKLOAD SA (not the principal directly) to hold BOTH issuance
+        permissions on the specific pool. Canonical CanExecuteAs -> CanSignAs completion:
+        once code runs as ?sa, it issues certs via the SA's metadata token. Do not emit if
+        ?sa's grant is scoped to a different pool. The downstream forgery/trust gates still
+        apply on the chained CanImpersonate.
+      narrative: >-
+        {principal.name}, able to execute as {sa.name}, can issue certificates from
+        {capool.name} because {sa.name} holds certificateRequester on it.
+
+  # --- Cross-project entry via cross-project issuance + trusted consumer -----
+  - id: gcp-certmanager-cross-project-forge
+    emits: CanEnterProject
+    description: "A cross-project requester forging a cert a privileged consumer in the CA's project trusts enters that project."
+    match:
+      - [ ?principal, CanImpersonate, ?target ]
+    where:
+      - "?principal.project != ?capool.project (the CanImpersonate was derived from a CanSignAs on a pool in another project)"
+      - "?target has bindings granting privilege in ?capool.project (the forged identity is privileged in the CA's project)"
+    emit:
+      source_type: Identity
+      target_type: Project
+      source: "<principal>"
+      target: "<capool.project>"
+      permissions: ["privateca.certificates.create", "privateca.caPools.use"]
+      conditions: [iam_permission, condition_expression, trust_relationship]
+      state_logic: >-
+        Inherits the CanImpersonate state (already double-gated on issuance policy +
+        trust). ACTIVE only when the cross-project issuance resolves, the subject is
+        forgeable, a consuming trust exists, AND the forged identity is privileged in the
+        CA's project; CONDITIONAL otherwise; BLOCKED if the CanImpersonate input is BLOCKED.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<CanImpersonate edge_id>", "<cross-project pool binding>", "<forged-identity privilege in capool.project>" ]
+      false_positive_note: >-
+        Only cross-boundary when principal and CA pool live in different projects AND the
+        forgeable identity is privileged in the pool's project AND a consumer there trusts
+        the CA. A cross-project certificateRequester binding is the common enabler; honor
+        its condition expressions. Inherits the issuance-policy and trust gates — do not
+        upgrade to ACTIVE while either is unconfirmed.
+      narrative: >-
+        {principal.name} (project {principal.project}) can issue a cert from CA pool
+        {capool.name} in project {capool.project} impersonating {target.name}, which is
+        privileged there — entering project {capool.project}.
+
+  # --- Tenant-wide issuance exposure via allUsers/allAuthenticatedUsers -------
+  - id: gcp-certmanager-public-requester
+    emits: ExposedToTenant
+    description: "A CA-pool binding granting requester/use to allUsers/allAuthenticatedUsers exposes issuance broadly."
+    match_record: {resource_type: "google.privateca.CaPool", field: "iamPolicy.bindings"}
+    where:
+      - "a binding on the pool (or inherited) grants roles/privateca.certificateRequester, roles/privateca.certificateManager, or privateca.caPools.use + privateca.certificates.create to allUsers or allAuthenticatedUsers"
+    emit:
+      source_type: "*"
+      source: "<CA pool>"
+      target: "<Tenant/Organization>"
+      permissions: ["privateca.certificates.create", "privateca.caPools.use"]
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE if the wildcard binding is present and not overridden by an IAM deny / org
+        policy / VPC-SC perimeter; else BLOCKED. Downstream forgery/impersonation still
+        gated by the issuance policy + trust consumer.
+      confidence: "0.9"
+      derived_from: [ "<CA pool iamPolicy binding to allUsers/allAuthenticatedUsers>" ]
+      false_positive_note: >-
+        allAuthenticatedUsers = any Google account (tenant/org-wide), NOT anonymous
+        internet — CAS has no anonymous data plane, so model as ExposedToTenant, never
+        ExposedToInternet. A DOMAIN_RESTRICTED_SHARING org policy or a VPC-SC perimeter
+        can neutralize allUsers/allAuthenticatedUsers -> BLOCKED. Broad issuance is only
+        as dangerous as the pool's issuance policy and the trusts that consume its certs.
+      narrative: >-
+        CA pool {capool.name} grants certificate issuance to any Google-authenticated
+        principal (allUsers/allAuthenticatedUsers bound to
+        roles/privateca.certificateRequester) — tenant-wide cert forgery exposure.
+
+  # --- Escalation roll-up ----------------------------------------------------
+  - id: gcp-certmanager-escalate-via-forged-identity
+    emits: CanEscalateTo
+    description: "Forging a cert that impersonates a strictly more-privileged identity is escalation."
+    match:
+      - [ ?principal, CanImpersonate, ?target ]
+    where:
+      - "?target.privilege_level > ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<forged identity>"
+      permissions: ["privateca.certificates.create", "privateca.caPools.use"]
+      conditions: [iam_permission, condition_expression, trust_relationship]
+      state_logic: >-
+        Inherits the CanImpersonate state (double-gated on the issuance policy and the
+        trust consumer; KMS-backed CAs remain CONDITIONAL(key_permission) until the
+        service-agent grant is confirmed).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanImpersonate edge_id>" ]
+      false_positive_note: >-
+        Only emit when the forged identity is strictly more privileged than the caller;
+        a cert for a same/lower-privilege subject is lateral, not escalation. Inherits
+        the issuance-policy and trust gates from CanImpersonate — never ACTIVE while
+        either is unconfirmed.
+      narrative: >-
+        {principal.name} can escalate to {target.name} by forging a certificate from
+        {capool.name} that a downstream trust accepts as {target.name}.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A VPC Service Controls perimeter denying privateca.googleapis.com (or specifically
+#    certificates.create / caPools.use / caPools.setIamPolicy / caPools.update) for the
+#    caller -> emit the edge with state: BLOCKED and denied_by=<perimeter>.
+#  - An IAM deny policy denying those actions at the effective scope -> BLOCKED.
+#  - CA DISABLED, pool has no ENABLED CA, or root/subordinate cert expired -> issuance
+#    fails -> CanSignAs BLOCKED.
+#  - KMS-backed CA: if the CAS service agent lacks cloudkms.cryptoKeyVersions.useToSign
+#    on the CA key, or the key/version is DISABLED/DESTROYED, issuance fails -> BLOCKED.
+#  - Pinned issuance policy (allowSubjectPassthrough=false + allowSubjectAltNamesPassthrough
+#    =false + restrictive celExpression / bound certificate template) -> forgery of an
+#    arbitrary subject BLOCKED; CanSignAs may still be ACTIVE for the policy-allowed subject.
+#  - A DOMAIN_RESTRICTED_SHARING org policy neutralizes allUsers/allAuthenticatedUsers
+#    requester bindings -> gcp-certmanager-public-requester BLOCKED.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw config -> explicit edges) live in
+# /rules/explicit/gcp-certmanager.yaml (HasPolicy, CanSignAs, CanRead, CanModifyPolicy,
+# CanModifyConfiguration, CanAdminister, CrossProjectTrust, LocatedIn, ContainsResource
+# Reference for the KMS-backed CA key + issuance-policy evidence). They match raw CA
+# Service API records, not edges.
+explicit_rules:
+
+  - id: gcp-certmanager-explicit-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    source_record: {api: "privateca.projects.locations.caPools.getIamPolicy", field: "bindings"}
+    emit: {source: "<CA pool>", target: "<CA pool ResourcePolicy>"}
+
+  - id: gcp-certmanager-explicit-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    source_record: {api: "privateca.projects.locations.caPools.getIamPolicy", field: "bindings[].members"}
+    where: ["a member (user/SA/group) belongs to a different project than the CA pool AND the role grants certificateRequester / caPools.use / certificates.create"]
+    emit: {source: "<capool.project>", target: "<member.project | external identity>"}
+
+  - id: gcp-certmanager-explicit-issuance-policy-ref
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    source_record: {api: "privateca.projects.locations.caPools.get", field: "issuancePolicy | issuancePolicy.identityConstraints | issuancePolicy.baselineValues"}
+    where: ["record the pool issuancePolicy (allowSubjectPassthrough / allowSubjectAltNamesPassthrough / celExpression / allowedIssuanceModes / allowedKeyTypes) — evidence for the forgery condition_expression gate"]
+    emit: {source: "<CA pool>", target: "<issuancePolicy evidence node (drives gcp-certmanager-impersonate-via-forged-cert)>"}
+
+  - id: gcp-certmanager-explicit-kms-key-ref
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    source_record: {api: "privateca.projects.locations.caPools.certificateAuthorities.get", field: "keySpec.cloudKmsKeyVersion | tier"}
+    where: ["CA is KMS-backed (Enterprise tier over a customer Cloud KMS/HSM key); record the key + tier to drive the service-agent key_permission gate for gcp-certmanager-sign-cmek-gate"]
+    emit: {source: "<CertificateAuthority>", target: "<Cloud KMS CryptoKeyVersion referenced by keySpec (signing gate evidence)>"}

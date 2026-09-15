@@ -1,0 +1,845 @@
+# AWS ECR — Derived attack-path rules (Phase 7 — containers & k8s)
+# ---------------------------------------------------------------------------
+# ECR is the supply-chain chokepoint for ECS, EKS, and Lambda container-image
+# workloads. The primary attack surface is the image PUSH: overwriting a mutable
+# tag in a repository causes every downstream workload that re-pulls that tag to
+# execute attacker-controlled layers.
+#
+# LINCHPIN DELEGATION — this file emits SERVICE FACTS; do NOT re-derive the
+# fan-out or escalation roll-ups that the linchpins own:
+#   * container-chains.yaml (rule image-push-poisons-consumers + poisoned-image-
+#     executes-as) — propagates CanModifyCode(principal -> ContainerRegistry) to
+#     CanModifyCode(principal -> each consuming workload), then to CanExecuteAs
+#     the workload's identity. NEVER re-derive that collapse here.
+#   * can-execute-as.yaml (execute-as-via-code-modify) — collapses CanModifyCode +
+#     ExecutesAs -> CanExecuteAs. Not re-derived here.
+#   * can-control.yaml (escalate-via-execute-as) — collapses CanExecuteAs ->
+#     CanEscalateTo when the target identity is more privileged. Not re-derived here.
+#   * credential-chains.yaml — collapses CanReadSecret + CredentialsFor ->
+#     CanImpersonate. Not re-derived here.
+#   * cicd-chains.yaml — handles the build-runner supply-chain leg once container-
+#     chains propagates CanModifyCode to the BuildWorker consumer. Not re-derived.
+#
+# WHAT THIS FILE EMITS:
+#   (1) CanModifyCode(principal -> ContainerRegistry) when push is possible and
+#       tags are mutable. This is the normalized fact container-chains consumes.
+#   (2) CanModifyConfiguration when PutImageTagMutability can flip IMMUTABLE
+#       repos back to MUTABLE (the "mutability unblock" escalation prerequisite).
+#   (3) CanModifyPolicy when SetRepositoryPolicy or DeleteRepositoryPolicy can
+#       rewrite/delete the repository policy to grant additional access (policy-mutation).
+#   (3b) CanModifyPolicy when DeleteRepositoryPolicy can delete and nullify
+#        protective policies (enabling self-grant escalation).
+#   (4) CrossAccountTrust when the repository policy grants push to an external
+#       account — the cross-account supply-chain entry.
+#   (4b) CanModifyCode(external -> repository) from the CrossAccountTrust fact,
+#        bridging cross-account push grants to external principals for container-chains.
+#   (6) CrossAccountTrust for registry-level replication policies that allow external
+#       account repositories to replicate into the victim registry.
+#   (6a) CanModifyConfiguration when PutReplicationConfiguration can route replicated
+#        images to an attacker-controlled destination (supply-chain diversion).
+#   (6b) CanTrigger when an image push emits EventBridge events that trigger
+#        downstream Compute automation (CodePipeline, Lambda, deploy pipelines).
+#   (8) CanReadData (image pull exposes embedded secrets / proprietary code; gated by
+#        kms:Decrypt if KMS-encrypted).
+#   (9) ExposedToInternet when a public ECR repository (AWS::ECR::PublicRepository)
+#       is pull-accessible without authentication, enabling unauthenticated supply-chain
+#       attacks by external/anonymous actors.
+#
+# Permissions are the EFFECTIVE actions the permission evaluator must confirm on
+# the given resource scope. State defaults to ACTIVE unless a condition is unmet
+# (CONDITIONAL/POTENTIAL) or an explicit deny/SCP/boundary applies (BLOCKED).
+#
+# Official docs:
+#   https://docs.aws.amazon.com/AmazonECR/latest/userguide/
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonelasticcontainerregistry.html
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 7-containers-k8s
+applies_to: [aws]
+
+rules:
+
+  # --- 1) Supply-chain push — primary CanModifyCode fact -----------------------
+  # An IAM principal that can push an image to a private ECR repository (PutImage
+  # on the repository, plus the layer-upload prerequisites) can overwrite a mutable
+  # tag and inject code into every downstream consumer. This rule emits the
+  # normalized CanModifyCode(principal -> ContainerRegistry) fact that
+  # container-chains/image-push-poisons-consumers consumes to fan out to workloads.
+  #
+  # PutImage is the manifest-write that creates or overwrites a tag. The Docker push
+  # client also calls BatchCheckLayerAvailability, InitiateLayerUpload, UploadLayerPart,
+  # and CompleteLayerUpload; those are prerequisites, but PutImage is the controlling
+  # action. GetAuthorizationToken is a registry-level prerequisite (always resource: *)
+  # and is checked separately in the where clause.
+  #
+  # IMMUTABILITY GATE: if imageTagMutability == IMMUTABLE, PutImage on an existing
+  # tag is rejected by the service -> the edge is BLOCKED for existing tags. If the
+  # attacker also holds ecr:PutImageTagMutability, the separate rule
+  # aws-ecr-mutability-unblock emits a BLOCKED -> CONDITIONAL upgrade; this rule
+  # does not re-derive that.
+  - id: aws-ecr-push-can-modify-code
+    emits: CanModifyCode
+    description: "An IAM principal with effective ecr:PutImage (+ layer-upload actions) on a repository can push/overwrite a mutable-tag image, injecting attacker code into every consumer that re-pulls that tag."
+    match:
+      - [ ?principal, HasPermission, ?repository ]
+    where:
+      - "node_type(?repository) == ContainerRegistry"
+      - "?repository.provider_type in ['AWS::ECR::Repository', 'AWS::ECR::PublicRepository']"
+      - "effective_permission(?principal, 'ecr:PutImage', ?repository) == true"
+      - "effective_permission(?principal, 'ecr:GetAuthorizationToken', '*') == true"
+      # Gating on layer-upload actions confirms the principal can upload new layers.
+      # PutImage + all three layer-upload actions (Initiate, UploadPart, Complete) are
+      # required for a complete push; however, a principal with PutImage but missing
+      # UploadLayerPart can still reuse already-uploaded layers (BatchCheckLayerAvailability
+      # + CompleteLayerUpload without uploading new parts). Because the controlling
+      # capability is PutImage (overwriting tags) and that enables the supply chain
+      # attack regardless of whether new layers are uploaded, we gate only on
+      # InitiateLayerUpload and CompleteLayerUpload to confirm upload capability.
+      # UploadLayerPart is intentionally omitted — its absence does not block the
+      # supply-chain attack when already-uploaded layers can be reused.
+      - "effective_permission(?principal, 'ecr:InitiateLayerUpload', ?repository) == true"
+      - "effective_permission(?principal, 'ecr:CompleteLayerUpload', ?repository) == true"
+    emit:
+      source_type: Identity
+      target_type: ContainerRegistry
+      source: ?principal
+      target: ?repository
+      permissions:
+        - "ecr:GetAuthorizationToken"
+        - "ecr:BatchCheckLayerAvailability"
+        - "ecr:InitiateLayerUpload"
+        - "ecr:UploadLayerPart"
+        - "ecr:CompleteLayerUpload"
+        - "ecr:PutImage"
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when ?repository.imageTagMutability == MUTABLE and the principal has
+        all push actions (GetAuthorizationToken registry-wide, PutImage + layer-upload
+        actions on the repository ARN) as effective permissions (identity policy OR
+        repository resource policy grant, not denied by SCP or permission boundary).
+        BLOCKED when ?repository.imageTagMutability == IMMUTABLE — existing tags cannot
+        be overwritten; downgrade to CONDITIONAL(image_tag_mutability) if the attacker
+        also holds ecr:PutImageTagMutability (see aws-ecr-mutability-unblock).
+        CONDITIONAL(resource_policy) when push is granted only via the repository
+        resource policy and the principal's identity policy does not independently
+        authorize it (valid but requires the policy to remain in place).
+        BLOCKED when an SCP or permission boundary denies ecr:PutImage or
+        ecr:GetAuthorizationToken on the relevant scope.
+      confidence: 0.95
+      derived_from:
+        - "effective_permission(?principal, ecr:PutImage, ?repository)"
+        - "effective_permission(?principal, ecr:GetAuthorizationToken, *)"
+        - "effective_permission(?principal, ecr:InitiateLayerUpload, ?repository)"
+        - "effective_permission(?principal, ecr:CompleteLayerUpload, ?repository)"
+      false_positive_note: >-
+        PutImage is the controlling action — the mere presence of layer-upload actions
+        without PutImage does NOT constitute CanModifyCode (the manifest is never
+        written). GetAuthorizationToken alone does NOT constitute CanModifyCode.
+        For imageTagMutability == IMMUTABLE repositories, emit state: BLOCKED for
+        existing tags; new (never-pushed) tags can still be created, but ONLY reach
+        consumers whose image reference resolves to that new tag — effectively no
+        consumer is affected unless the consumer's spec changes. Always scope to the
+        exact repository ARN; a wildcard grant on one repo does not imply push to another.
+        Honor SCP / permission boundary denials: a deny on ecr:PutImage at the OU/account
+        level blocks the push path entirely.
+      narrative: >-
+        {principal.name} can push an image to {repository.name} (ecr:PutImage +
+        ecr:GetAuthorizationToken + layer-upload actions). Overwriting a mutable tag
+        injects attacker-controlled layers into every workload that re-pulls that tag
+        (container-chains image-push-poisons-consumers propagates this to each consumer).
+
+  # --- 2) Mutability downgrade unblocks push on previously protected tags -------
+  # If the repository has imageTagMutability == IMMUTABLE, PutImage on existing tags is
+  # blocked. A principal that also holds ecr:PutImageTagMutability can switch the
+  # repository to MUTABLE, unblocking the push. This rule captures that precondition-
+  # removal upgrade: the principal can change the configuration that BLOCKED the push ->
+  # CanModifyConfiguration(principal -> ContainerRegistry) that enables CanModifyCode.
+  # The resulting push CanModifyCode is then CONDITIONAL(image_tag_mutability) until
+  # the mutability change is made.
+  - id: aws-ecr-mutability-unblock
+    emits: CanModifyConfiguration
+    description: "A principal with ecr:PutImageTagMutability can change an IMMUTABLE repository to MUTABLE, unblocking push overwrites on protected tags (prerequisite removal for CanModifyCode)."
+    match:
+      - [ ?principal, HasPermission, ?repository ]
+    where:
+      - "node_type(?repository) == ContainerRegistry"
+      - "?repository.provider_type in ['AWS::ECR::Repository']"
+      - "?repository.imageTagMutability == 'IMMUTABLE'"
+      - "effective_permission(?principal, 'ecr:PutImageTagMutability', ?repository) == true"
+    emit:
+      source_type: Identity
+      target_type: ContainerRegistry
+      source: ?principal
+      target: ?repository
+      permissions:
+        - "ecr:PutImageTagMutability"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective ecr:PutImageTagMutability on the
+        repository (not denied by SCP or boundary). This edge expresses the CAPABILITY
+        to change mutability; the downstream CanModifyCode (aws-ecr-push-can-modify-code)
+        becomes CONDITIONAL(image_tag_mutability) — it is not yet ACTIVE until the
+        mutability change is actually made and a push follows. An SCP requiring
+        ecr:PutImageTagMutability to always return IMMUTABLE (enforcement via config
+        rule / SCP condition) would BLOCK this edge.
+      confidence: 0.90
+      derived_from:
+        - "effective_permission(?principal, ecr:PutImageTagMutability, ?repository)"
+        - "?repository.imageTagMutability == IMMUTABLE"
+      false_positive_note: >-
+        This edge does not by itself yield code execution — it is a configuration
+        change that enables the push path. Emit it as a precursor to CanModifyCode,
+        not as a terminal escalation edge. The escalation consequence requires chaining:
+        this CanModifyConfiguration + aws-ecr-push-can-modify-code (CONDITIONAL) ->
+        ACTIVE after the mutability change -> container-chains fan-out.
+      narrative: >-
+        {principal.name} can change {repository.name} from IMMUTABLE to MUTABLE
+        (ecr:PutImageTagMutability), removing the tag-immutability guard that blocks
+        image push overwrites and enabling the supply-chain push attack path.
+
+  # --- 3) Repository policy self-grant -> CanModifyPolicy ----------------------
+  # A principal that can rewrite the repository policy (ecr:SetRepositoryPolicy) can
+  # add a statement granting itself (or any other principal) push or pull access.
+  # This is the policy-mutation escalation primitive for ECR. Model as CanModifyPolicy
+  # on the ResourcePolicy node; downstream: can-control.yaml / identity-escalation.yaml
+  # will roll up to CanGrantPermission / CanEscalateTo.
+  #
+  # The most dangerous two-step: SetRepositoryPolicy to self-grant PutImage, then
+  # execute aws-ecr-push-can-modify-code. This rule is the explicit normalization
+  # of the first step. The derived-rule engine will then find the second step from
+  # the updated HasPermission facts after the policy change is modeled.
+  - id: aws-ecr-set-policy-can-modify-policy
+    emits: CanModifyPolicy
+    description: "A principal with ecr:SetRepositoryPolicy can rewrite the repository resource policy to grant itself or any other principal push or pull access — policy-mutation escalation prerequisite."
+    match:
+      - [ ?principal, HasPermission, ?repository ]
+    where:
+      - "node_type(?repository) == ContainerRegistry"
+      - "?repository.provider_type in ['AWS::ECR::Repository']"
+      - "effective_permission(?principal, 'ecr:SetRepositoryPolicy', ?repository) == true"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: ?principal
+      target: "<repository policy of ?repository>"
+      permissions:
+        - "ecr:SetRepositoryPolicy"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective ecr:SetRepositoryPolicy on the
+        repository (not denied by SCP or permission boundary). The downstream
+        CanModifyCode (push path) is a SECOND step after the policy is rewritten;
+        emit this edge to capture the policy-mutation capability; the engine will
+        derive CanModifyCode once the self-granted push permission is realized.
+        BLOCKED when an SCP or permission boundary denies ecr:SetRepositoryPolicy.
+      confidence: 0.92
+      derived_from:
+        - "effective_permission(?principal, ecr:SetRepositoryPolicy, ?repository)"
+      false_positive_note: >-
+        SetRepositoryPolicy alone is not CanModifyCode — it is the precursor that
+        enables push by rewriting the policy. The escalation chain requires the
+        additional push permissions after the policy change. The engine will re-evaluate
+        effective permissions after the policy mutation is modeled; if the new policy
+        grants PutImage, aws-ecr-push-can-modify-code will fire. Do not pre-collapse
+        this into CanModifyCode here.
+      narrative: >-
+        {principal.name} can rewrite the resource policy of {repository.name}
+        (ecr:SetRepositoryPolicy) to grant itself or any principal push or pull access,
+        enabling self-grant of the supply-chain push path.
+
+  # --- 3b) Repository policy deletion — removing access controls (CanModifyPolicy) --
+  # A principal with ecr:DeleteRepositoryPolicy can delete the repository policy
+  # entirely, removing all existing resource-based access controls and cross-account
+  # restrictions. This is functionally equivalent to a full policy rewrite —
+  # a principal with only DeleteRepositoryPolicy can nullify protective policies
+  # and self-grant access by later setting a new policy (SetRepositoryPolicy).
+  # Model as CanModifyPolicy on the ResourcePolicy node.
+  - id: aws-ecr-delete-policy-can-modify-policy
+    emits: CanModifyPolicy
+    description: "A principal with ecr:DeleteRepositoryPolicy can delete the repository resource policy, removing all access controls and cross-account restrictions — policy-mutation escalation."
+    match:
+      - [ ?principal, HasPermission, ?repository ]
+    where:
+      - "node_type(?repository) == ContainerRegistry"
+      - "?repository.provider_type in ['AWS::ECR::Repository']"
+      - "effective_permission(?principal, 'ecr:DeleteRepositoryPolicy', ?repository) == true"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: ?principal
+      target: "<repository policy of ?repository>"
+      permissions:
+        - "ecr:DeleteRepositoryPolicy"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective ecr:DeleteRepositoryPolicy on the
+        repository (not denied by SCP or permission boundary). Deleting the policy
+        removes all resource-based access controls; the principal can then set a new
+        policy granting themselves push access (two-step: delete + SetRepositoryPolicy).
+        BLOCKED when an SCP or permission boundary denies ecr:DeleteRepositoryPolicy.
+      confidence: 0.90
+      derived_from:
+        - "effective_permission(?principal, ecr:DeleteRepositoryPolicy, ?repository)"
+      false_positive_note: >-
+        DeleteRepositoryPolicy removes all resource-based controls but does not by
+        itself grant push access — the principal must follow up with SetRepositoryPolicy
+        to add a new grant. The escalation chain is: DeleteRepositoryPolicy (remove
+        protections) + SetRepositoryPolicy (self-grant push) + PutImage. Emit this edge
+        to capture the policy-mutation capability; the engine will derive subsequent
+        escalation steps after the policy delete is modeled and a new policy is set.
+      narrative: >-
+        {principal.name} can delete the resource policy of {repository.name}
+        (ecr:DeleteRepositoryPolicy), removing all existing access controls and
+        cross-account restrictions. This enables a two-step escalation: delete the
+        protective policy, then set a new policy granting push access.
+
+  # --- 4) Cross-account trust — repository policy grants push to external account --
+  # When a repository's resource policy grants ecr:PutImage (+ prerequisites) to a
+  # principal or account other than the repository's own account, that creates a
+  # cross-account supply-chain trust. The external principal can push from their account
+  # into this account's repository, injecting code into workloads running here.
+  # Emit CrossAccountTrust (the explicit trust fact) and the downstream CanModifyCode
+  # on behalf of the external principal.
+  - id: aws-ecr-cross-account-push
+    emits: CrossAccountTrust
+    description: "A repository resource policy grants ecr:PutImage to a principal in another AWS account, creating a cross-account supply-chain push trust."
+    match:
+      - [ ?repository, HasPolicy, ?resource_policy ]
+    where:
+      - "node_type(?repository) == ContainerRegistry"
+      - "?repository.provider_type in ['AWS::ECR::Repository']"
+      - "?resource_policy grants ecr:PutImage (directly or via ecr:*) to a principal whose account != ?repository.account"
+      # The external principal may be a specific ARN (account:role/name), an entire account
+      # (arn:aws:iam::<account>:root), or an org-wide principal (aws:PrincipalOrgID).
+    emit:
+      source_type: ResourcePolicy
+      target_type: ExternalIdentity
+      source: ?resource_policy
+      target: "<external principal / account named in the repository policy>"
+      permissions:
+        - "ecr:PutImage"
+        - "ecr:BatchCheckLayerAvailability"
+        - "ecr:InitiateLayerUpload"
+        - "ecr:UploadLayerPart"
+        - "ecr:CompleteLayerUpload"
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the repository policy statement granting PutImage to the external
+        principal is present, not expired, and not blocked by an SCP in the owning
+        account's organization. CONDITIONAL(resource_policy) when the grant includes
+        a Condition (e.g. aws:SourceArn, aws:PrincipalOrgID, aws:PrincipalTag) that
+        must hold — downgrade to CONDITIONAL(condition_expression) in that case.
+        BLOCKED when an SCP in the owning org denies cross-account ECR push.
+      confidence: 0.92
+      derived_from:
+        - "?repository HasPolicy ?resource_policy (grants ecr:PutImage cross-account)"
+      false_positive_note: >-
+        Cross-account pull (BatchGetImage + GetDownloadUrlForLayer) is NOT a push trust;
+        emit CrossAccountTrust only when PutImage is granted. Validate that the external
+        account-id in the policy statement is distinct from ?repository.account; a policy
+        with Principal '*' but no cross-account implication (e.g. aws:PrincipalAccount
+        condition restricting to same account) does not create a cross-account trust.
+        Honor Condition blocks: aws:PrincipalOrgID restricts to org members, not all
+        external accounts — mark as CONDITIONAL(condition_expression).
+      narrative: >-
+        {resource_policy.name} (the repository policy of {repository.name}) grants
+        ecr:PutImage to {external.name} in account {external.account}, establishing
+        a cross-account push trust. The external principal can push a poisoned image
+        from their account into this repository, injecting attacker code into every
+        workload in account {repository.account} that pulls from this repository
+        (container-chains rolls up the supply-chain paths).
+
+  # --- 4b) Cross-account push bridges to CanModifyCode for external principal -----
+  # When a repository's resource policy grants ecr:PutImage (+ prerequisites) to a
+  # principal in another account, that external principal can push. This rule emits
+  # CanModifyCode(external -> repository) from the CrossAccountTrust fact, bridging
+  # the grant to the capability. This is necessary because aws-ecr-push-can-modify-code
+  # matches HasPermission scoped to the owning account and will not fire for
+  # principals in a foreign account. Container-chains rule image-push-poisons-consumers
+  # requires CanModifyCode(?external, ?repository) as a match clause; without this
+  # rule, cross-account supply-chain paths break in the graph.
+  - id: aws-ecr-cross-account-push-can-modify-code
+    emits: CanModifyCode
+    description: "An external principal granted ecr:PutImage via the repository's resource policy can push images (cross-account supply-chain attack)."
+    match:
+      - [ ?resource_policy, CrossAccountTrust, ?external ]
+    where:
+      - "node_type(?resource_policy) == ResourcePolicy"
+      - "?resource_policy is a policy of a ContainerRegistry (?repository)"
+      - "?resource_policy grants ecr:PutImage (directly or via ecr:*) to ?external"
+      - "?external.account != ?repository.account"
+    emit:
+      source_type: Identity
+      target_type: ContainerRegistry
+      source: ?external
+      target: ?repository
+      permissions:
+        - "ecr:PutImage"
+        - "ecr:BatchCheckLayerAvailability"
+        - "ecr:InitiateLayerUpload"
+        - "ecr:UploadLayerPart"
+        - "ecr:CompleteLayerUpload"
+      conditions: [resource_policy]
+      state_logic: >-
+        Inherit state from the matched CrossAccountTrust. ACTIVE when the resource
+        policy statement granting PutImage to the external principal is present and
+        not blocked by an SCP in the owning account's organization.
+        CONDITIONAL(resource_policy) when the policy includes a Condition gate
+        (aws:SourceArn, aws:PrincipalOrgID, etc.) — the cross-account push is then
+        conditional on those conditions holding.
+        BLOCKED when an SCP denies cross-account ECR push to this external principal.
+      confidence: "min(contributing_confidences) * 0.92"
+      derived_from:
+        - "?resource_policy CrossAccountTrust ?external (from aws-ecr-cross-account-push)"
+        - "?resource_policy grants ecr:PutImage in its statement"
+      false_positive_note: >-
+        This rule bridges the CrossAccountTrust fact to CanModifyCode so that
+        container-chains image-push-poisons-consumers can consume it and fan out to
+        consumers. Do not emit if the policy grants only pull (BatchGetImage +
+        GetDownloadUrlForLayer) without PutImage — that is pull-only trust, not
+        push trust.
+      narrative: >-
+        {external.name} (account {external.account}) is explicitly granted ecr:PutImage
+        to {repository.name} in account {repository.account} via the repository's
+        resource policy. The external principal can push images into this repository,
+        poisoning every workload that re-pulls from it (container-chains propagates
+        this to each consumer in the owning account).
+
+
+  # --- 6) Registry-level replication policy enables cross-account replication -----
+  # A registry-level replication policy (ecr:PutRegistryPolicy / GetRegistryPolicy)
+  # can be configured to allow an external account's repository to replicate images
+  # into the victim account's registry. If the external account's repository is
+  # attacker-controlled, they can then replicate poisoned images into the victim
+  # registry and have downstream workloads pull and execute them.
+  #
+  # NOTE: ECR does not model a separate registry-level node type. Registry-level
+  # policies are properties of the account-scoped ContainerRegistry aggregate.
+  # This rule matches repository nodes and reasons about their account-level
+  # replication policy configuration (fetched via ecr:GetRegistryPolicy or
+  # ecr:DescribeReplicationConfiguration).
+  #
+  # RECOMMENDED: Deploy as an explicit_rule keyed on GetRegistryPolicy API response
+  # that directly records cross-account replication grants, avoiding derived-rule
+  # complexity for registry-level properties that are not modeled as separate nodes.
+  - id: aws-ecr-registry-replication-cross-account-trust
+    emits: CrossAccountTrust
+    description: "A registry-level replication policy allows an external account's repository to replicate images into the victim's registry, enabling cross-account supply-chain poisoning via the replication mechanism."
+    match:
+      - [ ?repository, HasPolicy, ?registry_policy ]
+    where:
+      - "node_type(?repository) == ContainerRegistry"
+      - "?repository.provider_type in ['AWS::ECR::Repository']"
+      # The registry policy is account-level, not per-repository; we match a repository node
+      # and check that its account's registry policy grants cross-account replication.
+      - "?registry_policy is the account-level registry policy of ?repository.account (via ecr:GetRegistryPolicy)"
+      - "?registry_policy grants ecr:ReplicateImage (or implied by ecr:*) to a principal in a different account"
+    emit:
+      source_type: ResourcePolicy
+      target_type: ExternalIdentity
+      source: ?registry_policy
+      target: "<external account named in the registry's replication policy>"
+      permissions:
+        - "ecr:PutRegistryPolicy"
+        - "ecr:PutReplicationConfiguration"
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the registry-level policy grants cross-account replication to an
+        external account and the policy is not overridden by an SCP or deny policy.
+        CONDITIONAL(resource_policy) when the policy includes a Condition gate
+        (e.g. aws:PrincipalOrgID) — the cross-account replication is then conditional
+        on those conditions holding.
+        BLOCKED when an SCP or deny assignment blocks cross-account replication.
+      confidence: 0.88
+      derived_from:
+        - "?repository HasPolicy ?registry_policy (account-level registry policy grants cross-account replication)"
+      false_positive_note: >-
+        Replication must cross account boundaries to constitute a CrossAccountTrust —
+        same-account replication does not emit this edge. Validate that the principal
+        named in the policy is in a different account from the repository's account.
+        Honor Condition gates: if the policy restricts replication to members of an
+        org via aws:PrincipalOrgID, mark as CONDITIONAL(condition_expression).
+      narrative: >-
+        {registry_policy.name} (the account-level registry policy of account {repository.account})
+        grants cross-account replication to {external.name} in account {external.account}.
+        If the external account's repository is attacker-controlled, they can replicate
+        poisoned images into {repository.account}'s registry, where downstream workloads
+        will pull and execute them.
+
+  # --- 6a) Registry replication configuration enables supply-chain diversion -----
+  # A principal with ecr:PutReplicationConfiguration can configure the registry's
+  # replication settings to route replicated images to a destination repository they
+  # control. Replication is a registry-level operation (not per-repository), controlled
+  # by the registry policy and configuration. An attacker who can change replication
+  # destinations can intercept and poison images flowing through the registry.
+  #
+  # NOTE: ecr:PutReplicationConfiguration is a registry-level IAM action whose resource
+  # scope is arn:aws:ecr:region:account-id:* (not per-repository ARN). The effective-
+  # permission evaluator must be called with the registry/account scope, not a
+  # per-repository ARN.
+  - id: aws-ecr-put-replication-can-modify-configuration
+    emits: CanModifyConfiguration
+    description: "A principal with ecr:PutReplicationConfiguration can change the registry's replication destination settings, enabling supply-chain image interception and poisoning across all repositories in the account."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_type(?account) == Account"
+      - "effective_permission(?principal, 'ecr:PutReplicationConfiguration', '<account-registry-arn>') == true"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?principal
+      target: ?account
+      permissions:
+        - "ecr:PutReplicationConfiguration"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective ecr:PutReplicationConfiguration at
+        the registry/account level (not denied by SCP or permission boundary). This
+        edge expresses the capability to change registry-wide replication settings
+        affecting all repositories in the account. An SCP requiring replication to go
+        only to blessed destinations would BLOCK this edge.
+      confidence: 0.85
+      derived_from:
+        - "effective_permission(?principal, ecr:PutReplicationConfiguration, <account-registry-arn>)"
+      false_positive_note: >-
+        PutReplicationConfiguration is a registry/account-level operation, not
+        per-repository. The escalation consequence requires the attacker to also
+        control (or have CanModifyCode on) the destination repositories configured
+        by the new replication rule. If the destinations are in separate accounts or
+        untrusted, the supply-chain impact is realized only if the principal can push
+        to those destinations OR if they are already compromised.
+      narrative: >-
+        {principal.name} can reconfigure the replication settings of the ECR registry
+        in account {account.id} (ecr:PutReplicationConfiguration), potentially routing
+        replicated images to attacker-controlled destination repositories and enabling
+        a supply-chain interception attack that affects all repositories in the account.
+
+  # --- 6b) Push event triggers downstream automation (CanTrigger) ----------------
+  # An ECR image push (ecr:PutImage) emits ECR Image Action EventBridge events
+  # (PUSH/DELETE/MOVE actions) that can trigger EventBridge rules, which in turn
+  # invoke Lambda, start CodePipeline executions, trigger deploy pipelines, etc.
+  # A principal that can push an image (CanModifyCode) thereby triggers downstream
+  # event-driven automation — a CanTrigger edge that cicd-chains consumes to derive
+  # CanExecuteAs or CanModifyCode on the triggered workloads.
+  #
+  # NOTE: CanTrigger edge in schema/edges.yaml restricts target to Compute class only.
+  # EventBridge rules (Messaging class) are intermediate routing; we emit CanTrigger
+  # only to the Compute targets that EventBridge invokes (e.g., Lambda, CodePipeline).
+  - id: aws-ecr-push-triggers-eventbridge
+    emits: CanTrigger
+    description: "An image push to ECR emits EventBridge events (ecr:PutImage action emits ECR Image Action event) that can trigger downstream Compute workloads (Lambda, CodePipeline, deploy workers), enabling trigger-based code execution."
+    match:
+      - [ ?principal, CanModifyCode, ?repository ]
+      - [ ?repository, CanTrigger, ?compute_target ]
+    where:
+      - "node_type(?repository) == ContainerRegistry"
+      - "node_type(?compute_target) in [ServerlessFunction, BuildWorker, ContainerTask]"
+      - "?compute_target is ultimately invoked by an EventBridge rule listening for ecr:PutImage events"
+      - "?repository has an EventBridge source configuration for ecr:PutImage"
+    optional:
+      - [ ?repository, ContainsResourceReference, ?event_source ]  # confirms event source setup
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?compute_target
+      permissions:
+        - "ecr:PutImage"
+      conditions: [iam_permission, trigger_exists]
+      state_logic: >-
+        Inherit state from the matched CanModifyCode. ACTIVE when the principal can
+        push images and the event rule / compute target is confirmed to exist and be
+        active. CONDITIONAL(trigger_exists) when the event rule or downstream target
+        does not yet exist but the principal can push to trigger its creation
+        (POTENTIAL upgrade if CanCreateWorkload on the target exists).
+        CONDITIONAL(service_state) when the event rule or target is disabled.
+      confidence: "0.85 * contributing_confidence(CanModifyCode)"
+      derived_from:
+        - "?principal CanModifyCode ?repository (from aws-ecr-push-can-modify-code)"
+        - "?repository has EventBridge source for ecr:PutImage events"
+      false_positive_note: >-
+        PutImage generates ECR Image Action events that EventBridge can route to
+        rules. Only emit CanTrigger when a Compute target (Lambda, CodePipeline, etc.)
+        is confirmed to exist and to be listening for ecr:PutImage events (EventBridge
+        rule with source: 'aws.ecr' and event detail-type 'ECR Image Action'). Do not
+        emit CanTrigger to EventBridge rules themselves (Messaging class); only to the
+        Compute targets they ultimately invoke. Do not assume trigger capability
+        without an explicit event rule or Compute target node.
+      narrative: >-
+        {principal.name} can push images to {repository.name} (ecr:PutImage), which
+        emits ECR Image Action events to EventBridge. An EventBridge rule listens
+        for these events and triggers {compute_target.name}, giving {principal.name}
+        the capability to trigger downstream Compute execution (cicd-chains propagates
+        this to CanExecuteAs or CanModifyCode on the triggered workloads).
+
+  # --- 8) Image pull exposes embedded secrets or proprietary code (CanReadData) ---
+  # A principal that can pull images from a repository (BatchGetImage + GetDownloadUrlForLayer)
+  # can inspect the image layers. If the image contains embedded secrets (baked into
+  # environment variables in a Dockerfile, left in a layer as a credential file, etc.)
+  # or proprietary source code, the pull gives read access to those artifacts.
+  # Model as CanReadData(principal -> ContainerRegistry); the ContainsSecret node is
+  # a separate explicit edge emitted when the collector detects secrets in layers.
+  - id: aws-ecr-pull-can-read-data
+    emits: CanReadData
+    description: "A principal with effective ecr:BatchGetImage + ecr:GetDownloadUrlForLayer can pull image layers, reading embedded secrets or proprietary code contained in the repository's images. For KMS-encrypted repositories, the principal must also hold kms:Decrypt on the repository's CMK."
+    match:
+      - [ ?principal, HasPermission, ?repository ]
+    where:
+      - "node_type(?repository) == ContainerRegistry"
+      - "?repository.provider_type in ['AWS::ECR::Repository', 'AWS::ECR::PublicRepository']"
+      - "effective_permission(?principal, 'ecr:BatchGetImage', ?repository) == true"
+      - "effective_permission(?principal, 'ecr:GetDownloadUrlForLayer', ?repository) == true"
+      - "effective_permission(?principal, 'ecr:GetAuthorizationToken', '*') == true"
+      - "?repository.encryptionConfiguration.encryptionType != 'KMS' OR effective_permission(?principal, 'kms:Decrypt', ?repository.kmsKey) == true"
+    emit:
+      source_type: Identity
+      target_type: ContainerRegistry
+      source: ?principal
+      target: ?repository
+      permissions:
+        - "ecr:GetAuthorizationToken"
+        - "ecr:BatchGetImage"
+        - "ecr:GetDownloadUrlForLayer"
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective pull permissions (BatchGetImage +
+        GetDownloadUrlForLayer + GetAuthorizationToken) as confirmed by effective
+        permission evaluation, not blocked by SCP or permission boundary, AND either
+        the repository is NOT KMS-encrypted OR the principal holds kms:Decrypt on the
+        configured CMK.
+        CONDITIONAL(resource_policy) when pull access is granted only by the resource
+        policy (not the identity policy).
+        CONDITIONAL(key_permission) when the repository is KMS-encrypted and the
+        principal lacks kms:Decrypt on the CMK — the pull will fail at runtime without
+        the key permission. The security value of this edge depends on whether the
+        images actually contain sensitive data (ContainsSecret / ContainsCredential
+        facts drive CanReadSecret derivation in credential-chains).
+      confidence: 0.80
+      derived_from:
+        - "effective_permission(?principal, ecr:BatchGetImage, ?repository)"
+        - "effective_permission(?principal, ecr:GetDownloadUrlForLayer, ?repository)"
+        - "effective_permission(?principal, ecr:GetAuthorizationToken, *)"
+      false_positive_note: >-
+        Pull access is common and often legitimate (e.g. the ECS task execution role
+        needs it). This edge's escalation value is realized only when the repository
+        images actually contain secrets (ContainsSecret) or proprietary code. Do not
+        flag all pull grants as high-severity; gate on ContainsSecret /
+        ContainsCredential confirmation before routing this edge to analyst review.
+        Cross-account pull (via repository policy) is standard — model the policy as
+        CrossAccountTrust but do not treat pull-only cross-account grants as push.
+        For KMS-encrypted repositories, the edge is CONDITIONAL(key_permission) until
+        the principal is confirmed to hold kms:Decrypt on the CMK; do not claim ACTIVE
+        read capability without the key permission.
+      narrative: >-
+        {principal.name} can pull images from {repository.name} (ecr:BatchGetImage
+        + ecr:GetDownloadUrlForLayer + ecr:GetAuthorizationToken) and inspect layer
+        contents, potentially reading embedded secrets, credentials, or proprietary code
+        baked into the image layers. {if KMS-encrypted: Decryption requires kms:Decrypt
+        on the repository's CMK ({repository.kmsKey}); the edge is CONDITIONAL without it.}
+
+  # --- 9) Public ECR repositories are exposed to the internet -----------------
+  # Public ECR repositories (AWS::ECR::PublicRepository) are accessible without
+  # authentication at public.ecr.aws. Any workload that pulls from a public
+  # repository an attacker controls receives a poisoned image, enabling a
+  # supply-chain attack from an anonymous/external attacker. Model the public
+  # repository as ExposedToInternet(ContainerRegistry -> AnonymousIdentity).
+  # This allows container-chains rules to model attacker-controlled public images
+  # as a valid push vector for any workload pulling from public.ecr.aws.
+  - id: aws-ecr-public-repo-exposed
+    emits: ExposedToInternet
+    description: "A public ECR repository is pull-accessible to any user on the internet without authentication, enabling supply-chain poisoning by external/anonymous attackers."
+    match:
+      - [ ?repository, "node exists" ]
+    where:
+      - "node_type(?repository) == ContainerRegistry"
+      - "?repository.provider_type == 'AWS::ECR::PublicRepository'"
+    emit:
+      source_type: ContainerRegistry
+      target_type: AnonymousIdentity
+      source: ?repository
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE — a public ECR repository is always accessible without authentication
+        to any principal on the internet. No conditions gate this exposure.
+      confidence: 1.0
+      derived_from:
+        - "?repository.provider_type == AWS::ECR::PublicRepository"
+      false_positive_note: >-
+        Only public repositories (provider_type AWS::ECR::PublicRepository) are
+        exposed to the internet. Private repositories (AWS::ECR::Repository) require
+        authentication; emit ExposedToInternet only for public repositories. Verify
+        the repository URI resolves to public.ecr.aws before emitting this edge.
+      narrative: >-
+        {repository.name} is a public ECR repository accessible at
+        {repository.public_uri} without authentication. Any external or anonymous
+        attacker can push images to a public repository they control and have
+        workloads pull and execute poisoned images from public.ecr.aws,
+        enabling an unauthenticated supply-chain attack (container-chains
+        models this as a push vector for any workload pulling from this repository).
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION RECORDS (embedded here per lambda.yaml pattern)
+# These would live in /rules/explicit/aws-ecr.yaml but are listed here as the
+# authoritative spec for the normalization rules needed to populate the graph.
+# No separate explicit file is required — the permission-evaluator-driven records
+# below are straightforward normalizations.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: aws-ecr-repository-has-policy
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::ECR::Repository"
+      field: "repositoryPolicy"
+    emit:
+      source_type: ContainerRegistry
+      source: "<repository node>"
+      target: "<ResourcePolicy node for this repository>"
+      api_source: "ecr:GetRepositoryPolicy"
+      evidence_field: "repositoryPolicy (JSON)"
+      narrative: "{repository.name} has a resource-based policy."
+
+  - id: aws-ecr-cross-account-pull-trust
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::ECR::Repository"
+      field: "repositoryPolicy"
+    where:
+      - "Principal in policy is in a different account AND grants ecr:BatchGetImage or ecr:GetDownloadUrlForLayer but NOT ecr:PutImage"
+    emit:
+      source_type: ResourcePolicy
+      target_type: ExternalIdentity
+      source: "<ResourcePolicy node of ?repository>"
+      target: "<external account / principal named in the policy>"
+      api_source: "ecr:GetRepositoryPolicy"
+      evidence_field: "repositoryPolicy (Principal cross-account)"
+      narrative: "{resource_policy.name} (of {repository.name}) grants cross-account image pull to {external.name} (not push — supply-chain trust only for pull)."
+
+  - id: aws-ecr-workload-pulls-image
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record:
+      resource_type: ["AWS::ECS::TaskDefinition", "AWS::Lambda::Function", "AWS::EKS::Nodegroup"]
+      field: "containerDefinitions[*].image | imageUri | containerImages[*]"
+    where:
+      - "image URI resolves to an ECR repository in the same or a different account"
+    emit:
+      source_type: ContainerTask
+      source: "<workload node (ContainerTask / ServerlessFunction / KubernetesWorkload)>"
+      target: "<ContainerRegistry node for the resolved repository>"
+      api_source: "ecs:DescribeTaskDefinition | lambda:GetFunctionConfiguration | eks:DescribeNodegroup"
+      evidence_field: "image URI (tag or @sha256 digest)"
+      properties:
+        reference_kind: "runs_image"
+        image_reference_type: "tag | digest"   # set by collector based on URI format
+        image_pull_policy: "Always | IfNotPresent | Never"  # from pod spec where available
+      narrative: "{workload.name} pulls and runs images from {repository.name} (reference: {image_uri})."
+
+  - id: aws-ecr-can-modify-code
+    emits: CanModifyCode
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ecr:PutImage"
+      resource_type: "AWS::ECR::Repository"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<repository node>"
+      api_source: "iam:SimulatePrincipalPolicy"
+      permissions: ["ecr:PutImage", "ecr:GetAuthorizationToken", "ecr:InitiateLayerUpload", "ecr:CompleteLayerUpload"]
+      narrative: "{principal.name} can push images to {repository.name} (ecr:PutImage + layer-upload actions)."
+
+  - id: aws-ecr-can-modify-policy
+    emits: CanModifyPolicy
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ecr:SetRepositoryPolicy"
+      resource_type: "AWS::ECR::Repository"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<ResourcePolicy of repository>"
+      api_source: "iam:SimulatePrincipalPolicy"
+      permissions: ["ecr:SetRepositoryPolicy"]
+      narrative: "{principal.name} can rewrite the resource policy of {repository.name} (ecr:SetRepositoryPolicy)."
+
+  - id: aws-ecr-can-modify-configuration
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ecr:PutImageTagMutability"
+      resource_type: "AWS::ECR::Repository"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<repository node>"
+      api_source: "iam:SimulatePrincipalPolicy"
+      permissions: ["ecr:PutImageTagMutability"]
+      narrative: "{principal.name} can change tag mutability on {repository.name} (ecr:PutImageTagMutability), potentially unblocking push overwrites."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP or permission boundary denying ecr:PutImage -> aws-ecr-push-can-modify-code
+#     emits state: BLOCKED, denied_by = <SCP arn / boundary arn>.
+#   - imageTagMutability == IMMUTABLE -> aws-ecr-push-can-modify-code is BLOCKED for
+#     existing tags unless the principal also holds ecr:PutImageTagMutability (which
+#     shifts to CONDITIONAL via aws-ecr-mutability-unblock).
+#   - Digest-pinned consumer (@sha256) -> container-chains image-push-poisons-consumers
+#     does NOT fire ACTIVE for that consumer; the fan-out is BLOCKED.
+#   - SCP denying ecr:SetRepositoryPolicy -> aws-ecr-set-policy-can-modify-policy is
+#     BLOCKED.
+#   - Repository is KMS-encrypted and principal lacks kms:Decrypt on the CMK ->
+#     aws-ecr-pull-can-read-data emits state: CONDITIONAL(key_permission).
+#   - VPC endpoint policy restricting repository access -> modeled as CONDITIONAL on
+#     the CanReadData / CanModifyCode where network_reachability is required.
+#   - SCP denying ecr:ReplicateImage or ecr:PutReplicationConfiguration -> registry
+#     replication rules (6, 6a) emit state: BLOCKED.
+#   - EventBridge rule disabled or no event source configured -> aws-ecr-push-triggers-
+#     eventbridge emits state: CONDITIONAL(service_state) or POTENTIAL.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# LINCHPIN CITATIONS (do NOT re-derive these here):
+#   container-chains.yaml:
+#     image-push-poisons-consumers: CanModifyCode(principal -> registry) +
+#       ContainsResourceReference(consumer -> registry, runs_image) ->
+#       CanModifyCode(principal -> consumer). Mutable-tag / digest-pin gating.
+#       THIS RULE REQUIRES aws-ecr-cross-account-push-can-modify-code to bridge
+#       cross-account push grants (rule 4b) so that external principals' CanModifyCode
+#       is available to the linchpin.
+#     poisoned-image-executes-as: CanModifyCode(principal -> consumer) +
+#       ExecutesAs(consumer -> identity) -> CanExecuteAs(principal -> identity).
+#   can-execute-as.yaml:
+#     execute-as-via-code-modify: CanModifyCode + ExecutesAs -> CanExecuteAs.
+#   can-control.yaml:
+#     escalate-via-execute-as: CanExecuteAs -> CanEscalateTo (when target more privileged).
+#     enter-account-via-assume: CanAssume cross-account -> CanEnterAccount.
+#       NOTE: ECR cross-account supply-chain paths are owned by can-control here.
+#       Rule aws-ecr-supply-chain-cross-account-entry was DELETED; its derivation
+#       (CanModifyCode + CanExecuteAs -> CanEnterAccount) belongs to can-control's
+#       enter-account-via-assume and hierarchy-chains. ECR now stops at emitting
+#       CrossAccountTrust + CanModifyCode facts; the linchpins roll up to CanEnterAccount.
+#   credential-chains.yaml:
+#     read-secret-yields-identity: CanReadSecret + CredentialsFor -> CanImpersonate.
+#     This chain gates on CanReadData — aws-ecr-pull-can-read-data emits it, gated
+#     by kms:Decrypt for encrypted repositories (rule 8).
+#   cicd-chains.yaml:
+#     build-runner supply-chain: CanModifyCode(principal -> BuildWorker) +
+#       ExecutesAs(BuildWorker -> service-role) -> CanExecuteAs (CI/CD framing,
+#       after container-chains propagates CanModifyCode to the CI runner consumer).
+#     CanTrigger from aws-ecr-push-triggers-eventbridge (rule 6b) bridges ECR push
+#     to triggered Compute automation targets for cicd-chains to consume.
+#   federation-chains.yaml:
+#     Workload identity federation for k8s pods is owned by federation-chains;
+#     ECR emits no cross-tenant/cross-cloud federation edges.
+#   hierarchy-chains.yaml:
+#     guardrail-removal: CanModifyConfiguration / CanModifyPolicy can remove guards
+#     (imageTagMutability / policies) that block escalation paths — rules 2, 3, 3b
+#     emit these capabilities.
+# ---------------------------------------------------------------------------

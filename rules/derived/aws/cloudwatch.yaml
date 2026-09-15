@@ -1,0 +1,620 @@
+# AWS CloudWatch / CloudWatch Logs — Derived attack-path rules (Phase 12 — security & logging)
+# ---------------------------------------------------------------------------
+# CloudWatch and CloudWatch Logs are the primary DETECTIVE-CONTROL fabric for
+# AWS accounts. Their security relevance in the attack-path graph is:
+#
+#   (1) DEFENSE EVASION / TAMPERING (dominant mode):
+#       Deleting or disabling alarms, metric filters, subscription filters, or
+#       log groups suppresses detection without granting any access to compute
+#       or data. These produce CanModifyConfiguration and/or CanDelete /
+#       CanDeleteData on the LoggingService node.
+#
+#   (2) DATA (moderate): log groups aggregate application output that frequently
+#       contains embedded secrets, tokens, or connection strings. A principal with
+#       logs:GetLogEvents / logs:FilterLogEvents on such a group can harvest
+#       credentials → CanReadData + ContainsSecret → credential-chains rollup.
+#
+# WHAT THIS FILE EMITS:
+#   Rule 1 (aws-cloudwatch-disable-alarm-actions):
+#     cloudwatch:DisableAlarmActions on an alarm → CanModifyConfiguration
+#     (silences incident response without destroying the alarm)
+#
+#   Rule 2 (aws-cloudwatch-tamper-metric-filter):
+#     logs:DeleteMetricFilter OR logs:PutMetricFilter on a log group
+#     → CanModifyConfiguration (removes or corrupts the metric that feeds alarms)
+#
+#   Rule 3 (aws-cloudwatch-tamper-subscription-filter):
+#     logs:DeleteSubscriptionFilter OR logs:PutSubscriptionFilter on a log group
+#     → CanModifyConfiguration (cuts or redirects real-time SIEM log delivery)
+#
+#   Rule 4 (aws-cloudwatch-delete-alarm):
+#     cloudwatch:DeleteAlarms on an alarm → CanDelete
+#     (destroys the alarm node entirely; more detectable but complete)
+#
+#   Rule 5 (aws-cloudwatch-delete-log-group):
+#     logs:DeleteLogGroup on a log group → CanDelete
+#     (destroys the log group and all its events — evidence destruction)
+#
+#   Rule 6 (aws-cloudwatch-read-log-data):
+#     logs:GetLogEvents OR logs:FilterLogEvents on a log group → CanRead
+#     (log events may embed secrets → credential-chains rolls up if ContainsSecret;
+#     emits CanRead not CanReadData because log groups are LoggingService nodes,
+#     outside CanReadData's [Storage, Data, Messaging] target set)
+#
+# WHAT THIS FILE DOES NOT EMIT (cite and defer):
+#   * CanExecuteAs — CloudWatch does not execute code as an IAM identity.
+#   * CanEnterAccount / CanEscalateTo / CanAssume — defense evasion does not
+#     grant access; these are COVER-TRACKS primitives only.
+#   * CanExfiltrate — logs:CreateExportTask to a foreign S3 bucket; data-plane
+#     rules own the exfiltration rollup. Cite, do not re-derive.
+#   * CanImpersonate / CanEscalateTo from credential harvest — owned by
+#     credential-chains (read-secret-yields-identity, impersonate-is-escalation).
+#     Cite, do not re-derive.
+#   * CanTrigger — alarm actions invoke Lambda/SNS/SSM; those edges are emitted by
+#     the Lambda / SNS / SSM rules, not here.
+#   * ContainsSecret — heuristic analyst annotation on the log group node;
+#     not a derived edge computed here.
+#
+# CRITICAL DESIGN RULE (Phase 12):
+#   Detective controls do NOT set BLOCKED state and are not preventive guardrails.
+#   Suppressing a detective control reduces detection probability but does not
+#   grant or block any IAM capability. Do NOT emit BLOCKED state for CloudWatch
+#   controls. Do NOT claim these edges chain to CanEnter*, CanExecuteAs, or any
+#   escalation edge — they do not. Narrative MUST say "reduces detection" not
+#   "grants access."
+#
+# LINCHPINS CITED (not re-derived):
+#   * /rules/derived/credential-chains.yaml — read-secret-yields-identity,
+#     decrypt-gates-secret-read, impersonate-is-escalation.
+#   * /rules/derived/can-execute-as.yaml — not applicable (no execution path).
+#   * /rules/derived/can-control.yaml — not applicable (no escalation path).
+#   * /rules/derived/cicd-chains.yaml — not applicable (no CI/CD execution path).
+#
+# PERMISSIONS (from AWS Service Authorization Reference — CloudWatch + CloudWatch Logs):
+#   cloudwatch:DisableAlarmActions   — disables actions on one or more alarms
+#   cloudwatch:DeleteAlarms          — deletes one or more alarms
+#   cloudwatch:PutMetricAlarm        — creates or overwrites an alarm definition
+#   logs:DeleteMetricFilter          — deletes a metric filter from a log group
+#   logs:PutMetricFilter             — creates or overwrites a metric filter
+#   logs:DeleteSubscriptionFilter    — deletes a subscription filter from a log group
+#   logs:PutSubscriptionFilter       — creates or overwrites a subscription filter
+#   logs:DeleteLogGroup              — deletes a log group and all its log streams
+#   logs:DeleteLogStream             — deletes a log stream from a log group
+#   logs:GetLogEvents                — retrieves log events from a log stream
+#   logs:FilterLogEvents             — retrieves log events matching a filter pattern
+#   logs:StartQuery                  — initiates a CloudWatch Logs Insights query
+#   logs:GetQueryResults             — retrieves results of a Logs Insights query
+#
+# STATE CONVENTIONS (RULE-FORMAT.md):
+#   A derived edge is never stronger than its weakest contributor.
+#   CONDITIONAL(key_permission) applies when the log group uses a KMS CMK and
+#   the caller lacks kms:Decrypt — CanReadData is CONDITIONAL, not ACTIVE.
+#   credential-chains:decrypt-gates-secret-read upgrades to ACTIVE when CanDecrypt
+#   is confirmed on the CMK.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 12-security-logging
+applies_to: [aws]
+
+rules:
+
+  # --- 1) DisableAlarmActions — silence incident response automation ----------
+  # The primary alarm-silencing evasion primitive. cloudwatch:DisableAlarmActions
+  # sets ActionsEnabled=false on one or more CloudWatch alarms, preventing the
+  # alarm from firing SNS notifications, invoking Lambda, or triggering SSM
+  # Automation when the metric crosses the threshold. The alarm STILL evaluates
+  # the metric — the console and DescribeAlarms still show ALARM state — but no
+  # automated incident response occurs. This is a stealthy evasion choice
+  # (harder to detect than deleting the alarm).
+  #
+  # Target: the LoggingService node representing the CloudWatch alarm.
+  # Edge: CanModifyConfiguration (not CanDelete — the alarm is not destroyed).
+  # This is defense evasion / cover-tracks. NOT escalation. NOT CanEnterAccount.
+  - id: aws-cloudwatch-disable-alarm-actions
+    emits: CanModifyConfiguration
+    description: "cloudwatch:DisableAlarmActions silences alarm response automation (SNS/Lambda/SSM actions) without deleting the alarm — a stealthy detection-evasion primitive."
+    match:
+      - [ ?principal, HasPermission, ?alarm ]
+    where:
+      - "node_type(?alarm) == LoggingService"
+      - "?alarm.provider_type == 'AWS::CloudWatch::Alarm'"
+      - "?principal has EFFECTIVE cloudwatch:DisableAlarmActions on ?alarm ARN"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?alarm
+      permissions: ["cloudwatch:DisableAlarmActions"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when cloudwatch:DisableAlarmActions is confirmed EFFECTIVE on the
+        alarm ARN (identity-based policy + no explicit deny + no SCP deny).
+        CONDITIONAL(scp_or_org_policy) when an SCP may restrict the action.
+        BLOCKED by an explicit deny on cloudwatch:DisableAlarmActions.
+        This edge is a defense-evasion primitive: it does NOT grant access to any
+        compute, data, or identity resource. It reduces detection capability only.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "?principal HasPermission ?alarm (cloudwatch:DisableAlarmActions effective permission)"
+      false_positive_note: >-
+        cloudwatch:DisableAlarmActions is a CONFIGURATION change, not a destructive
+        action — the alarm node is not removed, and CloudWatch continues to evaluate
+        the metric. The attack value is purely evasion: suppressing automated incident
+        response (SNS page, Lambda remediation, SSM Automation runbook). This does NOT
+        chain to CanExecuteAs, CanEnterAccount, or any escalation edge. Narrative MUST
+        say "reduces detection" not "grants access." A complementary
+        cloudwatch:EnableAlarmActions permission restores the actions — the evasion
+        is reversible and may be re-enabled by monitoring infrastructure.
+        Do not emit this edge for read-only principals (cloudwatch:DescribeAlarms
+        does not imply DisableAlarmActions).
+      narrative: >-
+        {principal.name} can disable alarm actions on {alarm.name}
+        (cloudwatch:DisableAlarmActions), silencing the automated incident response
+        (SNS notifications, Lambda invocations, or SSM Automation) that the alarm
+        would normally trigger. The alarm continues to evaluate the underlying
+        metric but fires no response. This reduces detection coverage — it does not
+        grant access to any resource.
+
+  # --- 1b) PutMetricAlarm — rewrite or suppress alarm definitions -----------
+  # cloudwatch:PutMetricAlarm creates a new CloudWatch alarm or overwrites an
+  # existing one. An attacker with this permission can: (1) rewrite a security-
+  # critical alarm to have MAX_INT threshold so it never fires, (2) change the
+  # alarm actions to point at attacker-controlled SNS/Lambda ARNs, or (3) suppress
+  # an existing CIS-mandated alarm by changing its metric/threshold/expression.
+  # This is a high-impact evasion primitive that overwrites the alarm definition
+  # entirely — more destructive than DisableAlarmActions (rule 1).
+  #
+  # State: CONDITIONAL when the target is a non-security alarm (e.g., application
+  # performance monitoring; rewriting it has low evasion value). ACTIVE when the
+  # target alarm's name suggests a security/compliance alarm (e.g., contains
+  # "RootSignIn", "IAMPolicy", "FailedLogin", "CIS", "Compliance").
+  #
+  # Target: the LoggingService node for the CloudWatch alarm.
+  # Edge: CanModifyConfiguration (not CanDelete — the alarm is not destroyed).
+  - id: aws-cloudwatch-put-metric-alarm
+    emits: CanModifyConfiguration
+    description: "cloudwatch:PutMetricAlarm creates or overwrites an alarm definition, enabling alarm suppression via threshold manipulation, action redirection, or metric/expression rewriting — a high-impact evasion primitive."
+    match:
+      - [ ?principal, HasPermission, ?alarm ]
+    where:
+      - "node_type(?alarm) == LoggingService"
+      - "?alarm.provider_type == 'AWS::CloudWatch::Alarm'"
+      - "?principal has EFFECTIVE cloudwatch:PutMetricAlarm on ?alarm ARN"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?alarm
+      permissions: ["cloudwatch:PutMetricAlarm"]
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        ACTIVE when cloudwatch:PutMetricAlarm is confirmed EFFECTIVE on the alarm
+        ARN AND the target alarm name/description suggests a security or compliance
+        alarm (e.g., contains "RootSignIn", "IAMPolicy", "Unauthorized", "CIS",
+        "Compliance", "SecurityGroup", "FailedLogin"). The attacker can rewrite the
+        alarm definition to suppress detection by raising the threshold, removing
+        actions, or corrupting the metric/expression.
+        CONDITIONAL(service_state) when the target is a non-security alarm (e.g.,
+        application performance, cost tracking, capacity planning) — alarm rewrite
+        has low evasion value in this case. CONDITIONAL(condition_expression) if the
+        alarm name/purpose is ambiguous or unknown.
+        BLOCKED by an explicit deny on cloudwatch:PutMetricAlarm.
+        This edge is defense evasion — NOT escalation.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "?principal HasPermission ?alarm (cloudwatch:PutMetricAlarm effective permission)"
+      false_positive_note: >-
+        cloudwatch:PutMetricAlarm is a broad capability — it can create new alarms
+        or overwrite existing ones. Creating a new non-security alarm has low evasion
+        value; overwriting a CIS-mandated or security-critical alarm is high-value.
+        Distinguish by alarm name/description and emit ACTIVE only when the target
+        is a known security alarm (check AlarmName against CIS Benchmark alarms,
+        SOC playbook alarms, or keywords like "RootSignIn", "Unauthorized", "Failed").
+        Do not emit CanExecuteAs or CanEnterAccount as consequences. This does NOT
+        chain to escalation edges. Narrative MUST say "can suppress or rewrite an
+        alarm" not "grants access to resources."
+      narrative: >-
+        {principal.name} can create or overwrite CloudWatch alarms
+        (cloudwatch:PutMetricAlarm). If applied to a security-critical alarm (such
+        as one monitoring root sign-in, IAM policy changes, or network ACL
+        modifications), the attacker can suppress detection by raising the threshold
+        to MAX_INT, removing alarm actions, or rewriting the metric/expression.
+        This is a detection-evasion primitive — it does not grant access to any
+        resource.
+
+  # --- 2) Metric filter tampering — suppress alarm triggers ------------------
+  # Metric filters are patterns applied to log group events that increment a
+  # CloudWatch metric counter; those metrics feed CloudWatch alarms (e.g.,
+  # "alert on >0 occurrences of Root sign-in without MFA"). Deleting a metric
+  # filter (logs:DeleteMetricFilter) or overwriting it with a non-matching
+  # expression (logs:PutMetricFilter) prevents the metric from incrementing,
+  # causing the alarm to never fire — even if the original condition occurs.
+  # This is a detection blind spot: the log events still exist in the log group,
+  # but the alarm is now deaf to them.
+  #
+  # Target: the LoggingService node representing the log group (the filter lives
+  # on the log group, and its deletion affects the log group's alarm surface).
+  # Edge: CanModifyConfiguration. NOT CanDelete (the log group is not deleted).
+  - id: aws-cloudwatch-tamper-metric-filter
+    emits: CanModifyConfiguration
+    description: "logs:DeleteMetricFilter or logs:PutMetricFilter on a log group removes or corrupts the metric filter expression that feeds CloudWatch alarms, creating a detection blind spot."
+    match:
+      - [ ?principal, HasPermission, ?log_group ]
+    where:
+      - "node_type(?log_group) == LoggingService"
+      - "?log_group.provider_type == 'AWS::Logs::LogGroup'"
+      - "?log_group.metricFilterCount > 0"
+      - "?principal has EFFECTIVE logs:DeleteMetricFilter OR logs:PutMetricFilter on ?log_group ARN"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?log_group
+      permissions: ["logs:DeleteMetricFilter", "logs:PutMetricFilter"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when logs:DeleteMetricFilter is confirmed EFFECTIVE on the log
+        group ARN (identity-based policy + no explicit deny + no SCP deny) —
+        definitive alarm silence (filter gone, metric no longer increments).
+        CONDITIONAL(condition_expression) when only logs:PutMetricFilter is
+        confirmed effective — alarm silence requires the attacker to correctly
+        rewrite the filter expression to no longer match the events they generate.
+        BLOCKED by an explicit deny on logs:DeleteMetricFilter or logs:PutMetricFilter.
+        This edge is defense evasion / cover-tracks only — NOT escalation.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from:
+        - "?principal HasPermission ?log_group (logs:DeleteMetricFilter / logs:PutMetricFilter effective permission)"
+      false_positive_note: >-
+        Two distinct actions with different state values: logs:DeleteMetricFilter
+        (remove filter entirely → definitive silence, ACTIVE) vs. logs:PutMetricFilter
+        (overwrite expression → conditional on the attacker correctly rewriting the
+        filter to exclude their activity, emit CONDITIONAL(condition_expression) if
+        rewrite precision is unknown). A log group with NO metric filters has no alarm
+        surface to suppress (metricFilterCount check prevents zero-value emissions).
+        This does NOT delete the log group or its events; the historical log events
+        remain and may be queried later. This does NOT chain to CanExecuteAs or
+        CanEnterAccount. Narrative MUST say "creates a detection blind spot" not
+        "grants access." Consider splitting this rule into two (aws-cloudwatch-
+        delete-metric-filter → ACTIVE and aws-cloudwatch-overwrite-metric-filter →
+        CONDITIONAL) if explicit state separation is needed for downstream consumers.
+      narrative: >-
+        {principal.name} can delete or overwrite a metric filter on {log_group.name}
+        (logs:DeleteMetricFilter / logs:PutMetricFilter). The affected metric
+        filter feeds a CloudWatch alarm; removing or corrupting the filter prevents
+        the metric from incrementing, causing the alarm to remain silent even when the
+        original condition occurs. This creates a detection blind spot — it does not
+        grant access to any resource.
+
+  # --- 3) Subscription filter tampering — cut SIEM / security data lake feed --
+  # Subscription filters deliver matching log events in real time to a Lambda
+  # function, a Kinesis Data Stream, or a Kinesis Data Firehose destination. Many
+  # organizations route CloudTrail / VPC Flow Log / application logs to a central
+  # SIEM or security data lake via subscription filters. Deleting the filter
+  # (logs:DeleteSubscriptionFilter) cuts the real-time feed; overwriting it
+  # (logs:PutSubscriptionFilter) with a non-matching pattern or attacker-controlled
+  # destination redirects or suppresses log delivery without destroying evidence.
+  # This is a real-time SIEM blind spot — the events remain in the log group
+  # but are no longer shipped to the security tooling.
+  #
+  # Target: the LoggingService node for the log group (the subscription filter is
+  # an attribute of the log group). Edge: CanModifyConfiguration.
+  - id: aws-cloudwatch-tamper-subscription-filter
+    emits: CanModifyConfiguration
+    description: "logs:DeleteSubscriptionFilter or logs:PutSubscriptionFilter on a log group cuts or redirects real-time log delivery to a SIEM, security data lake, or Lambda-based alert processor."
+    match:
+      - [ ?principal, HasPermission, ?log_group ]
+    where:
+      - "node_type(?log_group) == LoggingService"
+      - "?log_group.provider_type == 'AWS::Logs::LogGroup'"
+      - "?principal has EFFECTIVE logs:DeleteSubscriptionFilter OR logs:PutSubscriptionFilter on ?log_group ARN"
+      - "?log_group has at least one subscription filter (check logs:DescribeSubscriptionFilters output)"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?log_group
+      permissions: ["logs:DeleteSubscriptionFilter", "logs:PutSubscriptionFilter"]
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        ACTIVE when logs:DeleteSubscriptionFilter or logs:PutSubscriptionFilter is
+        confirmed EFFECTIVE on the log group ARN AND the log group has at least one
+        subscription filter (otherwise the evasion has no security value).
+        CONDITIONAL(service_state) when no subscription filter is confirmed to exist
+        on the log group — the action is possible but the evasion target is absent.
+        logs:PutSubscriptionFilter may be CONDITIONAL(condition_expression) if
+        the required destination (Lambda ARN, Kinesis ARN) is not attacker-controlled.
+        BLOCKED by an explicit deny on the relevant logs: action.
+        This edge is defense evasion — NOT escalation.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal HasPermission ?log_group (logs:DeleteSubscriptionFilter / logs:PutSubscriptionFilter effective permission)"
+      false_positive_note: >-
+        This edge has no evasion value if the log group has no subscription filter —
+        confirm subscription filter existence via logs:DescribeSubscriptionFilters;
+        if none, emit CONDITIONAL(service_state). logs:PutSubscriptionFilter requires
+        the resource-based permission on the destination (Lambda / Kinesis) to allow
+        CloudWatch Logs to invoke it; if the attacker cannot configure the destination,
+        they can still delete the existing filter (DeleteSubscriptionFilter) to cut the
+        feed. Distinguish DeleteSubscriptionFilter (definitive cut, ACTIVE) from
+        PutSubscriptionFilter (redirect, may require destination setup — CONDITIONAL).
+        This does NOT chain to CanExecuteAs or CanEnterAccount. The redirected log
+        stream going to an attacker-controlled Kinesis may enable data exfiltration —
+        but that CanExfiltrate edge is produced by data-plane rules off the destination,
+        not here.
+      narrative: >-
+        {principal.name} can delete or overwrite the subscription filter on
+        {log_group.name} (logs:DeleteSubscriptionFilter / logs:PutSubscriptionFilter),
+        cutting or redirecting real-time log delivery to the SIEM, Lambda alert
+        processor, or security data lake that depends on this filter. Events continue
+        to accumulate in the log group but are no longer shipped for real-time
+        analysis. This is a SIEM blind spot — it does not grant access to any resource.
+
+  # --- 4) Delete alarm — destroy the detective control entirely ---------------
+  # cloudwatch:DeleteAlarms removes one or more CloudWatch alarms permanently.
+  # Unlike DisableAlarmActions (rule 1), deletion is irreversible without
+  # recreating the alarm from a backup or re-deploying IaC. This is more
+  # disruptive and more detectable (CloudTrail records a DeleteAlarms API call)
+  # but achieves a complete elimination of the detective control. The alarm
+  # actions, metric filter associations, and alarm history are all lost.
+  # Edge: CanDelete (not CanModifyConfiguration — the node is destroyed).
+  # CanDelete is not traversable by default in path-finding
+  # (schema/edges.yaml: traversal.walkable: false) — it represents destructive
+  # impact, not escalation. Emitted for completeness and impact assessment.
+  - id: aws-cloudwatch-delete-alarm
+    emits: CanDelete
+    description: "cloudwatch:DeleteAlarms permanently removes one or more CloudWatch alarms, eliminating the detective control entirely — a higher-impact, more-detectable evasion than DisableAlarmActions."
+    match:
+      - [ ?principal, HasPermission, ?alarm ]
+    where:
+      - "node_type(?alarm) == LoggingService"
+      - "?alarm.provider_type == 'AWS::CloudWatch::Alarm'"
+      - "?principal has EFFECTIVE cloudwatch:DeleteAlarms on ?alarm ARN"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?alarm
+      permissions: ["cloudwatch:DeleteAlarms"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when cloudwatch:DeleteAlarms is confirmed EFFECTIVE on the alarm ARN
+        (identity-based policy + no explicit deny + no SCP deny).
+        CONDITIONAL(scp_or_org_policy) when an SCP may restrict the action.
+        BLOCKED by an explicit deny on cloudwatch:DeleteAlarms.
+        CanDelete is not traversable in default path-finding (walkable: false per
+        schema/edges.yaml). Emitted for impact assessment — defense evasion,
+        evidence destruction. NOT escalation.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "?principal HasPermission ?alarm (cloudwatch:DeleteAlarms effective permission)"
+      false_positive_note: >-
+        cloudwatch:DeleteAlarms is destructive and logged in CloudTrail; it is more
+        detectable than DisableAlarmActions (rule 1). Both rules may fire for the same
+        principal — they model distinct capabilities. Do NOT emit CanExecuteAs or
+        CanEnterAccount as consequences of alarm deletion. CanDelete edges are
+        excluded from default path-finding by the schema (walkable: false); they
+        surface only in impact-assessment and evidence-destruction queries.
+      narrative: >-
+        {principal.name} can delete {alarm.name} (cloudwatch:DeleteAlarms),
+        permanently removing the CloudWatch alarm and its associated actions.
+        This eliminates the detective control entirely — harder to recover from
+        than DisableAlarmActions, but more detectable in CloudTrail. This is an
+        evidence-destruction / defense-evasion primitive — it does not grant
+        access to any resource.
+
+  # --- 5) Delete log group — evidence destruction ----------------------------
+  # logs:DeleteLogGroup deletes the log group AND all its log streams and stored
+  # log events permanently (pending the retention period). This destroys forensic
+  # evidence of all activity logged to that group. Combined with deleting the
+  # metric filter and disabling alarm actions, this forms a complete cover-tracks
+  # sequence. This is the highest-impact evasion but also the most detectable
+  # (CloudTrail records a DeleteLogGroup API call; CIS Benchmark 3.x alarms fire
+  # if alarms are not themselves deleted first).
+  # Edge: CanDelete. Not traversable (destructive impact, not escalation).
+  - id: aws-cloudwatch-delete-log-group
+    emits: CanDelete
+    description: "logs:DeleteLogGroup permanently deletes a log group and all its stored events — evidence destruction that eliminates forensic audit records."
+    match:
+      - [ ?principal, HasPermission, ?log_group ]
+    where:
+      - "node_type(?log_group) == LoggingService"
+      - "?log_group.provider_type == 'AWS::Logs::LogGroup'"
+      - "?principal has EFFECTIVE logs:DeleteLogGroup on ?log_group ARN"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?log_group
+      permissions: ["logs:DeleteLogGroup"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when logs:DeleteLogGroup is confirmed EFFECTIVE on the log group ARN
+        (identity-based policy + no explicit deny + no SCP deny).
+        CONDITIONAL(scp_or_org_policy) when an SCP may restrict deletion.
+        BLOCKED by an explicit deny on logs:DeleteLogGroup.
+        CanDelete is not traversable by default (walkable: false per schema/edges.yaml).
+        Emitted for impact / evidence-destruction assessment. NOT escalation.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "?principal HasPermission ?log_group (logs:DeleteLogGroup effective permission)"
+      false_positive_note: >-
+        logs:DeleteLogGroup requires the permission on the specific log group ARN
+        (or wildcard). Many CloudWatch log groups are named after the service that
+        created them (e.g., /aws/lambda/<function-name>, /aws/ecs/<cluster>/<service>)
+        — confirm the log group ARN matches the permission scope. Retention-locked log
+        groups (RetentionInDays with a compliance hold) may be resistant to deletion
+        via service-level protection; downgrade to CONDITIONAL(service_state) if a
+        retention lock is confirmed. Note: logs:DeleteLogStream is a narrower action
+        (deletes one stream within a group); the group and its other streams survive.
+        Do NOT emit CanExecuteAs or CanEnterAccount as consequences. CanDelete is
+        excluded from default path-finding (walkable: false).
+      narrative: >-
+        {principal.name} can delete {log_group.name} (logs:DeleteLogGroup),
+        permanently removing the log group and all stored log events. This destroys
+        forensic evidence of all activity previously logged to this group and eliminates
+        the associated metric filters and subscription filter — a complete cover-tracks
+        primitive. It does not grant access to any resource.
+
+  # --- 6) Read log events — credential harvest from application logs ----------
+  # This is the DATA rule for CloudWatch Logs (Phase 12 mode 3). CloudWatch Logs
+  # aggregates output from Lambda functions, ECS tasks, EC2 instances, CodeBuild
+  # jobs, and custom applications. These logs frequently contain credential
+  # material embedded by developers: env var dumps at startup, stack traces
+  # exposing connection strings, boto3/SDK debug logging printing session tokens,
+  # or application code that prints API keys. A principal with logs:GetLogEvents,
+  # logs:FilterLogEvents, or logs:StartQuery + logs:GetQueryResults can read raw
+  # log events and harvest any secrets present.
+  #
+  # logs:GetLogEvents — read events from a specific log stream (requires both the
+  # log group ARN and the log stream name; may auto-iterate across streams).
+  # logs:FilterLogEvents — search across all streams in a log group using a filter
+  # pattern; more powerful than GetLogEvents for targeted harvest.
+  # logs:StartQuery + logs:GetQueryResults — CloudWatch Logs Insights query;
+  # requires BOTH actions on the log group ARN (StartQuery alone does not yield
+  # data; GetQueryResults alone requires a prior query ID). Functionally equivalent
+  # to logs:FilterLogEvents for credential-harvest purposes.
+  #
+  # SCHEMA NOTE: CanReadData.target is restricted to [Storage, Data, Messaging]
+  # (schema/edges.yaml). CloudWatch Logs log groups are modeled as LoggingService
+  # (ManagementService subtype), which is not in that set. We therefore emit CanRead
+  # (target: ["*"]) here — the general read capability — which accurately captures
+  # the data-plane read of log event content. The downstream credential-harvest chain
+  # (ContainsSecret → credential-chains:read-secret-yields-identity) operates off
+  # CanRead on the LoggingService node exactly as it would off CanReadData on a Data
+  # node, because ContainsSecret is the pivot edge, not the read edge type.
+  #
+  # Downstream credential-chains rollup (cited, not re-derived):
+  #   ContainsSecret(log_group, secret) + CanRead(principal, log_group)
+  #   => analyst inference: principal can read the log group and the group contains
+  #      a secret → CanReadSecret(principal, secret) [explicit normalization step]
+  #   => credential-chains:read-secret-yields-identity
+  #   => CanImpersonate(principal, target_identity) [CONDITIONAL: ContainsSecret heuristic]
+  #   => credential-chains:impersonate-is-escalation
+  #   => CanEscalateTo(principal, target_identity) [if privilege(target) > privilege(principal)]
+  - id: aws-cloudwatch-read-log-data
+    emits: CanRead
+    description: "logs:GetLogEvents, logs:FilterLogEvents, or logs:StartQuery + logs:GetQueryResults on a log group enables reading raw log events from the LoggingService node; application logs frequently embed secrets, tokens, or credentials usable for credential harvest."
+    match:
+      - [ ?principal, HasPermission, ?log_group ]
+    where:
+      - "node_type(?log_group) == LoggingService"
+      - "?log_group.provider_type == 'AWS::Logs::LogGroup'"
+      - "?principal has EFFECTIVE (logs:GetLogEvents OR logs:FilterLogEvents OR (logs:StartQuery AND logs:GetQueryResults)) on ?log_group ARN"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?log_group
+      permissions: ["logs:GetLogEvents", "logs:FilterLogEvents", "logs:StartQuery", "logs:GetQueryResults"]
+      conditions: [iam_permission, resource_policy, key_permission]
+      state_logic: >-
+        ACTIVE when logs:GetLogEvents OR logs:FilterLogEvents is confirmed EFFECTIVE
+        on the log group ARN (identity-based policy + no resource-policy deny + no
+        SCP deny) AND the log group is NOT KMS-encrypted (or the caller also holds
+        kms:Decrypt on the log group's CMK). ACTIVE when both logs:StartQuery AND
+        logs:GetQueryResults are confirmed EFFECTIVE on the log group ARN (Insights
+        query pair; neither action alone yields data). CONDITIONAL(iam_permission)
+        when only one of the Insights pair is confirmed (StartQuery without
+        GetQueryResults or vice versa). CONDITIONAL(key_permission) when the log
+        group has a kmsKeyId set and kms:Decrypt on that CMK is not confirmed —
+        credential-chains:decrypt-gates-secret-read upgrades to ACTIVE when CanDecrypt
+        is confirmed on the CMK. CONDITIONAL(resource_policy) when a resource policy
+        deny or missing grant caps the effective permission. BLOCKED by an explicit
+        deny on logs:GetLogEvents / logs:FilterLogEvents / logs:StartQuery /
+        logs:GetQueryResults, or on kms:Decrypt (for encrypted groups). The downstream
+        ContainsSecret + CanImpersonate chain (credential-chains) is CONDITIONAL on
+        the ContainsSecret annotation being confirmed — a heuristic ContainsSecret
+        (confidence 0.5) does not produce an ACTIVE CanImpersonate.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from:
+        - "?principal HasPermission ?log_group (logs:GetLogEvents / logs:FilterLogEvents effective permission)"
+        - "credential-chains:read-secret-yields-identity (downstream credential harvest — cited not re-derived)"
+        - "credential-chains:decrypt-gates-secret-read (KMS-encrypted log group gate — cited not re-derived)"
+      false_positive_note: >-
+        logs:GetLogEvents and logs:FilterLogEvents are distinct actions; either alone
+        is sufficient for log-event access (no pair requirement). logs:GetLogEvents
+        reads a specific log stream; logs:FilterLogEvents searches across all streams
+        in the group with a filter pattern. Either grants the CanRead capability —
+        emit for whichever is confirmed effective. logs:StartQuery and logs:GetQueryResults
+        form an Insights query pair: BOTH actions are required on the log group ARN to
+        yield results (StartQuery initiates the query, GetQueryResults retrieves results).
+        Emit ACTIVE only when BOTH are confirmed; emit CONDITIONAL(iam_permission) if
+        only one is confirmed.
+        KMS-encrypted log groups: logs:GetLogEvents returns encrypted event data when
+        called by a principal that lacks kms:Decrypt on the log group's CMK — emit as
+        CONDITIONAL(key_permission) in this case. credential-chains:decrypt-gates-
+        secret-read handles the upgrade when CanDecrypt is confirmed.
+        ContainsSecret is a heuristic annotation — not all log groups contain credential
+        material. The CanRead edge is always valid when the permission is confirmed;
+        the downstream CanImpersonate (credential-chains) is only ACTIVE when
+        ContainsSecret is confirmed with high confidence and CredentialsFor an identity
+        is evidenced. Do not over-claim: a log group of VPC Flow Logs contains IP
+        addresses, not credentials — CanRead is still valid for recon but ContainsSecret
+        should NOT be annotated. logs:DescribeLogGroups / logs:DescribeLogStreams are
+        recon-grade and do NOT warrant this CanRead edge (they return metadata, not
+        event content). Emits CanRead (not CanReadData) because schema/edges.yaml
+        CanReadData.target is restricted to [Storage, Data, Messaging]; LoggingService
+        is a ManagementService subtype and falls outside that set.
+      narrative: >-
+        {principal.name} can read log events from {log_group.name}
+        (logs:GetLogEvents / logs:FilterLogEvents / logs:StartQuery + logs:GetQueryResults).
+        Application log groups frequently contain credential material embedded in log
+        output (environment variable dumps, stack traces exposing connection strings,
+        SDK debug logging printing session tokens). If {log_group.name} carries a
+        ContainsSecret annotation, the credential-chains rollup (read-secret-yields-
+        identity) produces CanImpersonate over the embedded credential's target identity.
+        This is a credential-harvest path — CanRead on a log group does not by itself
+        grant access to compute or IAM.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying cloudwatch:DisableAlarmActions / cloudwatch:DeleteAlarms /
+#     logs:DeleteMetricFilter / logs:DeleteLogGroup on the account scope → emit
+#     the respective edge with state: BLOCKED and denied_by=<SCP arn>.
+#   - An explicit IAM deny on the relevant action (e.g. a preventive SCP as a
+#     CIS Benchmark control) → BLOCKED.
+#   - A KMS key policy deny on kms:Decrypt (for rule 6 over encrypted log groups)
+#     → CanReadData remains CONDITIONAL(key_permission), never upgraded to ACTIVE.
+#   - A CloudWatch resource tag-based condition (aws:ResourceTag) that the principal
+#     does not satisfy → CONDITIONAL(condition_expression).
+#   - State never exceeds the weakest contributor (RULE-FORMAT.md).
+#   - Detective controls do NOT themselves enter BLOCKED state — they are not
+#     preventive guardrails. BLOCKED applies only to CAPABILITY edges (rules 1-6),
+#     not to the LoggingService node.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules recommended (add to /rules/explicit/aws-cloudwatch.yaml
+# if created; these translate raw CloudWatch config to explicit edges that the derived
+# rules above consume):
+#
+#   aws-cloudwatch-log-group-kms:
+#     emits: HasPolicy
+#     match_record:
+#       resource_type: "AWS::Logs::LogGroup"
+#       field: "kmsKeyId"
+#     emit:
+#       source: "<log group node>"
+#       target: "<KMS key node>"
+#       api_source: "logs:DescribeLogGroups"
+#       evidence_field: "kmsKeyId"
+#       narrative: "{log_group.name} is encrypted with KMS key {kmsKeyId}."
+#       note: "HasPolicy edge; credential-chains rules consume this to gate CanRead
+#              on encrypted log groups (CanReadData → CONDITIONAL(key_permission))."
+#
+#   aws-cloudwatch-put-resource-policy:
+#     emits: CanModifyPolicy
+#     match_effective_permission:
+#       action: "logs:PutResourcePolicy"
+#       resource_type: "AWS::Logs::LogGroup"
+#     emit:
+#       source: "<principal>"
+#       target: "<resource policy node for log group>"
+#       permissions: ["logs:PutResourcePolicy"]
+#       narrative: "{principal.name} can rewrite the resource policy on {log_group.name}
+#                   (logs:PutResourcePolicy), enabling cross-account log access redirection
+#                   or escalation via policy mutation. Generic escalation rules (can-
+#                   control, can-modify-policy) consume CanModifyPolicy to derive
+#                   downstream CanGrantPermission / CanEnterAccount paths."
+#       note: "CanModifyPolicy is the entry point for resource-policy-mutation escalation;
+#              this is not a derived rule but a policy-evaluation normalization."

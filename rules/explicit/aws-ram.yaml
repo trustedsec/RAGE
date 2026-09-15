@@ -1,0 +1,327 @@
+# Explicit (normalization) rules for AWS Resource Access Manager (RAM).
+# ---------------------------------------------------------------------------
+# Turns raw collected RAM configuration (resource shares, principals, resource
+# associations) into explicit edges conforming to schema/edges.yaml.
+# These feed the derived rules in /rules/derived/aws/ram.yaml.
+#
+# ANTI-DUPLICATION:
+#   - The shared RESOURCE nodes (Subnet, TransitGateway, DNS/ResolverRule, etc.)
+#     are created and owned by their respective service adapters (VPC, TGW,
+#     Route53). We only ADD the cross-account access relationship here.
+#   - Account and Organization/OU boundary nodes are created by the Organizations
+#     adapter; we reference them as targets of CrossAccountTrust edges.
+#   - The CanNetworkReach and RoutesTo derivation from CrossAccountTrust is in
+#     /rules/derived/aws/ram.yaml; not re-derived here.
+#
+# NATURE: CrossAccountTrust is declared nature: explicit in schema/edges.yaml,
+# so it MUST be normalized in an /rules/explicit/ file and not emitted by
+# /rules/derived/. CanModifyPolicy (nature: explicit) is also normalized here.
+# ---------------------------------------------------------------------------
+
+rules:
+
+  # --- Resource Share is located in the owner account -------------------------
+  - id: aws-ram-share-locatedin-account
+    emits: LocatedIn
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::RAM::ResourceShare"
+      field: "owningAccountId"
+    emit:
+      target_type: Account
+      source_type: "*"
+      source: "<ResourceShare node (ResourcePolicy subtype)>"
+      target: "<Account node for owningAccountId>"
+      api_source: "ram:GetResourceShares (resourceOwner=SELF)"
+      evidence_field: "ResourceShare.owningAccountId"
+      narrative: "RAM share {share.name} is owned by and located in account {account.name}."
+
+  # --- Cross-account share: owner share -> consumer Account -------------------
+  # Emits when a specific external account ID is named in the share's principals.
+  # The consumer is an external Account node (from the Organizations adapter).
+  # For pending (invitation-not-accepted) shares, status is PENDING_ACCEPTANCE;
+  # the edge is CONDITIONAL(service_state) until accepted.
+  - id: aws-ram-share-crossaccount-trust
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::RAM::ResourceShare"
+      field: "principals"
+    where:
+      - "principal_entry matches a 12-digit AWS account ID"
+      - "account_id(principal_entry) != share.owningAccountId   # cross-account, not self"
+      - "share.allowExternalPrincipals == true OR same_org(principal_entry, share.owningAccountId)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<ResourceShare node (ResourcePolicy)>"
+      target: "<Account node for principal_entry account ID>"
+      api_source: "ram:GetResourceShares + ram:ListPrincipals (associationType=PRINCIPAL)"
+      evidence_field: "ResourceShare.principals[]"
+      permissions: []
+      conditions: [resource_policy, service_state]
+      state_logic: >-
+        ACTIVE when share.status == 'ACTIVE' (accepted or org-wide auto-accept).
+        CONDITIONAL(service_state) when share.status == 'PENDING_ACCEPTANCE'
+        (cross-account invitation not yet accepted by the consumer).
+        BLOCKED if an SCP on the consumer account denies ram:AcceptResourceShareInvitation.
+      false_positive_note: >-
+        A pending share grants NO access until accepted. Emit CONDITIONAL not
+        ACTIVE for PENDING_ACCEPTANCE status. Skip shares where principal_entry ==
+        owningAccountId (self-share, no cross-account effect). When
+        allowExternalPrincipals == false and the account is outside the org, RAM
+        rejects the association — the data should not appear, but if it does
+        (stale/inconsistent data), emit CONDITIONAL and flag as inconsistent.
+      narrative: >-
+        RAM share {share.name} (account {owner.name}) grants cross-account access
+        to account {consumer.name}. Shared resources: {share.resourceArns}.
+        Status: {share.status}.
+
+  # --- Org-wide share: owner share -> Organization (all members) ---------------
+  # When the principal is an org ARN (o-*), every member of the org is a consumer
+  # with no invitation required. Per schema/edges.yaml, CrossAccountTrust targets
+  # [Account, ExternalIdentity]. Since Organization is not an allowed target, we
+  # emit ExposedToTenant (nature: derived) with high blast-radius semantics instead.
+  # Individual account-to-account shares are normalized by aws-ram-share-crossaccount-trust.
+  - id: aws-ram-share-org-wide-exposed-to-tenant
+    emits: ExposedToTenant
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::RAM::ResourceShare"
+      field: "principals"
+    where:
+      - "principal_entry matches regex '^arn:aws:organizations::.*:organization/o-'"
+      - "share.status == 'ACTIVE'"
+      - "ram:EnableSharingWithAwsOrganization has been called (or assumed true for ACTIVE shares)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Organization
+      source: "<shared resource node(s) referenced in share.resourceArns>"
+      target: "<Organization node matching the org ARN in principal_entry>"
+      api_source: "ram:GetResourceShares + ram:ListPrincipals"
+      evidence_field: "ResourceShare.principals[]"
+      permissions: []
+      conditions: [resource_policy, service_state]
+      state_logic: >-
+        ACTIVE when share.status == 'ACTIVE' AND ram:EnableSharingWithAwsOrganization
+        is confirmed enabled. CONDITIONAL(service_state) when enablement status is
+        unconfirmed. This edge carries HIGH blast radius: it covers ALL current +
+        future org members with the capability to use the shared resource.
+      false_positive_note: >-
+        Org-wide sharing requires ram:EnableSharingWithAwsOrganization to have been
+        called in the management account. If not confirmed, downgrade to
+        CONDITIONAL(service_state). Member accounts still need to take actions
+        (attach TGW, launch instances in shared subnet, etc.) to REALIZE the access;
+        ExposedToTenant reflects that EVERY member account has the RIGHT to do so.
+        Do NOT conflate ExposedToTenant with the management-account controlling
+        member accounts — RAM sharing grants resource access, not account control.
+        For OU-level shares (ou-* ARN), do NOT emit ExposedToTenant; emit individual
+        CrossAccountTrust edges to each member account (or a set-level note).
+      narrative: >-
+        RAM share {share.name} in account {owner.name} grants access to {resource.name}
+        to the ENTIRE Organization {org.name} (org-wide principal o-{org.id}). Every
+        current and future member account can access this resource without invitation
+        — high blast-radius exposure.
+
+  # --- OU-wide share: owner share -> member accounts in OU -------------------
+  # When the principal is an OU ARN (ou-*), every member account in that OU is
+  # a consumer. Per schema/edges.yaml, CrossAccountTrust targets [Account, ExternalIdentity],
+  # not Folder. For OU-level shares, we emit individual CrossAccountTrust edges to
+  # each member account (realized via collection / org hierarchy), OR annotate with
+  # ExposedToTenant scoped to the Folder boundary as a high-blast-radius note.
+  # NOTE: This rule template is for the collection/normalization perspective.
+  # In practice, the Organizations adapter resolves the OU membership and emits
+  # one CrossAccountTrust per member account. This rule fires when detected.
+  - id: aws-ram-share-ou-members-trust
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::RAM::ResourceShare"
+      field: "principals"
+    where:
+      - "principal_entry matches regex '^arn:aws:organizations::.*:ou/o-.*'"
+      - "share.status == 'ACTIVE'"
+      - "org_member_accounts = list of accounts in the OU (from Organizations adapter)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<ResourceShare node (ResourcePolicy)>"
+      target: "<Account node for each member of the OU (emitted per account)>"
+      api_source: "ram:GetResourceShares + ram:ListPrincipals; Organizations:ListAccountsForParent"
+      evidence_field: "ResourceShare.principals[] (OU ARN); OU membership from Organizations API"
+      permissions: []
+      conditions: [resource_policy, service_state]
+      state_logic: >-
+        ACTIVE when share.status == 'ACTIVE' AND the account is confirmed to be
+        a current member of the OU. CONDITIONAL(service_state) for pending invitations
+        or unconfirmed membership. Member accounts added to the OU after the share
+        is created automatically gain access (future members) — surfaces as a
+        collection-time trigger to emit new CrossAccountTrust edges as accounts join.
+      false_positive_note: >-
+        OU-wide shares reach only accounts within the specified OU, not the entire
+        org. Emit one CrossAccountTrust edge per member account (target_type: Account).
+        For cross-OU visibility or blast-radius annotations, emit ExposedToTenant
+        separately with target_type: Organization (or Folder), flagging the OU-level
+        reach without violating the CrossAccountTrust schema constraint. Do NOT emit
+        CrossAccountTrust with target_type: Folder (OU); always resolve to member
+        Account nodes. If the OU membership is dynamic, mark edges CONDITIONAL and
+        set up collection triggers to update as membership changes.
+      narrative: >-
+        RAM share {share.name} grants access to {resource.name} to OU {ou.name}.
+        Every current and future member account in that OU gains access without
+        an invitation (or with org-internal invite if required).
+
+  # --- Share resource associations (what is shared) ---------------------------
+  # Records which resource ARNs are part of the share. This is metadata linking
+  # the resource to the share for downstream derived rules to inspect.
+  # NOTE: This used to emit HasPolicy with inverted semantics. The semantically
+  # cleaner approach is AttachedTo (resource bound to share) or to capture the
+  # resource list in the RAM ResourceShare node itself. We now omit this rule;
+  # the resource ARNs are embedded in the ResourceShare node collection, and
+  # derived rules inspect share.resourceArns directly.
+  # (Kept for reference; commented out to avoid duplicate/redundant edges.)
+  # - id: aws-ram-share-resource-association
+  #   emits: AttachedTo   # or omit and read from share node directly
+  #   applies_to: [aws]
+  #   match_record:
+  #     resource_type: "AWS::RAM::ResourceShare"
+  #     field: "resourceArns"
+  #   emit:
+  #     source_type: "*"
+  #     target_type: ResourcePolicy
+  #     source: "<specific resource node (Subnet, TransitGateway, DNS, etc.) resolved from ARN>"
+  #     target: "<ResourceShare node (ResourcePolicy)>"
+  #     narrative: "Resource {resource.name} is included in RAM share {share.name}."
+
+  # --- CanModifyPolicy: principal can add/remove principals from a share -------
+  # Effective permission normalization: a principal with ram:AssociateResourceShare
+  # on a specific share ARN can add arbitrary principals (including external
+  # accounts), manufacturing new CrossAccountTrust edges. Normalized here as
+  # CanModifyPolicy (nature: explicit) so the derived rule and hierarchy-chains
+  # rule 3 can consume it.
+  - id: aws-ram-associate-resource-share
+    emits: CanModifyPolicy
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ram:AssociateResourceShare"
+      resource_type: "AWS::RAM::ResourceShare"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<ResourceShare node in scope>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ram:AssociateResourceShare"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal has unconditional EFFECTIVE ram:AssociateResourceShare
+        on the share ARN. CONDITIONAL(iam_permission) when scoped by a condition
+        (e.g. aws:ResourceTag). BLOCKED when an SCP denies the action.
+      false_positive_note: >-
+        ONLY the OWNER account can call ram:AssociateResourceShare on a share.
+        Consumer accounts cannot. Scope the permission check to the share ARN
+        (wildcard Resource: "*" also triggers). This CanModifyPolicy is consumed
+        by derived/aws/ram.yaml rule 4 (manufacture new CrossAccountTrust) and by
+        hierarchy-chains.yaml guardrail-removal-upgrades-blocked when the share
+        itself is the guardrail.
+      narrative: >-
+        {principal.name} can add principals to RAM share {share.name}
+        (ram:AssociateResourceShare), granting cross-account access to the shared
+        resources to any account ID it names.
+
+  # --- CanModifyPolicy: principal can update share properties (incl. allowExternalPrincipals)
+  - id: aws-ram-update-resource-share
+    emits: CanModifyPolicy
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ram:UpdateResourceShare"
+      resource_type: "AWS::RAM::ResourceShare"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<ResourceShare node in scope>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ram:UpdateResourceShare"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when effective ram:UpdateResourceShare on the share ARN.
+        CONDITIONAL(iam_permission) when tag-conditioned. BLOCKED when SCP denies.
+      false_positive_note: >-
+        ram:UpdateResourceShare can flip allowExternalPrincipals from false to
+        true, enabling the addition of external account principals. If that flag
+        was previously blocking an external-account association, flipping it is a
+        guardrail removal — consumed by hierarchy-chains rule 3's
+        CanModifyPolicy branch. Only the share owner can call this. Consumer
+        cannot update a share they don't own.
+      narrative: >-
+        {principal.name} can update RAM share {share.name} (ram:UpdateResourceShare),
+        including flipping allowExternalPrincipals to enable cross-org sharing.
+
+  # --- CanCreate: principal can create a new resource share --------------------
+  - id: aws-ram-create-resource-share
+    emits: CanCreate
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ram:CreateResourceShare"
+      resource_type: "AWS::RAM::ResourceShare"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<owner Account (scope of the create action)>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ram:CreateResourceShare"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when effective ram:CreateResourceShare in the account. BLOCKED
+        when SCP denies.
+      false_positive_note: >-
+        CanCreate here surfaces the principal's ability to manufacture NEW
+        CrossAccountTrust edges ex nihilo. The actual cross-account trust only
+        materializes once the share is created and (for non-org shares) accepted.
+        The downstream POTENTIAL CrossAccountTrust and capability edges are
+        derived from the OBSERVED share; this edge surfaces the creation right
+        for analyst awareness.
+      narrative: >-
+        {principal.name} can create new RAM resource shares (ram:CreateResourceShare)
+        in account {account.name}, manufacturing new cross-account access grants
+        to any owned resource.
+
+  # --- Consumer-side: accept incoming invitation --------------------------------
+  # Consumer account principals with ram:AcceptResourceShareInvitation can
+  # transition a PENDING_ACCEPTANCE share to ACTIVE. This is normalized as
+  # HasPermission (nature: both) targeting the OWNER ACCOUNT (not the invitation),
+  # since the permission is scoped to accepting on behalf of the consumer account.
+  - id: aws-ram-accept-invitation
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "ram:AcceptResourceShareInvitation"
+      resource_type: "AWS::RAM::ResourceShare"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: "<consumer-account principal>"
+      target: "<owner Account (scope: consumer can accept invitations from any owner in this consumer account)>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["ram:AcceptResourceShareInvitation"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the consumer principal has effective ram:AcceptResourceShareInvitation
+        in the consumer account and there exists a PENDING_ACCEPTANCE share from
+        an owner. CONDITIONAL(service_state) when the permission is present but
+        no pending invitation exists yet. BLOCKED when SCP on the consumer account
+        denies acceptance.
+      false_positive_note: >-
+        The invitation only exists when an owner has created a share with this
+        consumer's account ID as a principal and status == PENDING_ACCEPTANCE.
+        This permission gates the upgrade from CONDITIONAL(service_state)
+        CrossAccountTrust to ACTIVE. Scope: the principal's account (not the
+        specific share, since at evaluation time the share may not exist yet).
+        If an SCP on the consumer denies this action, cross-account shares remain
+        PENDING and BLOCKED regardless of the owner's intent.
+      narrative: >-
+        {principal.name} in consumer account {consumer.name} can accept pending
+        RAM invitations (ram:AcceptResourceShareInvitation), activating cross-account
+        access to resources shared by other AWS accounts.

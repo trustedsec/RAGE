@@ -1,0 +1,754 @@
+# GCP Kubernetes Engine (GKE) — Phase 7 container/k8s attack-path rules
+# ---------------------------------------------------------------------------
+# GKE attack surface spans three orthogonal planes:
+#   (A) GCP IAM plane — container.clusters.getCredentials + a Kubernetes RBAC
+#       binding to cluster-admin / system:masters => full cluster control =>
+#       CanExecuteCommand on any pod => CanExecuteAs the pod's WI / node SA.
+#   (B) Kubernetes RBAC plane — pods/exec create on a workload => run commands
+#       inside the pod => read the mounted KSA token or WI credential =>
+#       CanExecuteAs the federated GSA (container-chains cluster-rbac-exec).
+#   (C) Workload Identity (WI) federation — KSA annotated to a GSA via the
+#       cluster OIDC issuer => projected token exchanged for GSA access token =>
+#       CanFederateAs (container-chains workload-identity-federates, which in turn
+#       fires federation-chains for CanImpersonate / CanEnterProject rollups).
+#
+# This file emits SERVICE-SPECIFIC FACTS and defers multi-hop rollups to the
+# linchpins:
+#   * container-chains.yaml — image-push-poisons-consumers, cluster-rbac-exec,
+#       workload-identity-federates (CITE, not re-derived here).
+#   * federation-chains.yaml — federation-maps-to-identity, federate-then-enter-project,
+#       federate-inherits-capabilities (CITE, not re-derived here).
+#   * can-execute-as.yaml — execute-as-via-code-modify, execute-as-via-command (CITE).
+#   * credential-chains.yaml — read-secret-yields-identity, impersonate-is-escalation (CITE).
+#   * can-control.yaml — escalate-via-execute-as (CITE).
+#   * gcp/identity-escalation.yaml — gcp-sa-act-as (CanPassIdentity for actAs gating),
+#       gcp-sa-set-iam-policy (CanModifyTrust for WI binding mutation) (CITE).
+#
+# Permissions are exact names from:
+#   https://cloud.google.com/kubernetes-engine/docs/reference/rest/v1/projects.locations.clusters
+#   https://cloud.google.com/kubernetes-engine/docs/reference/iam-roles
+#   https://cloud.google.com/iam/docs/permissions-reference (container.*)
+#   https://kubernetes.io/docs/reference/access-authn-authz/rbac/
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 7-containers-k8s
+applies_to: [gcp]
+
+rules:
+
+  # ===========================================================================
+  # SURFACE A — GCP IAM → CLUSTER CREDENTIAL ACQUISITION
+  # ===========================================================================
+
+  # --- A1) container.clusters.getCredentials => authenticated cluster access --
+  # THE GCP-specific bridge: a GCP IAM principal with getCredentials fetches a
+  # kubeconfig whose token is the caller's own GCP OAuth token. The k8s API
+  # server then evaluates that token against RBAC. ALONE this is just CanRead
+  # (cluster endpoint + CA certificate). Escalation requires a RBAC binding.
+  - id: gcp-gke-get-credentials
+    emits: CanRead
+    description: "container.clusters.getCredentials yields a kubeconfig (endpoint + CA) authenticated with the caller's GCP token; k8s RBAC then governs what actions are permitted."
+    match_effective_permission:
+      action: "container.clusters.getCredentials"
+      resource_type: "container.googleapis.com/Cluster"
+    emit:
+      source_type: Identity
+      target_type: KubernetesCluster
+      source: "<principal>"
+      target: "<GKE cluster>"
+      permissions: ["container.clusters.getCredentials"]
+      conditions: [iam_permission, api_enabled]
+      state_logic: "ACTIVE if the principal has container.clusters.getCredentials at the project/cluster scope and the Kubernetes Engine API is enabled; CONDITIONAL(api_enabled) if the GKE API is disabled in the project."
+      confidence: 0.95
+      derived_from: ["<effective iam_permission: container.clusters.getCredentials on cluster>"]
+      false_positive_note: >-
+        container.clusters.getCredentials does NOT grant admin access by itself.
+        The kubeconfig uses the caller's GCP OAuth token; k8s RBAC determines
+        privilege. Without a ClusterRoleBinding to cluster-admin or system:masters,
+        the caller has only its RBAC-granted permissions. Do NOT conflate with
+        container.clusters.get (read-only metadata, no cluster authentication).
+        container.clusters.get alone is pure recon — emit only CanRead on the
+        cluster metadata, not on authenticated cluster access.
+      narrative: >-
+        {principal.name} can fetch a kubeconfig for {cluster.name}
+        (container.clusters.getCredentials), authenticating to the cluster API
+        server with its GCP OAuth token; its k8s RBAC bindings then determine
+        what actions it may perform.
+
+  # --- A2) getCredentials + cluster-admin RBAC => CanExecuteCommand on all pods
+  # When the principal's GCP identity has a ClusterRoleBinding (or is in the
+  # system:masters group) mapping it to cluster-admin, it holds pods/exec create
+  # across all namespaces — full CanExecuteCommand fan-out. This is the headline
+  # GKE escalation: a single GCP IAM permission + RBAC binding = RCE in every pod.
+  - id: gcp-gke-credentials-cluster-admin-exec
+    emits: CanExecuteCommand
+    description: "container.clusters.getCredentials + cluster-admin ClusterRoleBinding (or system:masters group) => pods/exec create on all pods => CanExecuteCommand fan-out."
+    match:
+      - [ ?principal, CanRead, ?cluster ]
+    where:
+      - "node_type(?cluster) == KubernetesCluster"
+      - "?principal's GCP identity maps (via GKE IAM authenticator) to a k8s subject that holds cluster-admin (via ClusterRoleBinding OR system:masters group membership)"
+      - "The ClusterRoleBinding or system:masters binding is present in the cluster's RBAC config"
+    emit:
+      source_type: Identity
+      target_type: KubernetesWorkload
+      source: ?principal
+      target: "<all pods in cluster>"
+      permissions: ["container.clusters.getCredentials", "k8s:pods/exec:create", "k8s:pods/portforward:create"]
+      conditions: [iam_permission, trust_relationship, network_reachability]
+      state_logic: >-
+        ACTIVE if the ClusterRoleBinding to cluster-admin (or system:masters group
+        assignment) binds the principal's GCP identity/email AND
+        container.clusters.getCredentials is ACTIVE AND the k8s API server endpoint
+        is reachable from the principal's network position. CONDITIONAL(network_reachability)
+        when the cluster's masterAuthorizedNetworksConfig restricts access and the
+        principal is not within an allowed CIDR / VPC peering. BLOCKED when the
+        endpoint is fully private and the principal has no in-VPC foothold. Note:
+        container.clusters.getCredentials itself uses the public GCP API and is always
+        reachable, but the resulting kubeconfig must ALSO reach the k8s API server
+        endpoint to perform exec. CONDITIONAL(trust_relationship) if the RBAC binding
+        exists but the GKE IAM authenticator subject mapping is not confirmed (e.g.
+        the GCP email vs. k8s User subject is ambiguous).
+      confidence: 0.93
+      derived_from:
+        - "<gcp-gke-get-credentials CanRead edge>"
+        - "<ClusterRoleBinding to cluster-admin or system:masters group membership>"
+      false_positive_note: >-
+        Only emit when BOTH sides are confirmed: (1) container.clusters.getCredentials
+        is ACTIVE and (2) a ClusterRoleBinding (or system:masters group) binds the
+        principal's GCP email/group to cluster-admin. Confirm the exact subject in the
+        ClusterRoleBinding matches the GCP identity (user: vs. group: vs.
+        serviceAccount: in the subjects list). For private clusters add
+        network_reachability as a gate (the API endpoint is not internet-reachable
+        without Authorized Networks or a VPN). Do NOT emit for container.clusters.get
+        alone — that permission does not authenticate to the cluster API server.
+      narrative: >-
+        {principal.name} can obtain a cluster-admin kubeconfig for {cluster.name}
+        (container.clusters.getCredentials + ClusterRoleBinding to cluster-admin);
+        this grants pods/exec create on every pod, CanExecuteCommand across all
+        workloads, and — via container-chains cluster-rbac-exec and each pod's
+        ExecutesAs — CanExecuteAs every workload identity in the cluster.
+
+  # --- A3) K8s RBAC pods/exec create => CanExecuteCommand on specific pod -----
+  # The Kubernetes-plane exec capability: a principal (GCP IAM or k8s-native)
+  # holding pods/exec create on a namespace or cluster can run commands inside
+  # pods in scope. This is the per-pod-precise version; cluster-admin gets it
+  # for all pods via rule A2. This rule covers narrower RBAC grants.
+  - id: gcp-gke-rbac-exec-pod
+    emits: CanExecuteCommand
+    description: "K8s RBAC pods/exec create (or ClusterRole containing it) on a namespace/cluster grants CanExecuteCommand on pods in scope — the direct exec path independent of GCP IAM."
+    match_effective_permission:
+      action: "k8s:pods/exec create"
+      resource_type: "k8s/Pod"
+    where:
+      - "?principal holds pods/exec create (as a ClusterRole verb) via a ClusterRoleBinding or a RoleBinding in the pod's namespace"
+      - "?pod is within the scope of the RBAC grant (namespace or cluster-wide)"
+    emit:
+      source_type: Identity
+      target_type: KubernetesWorkload
+      source: "<principal>"
+      target: "<pod / KubernetesWorkload in scope>"
+      permissions: ["k8s:pods/exec create"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE if the ClusterRoleBinding or RoleBinding granting pods/exec create is
+        confirmed and the pod is running. CONDITIONAL(service_state) if the pod is
+        not currently running (exec requires a live container). BLOCKED if a
+        PodSecurity admission controller, OPA/Gatekeeper, or Kyverno policy denies
+        exec; emit BLOCKED with denied_by=<admission controller>.
+      confidence: 0.95
+      derived_from:
+        - "<RBAC ClusterRoleBinding / RoleBinding granting pods/exec create on ?pod>"
+      false_positive_note: >-
+        Scope the exec verb PRECISELY to the namespace and pod. A RoleBinding in
+        namespace A does not grant exec in namespace B. A ClusterRoleBinding with
+        resourceNames restricts to specific pods — honor it. Exec requires the pod to
+        be Running; a Pending/Completed/CrashLoopBackOff pod is CONDITIONAL(service_state).
+        PodSecurity / admission webhooks may deny exec even if RBAC allows it — emit
+        BLOCKED when such a policy is detected.
+      narrative: >-
+        {principal.name} holds pods/exec create (via ClusterRoleBinding / RoleBinding)
+        on {pod.name}, allowing it to run arbitrary shell commands inside the running
+        pod — equivalent to interactive access to the container filesystem and any
+        mounted credentials.
+
+  # ===========================================================================
+  # SURFACE B — NODE SA EXPOSURE (legacy, no GKE_METADATA_SERVER)
+  # ===========================================================================
+
+  # --- B1) Legacy metadata server: node SA accessible from pods ---------------
+  # When a node pool's workloadMetadataConfig.mode is NOT GKE_METADATA (i.e.,
+  # EXPOSE_ALL_SCOPES or the older default), pods on those nodes can reach the
+  # GCE metadata server directly and read the node pool SA's OAuth token — the
+  # same token the GCE gcp-gce-metadata-token rule covers for GCE instances. This
+  # is a GKE-specific fact because the GKE_METADATA_SERVER is the mitigation.
+  - id: gcp-gke-node-sa-legacy-exposure
+    emits: ExposesCredential
+    description: "A GKE node pool with workloadMetadataConfig.mode != GKE_METADATA allows pods to reach the GCE metadata server and read the node pool SA's OAuth token — the node SA credential is exposed to every pod on those nodes."
+    match_record:
+      resource_type: "container.googleapis.com/NodePool"
+      field: "config.workloadMetadataConfig.mode"
+    where:
+      - "config.workloadMetadataConfig.mode != 'GKE_METADATA'  (i.e., EXPOSE_ALL_SCOPES, UNSPECIFIED, or legacy)"
+      - "?node_pool has a service account in config.serviceAccount"
+    emit:
+      source_type: Compute
+      target_type: ServiceAccount
+      source: "<node pool (VirtualMachine aggregate)>"
+      target: "<node pool SA (ServiceAccount)>"
+      permissions: []
+      conditions: [service_state, network_reachability]
+      state_logic: >-
+        ACTIVE when config.workloadMetadataConfig.mode is EXPOSE_ALL_SCOPES (or
+        unset / legacy) AND the node pool SA is non-empty AND nodes are running.
+        BLOCKED when GKE_METADATA mode is enforced (the GKE metadata proxy intercepts
+        metadata requests and scopes tokens to the pod's WI identity, blocking node
+        SA access from pods). CONDITIONAL(service_state) if node pool nodes are not
+        yet running (scale-up in progress).
+      confidence: 0.90
+      derived_from:
+        - "<node pool config.workloadMetadataConfig.mode collected from GKE API>"
+        - "<node pool config.serviceAccount>"
+      false_positive_note: >-
+        This edge is BLOCKED whenever workloadMetadataConfig.mode == GKE_METADATA
+        — the GKE Metadata Proxy prevents pods from reaching the raw node metadata
+        endpoint. Do NOT emit ACTIVE for GKE_METADATA mode clusters. Also check that
+        the node pool SA is not the GKE-managed service account (which has limited
+        scope); the Compute Engine default SA (PROJECT_NUMBER-compute@developer.
+        gserviceaccount.com) historically holds roles/editor and is a high-value target.
+        access scopes on the node pool constrain the token even if the SA holds the
+        role — note as false-positive risk (scopes are not an enumerated condition_type).
+      narrative: >-
+        {node_pool.name}'s workload metadata is configured with EXPOSE_ALL_SCOPES
+        (not GKE_METADATA); pods on these nodes can reach the GCE metadata server at
+        http://metadata.google.internal and read the node SA {sa.name}'s OAuth token,
+        effectively executing as {sa.name} without any GCP IAM permission from within
+        the pod.
+
+  # --- B2) Pod-level: code exec on pod + node SA exposure => retrieve token ---
+  # Once a principal can exec into a pod on a legacy-metadata node pool, it reads
+  # the node SA token via the metadata endpoint. Feeds can-execute-as and
+  # credential-chains.
+  - id: gcp-gke-exec-reads-node-sa-token
+    emits: CanRetrieveToken
+    description: "Executing inside a pod on a legacy-metadata node pool (no GKE_METADATA) allows the code to call the GCE metadata server and retrieve the node pool SA's access token."
+    match:
+      - [ ?principal, CanExecuteCommand, ?pod ]
+      - [ ?node_pool,  ExposesCredential, ?node_sa ]
+    where:
+      - "node_type(?pod) in [KubernetesWorkload, Container]"
+      - "?pod runs on ?node_pool (pod is scheduled on a node from the node pool)"
+      - "node_type(?node_sa) == ServiceAccount"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: ?principal
+      target: ?node_sa
+      permissions: []
+      conditions: [service_state, network_reachability]
+      state_logic: >-
+        ACTIVE when CanExecuteCommand is ACTIVE AND gcp-gke-node-sa-legacy-exposure
+        is ACTIVE (node pool not using GKE_METADATA). CONDITIONAL(service_state)
+        if the pod is not running. BLOCKED if node_pool uses GKE_METADATA mode
+        (metadata server intercepts and scopes token to WI identity only).
+      confidence: 0.88
+      derived_from:
+        - "<gcp-gke-rbac-exec-pod or gcp-gke-credentials-cluster-admin-exec CanExecuteCommand edge>"
+        - "<gcp-gke-node-sa-legacy-exposure ExposesCredential edge>"
+      false_positive_note: >-
+        GKE_METADATA mode BLOCKS this path — the metadata proxy at 169.254.169.254
+        returns only the pod's own WI-scoped token. Only emit when the node pool's
+        workloadMetadataConfig.mode is NOT GKE_METADATA. Network reachability to
+        the metadata endpoint (169.254.169.254 / metadata.google.internal) is
+        granted by default from within the pod's network namespace; no additional
+        firewall rule needed.
+      narrative: >-
+        {principal.name} can exec into {pod.name} on node pool {node_pool.name}
+        (which uses EXPOSE_ALL_SCOPES metadata mode), then call the GCE metadata
+        server to retrieve {node_sa.name}'s OAuth token — effectively impersonating
+        the node pool SA with no GCP IAM permission beyond the exec capability.
+
+  # ===========================================================================
+  # SURFACE C — CONTROL-PLANE MUTATION (GCP IAM)
+  # ===========================================================================
+
+  # --- C1) container.clusters.update => CanModifyConfiguration ---------------
+  # Cluster-level config changes: disabling WI, changing node SA, modifying
+  # master auth networks, switching to legacy metadata — each is a configuration
+  # mutation that can degrade cluster isolation and expose node SA credentials.
+  - id: gcp-gke-cluster-update-config
+    emits: CanModifyConfiguration
+    description: "container.clusters.update allows modifying cluster-wide security configuration: disabling Workload Identity, changing master auth networks, disabling Binary Authorization, or enabling EXPOSE_ALL_SCOPES metadata — each is a misconfiguration that opens downstream escalation paths."
+    match_effective_permission:
+      action: "container.clusters.update"
+      resource_type: "container.googleapis.com/Cluster"
+    emit:
+      source_type: Identity
+      target_type: KubernetesCluster
+      source: "<principal>"
+      target: "<GKE cluster>"
+      permissions: ["container.clusters.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if container.clusters.update is confirmed effective at the project
+        or cluster scope. The downstream impact (WI disabled, metadata exposed, etc.)
+        is CONDITIONAL on which specific mutation is applied — this emits the
+        configuration-change capability; downstream rules (e.g., node SA exposure)
+        fire once the config is changed.
+      confidence: 0.90
+      derived_from: ["<effective iam_permission: container.clusters.update on cluster>"]
+      false_positive_note: >-
+        container.clusters.update is a broad permission; the actual attack impact
+        depends on WHICH field is updated. Disabling WI (workloadIdentityConfig)
+        reverts pods to node SA metadata access (feeds gcp-gke-node-sa-legacy-exposure).
+        Disabling Binary Authorization may allow arbitrary image pulls. Modifying
+        masterAuthorizedNetworksConfig to 0.0.0.0/0 opens the API server. Emit a
+        single CanModifyConfiguration edge and let the analyst trace the specific
+        sub-attack via gcp-gke-node-sa-legacy-exposure or other rules.
+      narrative: >-
+        {principal.name} can update the GKE cluster {cluster.name}
+        (container.clusters.update), enabling reconfiguration of Workload Identity,
+        node pool metadata mode, master auth networks, and admission controllers —
+        each of which can open downstream escalation paths.
+
+  # --- C2) Node pool create with chosen SA => CanCreateWorkloadAs ------------
+  # An attacker with container.nodePools.create + iam.serviceAccounts.actAs on a
+  # privileged SA can add a new node pool running as that SA. Legacy metadata
+  # pods on those nodes inherit the SA token — effectively creating a workload
+  # that executes as the SA. GKE-specific CanCreateWorkloadAs.
+  - id: gcp-gke-create-nodepool-as-sa
+    emits: CanCreateWorkloadAs
+    description: "container.nodePools.create + iam.serviceAccounts.actAs on a chosen SA => create a new node pool running as that SA; pods on those nodes read the node SA token via the metadata server (legacy metadata mode)."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has EFFECTIVE container.nodePools.create on the cluster"
+      - "?sa is the target node SA (config.serviceAccount in the new node pool)"
+      - "?principal has iam.serviceAccounts.actAs on ?sa (GKE requires actAs to bind a SA to a node pool)"
+      - "the new node pool uses EXPOSE_ALL_SCOPES metadata mode OR WI is disabled on the cluster (so pods can reach the node SA metadata)"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: ?principal
+      target: ?sa
+      permissions: ["container.nodePools.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility, service_state]
+      state_logic: >-
+        ACTIVE when both container.nodePools.create AND iam.serviceAccounts.actAs
+        are confirmed and the node pool will use EXPOSE_ALL_SCOPES (or the cluster
+        has WI disabled). POTENTIAL(role_compatibility) if the node pool SA
+        permissibility is uncertain (the target SA may already be in use and
+        GKE may reject re-binding). CONDITIONAL(service_state) until the node pool
+        nodes are running and pods are scheduled.
+      confidence: 0.85
+      derived_from:
+        - "<gcp/identity-escalation.yaml gcp-sa-act-as CanPassIdentity edge>"
+        - "<effective iam_permission: container.nodePools.create on cluster>"
+      false_positive_note: >-
+        container.nodePools.create requires iam.serviceAccounts.actAs on the SA to
+        bind it to the node pool — without actAs GKE rejects the request. The node
+        SA token is only accessible to pods if workloadMetadataConfig is NOT set to
+        GKE_METADATA (downgrade to POTENTIAL if WI is enforced cluster-wide).
+        Adding a node pool with GKE_METADATA still enabled means pods get scoped WI
+        tokens, not the node SA — so the token-theft step does not apply. Only
+        emit when legacy metadata access is confirmed (or will be configured on the
+        new node pool). GKE Autopilot clusters do NOT allow custom node pools —
+        BLOCKED for Autopilot.
+      narrative: >-
+        {principal.name} can create a new node pool for cluster {cluster.name} bound
+        to {sa.name} (container.nodePools.create + iam.serviceAccounts.actAs); pods
+        scheduled on those nodes can read {sa.name}'s OAuth token from the GCE
+        metadata server, executing with its cloud IAM permissions.
+
+  # --- C2b) Node pool update with SA mutation => CanModifyConfiguration -----
+  # An attacker with container.nodePools.update + iam.serviceAccounts.actAs on a
+  # privileged SA can modify an EXISTING node pool to run as that SA (instead of
+  # its original SA). This changes the node SA for all nodes in the pool, including
+  # existing/running nodes. Pods already scheduled on those nodes (via legacy
+  # metadata mode) immediately gain access to the new (more privileged) SA's token.
+  # High-value because the attacker does not need to create a new node pool —
+  # existing infrastructure is compromised in-place.
+  - id: gcp-gke-update-nodepool-sa
+    emits: CanModifyConfiguration
+    description: "container.nodePools.update + iam.serviceAccounts.actAs on a privileged SA allows changing an existing node pool's service account — converts existing pod workloads to run as the new (more privileged) SA via legacy metadata access."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has EFFECTIVE container.nodePools.update on the cluster"
+      - "?sa is the new node SA being bound to an existing node pool"
+      - "?principal has iam.serviceAccounts.actAs on ?sa (GKE requires actAs to bind a SA to a node pool)"
+      - "the node pool uses EXPOSE_ALL_SCOPES metadata mode OR WI is disabled on the cluster (so pods can reach the node SA metadata)"
+    emit:
+      source_type: Identity
+      target_type: KubernetesCluster
+      source: ?principal
+      target: "<GKE cluster / node pool>"
+      permissions: ["container.nodePools.update", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility, service_state]
+      state_logic: >-
+        ACTIVE when both container.nodePools.update AND iam.serviceAccounts.actAs
+        are confirmed and the node pool will use EXPOSE_ALL_SCOPES (or the cluster
+        has WI disabled). The node SA change is applied immediately to the node pool
+        metadata, but running pods only read the new token after restart or after
+        the metadata server cache expires. POTENTIAL(role_compatibility) if the node
+        pool SA permissibility is uncertain. CONDITIONAL(service_state) until running
+        pods refresh their metadata-cached tokens (typically within seconds to minutes).
+      confidence: 0.87
+      derived_from:
+        - "<gcp/identity-escalation.yaml gcp-sa-act-as CanPassIdentity edge>"
+        - "<effective iam_permission: container.nodePools.update on cluster>"
+      false_positive_note: >-
+        container.nodePools.update requires iam.serviceAccounts.actAs on the new SA
+        to bind it to the node pool — without actAs GKE rejects the request. The node
+        SA token is only accessible to pods if workloadMetadataConfig is NOT set to
+        GKE_METADATA. This is a CanModifyConfiguration(target=cluster) emission because
+        the attack modifies the cluster's node pool configuration; it differs from
+        gcp-gke-create-nodepool-as-sa (CanCreateWorkloadAs) in that no new workload is
+        created — existing pods are compromised in-place when they read the updated node
+        SA token from metadata. GKE Autopilot clusters do NOT allow node pool mutations —
+        BLOCKED for Autopilot.
+      narrative: >-
+        {principal.name} can update an existing node pool in {cluster.name}
+        (container.nodePools.update + iam.serviceAccounts.actAs) to change its node SA to
+        {sa.name}; pods on those nodes (in legacy metadata mode) immediately gain
+        {sa.name}'s OAuth token and cloud IAM privileges, compromising existing workloads
+        without creating new resources.
+
+  # --- C3) K8s ClusterRoleBinding create => CanGrantPermission (cluster-admin) -
+  # A principal with the k8s RBAC verb clusterrolebindings/create (or a wildcard
+  # * on the RBAC API group) can bind cluster-admin to any subject — the K8s
+  # analogue of CanGrantPermission. This is commonly reachable via a
+  # ClusterRoleBinding to admin or cluster-admin that includes the create verb.
+  - id: gcp-gke-rbac-create-clusterrolebinding
+    emits: CanGrantPermission
+    description: "K8s RBAC clusterrolebindings/create (or wildcard *) verb lets a principal bind cluster-admin to any subject, effectively granting itself full cluster control — the k8s privilege escalation via RBAC."
+    match_effective_permission:
+      action: "k8s:clusterrolebindings create"
+      resource_type: "k8s/ClusterRoleBinding"
+    where:
+      - "?principal holds clusterrolebindings/create (or a wildcard * covering it) via a ClusterRoleBinding or RoleBinding in scope"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<any k8s subject (self-grant to cluster-admin)>"
+      permissions: ["k8s:clusterrolebindings create"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if the RBAC grant allows creating ClusterRoleBindings at cluster scope.
+        BLOCKED if an admission webhook / OPA-Gatekeeper / Kyverno policy denies
+        ClusterRoleBinding creation or restricts ClusterRole references to non-admin
+        roles.
+      confidence: 0.92
+      derived_from:
+        - "<RBAC ClusterRoleBinding granting clusterrolebindings/create to ?principal>"
+      false_positive_note: >-
+        Only emit when the create verb is confirmed on clusterrolebindings in the
+        rbac.authorization.k8s.io API group at cluster scope (not just namespace
+        scope). A RoleBinding scoped to a namespace does NOT grant cluster-wide
+        ClusterRoleBinding creation. Admission webhooks may restrict which ClusterRoles
+        may be referenced — honor as BLOCKED when such a policy is confirmed.
+      narrative: >-
+        {principal.name} can create ClusterRoleBindings in {cluster.name}
+        (k8s clusterrolebindings/create), allowing it to bind cluster-admin to its
+        own identity, granting full cluster control and pods/exec on all pods.
+
+  # ===========================================================================
+  # SURFACE D — WORKLOAD IDENTITY TRUST MUTATION
+  # ===========================================================================
+
+
+  # ===========================================================================
+  # SURFACE E — IMAGE SUPPLY CHAIN (delegates to container-chains)
+  # ===========================================================================
+
+  # --- D4) K8s Deployment image update via RBAC => CanModifyCode -----------
+  # A principal with k8s:deployments/update (or equivalent patch verb) in RBAC
+  # can change the container image reference in a Deployment spec — a direct
+  # CanModifyCode into the workload, independent of registry push. Distinct from
+  # the registry-push path (E1) because it does not require writing to an external
+  # registry; a principal with only namespace-scoped RBAC deploy/patch access can
+  # overwrite the image field of an existing Deployment and trigger an immediate
+  # rollout with a poisoned image.
+  - id: gcp-gke-rbac-deploy-update-image
+    emits: CanModifyCode
+    description: "K8s RBAC deployments/update (or equivalent patch verb) on a Deployment lets a principal change the container image reference — direct CanModifyCode into the workload, triggering a rollout with attacker-controlled image."
+    match_effective_permission:
+      action: "k8s:deployments/update"
+      resource_type: "k8s/Deployment"
+    where:
+      - "?principal holds deployments/update (or deployments/patch) via a ClusterRoleBinding or RoleBinding in the deployment's namespace or cluster-wide"
+      - "?deployment is within the scope of the RBAC grant"
+    emit:
+      source_type: Identity
+      target_type: KubernetesWorkload
+      source: "<principal>"
+      target: "<Deployment / KubernetesWorkload>"
+      permissions: ["k8s:deployments/update", "k8s:deployments/patch"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE if the ClusterRoleBinding or RoleBinding granting deployments/update/patch
+        is confirmed and the Deployment controller is running to reconcile spec changes.
+        CONDITIONAL(service_state) if the Deployment controller is not running or the
+        cluster is paused. This CanModifyCode(principal -> workload) feeds container-chains
+        poisoned-image-executes-as + can-execute-as execute-as-via-code-modify to roll up
+        to CanExecuteAs the workload's identity.
+      confidence: 0.93
+      derived_from:
+        - "<RBAC ClusterRoleBinding / RoleBinding granting deployments/update or deployments/patch on ?deployment>"
+      false_positive_note: >-
+        Scope the update/patch verb PRECISELY to the namespace and resource. A RoleBinding
+        in namespace A does not grant update in namespace B. A ClusterRoleBinding with
+        resourceNames restricts to specific Deployments — honor it. The rollout is ACTIVE
+        only if the Deployment controller is running; if the cluster is paused or the
+        controller is crashed, the image change is CONDITIONAL(service_state). This rule
+        emits the direct image-mutation path independent of the registry-push supply chain
+        (E1). Digest-pinned image references are not relevant here — the attacker directly
+        overwrites the image field, bypassing all registry immutability controls.
+      narrative: >-
+        {principal.name} can update the Deployment {deployment.name}
+        (k8s deployments/update or deployments/patch), allowing it to change the container
+        image reference to a poisoned image — the Deployment controller immediately rolls
+        out the new image to all pods, executing attacker code as each pod's identity.
+
+  # --- E1) Artifact Registry push => CanModifyCode (feeds container-chains) ---
+  # An attacker with artifactregistry.repositories.uploadArtifacts can overwrite a
+  # mutable image/tag in a registry that GKE workloads pull from. container-chains
+  # image-push-poisons-consumers then propagates CanModifyCode to each consuming
+  # KubernetesWorkload, and container-chains poisoned-image-executes-as derives
+  # CanExecuteAs. This rule emits the registry-level CanModifyCode fact.
+  - id: gcp-gke-registry-push
+    emits: CanModifyCode
+    description: "artifactregistry.repositories.uploadArtifacts on an Artifact Registry repository (or storage.objects.create on a legacy GCR bucket) lets an attacker push/overwrite an image tag that GKE workloads pull — registry-level CanModifyCode, propagated by container-chains to each consuming workload."
+    match_effective_permission:
+      action: "artifactregistry.repositories.uploadArtifacts"
+      resource_type: "artifactregistry.googleapis.com/Repository"
+    emit:
+      source_type: Identity
+      target_type: ContainerRegistry
+      source: "<principal>"
+      target: "<Artifact Registry repository>"
+      permissions: ["artifactregistry.repositories.uploadArtifacts"]
+      conditions: [iam_permission, api_enabled]
+      state_logic: >-
+        ACTIVE if artifactregistry.repositories.uploadArtifacts is confirmed effective
+        on the repository. BLOCKED if the repository is configured with
+        virtual-repository immutability (tag immutability) — overwriting a tag is
+        rejected and the supply-chain fan-out is blocked for tag-referenced consumers.
+        container-chains image-push-poisons-consumers then handles per-consumer
+        propagation (gating on mutable vs. digest-pinned references).
+      confidence: 0.95
+      derived_from:
+        - "<effective iam_permission: artifactregistry.repositories.uploadArtifacts>"
+      false_positive_note: >-
+        Propagation to consumers is handled by container-chains (image-push-poisons-
+        consumers) — do NOT re-derive the fan-out here. The tag-immutability check
+        on the repository is the primary BLOCKED gate; per-consumer digest pinning is
+        container-chains' gate. Also covers the legacy GCR path via
+        storage.objects.create on the underlying GCS bucket (gcr.io/<project>/...),
+        but that path requires storage bucket access and is rarer.
+      narrative: >-
+        {principal.name} can push or overwrite images in Artifact Registry repository
+        {registry.name} (artifactregistry.repositories.uploadArtifacts); container-chains
+        propagates this CanModifyCode to every GKE workload that references a mutable
+        tag from that repository, executing attacker code as each workload's identity.
+
+  # ===========================================================================
+  # EXPLICIT NORMALIZATION FACTS (edge normalization for the collector)
+  # ===========================================================================
+  # These are structural/explicit facts the normalization layer must emit from
+  # raw GKE API responses. Listed here (not in rules/explicit/) because GKE's
+  # explicit normalization is thin enough to co-locate with the derived rules.
+
+explicit_rules:
+
+  - id: gcp-gke-executes-as-ksa
+    emits: ExecutesAs
+    applies_to: [gcp]
+    match_record:
+      resource_type: "k8s/Pod"
+      field: "spec.serviceAccountName"
+    emit:
+      source_type: Compute
+      target_type: WorkloadIdentity
+      source: "<Pod / KubernetesWorkload>"
+      target: "<Kubernetes ServiceAccount (WorkloadIdentity)>"
+      permissions: []
+      api_source: "k8s GET /api/v1/namespaces/{ns}/pods"
+      evidence_field: "spec.serviceAccountName"
+      narrative: "{pod.name} executes as Kubernetes ServiceAccount {ksa.name} (spec.serviceAccountName)."
+
+  - id: gcp-gke-wi-trusts-external-identity
+    emits: TrustsExternalIdentity
+    applies_to: [gcp]
+    match_record:
+      resource_type: "iam.googleapis.com/ServiceAccount"
+      field: "iamPolicy.bindings[role=roles/iam.workloadIdentityUser].members"
+    where:
+      - "member is of the form serviceAccount:{project}.svc.id.goog[{ns}/{ksa}]"
+    emit:
+      source_type: ServiceAccount
+      target_type: WorkloadIdentity
+      source: "<GSA (ServiceAccount)>"
+      target: "<KSA subject (WorkloadIdentity)>"
+      permissions: []
+      api_source: "iam GET /{serviceAccount}:getIamPolicy"
+      evidence_field: "iamPolicy.bindings[role=roles/iam.workloadIdentityUser].members"
+      narrative: "{gsa.name} trusts KSA {ksa.name} as a Workload Identity federated principal (roles/iam.workloadIdentityUser)."
+
+  - id: gcp-gke-ksa-annotated-to-gsa
+    emits: ExternalIdentityMapsTo
+    applies_to: [gcp]
+    match_record:
+      resource_type: "k8s/ServiceAccount"
+      field: "metadata.annotations['iam.gke.io/gcp-service-account']"
+    emit:
+      source_type: WorkloadIdentity
+      target_type: ServiceAccount
+      source: "<KSA (WorkloadIdentity)>"
+      target: "<GSA email from annotation (ServiceAccount)>"
+      permissions: []
+      api_source: "k8s GET /api/v1/namespaces/{ns}/serviceaccounts"
+      evidence_field: "metadata.annotations['iam.gke.io/gcp-service-account']"
+      narrative: "KSA {ksa.name} is annotated to map to GSA {gsa.name} via Workload Identity (iam.gke.io/gcp-service-account)."
+
+  - id: gcp-gke-workload-image-ref
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    match_record:
+      resource_type: "k8s/Pod"
+      field: "spec.containers[].image"
+    where:
+      - "image reference does NOT contain @sha256: (mutable tag — supply-chain-relevant)"
+    emit:
+      source_type: Compute
+      target_type: ContainerRegistry
+      source: "<Pod / KubernetesWorkload>"
+      target: "<ContainerRegistry (resolved from image hostname)>"
+      permissions: []
+      api_source: "k8s GET /api/v1/namespaces/{ns}/pods"
+      evidence_field: "spec.containers[].image"
+      note: "reference_kind=runs_image. Digest-pinned refs (@sha256:) must be marked digest_pinned=true so container-chains skips the supply-chain fan-out for them."
+      narrative: "{pod.name} pulls image from {registry.name} using a mutable tag (no @sha256 digest pin) — subject to supply-chain poisoning."
+
+  - id: gcp-gke-node-pool-executes-as-sa
+    emits: ExecutesAs
+    applies_to: [gcp]
+    match_record:
+      resource_type: "container.googleapis.com/NodePool"
+      field: "config.serviceAccount"
+    emit:
+      source_type: Compute
+      target_type: ServiceAccount
+      source: "<node pool (VirtualMachine aggregate)>"
+      target: "<node SA (ServiceAccount)>"
+      permissions: []
+      api_source: "container GET /v1/projects/{project}/locations/{location}/clusters/{cluster}/nodePools"
+      evidence_field: "config.serviceAccount"
+      note: "The node pool SA is the identity all node VMs run as. When workloadMetadataConfig is not GKE_METADATA, pods can read this SA's token from the metadata server."
+      narrative: "{nodepool.name} node VMs execute as {node_sa.name} (config.serviceAccount)."
+
+  - id: gcp-gke-wi-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      resource_type: "iam.googleapis.com/ServiceAccount"
+      field: "iamPolicy.bindings[role=roles/iam.workloadIdentityUser].members"
+    where:
+      - "member is of the form serviceAccount:{projectA}.svc.id.goog[{ns}/{ksa}]"
+      - "the GSA's home project (extracted from the GSA resource path) differs from projectA"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<project A (source of the KSA / cluster OIDC issuer)>"
+      target: "<project B (home project of the GSA)>"
+      permissions: []
+      api_source: "iam GET /{serviceAccount}:getIamPolicy"
+      evidence_field: "iamPolicy.bindings[role=roles/iam.workloadIdentityUser].members with cross-project member"
+      note: "Cross-project WI: a GKE cluster's OIDC issuer in project A has a workloadIdentityUser binding to a GSA in project B. Pods in project A can federate into GSA in project B."
+      narrative: "GKE cluster in {projectA.name} establishes Workload Identity federation to {gsa.name} in {projectB.name} via roles/iam.workloadIdentityUser on the cross-project GSA — a pod running as the KSA in project A can exchange credentials to access resources in project B."
+
+# ---------------------------------------------------------------------------
+# LINCHPIN CITATIONS — what this file relies on (DO NOT RE-DERIVE):
+#
+# gcp/identity-escalation.yaml:
+#   * gcp-sa-set-iam-policy: iam.serviceAccounts.setIamPolicy on a GSA => CanModifyTrust.
+#     GKE context: when the GSA is bound to KSAs via roles/iam.workloadIdentityUser,
+#     the attacker can mutate this binding to establish rogue WI federation, enabling
+#     a pod running as the attacker's KSA to execute as the GSA. This is narrative
+#     enrichment; the CanModifyTrust(principal -> GSA) edge is emitted once by
+#     gcp-sa-set-iam-policy. Derivation chain (CanModifyTrust -> CanImpersonate /
+#     CanEscalateTo) is handled by federation-chains and credential-chains.
+#
+# container-chains.yaml:
+#   * image-push-poisons-consumers: propagates gcp-gke-registry-push
+#     CanModifyCode(registry) to each KubernetesWorkload that pulls the image
+#     (mutable tag). Triggered by ContainsResourceReference(workload -> registry).
+#   * poisoned-image-executes-as: once a workload has CanModifyCode via the
+#     supply chain, ExecutesAs(workload -> identity) => CanExecuteAs(principal -> identity).
+#   * cluster-rbac-exec: CanExecuteCommand(principal -> pod) + ExecutesAs(pod ->
+#     workload_identity) => CanExecuteAs(principal -> workload_identity). Fires on
+#     BOTH gcp-gke-credentials-cluster-admin-exec and gcp-gke-rbac-exec-pod edges.
+#   * workload-identity-federates: ExternalIdentityMapsTo(KSA -> GSA) + backing
+#     TrustsExternalIdentity(GSA -> KSA) => CanFederateAs(KSA -> GSA). Fires on
+#     the gcp-gke-ksa-annotated-to-gsa + gcp-gke-wi-trusts-external-identity edges.
+#
+# federation-chains.yaml:
+#   * federation-maps-to-identity: ExternalIdentityMapsTo + TrustsExternalIdentity =>
+#     CanFederateAs. State is ACTIVE if the WI binding is broad/unpinned (any pod
+#     in the namespace can be scheduled as the KSA); CONDITIONAL(trust_condition)
+#     if the KSA namespace:name is pinned to a specific SA the attacker cannot run.
+#   * federate-then-enter-project: CanFederateAs(KSA -> GSA_in_project_B) =>
+#     CanEnterProject(attacker -> project_B) for cross-project WI bindings.
+#   * federate-inherits-capabilities: CanFederateAs(KSA -> GSA) => CanImpersonate(
+#     attacker -> GSA) when GSA is a ServiceAccount.
+#
+# can-execute-as.yaml:
+#   * execute-as-via-command: CanExecuteCommand(principal -> pod) + ExecutesAs(pod
+#     -> identity) => CanExecuteAs. Dedupes with container-chains cluster-rbac-exec.
+#   * execute-as-via-code-modify: CanModifyCode(principal -> workload) + ExecutesAs(
+#     workload -> identity) => CanExecuteAs. Dedupes with container-chains
+#     poisoned-image-executes-as.
+#
+# gcp/identity-escalation.yaml:
+#   * gcp-sa-act-as: iam.serviceAccounts.actAs => CanPassIdentity (gates
+#     gcp-gke-create-nodepool-as-sa).
+#   * gcp-sa-get-access-token: iam.serviceAccounts.getAccessToken => CanImpersonate
+#     (a principal outside the cluster can directly impersonate a GSA without going
+#     through the WI pod path).
+#   * gcp-workload-identity-federation: WIF pool provider => CanFederateAs (for
+#     external-to-GCP federation, not intra-GKE WI — the KSA->GSA WI trust is
+#     normalized here and consumed by federation-chains).
+#
+# credential-chains.yaml:
+#   * read-secret-yields-identity: CanReadSecret(pod -> sa_token) + CredentialsFor(
+#     token -> GSA) => CanImpersonate(principal -> GSA). Fires when a pod reads a
+#     Secret containing a GSA key (legacy).
+#   * impersonate-is-escalation: CanImpersonate(p -> GSA) => CanEscalateTo when
+#     GSA is more privileged.
+#
+# can-control.yaml:
+#   * escalate-via-execute-as: CanExecuteAs(p -> GSA/node_SA) => CanEscalateTo
+#     when the GSA/node_SA is more privileged.
+#   * control-boundary-via-iam-admin: CanGrantPermission(p -> cluster project) =>
+#     Controls(p -> project) (for gcp-gke-rbac-create-clusterrolebinding combined
+#     with cluster-admin that grants IAM-writing permissions).
+# ---------------------------------------------------------------------------
+
+# BLOCKED-edge guidance:
+#  - GKE_METADATA workload metadata mode BLOCKS gcp-gke-node-sa-legacy-exposure
+#    and gcp-gke-exec-reads-node-sa-token.
+#  - Tag-immutable Artifact Registry BLOCKS gcp-gke-registry-push supply-chain
+#    fan-out via container-chains (overwriting a tag is rejected).
+#  - Digest-pinned image references (@sha256:) BLOCK container-chains
+#    image-push-poisons-consumers for that specific consumer.
+#  - Admission webhooks (OPA-Gatekeeper, Kyverno) denying pods/exec BLOCK
+#    gcp-gke-rbac-exec-pod; emit BLOCKED with denied_by=<admission controller>.
+#  - GKE Autopilot BLOCKS gcp-gke-create-nodepool-as-sa (Autopilot manages node
+#    pools and does not allow custom node pool SA binding).
+#  - Private cluster API endpoint without network reachability BLOCKS
+#    gcp-gke-credentials-cluster-admin-exec (kubeconfig cannot reach API server);
+#    emit CONDITIONAL(network_reachability) or BLOCKED based on Authorized Networks config.
+#  - IAM deny policy denying container.clusters.getCredentials at the project =>
+#    BLOCKED on gcp-gke-get-credentials and all downstream rules.

@@ -1,0 +1,628 @@
+# GCP Eventarc — Derived attack-path rules (Phase 10 — messaging & event systems)
+# ---------------------------------------------------------------------------
+# Catalog key gcp:eventarc. Emits ONLY common edge types from schema/edges.yaml.
+# All permission identifiers are verbatim from:
+#   cloud.google.com/eventarc/docs/access-control
+#   cloud.google.com/iam/docs/permissions-reference
+#
+# Central escalation invariant (Phase-10 signature):
+#   An Eventarc TRIGGER (EventRule) is a binding between an event source (Pub/Sub
+#   topic, Cloud Audit Log, GCS notification, Eventarc Advanced message bus) and
+#   a destination compute CONSUMER (Cloud Run, Cloud Function, Workflow, GKE).
+#   The trigger uses a TRIGGER SERVICE ACCOUNT (trigger.serviceAccount) to
+#   authenticate event delivery to the destination. The destination consumer
+#   executes as ITS OWN runtime SA — not the trigger SA. Therefore:
+#
+#     eventarc.triggers.create + actAs(trigger SA)
+#       → CanSchedule(principal → EventRule)            [create the binding]
+#     trigger source fires → CanTrigger(EventRule → consumer)  [live binding fact]
+#     consumer ExecutesAs its SA                         [consumer-side fact]
+#     messaging-chains rules 1+2 collapse:
+#       CanWriteData(p → src) + CanTrigger(src → consumer) → CanTrigger(p → consumer)
+#       CanTrigger(p → consumer) + ExecutesAs(consumer → SA) → CanExecuteAs(p → SA)
+#
+#   Trigger update (eventarc.triggers.update) redirects the destination of an
+#   existing trigger — injecting a new CanTrigger edge without touching the source
+#   event stream.
+#
+# KEY SAFETY NOTES FOR THIS SERVICE:
+#   1. Trigger SA ≠ consumer runtime SA. The trigger SA authenticates the delivery
+#      call; the consumer's ExecutesAs SA is the escalation target. Do NOT attribute
+#      the trigger SA as the escalation target for CanExecuteAs.
+#   2. Gate CanTrigger(trigger → consumer) on trigger.state == ACTIVE. A FAILED or
+#      PROVISIONING trigger does not deliver events.
+#   3. Event filters are a real control: a trigger with a narrow event filter only
+#      fires on matching events. Model as CONDITIONAL(condition_expression) when the
+#      attacker payload may not match the filter.
+#   4. The Eventarc P4SA manages the transport Pub/Sub topic. Direct pubsub publish
+#      to the transport topic requires the topic's IAM to grant pubsub.topics.publish.
+#
+# LINCHPINS — cite, do NOT duplicate:
+#   messaging-chains.yaml  — rule 1: CanWriteData + CanTrigger → CanTrigger(p→consumer)
+#                            rule 2: CanTrigger + ExecutesAs → CanExecuteAs
+#                            rule 3: CanSchedule + CanPassIdentity → CanExecuteAs
+#                            rule 4: cross-boundary messaging trust → CrossProjectTrust
+#   can-execute-as.yaml    — execute-as-via-code-modify (Workflows/Cloud Run consumer
+#                            side). This file emits the Eventarc SERVICE FACTS that
+#                            feed those linchpins; we do NOT re-derive CanExecuteAs here
+#                            unless providing the Eventarc-specific framing.
+#   can-control.yaml       — CrossProjectTrust → CanEnterProject rollup.
+#   credential-chains.yaml — ContainsSecret in event payload → ExposesCredential.
+#
+# NODES:
+#   EventRule  = google.cloud.eventarc.v1.Trigger
+#   EventBus   = google.cloud.eventarc.v1.MessageBus (Eventarc Advanced)
+#   Topic      = google.pubsub.v1.Topic (transport Pub/Sub topic)
+#   Compute    = destination consumer (Cloud Run ContainerService, ServerlessFunction,
+#                Workflow, GKE KubernetesWorkload)
+#   ServiceAccount = trigger.serviceAccount (delivery identity)
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 10-messaging
+service: eventarc
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # EXPLICIT-LIKE FACTS (raw config -> common explicit edges)
+  # Match resource records rather than combining existing edges.
+  # ---------------------------------------------------------------------------
+
+  # --- Live trigger binding: EventRule routes to destination consumer ----------
+  - id: gcp-eventarc-trigger-routes-to-consumer
+    emits: CanTrigger
+    description: "A live Eventarc trigger (state=ACTIVE) routes events from its source to the destination consumer — the event-source-binding fact feeding messaging-chains rules 1 and 2."
+    match_record:
+      resource_type: "google.cloud.eventarc.v1.Trigger"
+      field: "destination"
+    where:
+      - "trigger.state == ACTIVE"
+      - "trigger.destination is set to one of: cloudRun, workflow, gke, cloudFunction, httpEndpoint (Eventarc Advanced)"
+    emit:
+      source_type: EventRule
+      target_type: Compute
+      source: "<Eventarc trigger (EventRule)>"
+      target: "<destination consumer (Cloud Run service / Workflow / Cloud Function / GKE workload)>"
+      permissions: []
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        ACTIVE when trigger.state == ACTIVE and the destination resource is deployed and
+        reachable by the trigger SA (trigger SA holds the required invoker role on the destination).
+        CONDITIONAL(service_state) when the trigger is ACTIVE but the destination is not
+        deployed/enabled. CONDITIONAL(condition_expression) when the trigger has narrow event
+        filters that may not be satisfiable by an attacker payload (honor filter specificity).
+        BLOCKED when trigger.state == FAILED or PROVISIONING.
+      derived_from: ["trigger.destination field + trigger.state == ACTIVE"]
+      false_positive_note: >-
+        Always gate on trigger.state == ACTIVE. A FAILED trigger does not deliver events.
+        Event filters (Cloud Audit Log service/method/resource, Pub/Sub message attribute filters)
+        constrain which events fire — downgrade to CONDITIONAL(condition_expression) when the
+        attacker cannot craft a matching event. The trigger SA must hold the appropriate invoker
+        role on the destination; without it event delivery fails (404 or 403 from the destination).
+        This edge is consumed by messaging-chains rule 1 (when combined with CanWriteData on the
+        source) to derive CanTrigger(publisher → consumer), and by rule 2 with ExecutesAs
+        (from the destination's rule file) to derive CanExecuteAs.
+      narrative: >-
+        Eventarc trigger {trigger.name} (state=ACTIVE) routes events to {consumer.name}. Any
+        principal or source that causes a matching event fires {consumer.name} to execute with
+        the delivered event payload.
+
+  # --- Pub/Sub topic as event source directly triggers consumer ----------------
+  - id: gcp-eventarc-publish-to-trigger
+    emits: CanTrigger
+    description: "Publishing to an Eventarc-managed Pub/Sub transport topic directly triggers the bound destination consumer — collapses the Topic → EventRule → Compute chain into a single CanTrigger(Topic → Compute) for messaging-chains rule 1."
+    match_record:
+      resource_type: "google.cloud.eventarc.v1.Trigger"
+      field: ["transport.pubsub.topic", "destination"]
+    where:
+      - "trigger.transport.pubsub.topic is set (Pub/Sub-backed trigger)"
+      - "trigger.state == ACTIVE"
+      - "trigger.destination is set to one of: cloudRun, workflow, gke, cloudFunction"
+    emit:
+      source_type: Topic
+      target_type: Compute
+      source: "<Eventarc transport Pub/Sub topic (Topic)>"
+      target: "<destination consumer (Cloud Run / Workflow / Cloud Function / GKE workload)>"
+      permissions: []
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        ACTIVE when the transport topic exists, the trigger is ACTIVE, and the trigger SA
+        holds an invoker role on the destination (event delivery succeeds). CONDITIONAL(service_state)
+        when the destination is not deployed/enabled. BLOCKED when the trigger.state is FAILED or
+        PROVISIONING. CONDITIONAL(condition_expression) if the trigger has narrow event filters
+        the attacker payload may not satisfy.
+      derived_from: ["trigger.transport.pubsub.topic + trigger.destination + trigger.state == ACTIVE"]
+      false_positive_note: >-
+        This edge collapses the intermediate EventRule (Eventarc trigger node) into a direct
+        Topic → Compute link for use by messaging-chains rule 1 (CanWriteData on topic →
+        CanTrigger(topic → consumer)). The EventRule node still exists in the graph (via
+        gcp-eventarc-trigger-routes-to-consumer); this edge feeds messaging-chains' rollup.
+        Always gate on trigger.state == ACTIVE. The trigger SA must hold invoker rights on
+        the destination. Honor event filters as CONDITIONAL gates.
+      narrative: >-
+        Publishing to Pub/Sub topic {topic.name} (the Eventarc transport backing trigger
+        {trigger.name}) delivers an attacker-controlled CloudEvent to {consumer.name}.
+
+  # REMOVED: gcp-eventarc-trigger-executes-as-delivery-sa
+  # The trigger SA is NOT the CanExecuteAs escalation target (the consumer's runtime SA is).
+  # The trigger SA only authenticates delivery; its credential exposure (if any) is modeled
+  # via gcp-eventarc-passidentity-actas (CanPassIdentity → update trigger SA). The consumer's
+  # ExecutesAs edge is emitted by the consumer's own rule file (gcp-cloudrun-executes-as, etc.)
+  # and consumed by messaging-chains rule 2 → CanExecuteAs. Removed to prevent the false
+  # escalation path: publisher → CanWriteData/CanTrigger → delivery-SA (wrong target).
+
+  # ---------------------------------------------------------------------------
+  # PERMISSION-BASED FACTS (effective IAM permission → capability edge)
+  # ---------------------------------------------------------------------------
+
+  # --- Create trigger (event-source-binding creation primitive) ----------------
+  - id: gcp-eventarc-create-trigger
+    emits: CanSchedule
+    description: "eventarc.triggers.create lets an attacker bind any reachable event source to any destination consumer as an Eventarc trigger — the event-source-binding creation primitive (Phase-10 CanSchedule)."
+    match_effective_permission:
+      action: "eventarc.triggers.create"
+      resource_type: "google.cloud.eventarc.v1.Trigger"
+    where:
+      - "principal also holds iam.serviceAccounts.actAs on the trigger SA to be configured (required to set trigger.serviceAccount)"
+      - "trigger SA holds the appropriate invoker role on the intended destination"
+    emit:
+      source_type: Identity
+      target_type: EventRule
+      source: "<principal>"
+      target: "<new Eventarc trigger (EventRule)>"
+      permissions: ["eventarc.triggers.create", "iam.serviceAccounts.actAs"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds eventarc.triggers.create AND iam.serviceAccounts.actAs
+        on the trigger SA AND the trigger SA holds an invoker role on the chosen destination.
+        POTENTIAL(role_compatibility) when actAs on the trigger SA is unknown or unresolved, or
+        when the trigger SA's invoker rights on the destination are unconfirmed. BLOCKED when an
+        IAM deny or org policy denies eventarc.triggers.create or iam.serviceAccounts.actAs at the
+        effective scope.
+      derived_from: ["effective permission: eventarc.triggers.create on the project/location scope", "effective permission: iam.serviceAccounts.actAs on the trigger SA"]
+      false_positive_note: >-
+        Creating an Eventarc trigger requires actAs on the trigger SA — without it the API call
+        fails. The trigger SA must then hold an appropriate invoker role on the destination (e.g.
+        roles/run.invoker on the Cloud Run service, roles/workflows.invoker on the workflow); without
+        this the trigger is created but event delivery returns 403/404 — degrade the resulting
+        CanTrigger edge to CONDITIONAL. This CanSchedule feeds messaging-chains rule 3
+        (messaging-schedule-persists-executes-as) where the trigger invokes a consumer that runs
+        as a chosen SA, giving persistent event-driven execution as that SA's identity.
+        Also feeds rule 1 (messaging-publish-triggers-consumer) via the new CanTrigger binding.
+      narrative: >-
+        {principal.name} can create an Eventarc trigger (eventarc.triggers.create +
+        iam.serviceAccounts.actAs on trigger SA) binding any event source (Pub/Sub, Audit Log,
+        GCS, message bus) to a destination consumer, establishing persistent event-driven
+        execution as the consumer's runtime service account.
+
+  # --- Update trigger (redirect / filter widening / SA swap) ------------------
+  - id: gcp-eventarc-update-trigger
+    emits: CanModifyConfiguration
+    description: "eventarc.triggers.update can redirect an existing trigger's destination, swap the trigger SA, or widen event filters — hijacking a live event stream to an attacker-chosen consumer or re-activating a previously-filtered trigger path."
+    match_effective_permission:
+      action: "eventarc.triggers.update"
+      resource_type: "google.cloud.eventarc.v1.Trigger"
+    emit:
+      source_type: Identity
+      target_type: EventRule
+      source: "<principal>"
+      target: "<Eventarc trigger in scope>"
+      permissions: ["eventarc.triggers.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds eventarc.triggers.update on the trigger resource.
+        The downstream capability (redirect to attacker destination) requires additionally:
+        actAs on the new trigger SA (if changing serviceAccount) AND the trigger SA having
+        invoker rights on the new destination — gate the resulting CanTrigger redirect at
+        POTENTIAL(role_compatibility) when those are unconfirmed. Filter widening (removing
+        eventFilters entries) may upgrade a CONDITIONAL(condition_expression) CanTrigger to ACTIVE.
+      derived_from: ["effective permission: eventarc.triggers.update on the trigger resource"]
+      false_positive_note: >-
+        Three distinct attack vectors from trigger update: (1) destination redirect — swap
+        trigger.destination to attacker-controlled Cloud Run / Workflow; requires trigger SA
+        invoker rights on the new destination (POTENTIAL if unconfirmed). (2) trigger SA swap —
+        change trigger.serviceAccount to an attacker-actAs-able SA; requires actAs on the new SA.
+        (3) event filter widening — remove restrictive eventFilters to let more events through
+        (the underlying event source may already fire the trigger more broadly, upgrading
+        CONDITIONAL to ACTIVE). Model the downstream escalation as CONDITIONAL or POTENTIAL
+        depending on which sub-vector applies and whether the actAs/invoker gates are satisfied.
+      narrative: >-
+        {principal.name} can update the Eventarc trigger {trigger.name}
+        (eventarc.triggers.update), redirecting its event stream to an attacker-chosen
+        destination, widening event filters, or swapping the delivery SA.
+
+  # --- actAs on the trigger SA (CanPassIdentity) ------------------------------
+  # NOTE: the generic gcp-sa-act-as rule in identity-escalation.yaml already emits
+  # CanPassIdentity for all iam.serviceAccounts.actAs grants. This scoped alias
+  # records the Eventarc-specific pairing for narrative clarity. De-dupe on
+  # edge_id(type|source|target|scope) — the two collapse to one CanPassIdentity edge.
+  - id: gcp-eventarc-passidentity-actas
+    emits: CanPassIdentity
+    description: "actAs on a SA that the principal can configure as the trigger's serviceAccount is the GCP PassRole analog for Eventarc trigger SA assignment."
+    match_effective_permission:
+      action: "iam.serviceAccounts.actAs"
+      resource_type: "google.iam.ServiceAccount"
+    where:
+      - "principal holds eventarc.triggers.create OR eventarc.triggers.update in the same project/location scope"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["iam.serviceAccounts.actAs"]
+      conditions: [role_compatibility, iam_permission]
+      derived_from: ["effective permission: iam.serviceAccounts.actAs on the service account", "CITE: gcp-sa-act-as (generic actAs rule)"]
+      false_positive_note: >-
+        This rule de-dupes with gcp-sa-act-as (generic iam.serviceAccounts.actAs rule) on
+        (CanPassIdentity, ?principal, ?sa). The engine emits once per unique edge; the generic
+        rule already covers all actAs grants. This Eventarc-scoped narrative is for analyst clarity.
+        actAs is per-SA: actAs on SA-A does NOT allow configuring SA-B as the trigger SA. Only emit
+        for SAs the principal can actAs. The principal must also hold eventarc.triggers.create or
+        .update to actually use the actAs for an Eventarc trigger.
+      narrative: >-
+        {principal.name} holds iam.serviceAccounts.actAs on {sa.name} and can configure it
+        as the serviceAccount of an Eventarc trigger it creates or updates.
+
+  # --- IAM policy mutation on trigger -----------------------------------------
+  - id: gcp-eventarc-set-iam-policy
+    emits: CanModifyPolicy
+    description: "eventarc.triggers.setIamPolicy lets an attacker grant itself roles/eventarc.developer (trigger update/create) on the trigger, enabling destination redirect or filter widening."
+    match_effective_permission:
+      action: "eventarc.triggers.setIamPolicy"
+      resource_type: "google.cloud.eventarc.v1.Trigger"
+    emit:
+      source_type: Identity
+      target_type: Policy
+      source: "<principal>"
+      target: "<trigger IAM allow policy>"
+      permissions: ["eventarc.triggers.setIamPolicy"]
+      derived_from: ["effective permission: eventarc.triggers.setIamPolicy on the trigger resource"]
+      escalation: >-
+        Grant self roles/eventarc.developer → eventarc.triggers.update (CanModifyConfiguration)
+        → redirect destination or widen filters → CanTrigger (attacker consumer) →
+        CanExecuteAs(consumer's runtime SA). Or grant self trigger.create to bind new sources.
+      false_positive_note: >-
+        setIamPolicy on the trigger resource modifies only the trigger-level IAM policy.
+        Project-level IAM deny policies or org policies that deny eventarc.triggers.update/create
+        override a self-grant from the trigger policy. Check org policy and IAM deny before
+        marking ACTIVE.
+      narrative: >-
+        {principal.name} can set the IAM policy of trigger {trigger.name}
+        (eventarc.triggers.setIamPolicy), granting itself update or create capabilities and
+        completing a CanModifyConfiguration or CanSchedule escalation path.
+
+  # --- IAM policy mutation on message bus ------------------------------------
+  - id: gcp-eventarc-set-bus-iam-policy
+    emits: CanModifyPolicy
+    description: "eventarc.messageBuses.setIamPolicy lets an attacker grant itself eventarc.messageBuses.publish on a message bus, enabling direct event injection into all bound pipelines."
+    match_effective_permission:
+      action: "eventarc.messageBuses.setIamPolicy"
+      resource_type: "google.cloud.eventarc.v1.MessageBus"
+    emit:
+      source_type: Identity
+      target_type: Policy
+      source: "<principal>"
+      target: "<message bus IAM allow policy>"
+      permissions: ["eventarc.messageBuses.setIamPolicy"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal holds eventarc.messageBuses.setIamPolicy on the message bus.
+        A self-grant of eventarc.messageBuses.publish (via CanModifyPolicy → CanGrantPermission)
+        enables the principal to write events to the bus. CONDITIONAL when org policy or IAM deny
+        may block self-grants (constraints/iam.allowedPolicyMemberDomains). BLOCKED when an IAM
+        deny or org policy denies eventarc.messageBuses.setIamPolicy itself.
+      derived_from: ["effective permission: eventarc.messageBuses.setIamPolicy on the message bus resource"]
+      false_positive_note: >-
+        setIamPolicy on the message bus grants the principal control over who may publish to it.
+        A self-grant of eventarc.messageBuses.publish via a subsequent CanGrantPermission edge
+        completes the escalation. Org policy constraints/iam.allowedPolicyMemberDomains may block
+        the self-grant even if setIamPolicy succeeds. Validate that active pipelines with live
+        consumers exist on the bus before claiming CanExecuteAs via event injection.
+      narrative: >-
+        {principal.name} can set the IAM policy of message bus {bus.name}
+        (eventarc.messageBuses.setIamPolicy), granting itself eventarc.messageBuses.publish and
+        enabling event injection into all pipelines bound to the bus.
+
+  # --- Publish to Eventarc Advanced message bus --------------------------------
+  - id: gcp-eventarc-publish-to-bus
+    emits: CanWriteData
+    description: "Holding eventarc.messageBuses.publish on an Eventarc Advanced message bus lets an attacker inject arbitrary CloudEvents into the bus, driving all pipelines/enrollments bound to it — the direct Phase-10 publish primitive for Eventarc Advanced."
+    match_effective_permission:
+      action: "eventarc.messageBuses.publish"
+      resource_type: "google.cloud.eventarc.v1.MessageBus"
+    emit:
+      source_type: Identity
+      target_type: EventBus
+      source: "<principal>"
+      target: "<Eventarc Advanced message bus node that receives published events>"
+      permissions: ["eventarc.messageBuses.publish"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the principal holds eventarc.messageBuses.publish AND the message bus is
+        ACTIVE. BLOCKED when an IAM deny or org policy denies the permission. CONDITIONAL
+        when the bus has an event filter that may not match the attacker payload.
+      derived_from: ["effective permission: eventarc.messageBuses.publish on the message bus resource"]
+      false_positive_note: >-
+        Publishing to the message bus injects events that are routed to all active pipelines
+        and enrollments bound to the bus. The downstream CanTrigger edges (bus → pipeline/enrollment
+        → consumer) must be confirmed from the bus's bound pipelines before claiming CanExecuteAs.
+        This CanWriteData feeds messaging-chains rule 1 (messaging-publish-triggers-consumer)
+        with the CanTrigger(bus → consumer) binding edge.
+      narrative: >-
+        {principal.name} can publish events to the Eventarc Advanced message bus {bus.name}
+        (eventarc.messageBuses.publish), injecting attacker-controlled CloudEvent payloads into
+        all pipelines and enrollments bound to the bus.
+
+  # --- Direct publish to Eventarc transport Pub/Sub topic ---------------------
+  - id: gcp-eventarc-publish-to-transport-topic
+    emits: CanWriteData
+    description: "pubsub.topics.publish on the Eventarc-managed transport Pub/Sub topic lets an attacker inject crafted CloudEvent messages directly into the Eventarc delivery pipeline, bypassing the standard source adapter."
+    match_effective_permission:
+      action: "pubsub.topics.publish"
+      resource_type: "google.pubsub.v1.Topic"
+    where:
+      - "the target Topic is the transport.pubsub.topic of an active Eventarc trigger"
+    emit:
+      source_type: Identity
+      target_type: Topic
+      source: "<principal>"
+      target: "<Eventarc transport Pub/Sub topic backing the trigger's event pipeline>"
+      permissions: ["pubsub.topics.publish"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the principal holds pubsub.topics.publish on the transport topic AND the
+        topic's IAM policy grants this to the principal (the transport topic typically restricts
+        publish to the Eventarc P4SA and source adapter SAs). CONDITIONAL(resource_policy) in
+        all other cases — validate the topic IAM before emitting ACTIVE. BLOCKED when the topic
+        policy denies publish to the principal.
+      derived_from: ["effective permission: pubsub.topics.publish on the transport topic (confirmed by topic IAM policy)"]
+      false_positive_note: >-
+        This is a HIGH false-positive surface. The Eventarc P4SA (service-PROJECT_NUMBER@
+        gcp-sa-eventarc.iam.gserviceaccount.com) manages the transport topic; the topic
+        IAM typically grants pubsub.topics.publish ONLY to the P4SA and/or the source adapter
+        SA (Cloud Logging SA for Audit Log triggers, Cloud Storage SA for GCS triggers).
+        Do NOT emit ACTIVE without confirming the topic's IAM policy grants publish to the
+        principal. Inject via this path bypasses event filter matching in some Eventarc
+        configurations — condition_expression gate may apply. This CanWriteData feeds
+        messaging-chains rule 1 with the CanTrigger(transport topic → consumer) chain.
+      narrative: >-
+        {principal.name} can publish directly to the Eventarc transport Pub/Sub topic {topic.name}
+        (pubsub.topics.publish), injecting crafted CloudEvent messages that bypass the standard
+        source adapter and fire the bound trigger {trigger.name}.
+
+  # ---------------------------------------------------------------------------
+  # DERIVED ATTACK-PATH RULES (combine existing edges)
+  # ---------------------------------------------------------------------------
+
+  # --- CanExecuteAs via new trigger creation -----------------------------------
+  - id: gcp-eventarc-execute-as-via-new-trigger
+    emits: CanExecuteAs
+    description: "Create a new Eventarc trigger binding an event source to a destination consumer, then publish an event (or wait for a natural event) to run the consumer as its runtime SA. Provides the Eventarc-specific framing of messaging-chains rule 2."
+    match:
+      - [ ?principal, CanSchedule,  ?trigger ]
+      - [ ?trigger,   CanTrigger,   ?consumer ]
+      - [ ?consumer,  ExecutesAs,   ?sa ]
+    where:
+      - "node_type(?trigger) == EventRule"
+      - "node_class(?consumer) == Compute or node_type(?consumer) == Workflow"
+      - "?sa.privilege_level >= ?principal.privilege_level"
+    optional:
+      - [ ?principal, CanWriteData, ?src ]
+      - [ ?src, CanTrigger, ?trigger ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<consumer's runtime service account>"
+      permissions: ["eventarc.triggers.create", "iam.serviceAccounts.actAs", "pubsub.topics.publish"]
+      conditions: [trigger_exists, role_compatibility]
+      state_logic: >-
+        ACTIVE when the CanSchedule gate is satisfied (trigger.create + actAs on trigger SA),
+        the new trigger binding is confirmed live (CanTrigger(trigger → consumer) ACTIVE), AND
+        matched(optional[0]) confirms the principal can publish an event to drive the trigger
+        immediately. CONDITIONAL(trigger_exists) when the trigger is created but a natural event
+        (Audit Log, GCS notification) drives it rather than a direct publish — the consumer will
+        execute on the next matching event. POTENTIAL(role_compatibility) when actAs or the trigger
+        SA's invoker rights on the consumer are unconfirmed. Inherits weakest contributor state.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal CanSchedule ?trigger (gcp-eventarc-create-trigger)"
+        - "?trigger CanTrigger ?consumer (gcp-eventarc-trigger-routes-to-consumer)"
+        - "?consumer ExecutesAs ?sa (from consumer's rule file: gcp-cloudrun-executes-as / gcp-gcf-executes-as / gcp-workflows-executes-as)"
+        - "?principal CanWriteData ?src + ?src CanTrigger ?trigger (gcp-eventarc-publish-to-bus or -publish-to-transport-topic) [optional]"
+      false_positive_note: >-
+        De-dupes with messaging-chains messaging-trigger-executes-as on (CanExecuteAs, ?principal,
+        ?sa) — emit once, preferring this Eventarc-framed narrative for GCP-specific queries.
+        The CanSchedule gate enforces eventarc.triggers.create + actAs on trigger SA; without
+        actAs this degrades to POTENTIAL(role_compatibility). The consumer's runtime SA (the
+        escalation target) is determined by the consumer's own configuration (Cloud Run SA,
+        Workflow SA, Cloud Function SA) — NOT by the Eventarc trigger SA. Never attribute the
+        trigger SA as the CanExecuteAs target for this rule.
+      narrative: >-
+        {principal.name} can create an Eventarc trigger binding an event source to {consumer.name},
+        which executes as {sa.name}; publishing a matching event (or waiting for a natural one)
+        delivers an attacker-influenced payload to {consumer.name}, executing as {sa.name}.
+
+  # --- CanExecuteAs via trigger destination redirect --------------------------
+  - id: gcp-eventarc-execute-as-via-redirect
+    emits: CanExecuteAs
+    description: "Update an existing Eventarc trigger's destination to point at attacker-controlled or higher-privilege compute, then wait for a natural event to fire, gaining execution as the new destination's runtime SA."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?trigger ]
+      - [ ?trigger,   CanTrigger,             ?consumer ]
+      - [ ?consumer,  ExecutesAs,             ?sa ]
+    where:
+      - "node_type(?trigger) == EventRule"
+      - "node_class(?consumer) == Compute or node_type(?consumer) == Workflow"
+      - "?sa.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<consumer's runtime service account>"
+      permissions: ["eventarc.triggers.update", "iam.serviceAccounts.actAs?"]
+      conditions: [trigger_exists, role_compatibility]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) — the trigger update is immediate (ACTIVE once update succeeds)
+        but the consumer only executes when the next matching event arrives from the (unchanged)
+        event source. The ACTIVE gate requires both: (a) CanModifyConfiguration(trigger) is ACTIVE
+        and (b) the trigger SA holds invoker rights on the new destination. POTENTIAL(role_compatibility)
+        when the trigger SA's invoker rights on the new destination are unconfirmed. If the trigger's
+        event source fires frequently (e.g. high-volume Audit Log activity), CONDITIONAL is nearly
+        equivalent to ACTIVE in practice.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal CanModifyConfiguration ?trigger (gcp-eventarc-update-trigger)"
+        - "?trigger CanTrigger ?consumer (gcp-eventarc-trigger-routes-to-consumer)"
+        - "?consumer ExecutesAs ?sa (from consumer's rule file)"
+      false_positive_note: >-
+        Destination redirect is the strongest Eventarc escalation because it hijacks an existing
+        live event stream (no attacker-controlled publish needed). Key gates: (1) the trigger SA
+        must have invoker rights on the NEW destination (roles/run.invoker / roles/workflows.invoker);
+        if not, delivery fails — downgrade to POTENTIAL(role_compatibility). (2) If the trigger
+        SA must also be changed (the existing SA lacks invoker on the new destination), actAs on
+        the new trigger SA is required. (3) The redirected consumer must be attacker-controlled or
+        must run as a SA the attacker wants to execute as (modeling requires knowing the new
+        destination's ExecutesAs edge). De-dupes with messaging-chains messaging-trigger-executes-as
+        on (CanExecuteAs, ?principal, ?sa).
+      narrative: >-
+        {principal.name} can update trigger {trigger.name} (eventarc.triggers.update) to redirect
+        its event delivery to {consumer.name}; the next matching natural event causes {consumer.name}
+        to run as {sa.name} with an attacker-influenced payload.
+
+  # --- ExposesCredential: event payload may carry credential material ----------
+  # DEMOTED: gcp-eventarc-event-payload-credential
+  # Requires gate on concrete Secret node instantiation via trigger eventFilter analysis.
+  # Rule is aspirational documentation until Secret node collection is formalized.
+  # Removed from active rules — restore when collector can bind trigger.eventFilters
+  # to concrete secretmanager.googleapis.com DataAccess events carrying SecretVersion nodes.
+
+  # --- Cross-project trust: trigger IAM grants update rights to external principal
+  - id: gcp-eventarc-cross-project-trust
+    emits: CrossProjectTrust
+    description: "An IAM binding on an Eventarc trigger granting eventarc.triggers.update (or .create in the project) to a principal in a different project is cross-project trigger-management trust — that external principal can redirect the trigger or bind new sources to consumers in this project."
+    match_record:
+      resource_type: "google.cloud.eventarc.v1.Trigger"
+      field: "iamPolicy.bindings"
+    where:
+      - "a binding member (user:, serviceAccount:) belongs to a different project than the trigger"
+      - "the binding grants roles/eventarc.developer or roles/eventarc.admin (containing eventarc.triggers.update)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: "<trigger IAM allow policy (ResourcePolicy)>"
+      target: "<external project of the granted principal>"
+      permissions: []
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the binding unconditionally grants eventarc.triggers.update or
+        eventarc.triggers.create to an external principal. CONDITIONAL(condition_expression)
+        when scoped by an IAM condition (resource tag, request time, originating network).
+        BLOCKED by an org policy or IAM deny that overrides the grant.
+      derived_from: ["trigger.iamPolicy.bindings — cross-project member with trigger-update/create grant"]
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE can-control: this rule asserts ONLY the cross-project trigger
+        management trust — it does NOT emit CanEnterProject. The CanEnterProject consequence
+        (external principal updates trigger → redirected CanTrigger → CanExecuteAs runtime SA
+        in this project) is produced by can-control consuming this CrossProjectTrust together
+        with CanModifyConfiguration / CanTrigger / ExecutesAs edges. Honor IAM conditions.
+      narrative: >-
+        The IAM policy of trigger {trigger.name} grants a principal in project {ext_project.name}
+        the ability to update or create Eventarc triggers (roles/eventarc.developer), creating
+        cross-project trigger-management trust; an attacker in that project can redirect this
+        trigger's event stream to attacker-chosen compute in this project.
+
+  # --- Cross-project trust: message bus grants cross-project publish ----------
+  - id: gcp-eventarc-bus-cross-project-trust
+    emits: CrossProjectTrust
+    description: "An IAM binding on an Eventarc Advanced message bus granting eventarc.messageBuses.publish to a principal in a different project is cross-project event-injection trust — that external principal can drive all pipelines bound to the bus."
+    match_record:
+      resource_type: "google.cloud.eventarc.v1.MessageBus"
+      field: "iamPolicy.bindings"
+    where:
+      - "a binding member (user:, serviceAccount:) belongs to a different project than the message bus"
+      - "the binding grants eventarc.messageBuses.publish"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: "<message bus IAM allow policy (ResourcePolicy)>"
+      target: "<external project of the granted principal>"
+      permissions: []
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the binding unconditionally grants eventarc.messageBuses.publish to an
+        external principal. CONDITIONAL(condition_expression) when scoped by an IAM condition.
+        BLOCKED by an org policy or IAM deny denying the grant.
+      derived_from: ["messageBus.iamPolicy.bindings — cross-project publish grant"]
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE can-control and messaging-chains rule 4: this rule asserts the
+        cross-project publish trust. The CanEnterProject rollup (publish to bus → pipeline →
+        consumer → CanExecuteAs runtime SA in the bus's project) is can-control's. A publish
+        grant that reaches NO active pipeline in the bus is trust without an execution path —
+        validate that active pipelines with live consumers exist before connecting this to
+        CanEnterProject reasoning.
+      narrative: >-
+        The IAM policy on Eventarc Advanced message bus {bus.name} grants a principal in project
+        {ext_project.name} eventarc.messageBuses.publish, creating cross-project event-injection
+        trust; that external principal can drive all pipelines bound to the bus, triggering
+        consumers in this project.
+
+  # --- Escalation roll-up -----------------------------------------------------
+  - id: gcp-eventarc-escalate-to-consumer-sa
+    emits: CanEscalateTo
+    description: "CanExecuteAs on a consumer's runtime SA of strictly greater privilege than the attacker, reached via an Eventarc trigger, is privilege escalation."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    where:
+      - "?sa.privilege_level > ?principal.privilege_level"
+      - "?sa is a consumer runtime SA reached via an Eventarc trigger (CanExecuteAs derived from gcp-eventarc-execute-as-via-new-trigger or gcp-eventarc-execute-as-via-redirect)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<consumer's runtime service account>"
+      permissions: []
+      state_logic: >-
+        Inherits the state of the contributing CanExecuteAs edge. ACTIVE when contributing
+        CanExecuteAs is ACTIVE. CONDITIONAL(trigger_exists) when contributing CanExecuteAs is
+        CONDITIONAL (the typical case). POTENTIAL(role_compatibility) when actAs or invoker rights
+        are unconfirmed. BLOCKED when contributing CanExecuteAs is BLOCKED. Never stronger than
+        the contributing CanExecuteAs.
+      confidence: "min(contributing_confidences) * 1.0"
+      derived_from: ["?principal CanExecuteAs ?sa (gcp-eventarc-execute-as-via-new-trigger or gcp-eventarc-execute-as-via-redirect)"]
+      false_positive_note: >-
+        Only emit when the consumer's runtime SA is strictly more privileged than the caller;
+        a lateral same-privilege SA is not escalation. Inherits state from the contributing
+        CanExecuteAs. De-dupes with can-execute-as / can-control escalation roll-ups — emit once.
+      narrative: >-
+        {principal.name} can escalate to {sa.name} by using Eventarc to trigger a consumer
+        that executes as it.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - IAM deny or org policy denying eventarc.triggers.create, .update, .setIamPolicy,
+#     or iam.serviceAccounts.actAs → emit affected edges as BLOCKED with denied_by=<policy>.
+#   - constraints/iam.allowedPolicyMemberDomains blocking cross-project grants →
+#     gcp-eventarc-cross-project-trust and gcp-eventarc-bus-cross-project-trust BLOCKED.
+#   - trigger.state != ACTIVE (FAILED / PROVISIONING) →
+#     gcp-eventarc-trigger-routes-to-consumer BLOCKED.
+#   - Event filter specificity (narrow Cloud Audit Log method/service filters, Pub/Sub
+#     message attribute filters) → gcp-eventarc-trigger-routes-to-consumer
+#     CONDITIONAL(condition_expression) rather than ACTIVE.
+#   - VPC Service Controls perimeter denying eventarc.googleapis.com or the destination
+#     service API → downstream CanTrigger / CanExecuteAs CONDITIONAL(resource_policy)
+#     or BLOCKED depending on perimeter enforcement.
+#   - Trigger SA lacking invoker role on the destination → event delivery fails →
+#     gcp-eventarc-trigger-routes-to-consumer CONDITIONAL(role_compatibility).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# EXPLICIT RULES REMOVED FROM DERIVED FILE
+# Per RULE-FORMAT.md, explicit rules live in /rules/explicit/ only.
+# All Eventarc explicit normalization is defined in /rules/explicit/gcp-eventarc.yaml.
+# The engine loads explicit rules from the explicit/ directory, not from derived/ files.
+# Duplicate rule IDs (gcp-eventarc-explicit-*) appearing in both files cause conflicts.
+# CITE the explicit file in derived rules via derived_from when appropriate.
+# ---------------------------------------------------------------------------

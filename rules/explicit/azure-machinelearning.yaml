@@ -1,0 +1,423 @@
+# Azure Machine Learning — Explicit normalization rules.
+# Translates raw Microsoft.MachineLearningServices config into common explicit
+# edges consumed by the derived rules in
+# /rules/derived/azure/machinelearning.yaml.
+#
+# WHAT THIS FILE DOES:
+#   ExecutesAs  — which compute resource runs as which MI (from ARM identity block).
+#   AttachedTo  — which user-assigned MI is attached to which compute (structural).
+#   ContainsSecret     — datastores with static credentials (accountKey/SAS/SP).
+#   ContainsCredential — workspace connections with stored API keys / conn strings.
+#   LocatedIn          — workspace and compute placement in RG / subscription / VNet.
+#
+# Collection APIs (read-only):
+#   GET /subscriptions/{sub}/providers/Microsoft.MachineLearningServices/workspaces
+#   GET /...workspaces/{ws}                           (workspace config + identity)
+#   GET /...workspaces/{ws}/computes                  (compute list + identity block)
+#   GET /...workspaces/{ws}/onlineEndpoints           (endpoint list + identity)
+#   GET /...workspaces/{ws}/onlineEndpoints/{ep}/deployments
+#   GET /...workspaces/{ws}/datastores                (datastore type, credential type)
+#   GET /...workspaces/{ws}/connections               (connection category + cred type)
+#   GET /...workspaces/{ws}/schedules                 (schedule list)
+#   Microsoft.Authorization/roleAssignments + denyAssignments at workspace scope.
+#
+# DO NOT include listsecrets/action, listkeys/action, jobs/write, or any
+# mutating action in the read-only collector.
+
+rules:
+
+  # ===========================================================================
+  # STRUCTURAL: workspace placement
+  # ===========================================================================
+
+  - id: azure-aml-workspace-located-in-rg
+    emits: LocatedIn
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces"
+      field: "id"
+    emit:
+      source_type: AnalyticsService
+      target_type: ResourceGroup
+      source: "<AML workspace node>"
+      target: "<resource group containing the workspace>"
+      api_source: "GET /subscriptions/{sub}/providers/Microsoft.MachineLearningServices/workspaces"
+      evidence_field: "id (parse resource group from ARM resource ID)"
+      narrative: "AML workspace {workspace.name} is located in resource group {rg.name}."
+
+  - id: azure-aml-compute-located-in-vnet
+    emits: LocatedIn
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces/computes"
+      field: "properties.subnet.id"
+    where:
+      - "properties.subnet.id is not null"
+    emit:
+      source_type: Compute
+      target_type: VirtualNetwork
+      source: "<AML compute cluster or compute instance>"
+      target: "<VNet inferred from subnet resource ID>"
+      api_source: "GET /...workspaces/{ws}/computes/{name}"
+      evidence_field: "properties.subnet.id"
+      narrative: "AML compute {compute.name} is located in VNet subnet {subnet.name}."
+
+  # ===========================================================================
+  # ExecutesAs: compute → managed identity
+  # ===========================================================================
+
+  - id: azure-aml-amlcompute-executes-as-system-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces/computes"
+      field: "identity.type"
+      value_contains: "SystemAssigned"
+    where:
+      - "compute.kind == AmlCompute OR compute.kind == ComputeInstance"
+    emit:
+      source_type: Compute
+      target_type: ManagedIdentity
+      source: "<AML compute cluster or compute instance>"
+      target: "<system-assigned MI (identity.principalId on the compute)>"
+      api_source: "GET /...workspaces/{ws}/computes/{name}"
+      evidence_field: "identity.type + identity.principalId"
+      narrative: "AML compute {compute.name} (SystemAssigned) executes as managed identity {mi.principalId}."
+
+  - id: azure-aml-amlcompute-executes-as-user-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces/computes"
+      field: "identity.userAssignedIdentities"
+    where:
+      - "identity.type contains UserAssigned"
+      - "identity.userAssignedIdentities is not empty"
+    emit:
+      source_type: Compute
+      target_type: ManagedIdentity
+      source: "<AML compute cluster or compute instance>"
+      target: "<each user-assigned MI in identity.userAssignedIdentities (keyed by MI resource ID)>"
+      api_source: "GET /...workspaces/{ws}/computes/{name}"
+      evidence_field: "identity.userAssignedIdentities"
+      note: "Each key in userAssignedIdentities is a Microsoft.ManagedIdentity/userAssignedIdentities resource ID. Emit one ExecutesAs per MI."
+      narrative: "AML compute {compute.name} (UserAssigned) executes as user-assigned MI {mi.name}."
+
+  - id: azure-aml-online-endpoint-executes-as-system-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces/onlineEndpoints"
+      field: "identity.type"
+      value_contains: "SystemAssigned"
+    emit:
+      source_type: Compute
+      target_type: ManagedIdentity
+      source: "<online endpoint (API)>"
+      target: "<system-assigned MI (identity.principalId on the endpoint)>"
+      api_source: "GET /...workspaces/{ws}/onlineEndpoints/{ep}"
+      evidence_field: "identity.type + identity.principalId"
+      narrative: "AML online endpoint {endpoint.name} (SystemAssigned) executes as managed identity {mi.principalId}."
+
+  # ===========================================================================
+  # AttachedTo: user-assigned MI → compute (structural, for reverse-lookup)
+  # ===========================================================================
+
+  - id: azure-aml-user-mi-attached-to-compute
+    emits: AttachedTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces/computes"
+      field: "identity.userAssignedIdentities"
+    where:
+      - "identity.type contains UserAssigned"
+    emit:
+      source_type: ManagedIdentity
+      target_type: Compute
+      source: "<user-assigned MI (keyed by resource ID in identity.userAssignedIdentities)>"
+      target: "<AML compute cluster or compute instance>"
+      api_source: "GET /...workspaces/{ws}/computes/{name}"
+      evidence_field: "identity.userAssignedIdentities"
+      narrative: "User-assigned MI {mi.name} is attached to AML compute {compute.name}."
+
+  # ===========================================================================
+  # ContainsSecret: datastores with static credentials
+  # ===========================================================================
+
+  - id: azure-aml-datastore-accountkey-contains-secret
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces/datastores"
+      field: "properties.credentials.credentialsType"
+      value: "AccountKey"
+    emit:
+      source_type: Data
+      target_type: Secret
+      source: "<AML datastore>"
+      target: "<storage account key (AccessKey)>"
+      api_source: "GET /...workspaces/{ws}/datastores/{name}"
+      evidence_field: "properties.credentials.credentialsType == AccountKey"
+      narrative: "AML datastore {datastore.name} stores a storage account key credential, retrievable via datastores/listsecrets/action."
+
+  - id: azure-aml-datastore-sas-contains-secret
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces/datastores"
+      field: "properties.credentials.credentialsType"
+      value: "Sas"
+    emit:
+      source_type: Data
+      target_type: Secret
+      source: "<AML datastore>"
+      target: "<SAS token (Credential)>"
+      api_source: "GET /...workspaces/{ws}/datastores/{name}"
+      evidence_field: "properties.credentials.credentialsType == Sas"
+      narrative: "AML datastore {datastore.name} stores a SAS token credential, retrievable via datastores/listsecrets/action."
+
+  - id: azure-aml-datastore-sp-contains-secret
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces/datastores"
+      field: "properties.credentials.credentialsType"
+      value: "ServicePrincipal"
+    emit:
+      source_type: Data
+      target_type: Secret
+      source: "<AML datastore>"
+      target: "<service principal client secret or certificate (Credential)>"
+      api_source: "GET /...workspaces/{ws}/datastores/{name}"
+      evidence_field: "properties.credentials.credentialsType == ServicePrincipal"
+      note: "CredentialsFor the SP identified by clientId in the credential block; drives credential-chains read-secret-yields-identity."
+      narrative: "AML datastore {datastore.name} stores a service principal client secret (tenantId: {tenantId}, clientId: {clientId}), retrievable via datastores/listsecrets/action."
+
+  - id: azure-aml-datastore-cert-contains-secret
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces/datastores"
+      field: "properties.credentials.credentialsType"
+      value: "Certificate"
+    emit:
+      source_type: Data
+      target_type: Secret
+      source: "<AML datastore>"
+      target: "<certificate credential (Certificate)>"
+      api_source: "GET /...workspaces/{ws}/datastores/{name}"
+      evidence_field: "properties.credentials.credentialsType == Certificate"
+      narrative: "AML datastore {datastore.name} stores a certificate credential, retrievable via datastores/listsecrets/action."
+
+  # ===========================================================================
+  # ContainsCredential: workspace connections with stored API keys / conn strings
+  # ===========================================================================
+
+  - id: azure-aml-connection-apikey-contains-credential
+    emits: ContainsCredential
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces/connections"
+      field: "properties.authType"
+      value_in: ["ApiKey", "CustomKeys", "AccountKey"]
+    where:
+      - "properties.category in [AzureOpenAI, CognitiveService, CustomKeys, AzureBlob, ApiKey, Serverless]"
+    emit:
+      source_type: Data
+      target_type: Credential
+      source: "<AML workspace connection>"
+      target: "<API key or connection string (APIKey / ConnectionString)>"
+      api_source: "GET /...workspaces/{ws}/connections/{name}"
+      evidence_field: "properties.authType + properties.category"
+      narrative: "AML workspace connection {connection.name} (category: {category}) stores a {authType} credential retrievable via connections/listsecrets/action."
+
+  # ===========================================================================
+  # CanPassIdentity: per-job identity override
+  # ===========================================================================
+
+  - id: azure-aml-per-job-identity-override
+    emits: CanPassIdentity
+    applies_to: [azure]
+    description: "Submit a job specifying identity.client_id to override the cluster-default MI with a chosen user-assigned MI for that run."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/jobs/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "the job spec can include an identity block with type=managed and client_id of a user-assigned MI accessible to the workspace"
+    emit:
+      source_type: Identity
+      target_type: ManagedIdentity
+      source: "<principal>"
+      target: "<user-assigned MI referenced by client_id in the job spec>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/jobs/write"]
+      conditions: [role_compatibility]
+      api_source: "job submission with identity override block"
+      evidence_field: "workspaces/jobs/write + identity.client_id parameter"
+      state_logic: >-
+        ACTIVE when the referenced user-assigned MI is already assigned to the
+        workspace compute or explicitly listed in the workspace identity block.
+        CONDITIONAL(role_compatibility) when MI accessibility to the workspace
+        cannot be confirmed from collected data — the job may fail at submission
+        if the MI is not accessible.
+      false_positive_note: >-
+        The referenced MI must be accessible to the workspace (assigned to the
+        compute resource or workspace). An arbitrary MI client_id not pre-assigned
+        to the workspace will fail at job submission. Emit CONDITIONAL when
+        accessibility is unconfirmed. This is the AML iam:PassRole equivalent;
+        it only grants the identity for the duration of the job, not persistently.
+      narrative: "{principal.name} can submit a job (workspaces/jobs/write) with an identity override specifying user-assigned MI {target.name}, executing the job's code as that MI instead of the cluster default."
+
+  # ===========================================================================
+  # LocatedIn: workspace → subscription (boundary placement)
+  # ===========================================================================
+
+  - id: azure-aml-workspace-in-subscription
+    emits: LocatedIn
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces"
+      field: "id"
+    emit:
+      source_type: AnalyticsService
+      target_type: Subscription
+      source: "<AML workspace>"
+      target: "<Azure subscription (parsed from ARM resource ID)>"
+      api_source: "GET /subscriptions/{sub}/providers/Microsoft.MachineLearningServices/workspaces"
+      evidence_field: "id (subscriptionId segment of ARM resource ID)"
+      narrative: "AML workspace {workspace.name} is located in subscription {subscription.id}."
+
+  # ===========================================================================
+  # ADMINISTRATIVE CONTROL
+  # ===========================================================================
+
+  - id: azure-aml-workspace-admin
+    emits: CanAdminister
+    applies_to: [azure]
+    description: "Full ARM control of the AML workspace grants administrative authority over all compute, jobs, datastores, and linked services."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor / Owner / AzureML Workspace Admin (or a custom role granting Microsoft.MachineLearningServices/workspaces/*) at the scope"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: "<principal>"
+      target: "<AML workspace>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/write"]
+      api_source: "role assignment evaluation"
+      evidence_field: "roleAssignments.properties.roleDefinitionId"
+      false_positive_note: >-
+        workspaces/write grants ARM-level control of workspace configuration and
+        linked services but NOT Microsoft.Authorization/*/write; escalation is via
+        the workspace or compute MI, not self-role-assignment. Sufficient for all
+        downstream code-execution paths.
+      narrative: "{principal.name} has full control of AML workspace {target.name} (workspaces/write), including compute, jobs, datastores, and linked services."
+
+  # ===========================================================================
+  # COMMAND EXECUTION — SSH ACCESS
+  # ===========================================================================
+
+  - id: azure-aml-computeinstance-ssh-access
+    emits: CanExecuteCommand
+    applies_to: [azure]
+    description: "SSH access to a running compute instance when SSH is enabled and the principal controls the SSH private key."
+    match_record:
+      resource_type: "Microsoft.MachineLearningServices/workspaces/computes"
+      field: "properties.sshSettings"
+    where:
+      - "properties.sshSettings.sshPublicAccess == Enabled"
+      - "compute.kind == ComputeInstance"
+      - "evidence shows SSH public key is set and the attacker can demonstrate key control"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: "<principal with SSH key control>"
+      target: "<compute instance>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/computes/write"]
+      api_source: "GET /...workspaces/{ws}/computes/{name} + SSH key evidence"
+      evidence_field: "properties.sshSettings.sshPublicAccess + key material or computes/write evidence"
+      conditions: [network_reachability, service_state, role_compatibility]
+      false_positive_note: >-
+        Emit ACTIVE only when evidence shows: (a) SSH is enabled (sshPublicAccess=Enabled),
+        (b) the instance is running, (c) SSH public key is set on the instance, and
+        (d) the attacker can demonstrate private-key control (either by credential in evidence
+        or by computes/write permission allowing key replacement). Do not emit for instances
+        with SSH disabled or when SSH key is controlled by a different principal.
+      narrative: "{principal.name} can SSH to compute instance {target.name} (SSH enabled, {principal.name} controls the SSH private key) and run OS commands as the instance's managed identity."
+
+  # ===========================================================================
+  # SCHEDULING / TRIGGERING
+  # ===========================================================================
+
+  - id: azure-aml-schedule-write
+    emits: CanSchedule
+    applies_to: [azure]
+    description: "Principal can create or update job schedules that periodically trigger pipeline or training jobs on AML compute."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/schedules/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Scheduler
+      source: "<principal>"
+      target: "<AML job schedule>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/schedules/write"]
+      api_source: "role assignment evaluation"
+      evidence_field: "roleAssignments.properties.roleDefinitionId"
+      note: "Creates a cron/recurrence schedule that triggers a pipeline or command job; persistence + trigger creation for repeated code execution as the compute MI."
+      false_positive_note: >-
+        CanSchedule here is persistence / trigger creation only; onward
+        CanExecuteAs still requires the referenced compute to have a running
+        (or auto-scalable) cluster and a MI. If the target compute has no MI,
+        scheduling provides code execution but not identity escalation.
+      narrative: "{principal.name} can create or update AML job schedules (schedules/write) that repeatedly trigger training or pipeline jobs on compute as its managed identity."
+
+  - id: azure-aml-job-run-trigger
+    emits: CanTrigger
+    applies_to: [azure]
+    description: "Principal can trigger an existing AML job/pipeline run, executing the current job definition as the cluster MI."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/jobs/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: BatchJob
+      source: "<principal>"
+      target: "<AML compute cluster (BatchJob)>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/jobs/write"]
+      api_source: "role assignment evaluation"
+      evidence_field: "roleAssignments.properties.roleDefinitionId"
+      note: >-
+        Triggering a job runs the CURRENT definition. Escalation to the cluster MI
+        only occurs if the current job definition contains attacker-influenced code
+        (poisoned dependency, attacker-authored script, mutable environment image).
+      false_positive_note: >-
+        Triggering a trusted, pinned, reviewed job definition is NOT code execution
+        under attacker control. Only escalates when the current job definition
+        demonstrably runs attacker-influenced code.
+      narrative: "{principal.name} can trigger AML job runs (jobs/write); escalation depends on whether the triggered job definition runs attacker-influenced code."
+
+  - id: azure-aml-batch-endpoint-trigger
+    emits: CanTrigger
+    applies_to: [azure]
+    description: "Principal can invoke a batch endpoint to trigger a batch scoring job on the endpoint's compute cluster."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/batchEndpoints/jobs/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: BatchJob
+      source: "<principal>"
+      target: "<batch endpoint compute cluster>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/batchEndpoints/jobs/write"]
+      api_source: "role assignment evaluation"
+      evidence_field: "roleAssignments.properties.roleDefinitionId"
+      note: >-
+        Triggering a batch endpoint runs the existing deployment scoring code.
+        Escalation to the cluster MI requires the current scoring code to be
+        attacker-influenced.
+      false_positive_note: >-
+        Batch endpoint invoke with a clean, trusted scoring script is trigger-only;
+        it does not grant code control.
+      narrative: "{principal.name} can trigger batch scoring jobs (batchEndpoints/jobs/write); escalation depends on whether the scoring script runs attacker-influenced code."

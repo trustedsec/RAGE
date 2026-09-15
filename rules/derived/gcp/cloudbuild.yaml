@@ -1,0 +1,578 @@
+# GCP Cloud Build — Derived attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# Cloud Build ESCALATION INVARIANT (Phase 9):
+#   A build runs AS a service account (ExecutesAs). Whoever can inject arbitrary
+#   steps into a build — directly (cloudbuild.builds.create), via trigger
+#   mutation (cloudbuild.triggers.update), or via source/config writes that
+#   populate the build spec — can execute code as the build SA. This is the
+#   canonical GCP CI/CD privilege-escalation path:
+#
+#     cloudbuild.builds.create -> build node (CanModifyCode) + ExecutesAs(SA)
+#     + CanTrigger or ACTIVE run path -> CanExecuteAs(build SA) -> CanEscalateTo
+#
+# SERVICE ACCOUNT MODEL:
+#   Legacy SA:  PROJECT_NUMBER@cloudbuild.gserviceaccount.com
+#               Google-managed; does NOT require iam.serviceAccounts.actAs by the
+#               submitter. Historically granted roles/editor on the project.
+#   User SA:    any user-managed SA specified in trigger.serviceAccount or
+#               build.serviceAccount. Requires iam.serviceAccounts.actAs on that SA.
+#
+# LINCHPIN DELEGATION (CITE, DO NOT RE-DERIVE):
+#   cicd-chains.yaml   cicd-modify-buildspec-executes-as: CanModifyCode(runner) +
+#                      ExecutesAs -> CanExecuteAs. This file emits the normalized
+#                      facts (CanModifyCode, ExecutesAs, CanTrigger) and lets
+#                      cicd-chains produce the CanExecuteAs collapse.
+#   cicd-chains.yaml   cicd-trigger-runner-executes-as: CanTrigger + ExecutesAs ->
+#                      CanExecuteAs (CONDITIONAL).
+#   can-execute-as.yaml execute-as-via-code-modify: generic collapse, consumed by
+#                      cicd-chains (not re-derived here).
+#   identity-escalation.yaml gcp-execute-as-via-actas: actAs + cloudbuild.builds.create
+#                      -> CanExecuteAs (already handles the actAs+create case).
+#   can-control.yaml   escalate-via-execute-as: CanExecuteAs -> CanEscalateTo.
+#
+# This file emits service FACTS only:
+#   CanModifyCode  — explicit: builds.create / triggers.update give attacker
+#                   control of the executed build definition
+#   CanTrigger     — explicit: triggers.run / Pub/Sub publish fire a build
+#   ExecutesAs     — structural fact: which SA the build runs as
+#   ExposesCredential — structural: metadata token exposed to all build steps
+#   CanNetworkReach — explicit: private worker pool VPC peering
+#   CanModifyPolicy — explicit: connections.setIamPolicy
+#   CanPassIdentity — explicit: iam.serviceAccounts.actAs on the build SA (shared
+#                   with identity-escalation.yaml gcp-sa-act-as; here for
+#                   Cloud Build-specific narrative)
+#
+# Permissions are exact identifiers from the Cloud Build IAM reference and the
+# IAM service accounts reference. No permissions are hallucinated.
+# IAM deny policies evaluated first (deny wins) -> emit as BLOCKED.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 9-cicd-pipelines
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1. Direct build submission (cloudbuild.builds.create) — legacy SA path
+  # ---------------------------------------------------------------------------
+  # cloudbuild.builds.create lets a principal submit a build with arbitrary steps
+  # in the cloudbuild.yaml. When no serviceAccount is specified, the build runs as
+  # the legacy SA (PROJECT_NUMBER@cloudbuild.gserviceaccount.com) WITHOUT requiring
+  # iam.serviceAccounts.actAs. This is the lowest-friction privilege escalation path
+  # in Cloud Build: one permission + one API call = code execution as the legacy SA.
+  - id: gcp-cloudbuild-builds-create-as-legacy-sa
+    emits: CanModifyCode
+    description: "cloudbuild.builds.create gives the principal full control of build steps executed as the legacy Cloud Build service account, with no actAs requirement."
+    match_effective_permission:
+      action: "cloudbuild.builds.create"
+      resource_type: "google.devtools.cloudbuild.v1.Build"
+    where:
+      - "no user-specified serviceAccount on the build (legacy SA is the default)"
+      - "legacy SA is PROJECT_NUMBER@cloudbuild.gserviceaccount.com"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Cloud Build build node / BuildWorker>"
+      permissions: ["cloudbuild.builds.create"]
+      conditions: []
+      state_logic: "ACTIVE: cloudbuild.builds.create is a project-level permission; submitting a build with arbitrary steps is a single API call that runs immediately. No trigger, no actAs, no approval required unless an approval policy is active — in that case CONDITIONAL(build_approved). If a deny policy on cloudbuild.builds.create is in effect: BLOCKED."
+      confidence: 0.97
+      derived_from: ["<cloudbuild.builds.create effective permission on principal>"]
+      false_positive_note: >-
+        This path is ONLY valid for the legacy SA. Do NOT apply it when the build
+        specifies a user SA (that path requires iam.serviceAccounts.actAs — see
+        gcp-cloudbuild-builds-create-with-sa). If the project has removed the legacy
+        SA or disabled it via org policy (iam.automaticIamGrantsForDefaultServiceAccounts),
+        the legacy SA may have no meaningful roles — resolve its actual effective roles
+        before treating this as a high-value escalation target. If a build approval
+        policy is active, emit as CONDITIONAL(build_approved), not ACTIVE.
+      narrative: >-
+        {principal.name} can submit a Cloud Build build (cloudbuild.builds.create)
+        with arbitrary build steps; with no SA specified, the build executes as the
+        legacy Cloud Build service account PROJECT_NUMBER@cloudbuild.gserviceaccount.com
+        (historically roles/editor on the project). No actAs permission is required for
+        the legacy SA path — a single API call yields code execution as that SA.
+
+  # ---------------------------------------------------------------------------
+  # 2. Direct build submission — user-specified SA path
+  # ---------------------------------------------------------------------------
+  # When a user-specified SA is named in the build/trigger, iam.serviceAccounts.actAs
+  # is required. CanPassIdentity (emitted by gcp-sa-act-as in identity-escalation.yaml)
+  # gates this. Here we emit the CanModifyCode fact for the build worker node that
+  # captures the code-injection capability with a user SA.
+  - id: gcp-cloudbuild-builds-create-with-sa
+    emits: CanModifyCode
+    description: "cloudbuild.builds.create + iam.serviceAccounts.actAs on a user SA: submit arbitrary build steps as that SA."
+    match:
+      - [ "?principal", "CanPassIdentity", "?sa" ]
+    where:
+      - "?principal has effective cloudbuild.builds.create on the project"
+      - "node_type(?sa) in [ServiceAccount, MachineIdentity]  # user-managed SA"
+      - "?sa is NOT the legacy Cloud Build SA (PROJECT_NUMBER@cloudbuild.gserviceaccount.com)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Cloud Build build node / BuildWorker for ?sa>"
+      permissions: ["cloudbuild.builds.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: "ACTIVE if both cloudbuild.builds.create and iam.serviceAccounts.actAs on ?sa are confirmed in the effective permission set. CONDITIONAL(iam_permission) if actAs is unresolved. BLOCKED if a deny policy denies either permission at scope."
+      confidence: 0.95
+      derived_from: ["<CanPassIdentity edge_id for ?principal -> ?sa>", "<cloudbuild.builds.create effective permission>"]
+      false_positive_note: >-
+        actAs on the SA is the guard rail — without it Cloud Build rejects the
+        build submission at API time. Confirm both permissions are in the effective
+        grant (not just identity policy; also check project IAM + org policies/deny).
+        Do not emit for the legacy SA (no actAs required for that SA).
+      narrative: >-
+        {principal.name} can submit a Cloud Build build (cloudbuild.builds.create) with
+        arbitrary steps running as user-specified service account {sa.name}
+        (iam.serviceAccounts.actAs required and confirmed), yielding code execution as
+        that SA.
+
+  # ---------------------------------------------------------------------------
+  # 3. Trigger modification — inject steps or swap SA on existing trigger
+  # ---------------------------------------------------------------------------
+  # cloudbuild.triggers.update / patch lets a principal replace the trigger's inline
+  # build spec (inlineBuild), the cloudbuild.yaml path (filename), substitutions, and
+  # the serviceAccount. The next trigger fire executes the poisoned definition as the
+  # (possibly changed) SA. Requires actAs on both old and new SA when changing SA.
+  - id: gcp-cloudbuild-trigger-update-code
+    emits: CanModifyCode
+    description: "cloudbuild.triggers.update lets the principal replace a trigger's build definition (inline steps, cloudbuild.yaml path, or substitutions); the next trigger fire executes the attacker-controlled definition as the trigger's SA."
+    match:
+      - [ "?principal", "CanPassIdentity", "?sa" ]
+    where:
+      - "?principal has effective cloudbuild.triggers.update on the project"
+      - "node_type(?sa) in [ServiceAccount, MachineIdentity]  # the build SA"
+      - "?sa is the trigger's current serviceAccount"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Cloud Build trigger node / BuildWorker>"
+      permissions: ["cloudbuild.triggers.update", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if the principal has effective cloudbuild.triggers.update on the project
+        AND iam.serviceAccounts.actAs on the trigger's current SA is confirmed (via the
+        CanPassIdentity edge). The CanModifyCode edge is ACTIVE for the code-injection
+        fact; the downstream CanExecuteAs (from cicd-chains cicd-modify-buildspec-executes-as)
+        is ACTIVE when a run path exists (the trigger is armed by an SCM event or the
+        principal can also run it) or CONDITIONAL(run_path) if no run path is established.
+        BLOCKED if a deny policy applies to either permission.
+      confidence: 0.93
+      derived_from: ["<CanPassIdentity edge_id for ?principal -> ?sa>", "<cloudbuild.triggers.update effective permission>"]
+      false_positive_note: >-
+        actAs on the trigger's CURRENT SA is required to run any update, even if only the
+        build spec (not the SA) is being changed — this is confirmed via CanPassIdentity
+        edge match. Changing the SA to a different SA requires actAs on BOTH the old and
+        new SA; this rule covers the case where the current SA is confirmed. The trigger
+        fires only when its source event occurs (SCM push/PR, Pub/Sub, schedule) or when
+        manually run — scope run-path state accordingly.
+      narrative: >-
+        {principal.name} can update Cloud Build trigger {trigger.name}
+        (cloudbuild.triggers.update) to replace its build definition (inline steps or
+        cloudbuild.yaml path), with iam.serviceAccounts.actAs on trigger's SA {sa.name}
+        confirmed; the next trigger fire executes the poisoned steps as {sa.name}.
+
+  # ---------------------------------------------------------------------------
+  # 4. Trigger creation — new trigger with attacker-controlled spec and SA
+  # ---------------------------------------------------------------------------
+  - id: gcp-cloudbuild-trigger-create
+    emits: CanModifyCode
+    description: "cloudbuild.triggers.create + iam.serviceAccounts.actAs: create a new trigger whose builds execute attacker-controlled steps as a chosen SA."
+    match:
+      - [ "?principal", "CanPassIdentity", "?sa" ]
+    where:
+      - "?principal has effective cloudbuild.triggers.create on the project"
+      - "node_type(?sa) in [ServiceAccount, MachineIdentity]"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<new Cloud Build trigger (BuildWorker) bound to ?sa>"
+      permissions: ["cloudbuild.triggers.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE for the code-injection capability itself (the trigger spec is wholly under
+        attacker control). The downstream CanExecuteAs from cicd-chains is ACTIVE if the
+        attacker can also fire the trigger (has cloudbuild.triggers.run or can push to the
+        tracked branch or has Pub/Sub publish on the trigger topic) or CONDITIONAL(run_path)
+        if a fire mechanism must first be established. Inherits from CanPassIdentity;
+        BLOCKED if a deny policy applies to either permission.
+      confidence: 0.92
+      derived_from: ["<CanPassIdentity edge_id for ?principal -> ?sa>", "<cloudbuild.triggers.create effective permission>"]
+      false_positive_note: >-
+        This emits CanModifyCode for the NEW trigger being created (not an existing one).
+        The trigger node does not exist until created; emit the edge with the planned SA
+        as the associated ExecutesAs target, with state ACTIVE for the spec-control
+        capability. The legacy SA path (no actAs needed) is handled differently: if the
+        legacy SA is used, no actAs is required but triggering still needs a fire path.
+      narrative: >-
+        {principal.name} can create a new Cloud Build trigger (cloudbuild.triggers.create)
+        with arbitrary build steps, bound to {sa.name} (iam.serviceAccounts.actAs); the
+        next trigger fire executes attacker steps as {sa.name}.
+
+  # ---------------------------------------------------------------------------
+  # 5. Trigger run — fire an existing trigger (CONDITIONAL — weaker than modify)
+  # ---------------------------------------------------------------------------
+  # cloudbuild.triggers.run fires the trigger at a specific source revision. This
+  # yields code execution as the trigger's SA ONLY IF the trigger's current build
+  # definition is already attacker-influenced (e.g., the trigger builds from an
+  # attacker-controlled branch/repo, an unpinned dependency, or an already-poisoned
+  # inline spec). A trigger.run over a clean, pinned, reviewed definition is NOT
+  # by itself code execution — stays CONDITIONAL.
+  - id: gcp-cloudbuild-trigger-run
+    emits: CanTrigger
+    description: "cloudbuild.triggers.run lets the principal fire an existing trigger at a chosen source revision; code execution as the trigger's SA is CONDITIONAL on the current definition being attacker-influenced."
+    match_effective_permission:
+      action: "cloudbuild.triggers.run"
+      resource_type: "google.devtools.cloudbuild.v1.BuildTrigger"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Cloud Build trigger node / BuildWorker>"
+      permissions: ["cloudbuild.triggers.run"]
+      conditions: [attacker_influenced_definition]
+      state_logic: >-
+        CONDITIONAL(attacker_influenced_definition): triggers.run executes the CURRENT
+        trigger definition. This becomes ACTIVE code execution as the trigger's SA only
+        if: (a) the trigger builds from a branch/commit the attacker controls (so the
+        source revision arg lets the attacker choose an attacker-authored commit), OR
+        (b) the trigger's build spec references unpinned/mutable config the attacker can
+        poison (dependency, GCS bucket), OR (c) the trigger's inline build spec was
+        already tampered (by gcp-cloudbuild-trigger-update-code). A trigger.run over a
+        fully pinned, reviewed definition with no attacker-reachable inputs stays
+        CONDITIONAL, not ACTIVE. Inherits BLOCKED if a deny policy applies to triggers.run.
+      confidence: "0.70"
+      derived_from: ["<cloudbuild.triggers.run effective permission>"]
+      false_positive_note: >-
+        Do NOT emit ACTIVE merely because the principal can run the trigger — the
+        CURRENT definition must be demonstrably attacker-influenced for CanExecuteAs to
+        be ACTIVE. The classic ACTIVE case is a trigger that builds from a public fork /
+        untrusted PR (pwn-request pattern) or an unpinned Dockerfile FROM / base image
+        the attacker can push to. cicd-chains cicd-trigger-runner-executes-as handles the
+        CONDITIONAL -> CanExecuteAs collapse; do not re-derive here.
+      narrative: >-
+        {principal.name} can fire Cloud Build trigger {trigger.name}
+        (cloudbuild.triggers.run) at a chosen source revision; if the trigger's build
+        definition is attacker-influenced (attacker-controlled branch, unpinned
+        dependency, or already-poisoned spec), this executes code as the trigger's SA.
+
+  # ---------------------------------------------------------------------------
+  # 6. ExecutesAs — structural fact from trigger/build serviceAccount field
+  # ---------------------------------------------------------------------------
+  # Emitted per trigger (and per build where build.serviceAccount overrides).
+  # Zero-cost structural edge feeding cicd-chains and can-execute-as derivations.
+  - id: gcp-cloudbuild-executes-as
+    emits: ExecutesAs
+    description: "A Cloud Build trigger's builds execute as the configured service account (or the legacy SA if none is set)."
+    match:
+      - [ "?trigger", "ExecutesAs", "?sa" ]
+    where:
+      - "node_type(?trigger) == BuildWorker"
+      - "if trigger.serviceAccount is set: SA = trigger.serviceAccount; else SA = PROJECT_NUMBER@cloudbuild.gserviceaccount.com (legacy SA)"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: "<Cloud Build trigger / build node (BuildWorker)>"
+      target: "<build service account (legacy or user-specified)>"
+      permissions: []
+      conditions: []
+      state_logic: "ACTIVE: structural fact — the build platform guarantees this SA token is injected into the build environment (metadata server). Flag the legacy SA as elevated privilege if it still holds roles/editor."
+      confidence: 1.0
+      derived_from: ["<trigger.serviceAccount field from google.devtools.cloudbuild.v1.BuildTrigger resource>"]
+      false_positive_note: >-
+        If serviceAccount field is absent, the legacy SA is the runtime identity — confirm
+        the legacy SA's ACTUAL effective roles at collection time (org policy
+        iam.automaticIamGrantsForDefaultServiceAccounts may have removed roles/editor;
+        always resolve effective roles, not defaults). Build-level serviceAccount overrides
+        trigger-level SA for direct builds.
+      narrative: >-
+        Cloud Build builds triggered by {trigger.name} execute as service account
+        {sa.name}; all build steps can mint OAuth tokens for {sa.name} from the GCE
+        metadata server.
+
+  # ---------------------------------------------------------------------------
+  # 7. Metadata credential exposure
+  # ---------------------------------------------------------------------------
+  # All Cloud Build workers run on GCE-backed VMs and have access to the GCE
+  # metadata server endpoint for the configured SA. Any code running in a build
+  # step can retrieve an OAuth 2.0 access token for the build SA. This is a
+  # structural fact (like ExecutesAs) — it does not require any additional IAM
+  # grant beyond the build SA binding.
+  - id: gcp-cloudbuild-exposes-build-sa-cred
+    emits: ExposesCredential
+    description: "All Cloud Build steps can mint OAuth tokens for the build SA from the GCE metadata server; code execution in any step yields the build SA's credentials."
+    match:
+      - [ "?build", "ExecutesAs", "?sa" ]
+    where:
+      - "node_type(?build) in [BuildWorker]"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: "<Cloud Build build / worker pool node>"
+      target: "<build service account>"
+      permissions: []
+      conditions: []
+      state_logic: "ACTIVE: structural fact — GCE metadata server is always reachable from Cloud Build workers. This edge only becomes an attack step when combined with a CanModifyCode or CanExecuteAs edge."
+      confidence: 1.0
+      derived_from: ["<ExecutesAs edge_id for ?build -> ?sa>"]
+      false_positive_note: >-
+        Not an escalation by itself — expresses the fact that code execution in the build
+        equals credential access for the build SA. Attack value is gated by an upstream
+        execution-injection capability (CanModifyCode / CanTrigger + attacker-influenced
+        definition).
+      narrative: >-
+        Code running in {build.name} build steps can retrieve OAuth 2.0 access tokens
+        for build service account {sa.name} from the GCE metadata server
+        (http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token),
+        effectively granting all of {sa.name}'s IAM roles to any code in the build.
+
+  # ---------------------------------------------------------------------------
+  # 8. Pub/Sub publish -> trigger (CanTrigger via Pub/Sub)
+  # ---------------------------------------------------------------------------
+  # A Cloud Build trigger with a pubsubConfig fires whenever a message arrives on
+  # the configured Pub/Sub topic. A principal with pubsub.topics.publish on that
+  # topic can fire the trigger — this is a CanTrigger edge from the publisher to
+  # the trigger node. The downstream CanExecuteAs is CONDITIONAL (cicd-chains rule 2).
+  - id: gcp-cloudbuild-pubsub-trigger
+    emits: CanTrigger
+    description: "A principal with pubsub.topics.publish on a trigger's configured Pub/Sub topic can fire that trigger, potentially executing code as the trigger's SA."
+    match:
+      - [ "?principal", "CanTrigger", "?topic" ]
+      - [ "?topic", "CanTrigger", "?trigger" ]
+    where:
+      - "node_type(?topic) == Topic"
+      - "node_type(?trigger) == BuildWorker"
+      - "?principal has effective pubsub.topics.publish on ?topic"
+      - "?trigger.pubsubConfig.topic == ?topic.native_id"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal with pubsub.topics.publish on ?topic>"
+      target: "<Cloud Build trigger node (BuildWorker)>"
+      permissions: ["pubsub.topics.publish"]
+      conditions: [attacker_influenced_definition]
+      state_logic: >-
+        CONDITIONAL(attacker_influenced_definition): Pub/Sub publish fires the trigger,
+        which runs the CURRENT build definition. Escalation to CanExecuteAs requires the
+        definition to be attacker-influenced (same condition as gcp-cloudbuild-trigger-run).
+        If the trigger's build spec is attacker-controlled (inlineBuild under attacker
+        control, or already poisoned via trigger update): ACTIVE for CanExecuteAs once
+        cicd-chains processes this CanTrigger + ExecutesAs. If the topic is public
+        (allUsers publish): ExposedToInternet feeds here.
+      confidence: 0.70
+      derived_from: ["<pubsubConfig.topic field from BuildTrigger>", "<pubsub.topics.publish effective permission>"]
+      false_positive_note: >-
+        Pub/Sub publish alone is not code execution — it fires the trigger, which runs
+        the existing definition. Downgrade to CONDITIONAL unless the build definition is
+        demonstrably attacker-influenced. Also check whether the trigger has a
+        subscription filter (messageBody filter conditions) that limit which messages
+        fire the build — an overly restrictive filter may prevent arbitrary triggering.
+      narrative: >-
+        {principal.name} can publish to Pub/Sub topic {topic.name}
+        (pubsub.topics.publish), which fires Cloud Build trigger {trigger.name}; if the
+        trigger's build definition is attacker-influenced, this executes code as the
+        trigger's SA {sa.name}.
+
+  # ---------------------------------------------------------------------------
+  # 9. Private worker pool -> private network reachability
+  # ---------------------------------------------------------------------------
+  # A Cloud Build private worker pool is peered into a customer VPC. Builds running
+  # in this pool can reach private resources in the peered VPC (databases, internal
+  # APIs, on-prem via VPN/Interconnect). This is a significant lateral movement
+  # surface: CanExecuteAs(build SA) + CanNetworkReach(private resources) enables
+  # data exfiltration and pivoting to resources otherwise unreachable from the internet.
+  - id: gcp-cloudbuild-private-pool-network-reach
+    emits: CanNetworkReach
+    description: "A Cloud Build private worker pool peered into a VPC gives build steps network access to private resources in that VPC."
+    match_record:
+      resource_type: "google.devtools.cloudbuild.v1.WorkerPool"
+      field: "privatePoolV1Config.networkConfig.peeredNetwork"
+    where:
+      - "workerPool.privatePoolV1Config.networkConfig.peeredNetwork is set to VPC network ?vpc"
+    emit:
+      source_type: Compute
+      target_type: Compute
+      source: "<Cloud Build private worker pool / BuildWorker>"
+      target: "<private resources reachable via peered VPC network ?vpc>"
+      permissions: ["cloudbuild.workerpools.use"]
+      conditions: [network_reachability, service_state]
+      state_logic: >-
+        ACTIVE if the worker pool's peeredNetwork field references an active VPC and
+        the VPC peering is established (not merely requested). CONDITIONAL(network_reachability)
+        if peering status is pending or if the private resource's subnet is not routable
+        via the peered network. This edge is a structural fact of the pool topology; attack
+        value requires a CanExecuteAs or CanModifyCode edge on the build node as a prerequisite.
+      confidence: 0.85
+      derived_from: ["<WorkerPool.privatePoolV1Config.networkConfig.peeredNetwork field>"]
+      false_positive_note: >-
+        Not a standalone escalation — network reachability via the pool is only useful
+        when combined with code execution in the build (CanModifyCode/CanExecuteAs into
+        the BuildWorker). Verify that the peered network's routing and firewall rules
+        actually permit traffic to the target resource; a pool peered to a VPC does not
+        automatically reach all resources in that VPC. Use cloudbuild.workerpools.use to
+        gate which builds run in the pool (without this permission a build cannot use the
+        pool).
+      narrative: >-
+        Cloud Build private worker pool {pool.name} is peered into VPC {vpc.name}; build
+        steps executing in this pool can reach private resources in the peered network
+        (databases, internal APIs, on-prem hosts via VPN/Interconnect).
+
+  # ---------------------------------------------------------------------------
+  # 10. Connection IAM policy mutation
+  # ---------------------------------------------------------------------------
+  # cloudbuild.connections.setIamPolicy lets a principal grant other principals
+  # access to a source repository connection (used for triggered builds from GitHub/
+  # GitLab via Cloud Build 2nd-gen triggers). This can enable a third party to
+  # read source tokens or manage the connection. CanModifyPolicy at the connection
+  # resource level.
+  - id: gcp-cloudbuild-set-iam-policy-connection
+    emits: CanModifyPolicy
+    description: "cloudbuild.connections.setIamPolicy lets the principal grant or revoke access to a Cloud Build repository connection, potentially enabling unauthorized source token access."
+    match_effective_permission:
+      action: "cloudbuild.connections.setIamPolicy"
+      resource_type: "google.devtools.cloudbuild.v1.Connection"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Cloud Build repository connection>"
+      permissions: ["cloudbuild.connections.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE if cloudbuild.connections.setIamPolicy is in the effective grant at the connection or project scope. BLOCKED if a deny policy applies."
+      confidence: 0.85
+      derived_from: ["<cloudbuild.connections.setIamPolicy effective permission>"]
+      false_positive_note: >-
+        setIamPolicy on the connection resource enables granting cloudbuild.repositories.
+        accessReadWriteToken to arbitrary principals, which gives them write-level SCM
+        tokens (a code-write / source-poisoning path). This is a meaningful downstream
+        capability — flag the connection's token permissions alongside this edge.
+      narrative: >-
+        {principal.name} can set the IAM policy of Cloud Build connection {connection.name}
+        (cloudbuild.connections.setIamPolicy), granting itself or others access to read or
+        write repository tokens for the connected SCM source.
+
+  # ---------------------------------------------------------------------------
+  # 11. Worker pool update — network config substitution
+  # ---------------------------------------------------------------------------
+  # cloudbuild.workerpools.update lets a principal change the private worker pool's
+  # VPC peering target. An attacker who can update the pool can re-peer it to a VPC
+  # they control, changing future builds' network context — a configuration-level
+  # network misdirection / lateral movement setup.
+  - id: gcp-cloudbuild-workerpool-update-config
+    emits: CanModifyConfiguration
+    description: "cloudbuild.workerpools.update lets the principal change a private worker pool's VPC peering configuration, redirecting future builds' network access."
+    match_effective_permission:
+      action: "cloudbuild.workerpools.update"
+      resource_type: "google.devtools.cloudbuild.v1.WorkerPool"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Cloud Build private worker pool>"
+      permissions: ["cloudbuild.workerpools.update"]
+      conditions: [iam_permission, service_state]
+      state_logic: "ACTIVE if cloudbuild.workerpools.update is confirmed in the effective grant. Attack value (network misdirection) is CONDITIONAL on future builds using the pool (cloudbuild.workerpools.use) and a run path existing. BLOCKED if a deny policy applies."
+      confidence: 0.80
+      derived_from: ["<cloudbuild.workerpools.update effective permission>"]
+      false_positive_note: >-
+        Changing the peered VPC does not affect RUNNING builds — only future builds
+        dispatched to the pool after the update. The attack is: update pool -> next build
+        that uses it runs in the new VPC context. Requires that future builds use the pool
+        (cloudbuild.workerpools.use bindings) and that the attacker's VPC has useful
+        resources or that the new peering exposes a private resource previously isolated.
+      narrative: >-
+        {principal.name} can update the Cloud Build private worker pool {pool.name}
+        (cloudbuild.workerpools.update), changing its VPC peering configuration and
+        redirecting future builds' private network access.
+
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (normalization of raw Cloud Build config into
+# explicit edges for the collector). These belong logically in
+# /rules/explicit/gcp-cloudbuild.yaml; kept here as explicit_rules so the
+# service is self-contained. No separate explicit rules file is needed
+# (explicitPath null).
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-cloudbuild-trigger-executes-as
+    emits: ExecutesAs
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.devtools.cloudbuild.v1.BuildTrigger"
+      field: "serviceAccount"
+    where:
+      - "if trigger.serviceAccount is set: SA = trigger.serviceAccount"
+      - "else: SA = PROJECT_NUMBER@cloudbuild.gserviceaccount.com (legacy Cloud Build SA)"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: "<BuildTrigger node>"
+      target: "<service account>"
+      api_source: "cloudbuild.projects.triggers.get / list"
+      evidence_field: "serviceAccount"
+      narrative: "Cloud Build trigger {trigger.name} executes builds as {sa.name}."
+
+  - id: gcp-cloudbuild-pubsub-config
+    emits: CanTrigger
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.devtools.cloudbuild.v1.BuildTrigger"
+      field: "pubsubConfig.topic"
+    where:
+      - "trigger.pubsubConfig.topic is a non-empty Pub/Sub topic resource name"
+    emit:
+      source_type: Messaging
+      target_type: Compute
+      source: "<Pub/Sub topic node>"
+      target: "<BuildTrigger node (BuildWorker)>"
+      api_source: "cloudbuild.projects.triggers.get"
+      evidence_field: "pubsubConfig.topic"
+      narrative: "Pub/Sub topic {topic.name} triggers Cloud Build trigger {trigger.name}."
+
+  - id: gcp-cloudbuild-workerpool-peering
+    emits: CanNetworkReach
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.devtools.cloudbuild.v1.WorkerPool"
+      field: "privatePoolV1Config.networkConfig.peeredNetwork"
+    where:
+      - "workerPool.privatePoolV1Config.networkConfig.peeredNetwork is a non-empty VPC network resource name"
+    emit:
+      source_type: Compute
+      target_type: Network
+      source: "<WorkerPool node (BuildWorker)>"
+      target: "<peered VPC network>"
+      api_source: "cloudbuild.projects.locations.workerPools.get"
+      evidence_field: "privatePoolV1Config.networkConfig.peeredNetwork"
+      narrative: "Cloud Build worker pool {pool.name} is peered into VPC {vpc.name}, giving builds private network reach."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - IAM deny policy denying cloudbuild.builds.create or cloudbuild.triggers.update
+#    at the effective scope -> emit the relevant CanModifyCode edge as BLOCKED.
+#  - Deny policy denying iam.serviceAccounts.actAs for the build SA -> BLOCKED for
+#    gcp-cloudbuild-builds-create-with-sa and gcp-cloudbuild-trigger-update-code.
+#  - Org policy iam.automaticIamGrantsForDefaultServiceAccounts may remove legacy SA
+#    roles -> adjust privilege_level of the legacy SA accordingly.
+#  - Build approval policy active -> gcp-cloudbuild-execute-as-via-build-create is
+#    CONDITIONAL(build_approved), not ACTIVE.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# DEDUPLICATION NOTES:
+#  - cicd-chains.yaml cicd-modify-buildspec-executes-as fires on ANY CanModifyCode
+#    + ExecutesAs for a BuildWorker; this file's CanModifyCode edges feed that rule.
+#    cicd-chains produces CanExecuteAs(ACTIVE) for direct-submission builds and
+#    CanExecuteAs(CONDITIONAL) for trigger-based paths. No service-specific duplication.
+#  - identity-escalation.yaml gcp-execute-as-via-actas also fires for
+#    cloudbuild.builds.create as a qualifying create action. gcp-cloudbuild-builds-
+#    create-with-sa (rule 2) and that rule both produce CanExecuteAs — deduped.
+# ---------------------------------------------------------------------------

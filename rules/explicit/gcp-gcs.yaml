@@ -1,0 +1,218 @@
+# GCP Cloud Storage (GCS) — Explicit normalization rules
+# ---------------------------------------------------------------------------
+# Adapter translates raw GCS API records into explicit edges (schema/edges.yaml).
+# Rules match raw API responses; they do NOT combine edges (that is the job of
+# /rules/derived/gcp/gcs.yaml). Permissions are verbatim from:
+#   cloud.google.com/storage/docs/access-control/iam-permissions
+#   cloud.google.com/storage/docs/authentication/hmackeys
+#   cloud.google.com/storage/docs/encryption/customer-managed-keys
+#   cloud.google.com/storage/docs/uniform-bucket-level-access
+#
+# COLLECTOR NOTES:
+#   * Record iamConfiguration.uniformBucketLevelAccess.enabled on every bucket:
+#     when UBLA is enabled, the acl / defaultObjectAcl arrays are irrelevant for
+#     access control and may be omitted; when UBLA is disabled, both IAM and ACL
+#     layers must be inspected.
+#   * NEVER grant storage.objects.get to the collector (reads object content).
+#     Use storage.objects.list for object metadata (name, kmsKeyName, contentType).
+#   * HMAC key secrets are returned ONLY at creation time — storage.hmacKeys.list
+#     returns only key ID, SA email, and state. Record the EXISTENCE of ACTIVE keys.
+#   * CMEK defaultKmsKeyName is recorded as EVIDENCE on the Bucket node, not as an
+#     edge — the concrete EncryptionKey node lives in gcp:kms.
+# ---------------------------------------------------------------------------
+
+applies_to: [gcp]
+phase: 6-storage-databases
+service: gcs
+
+rules:
+
+  # --- Bucket IAM allow policy -> HasPolicy attachment -----------------------
+  - id: gcp-gcs-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record:
+      api: "storage.buckets.getIamPolicy"
+      resource_type: "google.storage.Bucket"
+      field: "bindings"
+    emit:
+      source_type: Storage
+      target_type: Policy
+      source: "<bucket node>"
+      target: "<bucket ResourcePolicy node>"
+      api_source: "storage.buckets.getIamPolicy"
+      evidence_field: "iamPolicy.bindings"
+      narrative: "{bucket.name} has an IAM allow policy governing access to its objects."
+
+  # --- Cross-project member in bucket IAM -> CrossProjectTrust ---------------
+  - id: gcp-gcs-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      api: "storage.buckets.getIamPolicy"
+      resource_type: "google.storage.Bucket"
+      field: "iamPolicy.bindings[].members"
+    where:
+      - "a member (serviceAccount email or user email) belongs to a different GCP project than the bucket (e.g. SA email project component != bucket project, or user is a cross-project guest)"
+      - "exclude well-known GCP service agents (service-NUMBER@gcp-sa-*.iam, service-NUMBER@gs-project-accounts.iam, etc.) — these are expected managed-service bindings"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<bucket.project>"
+      target: "<foreign project the member belongs to>"
+      api_source: "storage.buckets.getIamPolicy"
+      evidence_field: "iamPolicy.bindings[].members (cross-project SA or user email)"
+      permissions: []
+      narrative: "{bucket.name} in {projectA.name} grants access to a principal from {projectB.name} — cross-project data trust."
+
+  # --- Effective storage.buckets.setIamPolicy -> CanModifyPolicy -------------
+  - id: gcp-gcs-can-modify-policy
+    emits: CanModifyPolicy
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "storage.buckets.setIamPolicy"
+      resource_type: "google.storage.Bucket"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<bucket ResourcePolicy node>"
+      api_source: "Cloud Asset Inventory analyzeIamPolicy"
+      evidence_field: "storage.buckets.setIamPolicy effective permission"
+      permissions: ["storage.buckets.setIamPolicy"]
+      narrative: "{principal.name} can overwrite the IAM policy of {bucket.name} (storage.buckets.setIamPolicy)."
+
+  # --- ACTIVE HMAC key for a Service Account -> ExposesCredential ------------
+  # The HMAC secret itself is NOT returned by list/get; it was returned at
+  # creation time. An ACTIVE key means the secret is in use / was issued.
+  # Model this as an ExposesCredential fact on the HmacKey node -> SA.
+  - id: gcp-gcs-hmac-key-active
+    emits: ExposesCredential
+    applies_to: [gcp]
+    match_record:
+      api: "storage.hmacKeys.list"
+      resource_type: "google.storage.HmacKey"
+      field: "state == 'ACTIVE'"
+    where:
+      - "HMAC key state is ACTIVE (the secret was issued and is currently usable)"
+    emit:
+      source_type: Secret
+      target_type: Credential
+      source: "<HMAC key AccessKey node>"
+      target: "<service account the HMAC key authenticates (serviceAccountEmail)>"
+      api_source: "storage.hmacKeys.list (per project)"
+      evidence_field: "serviceAccountEmail, id (accessId), state == ACTIVE"
+      permissions: ["storage.hmacKeys.create (at issuance)"]
+      narrative: "HMAC key {hmacKey.id} for SA {sa.name} is ACTIVE; the holder of the key secret can authenticate to the GCS S3-compatible API as {sa.name}."
+
+  # --- CMEK defaultKmsKeyName -> evidence record (no graph edge) ------------
+  # A Bucket node is class Storage; it is NOT a valid source for HasPolicy
+  # targeting an EncryptionKey (Policy target), nor a valid source for
+  # ContainsResourceReference ([Data, Storage, Compute]… wait — Storage IS
+  # in ContainsResourceReference's source set, but EncryptionKey is class
+  # Secret, not in ContainsResourceReference's target set ["*"] — actually
+  # ContainsResourceReference targets ["*"], so it IS valid). However,
+  # recording CMEK as an evidence record on the Bucket node is preferred
+  # over a ContainsResourceReference edge, mirroring gcp-secretmanager
+  # convention and keeping the KMS key modeling in gcp:kms. The derived
+  # rule gcp-gcs-read-data-cmek uses this evidence to evaluate the
+  # service-agent key_permission gate.
+  - id: gcp-gcs-cmek-ref
+    emits: null
+    kind: evidence
+    applies_to: [gcp]
+    match_record:
+      api: "storage.buckets.get"
+      resource_type: "google.storage.Bucket"
+      field: "encryption.defaultKmsKeyName"
+    where:
+      - "encryption.defaultKmsKeyName is set (bucket has a CMEK default key)"
+    record:
+      on_node: "<bucket / ObjectStorage node>"
+      field: "cmek_key"
+      value: "<Cloud KMS CryptoKey resource name from defaultKmsKeyName>"
+      api_source: "storage.buckets.get"
+      evidence_field: "encryption.defaultKmsKeyName"
+      note: >-
+        Evidence for gcp-gcs-read-data-cmek derived rule: the key_permission
+        gate is evaluated against the Storage service agent
+        (service-PROJECT_NUMBER@gs-project-accounts.iam.gserviceaccount.com),
+        NOT the accessing principal. The concrete EncryptionKey node and its
+        KMS IAM bindings are collected and modeled by the gcp:kms service.
+        No graph edge is emitted here; the CMEK key reference is stored as
+        a property on the Bucket node for use by the key_permission evaluator.
+
+  # --- UBLA flag -> evidence record -----------------------------------------
+  # The UBLA flag determines which access control layers (IAM only, or IAM +
+  # legacy ACL) are authoritative. Record as a property on the Bucket node.
+  - id: gcp-gcs-ubla-flag
+    emits: null
+    kind: evidence
+    applies_to: [gcp]
+    match_record:
+      api: "storage.buckets.get"
+      resource_type: "google.storage.Bucket"
+      field: "iamConfiguration.uniformBucketLevelAccess.enabled"
+    record:
+      on_node: "<bucket / ObjectStorage node>"
+      field: "uniform_bucket_level_access"
+      value: "<true | false>"
+      api_source: "storage.buckets.get"
+      evidence_field: "iamConfiguration.uniformBucketLevelAccess.enabled"
+      note: >-
+        When true, only the bucket IAM policy is authoritative; legacy ACLs
+        (acl / defaultObjectAcl) cannot grant additional access. When false,
+        both IAM and ACL layers must be evaluated by gcp-gcs-exposed-to-internet
+        and other rules that inspect ACL fields.
+
+  # --- publicAccessPrevention flag -> evidence record -----------------------
+  - id: gcp-gcs-public-access-prevention
+    emits: null
+    kind: evidence
+    applies_to: [gcp]
+    match_record:
+      api: "storage.buckets.get"
+      resource_type: "google.storage.Bucket"
+      field: "iamConfiguration.publicAccessPrevention"
+    record:
+      on_node: "<bucket / ObjectStorage node>"
+      field: "public_access_prevention"
+      value: "<enforced | inherited>"
+      api_source: "storage.buckets.get"
+      evidence_field: "iamConfiguration.publicAccessPrevention"
+      note: >-
+        When 'enforced' (either at bucket level or via org policy
+        constraints/gcp.storagePublicAccessPrevention), allUsers bindings
+        are rejected and existing ones are removed -> gcp-gcs-exposed-to-internet
+        should be BLOCKED when this field is 'enforced'. When 'inherited',
+        the project/folder/org org policy determines the effective prevention;
+        check the org policy hierarchy for constraints/gcp.storagePublicAccessPrevention.
+
+  # --- Object name matches credential pattern -> ContainsSecret -------------
+  - id: gcp-gcs-contains-secret
+    emits: ContainsSecret
+    applies_to: [gcp]
+    match_record:
+      api: "storage.objects.list"
+      resource_type: "google.storage.Object"
+      field: "name | contentType"
+    where:
+      - "object name matches one or more credential-indicator patterns:"
+      - "  *.tfstate (Terraform state — often contains SA keys, DB passwords)"
+      - "  *serviceaccount*.json, *sa-key*.json, *service_account*.json (SA JSON keys)"
+      - "  *.env, *.env.* (environment variable files)"
+      - "  *kubeconfig*, *kube/config* (Kubernetes config with credentials)"
+      - "  *credentials*, *credential* (generic credential files)"
+      - "  *secret* (but not log/report files — apply noise filtering)"
+      - "  *.p12, *.pem, *.key, *.pfx (private key / certificate files)"
+      - "  *password*, *passwd* (password files)"
+      - "  OR contentType == 'application/json' AND bucket name suggests SA key storage (e.g. bucket name contains 'keys', 'credentials', 'service-accounts')"
+    emit:
+      source_type: Storage
+      target_type: Secret
+      source: "<bucket / ObjectStorage node>"
+      target: "<Secret node (heuristic classification)>"
+      api_source: "storage.objects.list (metadata only — object content MUST NOT be read)"
+      evidence_field: "object.name pattern match + contentType"
+      permissions: []
+      narrative: "{bucket.name} contains object '{object.name}' (pattern: {matched_pattern}) — classified as likely holding secret material based on name heuristic. CanReadData on this bucket may yield credentials for another identity (see credential-chains.yaml)."

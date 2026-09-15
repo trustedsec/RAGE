@@ -1,0 +1,236 @@
+# AWS EFS (Elastic File System) — Explicit normalization rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Explicit rules emit edges from direct observation of configuration/policy.
+# These feed downstream derived rules (in /rules/derived/aws/efs.yaml).
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml):
+#   CrossAccountTrust: source [Account, Role, ResourcePolicy, Data, Snapshot, DataLake]
+#                      target [Account, ExternalIdentity]
+#   CanModifyPolicy:   source [Identity]      target [Policy, Identity, "*"]
+#   HasPermission:     source [Identity]      target ["*"]  (effective permission)
+#
+# FileStorage (EFS) is Storage class; target of CrossAccountTrust is Account.
+# ResourcePolicy node's source is within CrossAccountTrust's declared source set.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # --- 1) File system policy names foreign-account principal -> CrossAccountTrust --
+  # A file system policy can name a Principal from another AWS account,
+  # granting that external principal NFS mount access (ClientMount,
+  # ClientWrite, ClientRootAccess). This is a cross-account data path: the
+  # external principal can mount the file system from a network-reachable
+  # location (VPC peering, TGW, or DirectConnect required).
+  #
+  # CrossAccountTrust nature is "explicit" in edges.yaml. This normalization
+  # rule pattern-matches the file system's ResourcePolicy and emits the
+  # structural trust fact. Source is the ResourcePolicy node (within the
+  # declared source set for CrossAccountTrust).
+  #
+  # IMPORTANT: A file system policy Statement can name either:
+  #   (1) An account ID or root (e.g., arn:aws:iam::111122223333:root) — target: Account
+  #   (2) A specific IAM role/user ARN (e.g., arn:aws:iam::111122223333:role/MyRole) — target: ExternalIdentity
+  # This rule emits two variants to preserve the granularity of the policy grant.
+  - id: aws-efs-cross-account-fs-policy
+    emits: CrossAccountTrust
+    description: "An EFS file system policy granting ClientMount to a principal from another AWS account creates a cross-account NFS data path."
+    match:
+      - [ ?filesystem, HasPolicy, ?fspolicy ]
+    where:
+      - "node_type(?filesystem) == FileStorage"
+      - "?filesystem.provider_type == 'AWS::EFS::FileSystem'"
+      - "node_type(?fspolicy) == ResourcePolicy"
+      - "?fspolicy is attached to ?filesystem"
+      - "?fspolicy.Statement contains a Principal from a different AWS account (?external_account)"
+      - "the Statement's Action includes at least elasticfilesystem:ClientMount or elasticfilesystem:Client*"
+      - "the Statement Effect is Allow"
+    emit:
+      - source_type: ResourcePolicy
+        target_type: Account
+        source: ?fspolicy
+        target: "<external AWS account named in ?fspolicy>"
+        permissions: ["elasticfilesystem:ClientMount"]
+        conditions: [resource_policy, network_reachability]
+        state_logic: >-
+          ACTIVE — the resource policy explicitly grants the cross-account mount
+          action to the entire account; the trust fact exists regardless of whether network
+          reachability is confirmed. Set CONDITIONAL(network_reachability) if it is unknown
+          whether the external account's VPC can reach the mount target on NFS
+          port 2049. BLOCKED if an SCP on either account denies the mount action
+          or the cross-account principal type. This variant applies when the Statement
+          Principal is an account ID or account root (arn:aws:iam::ACCOUNT:root).
+        confidence: 0.90
+        derived_from: [ "<ResourcePolicy observation on ?filesystem>", "<Principal cross-account in Statement>" ]
+        false_positive_note: >-
+          A cross-account ClientMount grant is a trust FACT regardless of whether
+          the external principal has identity-policy permissions (EFS uses
+          allow-in-either: the resource policy allow is sufficient). However, the
+          external principal still needs NFS network reachability (VPC peering,
+          Transit Gateway, or DirectConnect); a cross-account mount without
+          network reach is non-exploitable. Honor Condition keys in the statement:
+          `elasticfilesystem:AccessedViaMountTarget:true` is a common hardening
+          condition and does not block the trust (it enforces that the mount uses
+          the official NFS path). A condition on `elasticfilesystem:AccessPointArn`
+          restricts access to a specific subdirectory via the access point — the
+          trust still exists but CanReadData is narrowed to that path. Do NOT emit
+          for Deny statements or for Principals scoped to the same account.
+        narrative: >-
+          The file system policy on {filesystem.name} grants
+          elasticfilesystem:ClientMount to account {external_account} — any principal
+          in that account with matching IAM identity and NFS network reach to the mount
+          target can mount and read the file system cross-account.
+      - source_type: ResourcePolicy
+        target_type: ExternalIdentity
+        source: ?fspolicy
+        target: "<specific IAM role/user named in ?fspolicy>"
+        permissions: ["elasticfilesystem:ClientMount"]
+        conditions: [resource_policy, network_reachability]
+        state_logic: >-
+          ACTIVE — the resource policy explicitly grants the cross-account mount
+          action to a specific foreign principal (role or user ARN). The trust fact
+          exists regardless of whether network reachability is confirmed. Set
+          CONDITIONAL(network_reachability) if it is unknown whether the external
+          principal's VPC can reach the mount target on NFS port 2049. BLOCKED if
+          an SCP on either account denies the mount action. This variant applies when
+          the Statement Principal is a specific IAM ARN (role, user) rather than an account root.
+        confidence: 0.90
+        derived_from: [ "<ResourcePolicy observation on ?filesystem>", "<specific Principal ARN in Statement>" ]
+        false_positive_note: >-
+          A cross-account grant to a specific principal (rather than the entire account)
+          reflects more targeted access control. The same caveats apply: NFS network reach
+          is required, and downstream CanReadData edges are scoped to the specific named principal.
+        narrative: >-
+          The file system policy on {filesystem.name} grants elasticfilesystem:ClientMount
+          to a specific principal ({target}); that external principal with NFS network
+          reach to the mount target can mount and read the file system cross-account.
+
+  # --- 2) PutFileSystemPolicy permission -> CanModifyPolicy ----------------------
+  # A principal that holds elasticfilesystem:PutFileSystemPolicy can rewrite
+  # the file system's resource policy. This is the explicit normalization of
+  # the control-plane permission. Derived rules then consume this to model
+  # the consequence: self-grant data-plane actions (ClientMount, ClientWrite).
+  - id: aws-efs-can-modify-policy
+    emits: CanModifyPolicy
+    description: "A principal with elasticfilesystem:PutFileSystemPolicy can rewrite the EFS file system resource policy."
+    match:
+      - [ ?principal, HasPermission, ?filesystem ]
+    where:
+      - "node_type(?filesystem) == FileStorage"
+      - "?filesystem.provider_type == 'AWS::EFS::FileSystem'"
+      - "?principal has EFFECTIVE elasticfilesystem:PutFileSystemPolicy on ?filesystem"
+    emit:
+      source_type: Identity
+      target_type: Policy
+      source: ?principal
+      target: "<ResourcePolicy on ?filesystem>"
+      permissions: ["elasticfilesystem:PutFileSystemPolicy"]
+      conditions: [iam_permission, scp_or_org_policy, permission_boundary]
+      state_logic: >-
+        ACTIVE — the principal holds the permission and can immediately invoke
+        PutFileSystemPolicy to rewrite the resource policy. BLOCKED if an SCP
+        or permission boundary denies elasticfilesystem:PutFileSystemPolicy.
+      confidence: 0.95
+      derived_from: [ "<effective permission evaluation on ?filesystem ARN>" ]
+      false_positive_note: >-
+        This models the control-plane permission only. The actual data-plane
+        access (CanReadData, CanWriteData) follows AFTER the principal rewrites
+        the policy to self-grant ClientMount/ClientWrite, then mounts the file
+        system. This is a two-step escalation modeled in derived rules.
+      narrative: >-
+        {principal.name} holds elasticfilesystem:PutFileSystemPolicy on
+        {filesystem.name} and can rewrite the file system's resource policy.
+
+  # --- 3) ModifyMountTargetSecurityGroups -> network escalation -----------------
+  # A principal that holds elasticfilesystem:ModifyMountTargetSecurityGroups
+  # can alter the security group rules controlling NFS access (port 2049) to
+  # mount targets. This permission upgrades a CONDITIONAL(network_reachability)
+  # CanReadData/CanWriteData edge to ACTIVE by opening the network path.
+  #
+  # This is modeled as a separate derived rule (aws-efs-modifymounttarget-sg-escalation)
+  # that consumes this permission and emits the network-escalation consequence.
+  #
+  # The target_type is Network (not wildcard "*") because the concrete target is always
+  # a MountTarget (AWS::EFS::MountTarget), which is a Network node. Using the specific
+  # type enables downstream rules to match on CanModifyConfiguration without ambiguity.
+  - id: aws-efs-can-modify-mount-target-sg
+    emits: CanModifyConfiguration
+    description: "A principal with elasticfilesystem:ModifyMountTargetSecurityGroups can alter security group rules controlling NFS access to mount targets."
+    match:
+      - [ ?principal, HasPermission, ?mounttarget ]
+    where:
+      - "node_type(?mounttarget) == Network"
+      - "?mounttarget.provider_type == 'AWS::EFS::MountTarget'"
+      - "?principal has EFFECTIVE elasticfilesystem:ModifyMountTargetSecurityGroups on the FileSystem containing ?mounttarget"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: ?principal
+      target: ?mounttarget
+      permissions: ["elasticfilesystem:ModifyMountTargetSecurityGroups"]
+      conditions: [iam_permission, scp_or_org_policy, permission_boundary]
+      state_logic: >-
+        ACTIVE — the principal can immediately modify the security group.
+        BLOCKED if an SCP or permission boundary denies the action.
+      confidence: 0.95
+      derived_from: [ "<effective permission evaluation>" ]
+      false_positive_note: >-
+        This permission modifies network configuration (security group rules),
+        not the file system's IAM resource policy. It enables opening NFS port
+        2049 inbound from arbitrary CIDR blocks, converting CONDITIONAL edges
+        that depend on network_reachability to ACTIVE.
+      narrative: >-
+        {principal.name} holds elasticfilesystem:ModifyMountTargetSecurityGroups
+        and can alter the security group rules on mount targets, enabling or
+        restricting NFS access from different networks.
+
+  # --- 4) CreateMountTarget -> network escalation (missing rule) ----------------
+  # A principal with elasticfilesystem:CreateMountTarget can place a new mount
+  # target ENI in any subnet they choose (including a VPC they control), creating
+  # a network path to an otherwise-unreachable EFS file system. This converts
+  # CONDITIONAL(network_reachability) CanReadData/CanWriteData edges to ACTIVE.
+  #
+  # This is a network escalation primitive: a principal with CreateMountTarget
+  # can effectively place the mount target in their own VPC and gain NFS access
+  # to the file system, regardless of the original mount target's network configuration.
+  - id: aws-efs-can-create-mount-target
+    emits: CanNetworkReach
+    description: "A principal with elasticfilesystem:CreateMountTarget can place a new mount target in a subnet they control, gaining network access to the EFS file system."
+    match:
+      - [ ?principal, HasPermission, ?filesystem ]
+    where:
+      - "node_type(?filesystem) == FileStorage"
+      - "?filesystem.provider_type == 'AWS::EFS::FileSystem'"
+      - "?principal has EFFECTIVE elasticfilesystem:CreateMountTarget on ?filesystem"
+    emit:
+      source_type: Identity
+      target_type: FileStorage
+      source: ?principal
+      target: ?filesystem
+      permissions: ["elasticfilesystem:CreateMountTarget"]
+      conditions: [iam_permission, scp_or_org_policy, permission_boundary]
+      state_logic: >-
+        ACTIVE — the principal can immediately create a new mount target in a
+        subnet of their choice (typically one they control or have network access to).
+        This enables them to reach the EFS file system on port 2049 from their network.
+        CONDITIONAL if the principal must obtain network access to the EFS VPC first
+        (e.g., via VPC peering). BLOCKED if an SCP or permission boundary denies
+        elasticfilesystem:CreateMountTarget.
+      confidence: 0.90
+      derived_from: [ "<effective permission evaluation>" ]
+      false_positive_note: >-
+        CreateMountTarget is a high-value network escalation primitive. A principal
+        with both PutFileSystemPolicy and CreateMountTarget can achieve full file system
+        data access with no network constraints: they rewrite the policy to grant
+        ClientMount, then create a mount target in a network they control. This
+        combination (PutFileSystemPolicy + CreateMountTarget) converts all CONDITIONAL
+        CanReadData edges to ACTIVE regardless of the original mount target network
+        configuration. CreateMountTarget alone does not grant data access without
+        also having ClientMount/ClientWrite permissions.
+      narrative: >-
+        {principal.name} holds elasticfilesystem:CreateMountTarget on {filesystem.name}
+        and can create a new mount target in a subnet they control, gaining NFS network
+        reach to the file system and enabling data access when combined with ClientMount/ClientWrite permissions.

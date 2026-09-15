@@ -1,0 +1,627 @@
+# Azure Key Vault (Microsoft.KeyVault/vaults) — credential-access rules (Phase 5)
+# ---------------------------------------------------------------------------
+# Data-plane authorization has TWO models per vault, selected by
+# properties.enableRbacAuthorization:
+#   RBAC model (true, default on API 2026-02-01+): grants are ARM role
+#     assignments using built-in data-plane roles (Key Vault Secrets User /
+#     Crypto User / Certificate User / Administrator, ...).
+#   Access-policy model (false, legacy): grants live in
+#     properties.accessPolicies[] as per-objectId, per-object-type permission
+#     lists. NOT ARM RBAC — the evaluator reads the vault object.
+# Both models yield the SAME capability edges; only the grant source differs.
+# Every rule records the effective dataAction the evaluator must confirm at the
+# object or vault scope. Deny assignments / deny Azure Policy override -> BLOCKED.
+#
+# Verified dataActions (built-in roles / security):
+#   secrets/getSecret/action        -> read secret value (Secrets User)
+#   keys/decrypt/action             -> decrypt (Crypto User)
+#   keys/unwrap/action              -> unwrap symmetric key (Crypto User / CSE User)
+#   keys/sign/action                -> sign digest (Crypto User)
+#   certificates/read               -> cert public/metadata (Certificate User)
+#   (cert PFX incl. private key is read via secrets/getSecret/action)
+#
+# key_permission gate (Phase 5): reading a Key Vault SECRET does NOT require
+# keys/decrypt even under CMK — the vault decrypts transparently. The gate
+# applies only to CanReadData on EXTERNAL stores wrapped by a KV key (last rule).
+#
+# Azure-specific privesc: management-plane vaults/write (Contributor / Key Vault
+# Contributor) can self-grant data-plane access ONLY in the access-policy model
+# (accessPolicies/write). Under the RBAC model self-grant needs
+# Microsoft.Authorization/roleAssignments/write (Owner / User Access Admin).
+# Quote any scalar containing ':'.
+#
+# EMITS-NATURE NOTE: CanReadSecret, CanDecrypt, CanSignAs, CanExportKey and
+# CredentialsFor are nature: explicit in schema/edges.yaml — they are direct
+# effective-permission translations, not multi-fact derivations. Following the
+# aws/lambda.yaml precedent, those translations live in the explicit_rules block
+# at the bottom of this file; the `rules:` block below keeps only the genuinely
+# derived edges (CanAdminister roll-up, CanGrantPermission self-grant, the
+# vault-wide fan-out, CanEscalateTo, CanEnterSubscription, CanReadData gate,
+# ExposedToTenant). The base data-plane HasPermission facts they consume are
+# produced by /rules/explicit/azure-keyvault.yaml (azure-kv-eff-* / access-policy
+# rules); the explicit_rules here add the state_logic (network / deny / model
+# gating) those raw HasPermission records lack.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 5-secrets-credentials-kms
+applies_to: [azure]
+
+rules:
+
+  # === Administrative control over the vault ================================
+  - id: azure-kv-administer-dataplane
+    emits: CanAdminister
+    description: "Key Vault Administrator (data-plane vaults/* dataAction) fully controls the vault data plane."
+    match:
+      - [ ?principal, HasPermission, ?vault ]
+    where:
+      - "node_class(?vault) == ManagementService and ?vault is a Microsoft.KeyVault/vaults"
+      - "?principal has EFFECTIVE dataAction Microsoft.KeyVault/vaults/* at vault scope (Key Vault Administrator 00482a5a-887f-4fb3-b363-3b7fe8e74483, or an access-policy entry granting all secrets/keys/certificates permissions)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?vault
+      permissions: ["Microsoft.KeyVault/vaults/*"]
+      conditions: [network_reachability]
+      state_logic: "if networkAcls Deny-default blocks the caller: CONDITIONAL(network_reachability); elif a deny assignment/deny Azure Policy covers the dataActions: BLOCKED; else ACTIVE"
+      confidence: "0.95"
+      derived_from: [ "<HasPermission edge_id (vaults/* dataAction / Key Vault Administrator)>" ]
+      false_positive_note: >-
+        Key Vault Administrator is the DATA-plane superset (secrets get + keys
+        decrypt/unwrap/sign + certificates) — it is the single most direct
+        full-data-plane path. Do NOT confuse it with Key Vault Reader (metadata
+        only). A Deny-default firewall makes it CONDITIONAL(network_reachability)
+        for outside callers, not ACTIVE.
+      narrative: >-
+        {principal.name} is Key Vault Administrator on {vault.name}
+        (Microsoft.KeyVault/vaults/* data plane) and can read/decrypt/sign every
+        secret, key, and certificate in it.
+
+  - id: azure-kv-administer-controlplane
+    emits: CanAdminister
+    description: "Owner/Contributor/Key Vault Contributor (control-plane vaults/write) fully controls the vault object."
+    match:
+      - [ ?principal, HasPermission, ?vault ]
+    where:
+      - "node_class(?vault) == ManagementService and ?vault is a Microsoft.KeyVault/vaults"
+      - "?principal has EFFECTIVE Microsoft.KeyVault/vaults/write at vault scope (Owner, Contributor, or Key Vault Contributor f25e0fa2-a7c8-4377-a976-54943a77a395)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?vault
+      permissions: ["Microsoft.KeyVault/vaults/write"]
+      conditions: [service_state]
+      state_logic: "if a deny assignment/deny Azure Policy covers vaults/write: BLOCKED; else ACTIVE"
+      confidence: "0.9"
+      derived_from: [ "<HasPermission edge_id (vaults/write)>" ]
+      false_positive_note: >-
+        Control-plane admin of the vault OBJECT (networkAcls, delete, and — only in
+        the access-policy model — accessPolicies) is NOT by itself data-plane read.
+        On an RBAC-model vault, vaults/write does NOT grant secret read; the
+        data-plane path from here runs through the self-grant lever
+        (azure-kv-contributor-selfgrant-accesspolicy needs the access-policy model,
+        or azure-kv-selfgrant-rbac needs roleAssignments/write). Do not imply secret
+        read from this edge on an RBAC vault.
+      narrative: >-
+        {principal.name} controls vault {vault.name} at the control plane
+        (Microsoft.KeyVault/vaults/write) — networkAcls, deletion, and the
+        self-grant lever.
+
+  - id: azure-kv-administer-derives-dataplane
+    emits: CanReadSecret
+    description: "Key Vault Administrator over the vault yields read/decrypt/sign on every object in it."
+    match:
+      - [ ?principal, CanAdminister, ?vault ]
+      - [ ?vault,     Contains,      ?object ]
+    where:
+      - "the CanAdminister was produced by azure-kv-administer-dataplane on ?vault (data-plane vaults/*)"
+      - "node_class(?object) in [Secret, Certificate]  # CanReadSecret target set includes Secret and Certificate; keys are handled by the sibling CanDecrypt/CanSignAs derivations below"
+    emit:
+      source: ?principal
+      target: ?object
+      permissions: ["Microsoft.KeyVault/vaults/secrets/getSecret/action"]
+      conditions: [network_reachability]
+      state_logic: "inherit the CanAdminister state (ACTIVE / CONDITIONAL(network_reachability) / BLOCKED)"
+      confidence: "min(contributing_confidences) * 0.98"
+      derived_from: [ "<azure-kv-administer-dataplane CanAdminister edge_id>", "<Contains edge_id>" ]
+      false_positive_note: >-
+        Only fans out from the DATA-plane CanAdminister (Key Vault Administrator),
+        never from the control-plane one. Vault-wide (Administrator carries
+        vaults/*), unlike an object-scoped grant. Sibling derivations
+        azure-kv-administer-derives-decrypt / -derives-sign cover keys.
+      narrative: >-
+        {principal.name}, as Key Vault Administrator on {vault.name}, can read
+        secret/certificate {object.name}.
+
+  - id: azure-kv-administer-derives-decrypt
+    emits: CanDecrypt
+    description: "Key Vault Administrator can decrypt/unwrap with every key in the vault."
+    match:
+      - [ ?principal, CanAdminister, ?vault ]
+      - [ ?vault,     Contains,      ?key ]
+    where:
+      - "the CanAdminister was produced by azure-kv-administer-dataplane on ?vault (data-plane vaults/*)"
+      - "node_class(?key) == EncryptionKey"
+    emit:
+      target_type: EncryptionKey
+      source: ?principal
+      target: ?key
+      permissions: ["Microsoft.KeyVault/vaults/keys/decrypt/action", "Microsoft.KeyVault/vaults/keys/unwrap/action"]
+      conditions: [key_permission, network_reachability]
+      state_logic: "inherit the CanAdminister state (ACTIVE / CONDITIONAL(network_reachability) / BLOCKED)"
+      confidence: "min(contributing_confidences) * 0.98"
+      derived_from: [ "<azure-kv-administer-dataplane CanAdminister edge_id>", "<Contains edge_id>" ]
+      false_positive_note: >-
+        Fans out only from the DATA-plane CanAdminister (vaults/* includes
+        keys/decrypt + keys/unwrap). Not from control-plane vaults/write.
+      narrative: >-
+        {principal.name}, as Key Vault Administrator on {vault.name}, can
+        decrypt/unwrap with key {key.name}.
+
+  - id: azure-kv-administer-derives-sign
+    emits: CanSignAs
+    description: "Key Vault Administrator can sign with every signing-capable key in the vault."
+    match:
+      - [ ?principal, CanAdminister, ?vault ]
+      - [ ?vault,     Contains,      ?key ]
+    where:
+      - "the CanAdminister was produced by azure-kv-administer-dataplane on ?vault (data-plane vaults/*)"
+      - "node_class(?key) == SigningKey  # collector dual-types a KV key whose keyOps includes 'sign' as SigningKey; CanSignAs target set is [SigningKey, ServiceAccount, ApplicationIdentity]"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?key
+      permissions: ["Microsoft.KeyVault/vaults/keys/sign/action"]
+      conditions: [key_permission, network_reachability]
+      state_logic: "inherit the CanAdminister state (ACTIVE / CONDITIONAL(network_reachability) / BLOCKED)"
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<azure-kv-administer-dataplane CanAdminister edge_id>", "<Contains edge_id>" ]
+      false_positive_note: >-
+        Only for keys whose keyOps include 'sign' (dual-typed SigningKey by the
+        collector). vaults/* includes keys/sign. CanSignAs is a capability, not
+        automatic escalation — do not auto-roll-up to CanEscalateTo (see §14).
+      narrative: >-
+        {principal.name}, as Key Vault Administrator on {vault.name}, can sign
+        with key {key.name}.
+
+  # === Management-plane self-grant (access-policy model) ====================
+  - id: azure-kv-contributor-selfgrant-accesspolicy
+    emits: CanGrantPermission
+    description: "Contributor/Key Vault Contributor self-adds an access policy to gain data-plane access (access-policy model only)."
+    match:
+      - [ ?principal, HasPermission, ?vault ]
+    where:
+      - "node_class(?vault) == ManagementService and ?vault is a Microsoft.KeyVault/vaults"
+      - "?vault.properties.enableRbacAuthorization == false (access-policy model)"
+      - "?principal has EFFECTIVE Microsoft.KeyVault/vaults/accessPolicies/write (Contributor / Key Vault Contributor / Owner) at the vault"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?principal
+      permissions: ["Microsoft.KeyVault/vaults/accessPolicies/write"]
+      conditions: [service_state]
+      state_logic: "if a deny assignment/deny Azure Policy covers accessPolicies/write: BLOCKED; else ACTIVE"
+      confidence: "0.95"
+      derived_from: [ "<HasPermission edge_id (accessPolicies/write)>" ]
+      false_positive_note: >-
+        CRITICAL model gate: this ONLY works when enableRbacAuthorization==false.
+        On an RBAC-model vault, Microsoft.KeyVault/vaults/write does NOT grant
+        data-plane access; the self-grant then requires
+        Microsoft.Authorization/roleAssignments/write (see the RBAC variant rule).
+        Contributor on an RBAC vault CANNOT read secrets.
+      narrative: >-
+        {principal.name} has vault-write on {vault.name} (access-policy model) and can
+        add itself to the access policy, granting itself full data-plane access.
+
+  - id: azure-kv-selfgrant-rbac
+    emits: CanGrantPermission
+    description: "Owner/User Access Admin self-assigns a Key Vault data-plane role (RBAC model)."
+    match:
+      - [ ?principal, HasPermission, ?vault ]
+    where:
+      - "node_class(?vault) == ManagementService and ?vault is a Microsoft.KeyVault/vaults"
+      - "?vault.properties.enableRbacAuthorization == true (RBAC model)"
+      - "?principal has EFFECTIVE Microsoft.Authorization/roleAssignments/write at the vault (Owner / User Access Administrator)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?principal
+      permissions: ["Microsoft.Authorization/roleAssignments/write"]
+      conditions: [service_state]
+      state_logic: "if a deny assignment covers roleAssignments/write: BLOCKED; else ACTIVE"
+      confidence: "0.95"
+      derived_from: [ "<HasPermission edge_id (roleAssignments/write)>" ]
+      false_positive_note: >-
+        Contributor is NOT sufficient here — roleAssignments/write is only in Owner
+        and User Access Administrator (or a custom role explicitly granting it).
+      narrative: >-
+        {principal.name} can assign itself Key Vault Administrator on {vault.name}
+        (roleAssignments/write) and read all secrets/keys/certs.
+
+  - id: azure-kv-selfgrant-derives-read
+    emits: CanReadSecret
+    description: "A vault self-grant yields read of every secret/cert in the vault."
+    match:
+      - [ ?principal, CanGrantPermission, ?principal ]
+      - [ ?vault,     Contains,           ?object ]
+    where:
+      - "the CanGrantPermission was produced by azure-kv-contributor-selfgrant-accesspolicy or azure-kv-selfgrant-rbac on ?vault"
+      - "node_class(?object) in [Secret, Certificate]  # CanReadSecret target set includes Secret and Certificate"
+    emit:
+      source: ?principal
+      target: ?object
+      permissions: ["Microsoft.KeyVault/vaults/accessPolicies/write | Microsoft.Authorization/roleAssignments/write", "Microsoft.KeyVault/vaults/secrets/getSecret/action"]
+      conditions: [network_reachability]
+      state_logic: "inherit the self-grant state (ACTIVE/BLOCKED); then if networkAcls Deny-default blocks caller: CONDITIONAL(network_reachability)"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<self-grant CanGrantPermission edge_id>", "<Contains edge_id>" ]
+      false_positive_note: >-
+        Two-step, not one action: the principal must first add the policy/role, then
+        read. Still ACTIVE because both steps are within its control. Fans out to ALL
+        secrets/certs in the vault (vault-wide self-grant), unlike an object-scoped
+        data-plane grant. Sibling rules azure-kv-selfgrant-derives-decrypt /
+        -derives-sign complete the key fan-out (CanDecrypt / CanSignAs).
+      narrative: >-
+        {principal.name} can self-grant data-plane access to {vault.name} and then
+        read secret/certificate {object.name}.
+
+  - id: azure-kv-selfgrant-derives-decrypt
+    emits: CanDecrypt
+    description: "A vault self-grant equally yields decrypt/unwrap on every key in the vault."
+    match:
+      - [ ?principal, CanGrantPermission, ?principal ]
+      - [ ?vault,     Contains,           ?key ]
+    where:
+      - "the CanGrantPermission was produced by azure-kv-contributor-selfgrant-accesspolicy or azure-kv-selfgrant-rbac on ?vault"
+      - "node_class(?key) == EncryptionKey"
+    emit:
+      target_type: EncryptionKey
+      source: ?principal
+      target: ?key
+      permissions: ["Microsoft.KeyVault/vaults/accessPolicies/write | Microsoft.Authorization/roleAssignments/write", "Microsoft.KeyVault/vaults/keys/decrypt/action", "Microsoft.KeyVault/vaults/keys/unwrap/action"]
+      conditions: [key_permission, network_reachability]
+      state_logic: "inherit the self-grant state (ACTIVE/BLOCKED); then if networkAcls Deny-default blocks caller: CONDITIONAL(network_reachability)"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<self-grant CanGrantPermission edge_id>", "<Contains edge_id>" ]
+      false_positive_note: >-
+        The self-grant (access-policy write or roleAssignments/write) grants the full
+        key permission set, not just secrets — including keys/decrypt + keys/unwrap.
+        Two-step but fully within the principal's control; vault-wide.
+      narrative: >-
+        {principal.name} can self-grant data-plane access to {vault.name} and then
+        decrypt/unwrap with key {key.name}.
+
+  - id: azure-kv-selfgrant-derives-sign
+    emits: CanSignAs
+    description: "A vault self-grant equally yields sign on every signing-capable key in the vault."
+    match:
+      - [ ?principal, CanGrantPermission, ?principal ]
+      - [ ?vault,     Contains,           ?key ]
+    where:
+      - "the CanGrantPermission was produced by azure-kv-contributor-selfgrant-accesspolicy or azure-kv-selfgrant-rbac on ?vault"
+      - "node_class(?key) == SigningKey  # collector dual-types a KV key whose keyOps includes 'sign' as SigningKey; CanSignAs target set is [SigningKey, ServiceAccount, ApplicationIdentity]"
+    emit:
+      source_type: Identity
+      source: ?principal
+      target: ?key
+      permissions: ["Microsoft.KeyVault/vaults/accessPolicies/write | Microsoft.Authorization/roleAssignments/write", "Microsoft.KeyVault/vaults/keys/sign/action"]
+      conditions: [key_permission, network_reachability]
+      state_logic: "inherit the self-grant state (ACTIVE/BLOCKED); then if networkAcls Deny-default blocks caller: CONDITIONAL(network_reachability)"
+      confidence: "min(contributing_confidences) * 0.88"
+      derived_from: [ "<self-grant CanGrantPermission edge_id>", "<Contains edge_id>" ]
+      false_positive_note: >-
+        Only for keys whose keyOps include 'sign' (dual-typed SigningKey). The
+        self-grant carries keys/sign. CanSignAs is a capability, not automatic
+        escalation — do not roll up to CanEscalateTo without issuer evidence.
+      narrative: >-
+        {principal.name} can self-grant data-plane access to {vault.name} and then
+        sign with key {key.name}.
+
+  # === Roll-ups: escalation / cross-boundary ================================
+  - id: azure-kv-secret-to-escalation
+    emits: CanEscalateTo
+    description: "Reading a secret that is a credential for a more-privileged identity is escalation."
+    match:
+      - [ ?principal, CanReadSecret, ?secret ]
+      - [ ?secret,    CredentialsFor, ?identity ]
+    where:
+      - "node_class(?identity) == Identity  # CanEscalateTo target set is strictly [Identity] (User/Role/ServiceAccount/ServicePrincipal/ManagedIdentity/... are all Identity-class subtypes); a CredentialsFor target that resolves to a Data store is excluded here"
+      - "?identity.privilege_level > ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: ["Microsoft.KeyVault/vaults/secrets/getSecret/action"]
+      state_logic: "inherit the weaker of CanReadSecret and CredentialsFor states (CONDITIONAL(network_reachability) or BLOCKED propagate)"
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanReadSecret edge_id>", "<CredentialsFor edge_id>" ]
+      false_positive_note: >-
+        Only emit when the credentialed identity is strictly more privileged than the
+        reader; a lateral/same-privilege SP is not escalation. Requires the secret to
+        be classified as a credential (CredentialsFor present).
+      narrative: >-
+        {principal.name} can read secret {secret.name}, a credential for
+        {identity.name}, and thereby escalate to {identity.name}.
+
+  - id: azure-kv-secret-cross-subscription
+    emits: CanEnterSubscription
+    description: "A secret credential for a principal in another subscription yields entry there."
+    match:
+      - [ ?principal, CanReadSecret, ?secret ]
+      - [ ?secret,    CredentialsFor, ?identity ]
+    where:
+      - "?identity home subscription != ?principal home subscription"
+    emit:
+      source_type: Identity
+      target_type: Subscription
+      source: ?principal
+      target: "<subscription of ?identity>"
+      permissions: ["Microsoft.KeyVault/vaults/secrets/getSecret/action"]
+      state_logic: "inherit the weaker of CanReadSecret and CredentialsFor states"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanReadSecret edge_id>", "<CredentialsFor edge_id>" ]
+      false_positive_note: >-
+        Only when the credentialed identity actually holds access in the other
+        subscription. A secret naming an SP with no cross-sub roles does not yield
+        subscription entry.
+      narrative: >-
+        {principal.name} reads secret {secret.name} (a credential for {identity.name})
+        and gains access in subscription {subscription.name}.
+
+  # === key_permission gate: decrypt gates external encrypted data ===========
+  - id: azure-kv-decrypt-gates-readdata
+    emits: CanReadData
+    description: "CanDecrypt on the wrapping KV key completes CanReadData on an externally-stored, CMK-wrapped store."
+    match:
+      - [ ?principal, CanReadData, ?store ]
+      - [ ?principal, CanDecrypt,  ?key ]
+    where:
+      - "?store data-plane control-plane read is present but the store is encrypted with customer-managed key ?key (storage/disk/SQL TDE wrapped by this KV key)"
+    emit:
+      source: ?principal
+      target: ?store
+      permissions: ["Microsoft.KeyVault/vaults/keys/unwrap/action"]
+      conditions: [key_permission]
+      state_logic: "if ?principal lacks keys/unwrap|decrypt on ?key: CONDITIONAL(key_permission); else ACTIVE"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanReadData edge_id>", "<CanDecrypt edge_id>" ]
+      false_positive_note: >-
+        This gate is for EXTERNAL stores wrapped by a Key Vault key — NOT for reading
+        secrets inside Key Vault itself (those decrypt transparently). Only apply when
+        the store's CMK is this key; do not gate on unrelated keys.
+      narrative: >-
+        {principal.name} can read CMK-encrypted store {store.name} because it can
+        unwrap the wrapping key {key.name} (keys/unwrap).
+
+  # === Network exposure =====================================================
+  - id: azure-kv-exposed-to-tenant
+    emits: ExposedToTenant
+    description: "Public-network + Allow-default firewall exposes the data plane tenant-wide (still Entra-authz)."
+    match:
+      - [ ?vault, Contains, ?secret ]
+    where:
+      - "node_class(?vault) == ManagementService and ?vault is a Microsoft.KeyVault/vaults"
+      - "?vault.properties.publicNetworkAccess == 'Enabled'"
+      - "?vault.properties.networkAcls.defaultAction == 'Allow'"
+    emit:
+      source_type: "*"
+      source: ?vault
+      target: "<tenant>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: "ACTIVE for network reachability; data access STILL requires Entra data-plane authz (not anonymous)"
+      confidence: "0.8"
+      derived_from: [ "<vault networkAcls record>" ]
+      false_positive_note: >-
+        This is transport-level reachability only — NOT ExposedToInternet to an
+        AnonymousIdentity. Key Vault always requires Entra authentication and a
+        data-plane grant. Do not treat as anonymous secret exposure.
+      narrative: >-
+        Vault {vault.name} data plane is reachable from any network
+        (publicNetworkAccess=Enabled, firewall default Allow); access still needs an
+        Entra data-plane grant.
+
+# ---------------------------------------------------------------------------
+# Explicit effective-permission translations.
+# These emit nature: explicit edges (CanReadSecret / CanDecrypt / CanSignAs /
+# CanExportKey / CredentialsFor) as DIRECT translations of an effective dataAction
+# (or a content classification), not multi-fact derivations — mirroring the
+# explicit_rules block in aws/lambda.yaml. They consume the HasPermission facts
+# produced by /rules/explicit/azure-keyvault.yaml (azure-kv-eff-* / access-policy
+# rules) and add the state_logic (network / deny gating) those raw records lack.
+# The base grant records in the explicit file remain the source of truth; graph
+# consumers keying strictly off explicit normalization see these as explicit.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  # === Secret read =========================================================
+  - id: azure-kv-read-secret
+    emits: CanReadSecret
+    applies_to: [azure]
+    description: "Effective secrets/getSecret grants read of the secret value."
+    match:
+      - [ ?principal, HasPermission, ?secret ]
+    where:
+      - "node_class(?secret) == Secret"
+      - "?principal has EFFECTIVE dataAction Microsoft.KeyVault/vaults/secrets/getSecret/action at ?secret (RBAC role assignment) OR an accessPolicies entry granting secrets:get for ?principal.objectId (access-policy model)"
+    emit:
+      source: ?principal
+      target: ?secret
+      permissions: ["Microsoft.KeyVault/vaults/secrets/getSecret/action"]
+      conditions: [network_reachability]
+      state_logic: "if networkAcls.defaultAction==Deny and ?principal not in IP/VNet rule and no private endpoint path: CONDITIONAL(network_reachability); elif a deny assignment/deny Azure Policy covers the dataAction: BLOCKED; else ACTIVE"
+      confidence: "min(contributing_confidences) * 0.98"
+      derived_from: [ "<HasPermission/grant edge_id>" ]
+      false_positive_note: >-
+        Do NOT attach a key_permission condition: reading a Key Vault secret does
+        not require keys/decrypt even when the vault uses a customer-managed key —
+        the service decrypts transparently. Honor object-scoped RBAC (a grant on a
+        single secret must not fan out to the whole vault) and Deny-default
+        firewalls (CONDITIONAL(network_reachability) for outside callers).
+      narrative: >-
+        {principal.name} can read the value of secret {secret.name} in vault
+        {secret.vault} (secrets/getSecret/action).
+
+  # === Certificate: read secret / export private key =======================
+  - id: azure-kv-cert-read-secret
+    emits: CanReadSecret
+    applies_to: [azure]
+    description: "certificates/read + secrets/getSecret on a cert returns its PFX (incl. private key)."
+    match:
+      - [ ?principal, HasPermission, ?cert ]
+    where:
+      - "node_class(?cert) == Certificate"
+      - "?principal has EFFECTIVE Microsoft.KeyVault/vaults/secrets/getSecret/action on the certificate's backing secret object (Key Vault Certificate User grants certificates/read + secrets/getSecret)"
+    emit:
+      source: ?principal
+      target: ?cert
+      permissions: ["Microsoft.KeyVault/vaults/secrets/getSecret/action", "Microsoft.KeyVault/vaults/certificates/read"]
+      conditions: [network_reachability]
+      state_logic: "if networkAcls Deny-default blocks the caller: CONDITIONAL(network_reachability); elif deny assignment covers the dataAction: BLOCKED; else ACTIVE"
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<HasPermission/grant edge_id>" ]
+      false_positive_note: >-
+        certificates/read alone returns only public cert material. The PRIVATE key
+        (PFX) is returned by secrets/getSecret on the cert's secret object — require
+        that dataAction, not certificates/read alone.
+      narrative: >-
+        {principal.name} can read certificate {cert.name} including its private key
+        (PFX) via the secrets endpoint (secrets/getSecret/action).
+
+  - id: azure-kv-cert-export
+    emits: CanExportKey
+    applies_to: [azure]
+    description: "Reading a cert's PFX secret exports its private key for offline use."
+    match:
+      - [ ?principal, CanReadSecret, ?cert ]
+    where:
+      - "node_class(?cert) == Certificate"
+    emit:
+      source: ?principal
+      target: ?cert
+      permissions: ["Microsoft.KeyVault/vaults/secrets/getSecret/action"]
+      state_logic: "inherit state from the contributing CanReadSecret (ACTIVE / CONDITIONAL(network_reachability) / BLOCKED)"
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<azure-kv-cert-read-secret edge_id>" ]
+      false_positive_note: >-
+        Only emit for certificate objects whose PFX (private key) is retrievable via
+        getSecret. Do NOT emit CanExportKey from keys/read on a plain key object —
+        that exposes only the public key; raw key export needs keys/release (SKR,
+        attestation-gated) or an encrypted backup, which are not modeled as export.
+      narrative: >-
+        {principal.name} can export the private key of certificate {cert.name} as a
+        PFX, enabling persistent offline use.
+
+  # === Key decrypt / unwrap ================================================
+  - id: azure-kv-decrypt
+    emits: CanDecrypt
+    applies_to: [azure]
+    description: "keys/decrypt or keys/unwrap grants use of the key to decrypt/unwrap."
+    match:
+      - [ ?principal, HasPermission, ?key ]
+    where:
+      - "node_class(?key) == EncryptionKey"
+      - "?principal has EFFECTIVE Microsoft.KeyVault/vaults/keys/decrypt/action OR Microsoft.KeyVault/vaults/keys/unwrap/action at ?key (Key Vault Crypto User / Crypto Service Encryption User / Administrator, or accessPolicies keys:[decrypt|unwrapKey])"
+    emit:
+      source: ?principal
+      target: ?key
+      permissions: ["Microsoft.KeyVault/vaults/keys/decrypt/action", "Microsoft.KeyVault/vaults/keys/unwrap/action"]
+      conditions: [key_permission, network_reachability]
+      state_logic: "if networkAcls Deny-default blocks caller: CONDITIONAL(network_reachability); elif deny assignment covers the dataAction: BLOCKED; else ACTIVE"
+      confidence: "min(contributing_confidences) * 0.97"
+      derived_from: [ "<HasPermission/grant edge_id>" ]
+      false_positive_note: >-
+        Crypto Service Encryption User grants ONLY wrap/unwrap (no decrypt) — still
+        sufficient for CanDecrypt via unwrapKey. keys/read does NOT grant decrypt.
+        Honor object-scoped assignments.
+      narrative: >-
+        {principal.name} can use key {key.name} to decrypt/unwrap data
+        (keys/decrypt or keys/unwrap).
+
+  # === Key sign ============================================================
+  - id: azure-kv-sign
+    emits: CanSignAs
+    applies_to: [azure]
+    description: "keys/sign grants signing of digests with a signing-capable key."
+    match:
+      - [ ?principal, HasPermission, ?key ]
+    where:
+      - "node_class(?key) == SigningKey  # A KV key whose keyOps includes 'sign' is dual-typed SigningKey by the collector (a KV key object supporting sign is BOTH EncryptionKey and SigningKey). CanSignAs target set is [SigningKey, ServiceAccount, ApplicationIdentity] — EncryptionKey is NOT in it, so the target MUST be the SigningKey-typed node, never a plain EncryptionKey node. This mirrors azure/managedhsm.yaml (node_type==SigningKey gated on keyOps 'sign')."
+      - "?key.keyOps includes 'sign'"
+      - "?principal has EFFECTIVE Microsoft.KeyVault/vaults/keys/sign/action at ?key (Key Vault Crypto User / Crypto Officer / Administrator, or accessPolicies keys:[sign])"
+    emit:
+      source: ?principal
+      target: ?key
+      permissions: ["Microsoft.KeyVault/vaults/keys/sign/action"]
+      conditions: [key_permission, network_reachability]
+      state_logic: "if networkAcls Deny-default blocks caller: CONDITIONAL(network_reachability); elif deny assignment covers the dataAction: BLOCKED; else ACTIVE"
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<HasPermission/grant edge_id>" ]
+      false_positive_note: >-
+        Emit CanSignAs ONLY against a SigningKey-typed node (a key with keyOps
+        including 'sign'), never against a plain EncryptionKey node — EncryptionKey
+        is not in the CanSignAs target set. CanSignAs is a capability, not automatic
+        escalation: only when the key signs identity assertions (JWT/SAML for an
+        IdP/app) does it forge identity — usually unknown, so do NOT auto-roll-up to
+        CanEscalateTo here. If the key is evidenced as the signer for an app/SP
+        (key CredentialsFor an ApplicationIdentity/ServiceAccount), the
+        provider-agnostic sign-as-yields-impersonation rule handles that target
+        (both ApplicationIdentity and ServiceAccount ARE in the CanSignAs target set).
+      narrative: >-
+        {principal.name} can sign data with key {key.name} (keys/sign/action).
+
+  # === CredentialsFor pivot ================================================
+  - id: azure-kv-secret-credentials-for
+    emits: CredentialsFor
+    applies_to: [azure]
+    description: "A secret whose value is a credential authenticates as another principal/store."
+    match:
+      - [ ?backing_data, ContainsResourceReference, ?target ]
+    where:
+      - "node_class(?backing_data) == Data  # the secret-VERSION blob node the collector attaches; it is the valid ContainsResourceReference SOURCE (source set [Data, Storage, Compute])."
+      - "?secret := parent_secret_object_of(?backing_data)  # resolve the Data version blob to its owning Secret/Certificate object by collector metadata (the version blob's parent id). NOT a graph edge — a collector-provided resolution, so no off-schema edge is matched. ?backing_data and ?secret are DISTINCT nodes."
+      - "node_class(?secret) in [Secret, Certificate]  # CredentialsFor SOURCE set is [Secret, Credential, AccessKey, Token, Certificate]; ?secret stays within it while ?backing_data stays a valid ContainsResourceReference source — no single node plays both roles"
+      - "the ContainsResourceReference is the collector's content-classification of the secret value pointing at ?target (SP client secret -> ServicePrincipal; connection string / storage key / SAS -> Data; cert registered on an app -> ApplicationIdentity)"
+      - "node_class(?target) in [Identity, ServiceIdentity, Data]  # CredentialsFor target set is [Identity, Data, ServiceIdentity]"
+    emit:
+      source: ?secret
+      target: ?target
+      permissions: []
+      state_logic: "ACTIVE (zero-cost fact once classified); UNKNOWN if the target principal/store cannot be resolved"
+      confidence: "0.85"
+      derived_from: [ "<ContainsResourceReference classification edge_id (from the Data version blob)>", "<parent_secret_object_of(?backing_data) collector resolution>" ]
+      false_positive_note: >-
+        ?backing_data (Data-class secret-version blob) is the valid
+        ContainsResourceReference source; ?secret (Secret/Certificate) is the valid
+        CredentialsFor source — they are DISTINCT nodes, resolved via collector
+        parent metadata, never the same node dual-cast. Emit ONLY when classification
+        resolves a concrete target (SP appId, conn-string host, storage account).
+        Not every secret is a credential — unclassified secrets stay as CanReadSecret
+        targets only. Zero-cost link that turns CanReadSecret into an identity/data
+        pivot.
+      narrative: >-
+        Secret {secret.name} is a credential for {target.name}; reading it lets the
+        reader authenticate as {target.name}.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A deny assignment or deny Azure Policy on any of secrets/getSecret/action,
+#    keys/decrypt|unwrap|sign/action, accessPolicies/write, or roleAssignments/write
+#    at the effective scope -> emit the edge with state: BLOCKED and
+#    denied_by=<deny assignment / policy id>.
+#  - A Deny-default networkAcls firewall with no matching rule / PE for the caller
+#    -> CONDITIONAL(network_reachability), not BLOCKED (a foothold in an allowed
+#    network realizes it).
+#  - enablePurgeProtection / soft-delete are AVAILABILITY controls, not authz —
+#    they never produce read/decrypt edges.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization for Key Vault (grant sources for both authz models,
+# Contains, HasPolicy, network attributes) lives in
+# /rules/explicit/azure-keyvault.yaml.

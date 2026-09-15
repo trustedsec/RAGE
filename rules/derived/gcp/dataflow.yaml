@@ -1,0 +1,488 @@
+# GCP Dataflow — Derived attack-path rules (Phase 11 — data / analytics / ML)
+# ---------------------------------------------------------------------------
+# Dataflow ESCALATION INVARIANT (Phase 11 theme):
+#   A Dataflow pipeline runs on Compute Engine VMs that execute AS a worker
+#   service account (environment.serviceAccountEmail; defaults to the Compute
+#   Engine default SA PROJECT_NUMBER-compute@developer.gserviceaccount.com).
+#   Two execution paths exist:
+#
+#     PATH 1 — CREATE:
+#       dataflow.jobs.create + iam.serviceAccounts.actAs(workerSA)
+#       -> submit pipeline with attacker-controlled transforms
+#       -> CanPassIdentity(principal, workerSA) + CanCreateWorkloadAs(workerSA)
+#       -> CanExecuteAs(workerSA) via can-execute-as execute-as-via-new-workload
+#
+#     PATH 2 — UPDATE STREAMING JOB (code injection into live pipeline):
+#       dataflow.jobs.updateContents on a STREAMING job
+#       -> inject transforms into running pipeline (live update, no restart)
+#       -> CanModifyCode(principal, job) + ExecutesAs(job, workerSA)
+#       -> CanExecuteAs(workerSA) via can-execute-as execute-as-via-code-modify
+#
+#     PATH 3 — TEMPLATE POISONING (supply chain):
+#       storage.objects.create/update on the GCS bucket that holds the template
+#       -> overwrite the Flex/Classic Template GCS object before jobs.create reads it
+#       -> CanModifyCode(gcsObject, job) + ExecutesAs(job, workerSA) -> CanExecuteAs
+#       (this path surfaces via the GCS and cicd-chains rules, not Dataflow perms)
+#
+# SERVICE ACCOUNT MODEL:
+#   Submitter: needs dataflow.jobs.create + iam.serviceAccounts.actAs(workerSA).
+#   Worker SA: the Compute Engine default SA (PROJECT_NUMBER-compute@...) if
+#              environment.serviceAccountEmail is absent. actAs is always required
+#              (no actAs-free shortcut for the default SA, per security model).
+#   Dataflow Service Agent: service-PROJECT_NUMBER@dataflow-service-producer-prod.iam.gserviceaccount.com
+#              Google-managed; not directly attackable.
+#   Batch jobs: immutable after submission; updateContents applies to STREAMING jobs only.
+#
+# LINCHPIN DELEGATION (CITE, DO NOT RE-DERIVE):
+#   can-execute-as.yaml  execute-as-via-code-modify: CanModifyCode(job)+ExecutesAs
+#                        -> CanExecuteAs. This file emits CanModifyCode and ExecutesAs;
+#                        the linchpin collapses them.
+#   can-execute-as.yaml  execute-as-via-new-workload: CanCreateWorkloadAs -> CanExecuteAs.
+#   cicd-chains.yaml     cicd-modify-buildspec-executes-as: streaming update is the
+#                        CI/CD-analogous modify-then-run path; narrative cites this.
+#   can-control.yaml     escalate-via-execute-as: CanExecuteAs -> CanEscalateTo.
+#   credential-chains.yaml execute-then-read-secret: CanExecuteAs + CanReadSecret -> pivot.
+#
+# Permissions are exact identifiers from the Dataflow IAM reference and the IAM
+# service accounts reference. No permissions are hallucinated.
+# IAM deny policies evaluated first (deny wins) -> emit as BLOCKED.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 11-data-analytics-ml
+service: dataflow
+applies_to: [gcp]
+
+explicit_rules:
+
+  - id: gcp-dataflow-explicit-executes-as
+    emits: ExecutesAs
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.dataflow.Job"
+      field: "environment.serviceAccountEmail"
+    where:
+      - "if environment.serviceAccountEmail is set: workerSA = environment.serviceAccountEmail"
+      - "else: workerSA = PROJECT_NUMBER-compute@developer.gserviceaccount.com"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: "<Dataflow Job node (BatchJob)>"
+      target: "<worker service account (ServiceAccount)>"
+      api_source: "dataflow.projects.locations.jobs.get"
+      evidence_field: "environment.serviceAccountEmail"
+      narrative: "Dataflow job {job.name} workers execute as {sa.name} (from environment.serviceAccountEmail field)."
+
+  - id: gcp-dataflow-explicit-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.dataflow.Job"
+      field: "environment.serviceAccountEmail"
+    where:
+      - "the SA project component (extracted from environment.serviceAccountEmail) != job.projectId"
+    emit:
+      source_type: Project
+      target_type: ExternalIdentity
+      source: "<Dataflow job project>"
+      target: "<worker SA in foreign project (as ExternalIdentity from job's project perspective)>"
+      api_source: "dataflow.projects.locations.jobs.get"
+      evidence_field: "environment.serviceAccountEmail"
+      narrative: "Dataflow job {job.name} in project {jobProject} runs as worker SA {sa.name} from a different project {saProject} (cross-project SA usage)."
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1. ExposesCredential — metadata token available to all pipeline transforms
+  # ---------------------------------------------------------------------------
+  # All Dataflow worker VMs have access to the GCE metadata server. Any user code
+  # in a pipeline transform (DoFn, custom source/sink) can retrieve an OAuth 2.0
+  # access token for the worker SA. Structural fact — no additional grant needed.
+  - id: gcp-dataflow-exposes-worker-sa-cred
+    emits: ExposesCredential
+    description: "Dataflow worker SA credentials accessible via metadata server to code running in pipeline transforms (when execution is established via CanModifyCode or CanExecuteAs)."
+    match:
+      - [ "?job", "ExecutesAs", "?sa" ]
+    where:
+      - "node_type(?job) == BatchJob"
+      - "?job is a google.dataflow.Job"
+      - "?job has an incoming CanModifyCode OR CanExecuteAs edge (attacker-controlled code in pipeline is present or possible)"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: "<Dataflow Job node>"
+      target: "<worker service account>"
+      permissions: []
+      conditions: [execution_injection]
+      state_logic: >-
+        CONDITIONAL(execution_injection): ExposesCredential is only a viable attack step
+        when combined with CanModifyCode (updateContents injection) or CanExecuteAs
+        (attacker code running in pipeline). Without upstream injection capability, this
+        edge is not exploitable. Emit CONDITIONAL to reflect the gate.
+      confidence: 1.0
+      derived_from: ["<ExecutesAs edge_id for ?job -> ?sa>"]
+      false_positive_note: >-
+        Only emit ACTIVE or CONDITIONAL when an upstream execution-injection edge
+        (CanModifyCode via updateContents or CanExecuteAs from job creation) is confirmed.
+        Absence of injection capability -> do not emit. This prevents over-claiming
+        credential exposure on all Dataflow jobs and keeps the graph signal-to-noise ratio high.
+      narrative: >-
+        Code running in {job.name} pipeline transforms can retrieve OAuth 2.0 access
+        tokens for worker service account {sa.name} from the GCE metadata server,
+        effectively granting all of {sa.name}'s IAM roles to any attacker code in the
+        pipeline (contingent on execution-injection capability).
+
+  # ---------------------------------------------------------------------------
+  # 2. CanCreateWorkloadAs — create a Dataflow job bound to a passable SA
+  # ---------------------------------------------------------------------------
+  # The collapse of CanPassIdentity + dataflow.jobs.create into the
+  # "create a workload running as a chosen identity" primitive. Feeds
+  # can-execute-as execute-as-via-new-workload for the CanExecuteAs derivation.
+  - id: gcp-dataflow-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new Dataflow job whose workers run as a passable SA (dataflow.jobs.create + iam.serviceAccounts.actAs)."
+    match:
+      - [ "?principal", "CanPassIdentity", "?sa" ]
+    where:
+      - "?principal has effective dataflow.jobs.create on the project"
+      - "node_type(?sa) in [ServiceAccount, MachineIdentity]"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<worker service account>"
+      permissions: ["dataflow.jobs.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when both dataflow.jobs.create and iam.serviceAccounts.actAs on ?sa are
+        confirmed in the effective grant. The job runs immediately on creation (no invoke
+        step); there is no trigger_exists gate. POTENTIAL(iam_permission) if actAs on ?sa
+        is not confirmed. BLOCKED if a deny policy applies to either permission.
+        Downstream CanExecuteAs is derived by can-execute-as execute-as-via-new-workload
+        (CITED, not re-derived here).
+      confidence: 0.95
+      derived_from: ["<CanPassIdentity edge_id for ?principal -> ?sa>", "<dataflow.jobs.create effective permission>"]
+      false_positive_note: >-
+        Job creation requires both permissions to be in the effective grant. An attacker
+        with only dataflow.jobs.create but without actAs on a usable SA cannot start a
+        job (API returns a permission error). actAs is per-SA. The escalation consequence
+        (CanExecuteAs) is produced by can-execute-as / can-control off this
+        CanCreateWorkloadAs — cite those linchpins, do not re-derive.
+      narrative: >-
+        {principal.name} can create a Dataflow job (dataflow.jobs.create) bound to worker
+        service account {sa.name} (iam.serviceAccounts.actAs), submitting attacker-
+        controlled pipeline transforms that execute as {sa.name}.
+
+  # ---------------------------------------------------------------------------
+  # 3. CanModifyCode — dataflow.jobs.updateContents on streaming jobs
+  # ---------------------------------------------------------------------------
+  # dataflow.jobs.updateContents allows updating the user code of a RUNNING
+  # streaming Dataflow job in-place (no restart). Updated transforms execute
+  # immediately as the worker SA. This is the Dataflow-specific code injection
+  # surface for long-running streaming pipelines. DOES NOT apply to batch jobs.
+  - id: gcp-dataflow-update-contents-modify-code
+    emits: CanModifyCode
+    description: "dataflow.jobs.updateContents on a streaming Dataflow job lets the principal inject attacker-controlled transforms into the live pipeline; updated code runs immediately as the worker SA."
+    match_effective_permission:
+      action: "dataflow.jobs.updateContents"
+      resource_type: "google.dataflow.Job"
+    where:
+      - "?job is a STREAMING job (job type == JOB_TYPE_STREAMING or has no end time)"
+      - "?job state is RUNNING (active streaming pipeline)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Dataflow streaming job (BatchJob)>"
+      permissions: ["dataflow.jobs.updateContents"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE if dataflow.jobs.updateContents is confirmed in the effective grant at
+        project scope AND the target job is a RUNNING streaming job. The code update
+        takes effect without restart — there is no trigger_exists gate; the streaming
+        pipeline is already running. CONDITIONAL(service_state) if job state is not
+        confirmed as RUNNING (the streaming pipeline must already be running for this
+        to be an active code-injection path). Do not emit for batch jobs (they do not
+        support in-flight code updates via this permission). BLOCKED if a deny policy
+        applies to dataflow.jobs.updateContents.
+      confidence: 0.93
+      derived_from: ["<dataflow.jobs.updateContents effective permission>"]
+      false_positive_note: >-
+        STREAMING ONLY: dataflow.jobs.updateContents is meaningful for code injection
+        only on streaming jobs that are currently RUNNING. For batch jobs, this path does
+        not apply — emit as POTENTIAL or omit. Confirm job type (JOB_TYPE_STREAMING)
+        and state (RUNNING) from the collected job resource before emitting ACTIVE. The
+        downstream CanExecuteAs is derived by can-execute-as execute-as-via-code-modify
+        off the CanModifyCode + ExecutesAs combination — cite, do not re-derive.
+      narrative: >-
+        {principal.name} can update the user code of running streaming pipeline
+        {job.name} (dataflow.jobs.updateContents), injecting attacker-controlled
+        transforms that execute immediately as worker service account {sa.name}
+        without restarting the job.
+
+  - id: gcp-dataflow-update-contents-modify-config
+    emits: CanModifyConfiguration
+    description: "dataflow.jobs.updateContents also allows changing job configuration parameters (worker count, machine type, autoscaling) on running streaming jobs; configuration changes alone are lower-value escalation than code injection."
+    match_effective_permission:
+      action: "dataflow.jobs.updateContents"
+      resource_type: "google.dataflow.Job"
+    where:
+      - "?job is a STREAMING job (job type == JOB_TYPE_STREAMING or has no end time)"
+      - "?job state is RUNNING (active streaming pipeline)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Dataflow streaming job (BatchJob)>"
+      permissions: ["dataflow.jobs.updateContents"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE if dataflow.jobs.updateContents is confirmed in the effective grant at
+        project scope AND the target job is a RUNNING streaming job. Configuration
+        changes (worker count, machine type, autoscaling) do not require a restart.
+        Note: changing environment.serviceAccountEmail is NOT supported after job
+        creation — the worker SA is fixed at launch, so CanAttachIdentity does not apply
+        to Dataflow post-creation. CONDITIONAL(service_state) if job state is unconfirmed.
+        BLOCKED if denied.
+      confidence: 0.7
+      derived_from: ["<dataflow.jobs.updateContents effective permission>"]
+      false_positive_note: >-
+        This captures the documented configuration-change capability of updateContents.
+        However, the escalation value is lower than CanModifyCode (code injection) because
+        configuration-only changes do not inherently yield execution without an execution-injection
+        edge already in place. Service-account swaps are not supported post-creation.
+        This edge surfaces configuration-change attack surfaces for completeness.
+      narrative: >-
+        {principal.name} can modify the configuration of running streaming pipeline
+        {job.name} (dataflow.jobs.updateContents), including worker count, machine type,
+        and autoscaling settings. Note that worker service account changes are not
+        supported after job creation.
+
+  # ---------------------------------------------------------------------------
+  # 4. CanModifyCode — GCS template poisoning (supply-chain path)
+  # ---------------------------------------------------------------------------
+  # Flex and Classic Templates are GCS objects. Overwriting the template object
+  # before dataflow.jobs.create reads it injects attacker code into the next job.
+  # This is a storage-level supply-chain attack, not a Dataflow IAM attack: the
+  # required permission is storage.objects.create/update on the template bucket.
+  # The Dataflow job that reads the poisoned template still runs as the worker SA.
+  - id: gcp-dataflow-template-poison
+    emits: CanModifyCode
+    description: "Writing to the GCS object that serves as a Dataflow Flex or Classic Template poisons the next job created from that template; the job runs the attacker-controlled pipeline code as the worker SA."
+    match:
+      - [ "?principal", "CanWriteData", "?templateObject" ]
+      - [ "?templateObject", "ContainsResourceReference", "?job" ]
+    where:
+      - "node_type(?templateObject) == ObjectStorage  # GCS object"
+      - "ContainsResourceReference edge is confirmed by evidence (job's gcsPath / containerSpecGcsPath field references the specific template object)"
+      - "?job is a google.dataflow.Job (or job template definition) that reads the template"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Dataflow job (BatchJob) created from the template>"
+      permissions: ["storage.objects.create"]
+      conditions: [iam_permission, trigger_exists]
+      state_logic: >-
+        CONDITIONAL(trigger_exists): the template is poisoned, but the malicious code
+        only executes when a new job is created from that template
+        (dataflow.jobs.create reading the GCS path). ACTIVE when a job-creation event
+        is confirmed to use this template imminently or on a schedule. Inherits from
+        CanWriteData on the template object; BLOCKED if VPC Service Controls prevent
+        writes to the GCS path.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: ["<CanWriteData edge_id for ?principal -> ?templateObject>", "<ContainsResourceReference edge_id for ?templateObject -> ?job (must be evidence-confirmed)>"]
+      false_positive_note: >-
+        STRICT: Only emit when (1) the ContainsResourceReference edge is CONFIRMED by
+        the collector (the job or job template definition explicitly references the
+        specific GCS path in its gcsPath / containerSpecGcsPath field), (2) the write is
+        to the SPECIFIC GCS path that a job references, not to an arbitrary bucket. Write
+        to an unrelated bucket is not this edge. The template poisoning only takes effect
+        on jobs created AFTER the poisoning — existing running jobs unaffected. Without
+        confirmed link between template GCS path and job (often unavailable before
+        job creation), do not emit. This pattern is supply-chain injection; prefer
+        citation of cicd-chains for the narrative.
+      narrative: >-
+        {principal.name} can overwrite the Dataflow template GCS object {templateObject.name}
+        (storage.objects.create) referenced by job {job.name}; the next job created from
+        that template will run the attacker-controlled pipeline code as the worker service account.
+
+  # ---------------------------------------------------------------------------
+  # 5. CanExfiltrate — worker SA writes data to an external GCS bucket
+  # ---------------------------------------------------------------------------
+  # The worker SA's IAM grants determine what GCS buckets the pipeline can write
+  # to. If the worker SA has storage.objects.create on an external GCS bucket
+  # (outside the project boundary or VPC SC perimeter), pipeline UNLOAD/output
+  # steps can exfiltrate data to that external location.
+  - id: gcp-dataflow-exfiltrate-via-sink
+    emits: CanExfiltrate
+    description: "A Dataflow worker SA with storage.objects.create on an external GCS bucket can stream pipeline output (data records, query results) to that external location."
+    match:
+      - [ "?job", "ExecutesAs", "?sa" ]
+      - [ "?sa",  "CanWriteData", "?externalBucket" ]
+    where:
+      - "node_type(?job) == BatchJob"
+      - "node_type(?externalBucket) == ObjectStorage  # GCS bucket"
+      - "?externalBucket.project != ?job.project OR ?externalBucket is outside the VPC SC perimeter"
+    emit:
+      source_type: Compute
+      target_type: Storage
+      source: "<Dataflow job>"
+      target: "<external GCS bucket>"
+      permissions: ["storage.objects.create"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        ACTIVE when the worker SA's effective grant includes storage.objects.create on
+        the external bucket AND no VPC Service Controls perimeter prevents the write.
+        BLOCKED if the Dataflow project is within a VPC SC perimeter that restricts
+        storage.googleapis.com writes to external buckets. CONDITIONAL(iam_permission)
+        if the grant is unresolved.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: ["<ExecutesAs edge_id for ?job -> ?sa>", "<CanWriteData edge_id for ?sa -> ?externalBucket>"]
+      false_positive_note: >-
+        Exfiltration requires BOTH that the worker SA can write to the external bucket
+        AND that no VPC SC perimeter blocks the storage API call. If the Dataflow
+        project is in a VPC SC perimeter, cross-perimeter storage writes are BLOCKED
+        unless an access policy explicitly allows them. Confirm perimeter configuration
+        before emitting ACTIVE. This edge is only meaningful when combined with a
+        CanExecuteAs or CanModifyCode edge — a job the attacker cannot influence is
+        not an exfil path even if the worker SA has broad GCS access.
+      narrative: >-
+        Dataflow job {job.name} runs as worker service account {sa.name}, which has
+        storage.objects.create on external GCS bucket {externalBucket.name}; pipeline
+        output steps can stream data records to that external location (UNLOAD/exfiltration).
+
+
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw Dataflow config -> explicit edges for the
+# collector). These belong in /rules/explicit/gcp-dataflow.yaml; recorded here
+# as explicit_rules so the service is self-contained. No separate explicit file
+# needed (explicitPath null).
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-dataflow-explicit-executes-as
+    emits: ExecutesAs
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.dataflow.Job"
+      field: "environment.serviceAccountEmail"
+    where:
+      - "if environment.serviceAccountEmail is set: workerSA = environment.serviceAccountEmail"
+      - "else: workerSA = PROJECT_NUMBER-compute@developer.gserviceaccount.com"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: "<Dataflow Job node (BatchJob)>"
+      target: "<worker service account (ServiceAccount)>"
+      api_source: "dataflow.projects.locations.jobs.get"
+      evidence_field: "environment.serviceAccountEmail"
+      narrative: "Dataflow job {job.name} workers execute as {sa.name} (from environment.serviceAccountEmail field)."
+
+  - id: gcp-dataflow-explicit-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.dataflow.Job"
+      field: "environment.serviceAccountEmail"
+    where:
+      - "the SA project component (extracted from environment.serviceAccountEmail) != job.projectId"
+    emit:
+      source_type: Project
+      target_type: ExternalIdentity
+      source: "<Dataflow job project>"
+      target: "<worker SA in foreign project (as ExternalIdentity from job's perspective)>"
+      api_source: "dataflow.projects.locations.jobs.get"
+      evidence_field: "environment.serviceAccountEmail"
+      narrative: "Dataflow job {job.name} in project {jobProject} runs as worker SA {sa.name} from a different project {saProject} (cross-project SA usage)."
+
+  - id: gcp-dataflow-trigger-from-composer
+    emits: CanTrigger
+    applies_to: [gcp]
+    description: "Cloud Composer DAGs trigger Dataflow jobs via the Composer worker SA's dataflow.jobs.create permission."
+    match_record:
+      resource_type: "google.cloud.composer.Environment"
+    where:
+      - "Composer environment specifies a nodeConfig.serviceAccount (or uses Compute Engine default SA)"
+      - "This SA holds dataflow.jobs.create + iam.serviceAccounts.actAs on the worker SA of triggered Dataflow jobs"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<Composer worker service account>"
+      target: "<Dataflow job created by Composer DAG>"
+      permissions: ["dataflow.jobs.create", "iam.serviceAccounts.actAs"]
+      api_source: "composer.projects.locations.environments.get"
+      evidence_field: "nodeConfig.serviceAccount"
+      narrative: "Cloud Composer environment {composer.name} executes DAG operators as {sa.name}, which can trigger Dataflow jobs {job.name} via dataflow.jobs.create; the Dataflow job executes as the worker SA."
+
+  - id: gcp-dataflow-trigger-from-workflows
+    emits: CanTrigger
+    applies_to: [gcp]
+    description: "Cloud Workflows steps trigger Dataflow jobs via REST API calls executed as the workflow's runtime SA."
+    match_record:
+      resource_type: "google.cloud.workflows.Workflow"
+    where:
+      - "Workflow definition contains a step that calls the Dataflow REST API (e.g. projects.locations.jobs.create)"
+      - "Workflow's serviceAccount holds dataflow.jobs.create + iam.serviceAccounts.actAs on the worker SA"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<Workflow service account>"
+      target: "<Dataflow job created by Workflow>"
+      permissions: ["dataflow.jobs.create", "iam.serviceAccounts.actAs", "workflows.workflows.execute"]
+      api_source: "workflows.projects.locations.workflows.get"
+      evidence_field: "serviceAccount"
+      narrative: "Cloud Workflow {workflow.name} executes as {sa.name}, which can trigger Dataflow jobs via REST API calls (dataflow.jobs.create); the Dataflow job executes as the worker SA."
+
+  - id: gcp-dataflow-trigger-from-scheduler
+    emits: CanTrigger
+    applies_to: [gcp]
+    description: "Cloud Scheduler jobs trigger Dataflow jobs via HTTP targets (calling the Dataflow REST API) as the scheduler's service account."
+    match_record:
+      resource_type: "google.cloud.scheduler.Job"
+    where:
+      - "Scheduler job has an HTTP target pointing to the Dataflow REST API endpoint (projects.locations.jobs.create)"
+      - "Scheduler's serviceAccount holds dataflow.jobs.create + iam.serviceAccounts.actAs on the worker SA"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<Scheduler job service account>"
+      target: "<Dataflow job created by Scheduler HTTP target>"
+      permissions: ["dataflow.jobs.create", "iam.serviceAccounts.actAs", "cloudscheduler.jobs.get"]
+      api_source: "cloudscheduler.projects.locations.jobs.get"
+      evidence_field: "serviceAccount"
+      narrative: "Cloud Scheduler job {scheduler.name} triggers Dataflow jobs via HTTP target as {sa.name}, which holds dataflow.jobs.create; the Dataflow job executes as the worker SA."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - IAM deny policy denying dataflow.jobs.create at project scope -> emit
+#    CanPassIdentity / CanCreateWorkloadAs as BLOCKED.
+#  - Deny policy denying iam.serviceAccounts.actAs for the worker SA -> BLOCKED
+#    for gcp-dataflow-jobs-create-with-sa and gcp-dataflow-create-workload-as.
+#  - VPC Service Controls perimeter restricting storage.googleapis.com writes
+#    to external buckets -> gcp-dataflow-exfiltrate-via-sink BLOCKED.
+#  - Org policy iam.disableCrossProjectServiceAccountUsage -> BLOCKED for
+#    cross-project worker SA usage (gcp-dataflow-explicit-cross-project-trust
+#    and any CanExecuteAs derived from it are BLOCKED).
+#  - Target job is a batch (non-streaming) job -> gcp-dataflow-update-contents-
+#    modify-code do NOT emit ACTIVE; downgrade to POTENTIAL or omit.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# LINCHPIN + DEDUPLICATION NOTES:
+#  - can-execute-as.yaml execute-as-via-new-workload fires on CanCreateWorkloadAs +
+#    ExecutesAs for any workload. This file emits CanCreateWorkloadAs; the linchpin
+#    produces CanExecuteAs automatically. No Dataflow-specific CanExecuteAs rule.
+#  - can-execute-as.yaml execute-as-via-code-modify fires on CanModifyCode +
+#    ExecutesAs for Compute resources. This file emits CanModifyCode on streaming
+#    jobs; the linchpin produces CanExecuteAs automatically.
+#  - identity-escalation.yaml gcp-sa-act-as emits CanPassIdentity for any
+#    iam.serviceAccounts.actAs grant globally. This service relies on that
+#    linchpin for the CanPassIdentity edge (Dataflow does not emit it separately).
+#  - can-control.yaml escalate-via-execute-as produces CanEscalateTo from any
+#    CanExecuteAs where privilege_level increases. No Dataflow-specific rule needed.
+#  - credential-chains.yaml execute-then-read-secret produces credential-access
+#    roll-ups from CanExecuteAs. gcp-dataflow-exposes-worker-sa-cred is
+#    CONDITIONAL(execution_injection) and does not duplicate that linchpin.
+# ---------------------------------------------------------------------------

@@ -1,0 +1,411 @@
+# Provider-agnostic messaging & event-system chain rules (Phase 10 — messaging)
+# ===========================================================================
+# THE PHASE-10 LINCHPIN. Written first, as the provider-agnostic roll-up that
+# the per-service messaging adapters target (aws:sqs / sns / eventbridge /
+# eventbridge-scheduler / kinesis / dynamodb-streams / step-functions / mq /
+# appflow; azure:servicebus / eventgrid / eventhub / logic-apps / automation;
+# gcp:pubsub / eventarc / cloud-scheduler / workflows / cloud-tasks). Each
+# adapter emits a handful of NORMALIZED messaging FACTS and inherits full
+# path-finding here — exactly as cicd-chains does for pipelines/runners and
+# container-chains does for registries/k8s.
+#
+# THE PHASE-10 IDEA (messaging as trigger confusion):
+#   A message / queue / topic / event-bus / stream / schedule is an EVENT
+#   SOURCE bound to a compute CONSUMER (an SQS event-source-mapping to a Lambda,
+#   an EventBridge rule targeting a Step Function, a Pub/Sub push subscription
+#   to a Cloud Run service, an Event Grid subscription to a Function). The
+#   consumer runs as ITS OWN execution identity, with a payload the sender
+#   controls. Therefore:
+#     * whoever can PUBLISH/SEND to that event source (or CREATE the
+#       subscription/rule/schedule that binds it) can TRIGGER the consumer with
+#       an attacker-influenced payload => CanTrigger(principal -> consumer).
+#       This is the signature primitive of the phase. (rule 1)
+#     * a CanTrigger into a consumer that ExecutesAs an identity is the same
+#       collapse cicd/can-execute-as already own for CanTrigger+ExecutesAs ->
+#       CanExecuteAs; we CITE that and only add the minimal bridge if the
+#       linchpins do not already cover the generic (non-CI/CD) messaging case.
+#       (rule 2)
+#     * a SCHEDULER / event RULE that INVOKES a target as a chosen passed
+#       identity (EventBridge Scheduler role, Cloud Scheduler OIDC SA, Automation
+#       runbook run-as) is persistence AND CanExecuteAs of the passed identity.
+#       (rule 3)
+#     * a messaging RESOURCE POLICY (SQS/SNS/EventBridge-bus policy, Pub/Sub
+#       topic IAM, Service Bus SAS) or a rule target that reaches ANOTHER
+#       account/project/tenant is cross-boundary publish/subscribe trust
+#       (CrossAccountTrust / CrossProjectTrust); when that cross-boundary publish
+#       triggers compute in the other boundary it feeds CanEnter* — CITED to
+#       can-control, kept conservative. (rule 4)
+#
+# NORMALIZED FACTS THIS FILE CONSUMES (what the messaging adapters emit):
+#   [?p, CanWriteData, ?src]      principal can PUBLISH/SEND to the event source
+#                                  (sqs:SendMessage, sns:Publish, events:PutEvents,
+#                                  kinesis:PutRecord, pubsub.topics.publish,
+#                                  ServiceBus/EventGrid/EventHub send). The adapter
+#                                  targets the Messaging (Queue/Topic/EventBus/
+#                                  Stream) node; S3-as-event-source is a Storage
+#                                  source with CanWriteData.
+#   [?src, CanTrigger, ?consumer] the event-source binding: the source triggers
+#                                  its consumer (event-source-mapping, subscription,
+#                                  rule target). Adapter emits this per binding.
+#   [?p, CanTrigger, ?consumer]   principal can directly cause the consumer to run
+#                                  (already-bound trigger the principal drives, or a
+#                                  subscription/rule the principal can create).
+#   [?consumer, ExecutesAs, ?id]  the consumer runs as its execution identity.
+#   [?p, CanSchedule, ?target]    principal can create a schedule/rule that invokes
+#                                  a target (events:PutRule+PutTargets, scheduler:
+#                                  CreateSchedule, cloudscheduler.jobs.create).
+#   [?policy, CrossAccountTrust|CrossProjectTrust, ?boundary]  a messaging resource
+#                                  policy names a principal in another account/project.
+#   [?src, ContainsSecret|ContainsCredential, ?secret]  messages carry secrets —
+#                                  handled by credential-chains (cited, not re-derived).
+#
+# WHAT THIS FILE PRODUCES (the collapse):
+#   CanWriteData(?p, ?src) + CanTrigger(?src, ?consumer)  => CanTrigger(?p, ?consumer)   (rule 1)
+#   CanTrigger(?p, ?consumer) + ExecutesAs(?consumer,?id) => CanExecuteAs(?p, ?id)        (rule 2, CONDITIONAL)
+#   CanSchedule(?p, ?target as ?id)                       => CanExecuteAs(?p, ?id)         (rule 3, persistence)
+#   messaging resource policy / rule target cross-boundary => CrossAccountTrust /
+#                                                             CrossProjectTrust           (rule 4)
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE:
+#   * can-execute-as.yaml — the CanExecuteAs PRIMITIVE. execute-as-via-code-modify /
+#     execute-as-via-command collapse code/command control + ExecutesAs; NONE of its
+#     four rules collapse the pure CanTrigger + ExecutesAs case (a bare event trigger
+#     over an unmodified consumer). cicd-chains cicd-trigger-runner-executes-as DOES
+#     collapse CanTrigger + ExecutesAs — but it is SCOPED to CI/CD runners
+#     (node_type in [BuildWorker, ContainerTask, ContainerService, ServerlessFunction,
+#     VirtualMachine, KubernetesWorkload] acting as build/deploy agents) and framed
+#     around build DEFINITIONS. A generic messaging consumer (a plain event-driven
+#     Lambda / Cloud Run / Function with no build-definition semantics) is not a CI/CD
+#     runner, so rule 2 here supplies the minimal messaging-framed CanTrigger+ExecutesAs
+#     => CanExecuteAs bridge and DEDUPES with cicd-trigger-runner-executes-as on
+#     (CanExecuteAs, ?p, ?identity) — emit once; where both would fire (a consumer that
+#     is also a CI runner) cicd's framing wins, do not double-count weight. The
+#     escalation roll-up (CanExecuteAs -> CanEscalateTo) is can-execute-as / can-control's
+#     job — NEVER re-derived here.
+#   * cicd-chains.yaml — CanTrigger propagation (a pipeline reaching stage runners) is
+#     cicd-pipeline-orchestrates-stages. Rule 1 here is the messaging analog: a PUBLISH
+#     reaching a consumer via an event-source binding. Different surface (event source,
+#     not pipeline orchestration); we do not re-derive the pipeline case.
+#   * credential-chains.yaml — a message / SAS key / connector profile that carries a
+#     secret is ContainsSecret/ExposesCredential + CredentialsFor; reading it ->
+#     CanImpersonate is OWNED by credential-chains (read-secret-yields-identity). This
+#     file does NOT re-derive secret-in-message escalation; the adapters emit the
+#     ContainsSecret/ExposesCredential facts and credential-chains rolls them up.
+#   * can-control.yaml — the terminal CrossAccountTrust/CrossProjectTrust -> CanEnter*
+#     roll-up (enter-account-via-assume and its azure/gcp analogs) is can-control's.
+#     Rule 4 only asserts the cross-boundary messaging TRUST fact; it does NOT emit
+#     CanEnter* — it feeds can-control, cited not duplicated.
+#   * messaging reads (CanReadData over a queue/stream/AppFlow flow -> CanExfiltrate)
+#     are emitted by the per-service adapters as CanReadData/CanExfiltrate facts and
+#     rolled up by the data-plane rules; not re-derived here.
+#
+# STATE PROPAGATION (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. The messaging-specific gates:
+#   * TRIGGER path (rule 1): CONDITIONAL(trigger_exists) unless the event-source
+#     binding is confirmed present AND the consumer is invocable (enabled mapping /
+#     active subscription / enabled rule). A disabled mapping or a filter the payload
+#     cannot satisfy caps or blocks it.
+#   * TRIGGER -> EXECUTE (rule 2): CONDITIONAL(trigger_exists) — the trigger yields the
+#     consumer's identity only when the binding is live and the consumer runs the
+#     attacker payload; strictly weaker than code-modify.
+# ===========================================================================
+
+applies_to: ["*"]
+phase: 10-messaging
+
+rules:
+
+  # --- 1) Publish to an event source => trigger its bound consumer -------------
+  # THE core Phase-10 primitive. An event source (queue/topic/event-bus/stream)
+  # is BOUND to a compute consumer via an event-source-mapping / subscription /
+  # rule target — the adapter emits that binding as CanTrigger(?src -> ?consumer).
+  # Whoever can PUBLISH/SEND to the source (CanWriteData on the Messaging node)
+  # thereby causes the consumer to run with an attacker-controlled payload:
+  # CanTrigger(?p -> ?consumer). Conditional on the binding existing and the
+  # consumer being invocable (enabled mapping / active subscription / enabled rule).
+  - id: messaging-publish-triggers-consumer
+    emits: CanTrigger
+    description: "Publishing/sending to an event source triggers the consumer bound to it (via an event-source-mapping/subscription/rule target) with an attacker-influenced payload."
+    applies_to: ["*"]
+    match:
+      - [ ?principal, CanWriteData, ?src ]
+      - [ ?src,       CanTrigger,   ?consumer ]
+    where:
+      # ?src is a messaging event source (queue/topic/event-bus/stream modeled as
+      # Messaging) or a storage source (S3/blob event notification). Streams
+      # (Kinesis/Kafka/Event Hubs) carry no dedicated subtype and normalize to the
+      # Messaging class.
+      - "node_class(?src) in [Messaging, Storage]"
+      # ?consumer is the compute that runs on the event (a serverless function,
+      # container service/task, VM, k8s workload, or a Workflow that starts one).
+      - "node_class(?consumer) == Compute or node_type(?consumer) == Workflow"
+    optional:
+      # The principal can ALSO create/enable the binding itself (e.g. add an event
+      # source mapping / create the subscription / add the rule target). Present =>
+      # the trigger path is realizable even if not yet bound; still gated on invocable.
+      - [ ?principal, CanSchedule, ?src ]
+    emit:
+      source_type: Messaging
+      target_type: Compute
+      source: ?principal
+      target: ?consumer
+      permissions: []
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        ACTIVE when the event-source binding is confirmed present and the consumer is
+        invocable — the event-source-mapping is ENABLED, the subscription is ACTIVE, or
+        the rule is ENABLED — so a published message actually drives a run. Otherwise
+        CONDITIONAL(trigger_exists): the principal can publish but the binding is
+        disabled/absent (then matched(optional[0]) — the principal can also create/enable
+        the binding — keeps it realizable as CONDITIONAL, not BLOCKED). A source event
+        filter / subscription filter the attacker payload CANNOT satisfy downgrades to
+        CONDITIONAL(condition_expression) or BLOCKED. Inherit weakest with the
+        contributing CanWriteData (a resource-policy/deny-gated publish caps this) and the
+        CanTrigger binding edge.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?principal CanWriteData ?src", "?src CanTrigger ?consumer" ]
+      false_positive_note: >-
+        The judgment is (a) the principal can genuinely PUBLISH to ?src (the send
+        action — sqs:SendMessage / sns:Publish / events:PutEvents / kinesis:PutRecord /
+        pubsub.topics.publish / ServiceBus/EventGrid/EventHub send — is granted, not
+        denied by a resource policy) and (b) a LIVE binding routes ?src to ?consumer.
+        Do NOT emit ACTIVE for a disabled event-source-mapping, an inactive/expired
+        subscription, or a rule whose event pattern the attacker payload cannot match —
+        an event-pattern/subscription filter is a real control (downgrade to
+        CONDITIONAL/BLOCKED). A dead-letter-only or archive-only source that never
+        invokes compute is not this edge. This CanTrigger feeds rule 2 (and cicd-chains
+        rule 2 where the consumer is a CI runner) for the execute-as consequence; it does
+        NOT by itself grant an identity.
+      narrative: >-
+        {principal.name} can publish to the event source {src.name}
+        ({perm:CanWriteData}), which is bound to {consumer.name} via an event-source
+        mapping/subscription/rule; a crafted message therefore triggers {consumer.name}
+        to run with an attacker-influenced payload.
+
+  # --- 2) Trigger a consumer => execute as its identity (messaging bridge) ------
+  # The minimal bridge from CanTrigger to CanExecuteAs for a GENERIC (non-CI/CD)
+  # messaging consumer. can-execute-as does NOT collapse the bare CanTrigger +
+  # ExecutesAs case, and cicd-chains cicd-trigger-runner-executes-as covers it only
+  # for CI/CD RUNNERS (build/deploy agents). An ordinary event-driven Lambda / Cloud
+  # Run / Function with no build-definition semantics needs this rule so the Phase-10
+  # trigger primitive reaches the identity graph. DEDUPES with
+  # cicd-trigger-runner-executes-as on (CanExecuteAs, ?p, ?identity) — where the
+  # consumer is ALSO a CI runner, cicd's framing owns it; emit once. Kept CONDITIONAL:
+  # a trigger yields the identity only when a live binding delivers the attacker
+  # payload to the running consumer.
+  - id: messaging-trigger-executes-as
+    emits: CanExecuteAs
+    description: "Triggering an event-driven consumer that executes as an identity runs the attacker-influenced payload as that identity (generic messaging case; CI/CD runners are cicd-chains')."
+    applies_to: ["*"]
+    match:
+      - [ ?principal, CanTrigger, ?consumer ]
+      - [ ?consumer,  ExecutesAs, ?identity ]
+    where:
+      # A messaging/event-driven consumer — NOT a CI/CD build runner (that is
+      # cicd-trigger-runner-executes-as). Serverless / container / VM / k8s / Workflow
+      # consumers driven by an event source.
+      - "node_class(?consumer) == Compute or node_type(?consumer) == Workflow"
+      - "?consumer is an event-driven consumer, not a CI/CD build/deploy runner (else defer to cicd-chains)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: []
+      conditions: [trigger_exists]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) by default — the trigger delivers the attacker
+        payload to the consumer only when a LIVE event-source binding routes it and the
+        consumer processes attacker-controllable input (the common messaging case: the
+        consumer parses the message body/attributes the attacker sends). ACTIVE when the
+        binding is confirmed live and the consumer runs on the delivered payload without
+        further gating. Never stronger than the contributing CanTrigger (rule 1's state
+        flows through) or ExecutesAs. A BLOCKED/deny-gated trigger blocks this.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "?principal CanTrigger ?consumer", "?consumer ExecutesAs ?identity" ]
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE cicd-chains: when ?consumer is a CI/CD build/deploy runner,
+        cicd-trigger-runner-executes-as owns this collapse (with its
+        attacker_influenced_definition gate) — this rule handles the GENERIC event-driven
+        consumer and dedupes on (CanExecuteAs, ?principal, ?identity). Kept CONDITIONAL
+        because a trigger is not code control: it yields the identity only if the consumer
+        actually runs attacker-influenced input from the delivered event (nearly always
+        true for a message-body-parsing consumer, but a consumer that ignores the payload
+        and only reacts to the fact-of-event is weaker). The escalation consequence
+        (identity outranks the principal) is produced by can-execute-as / can-control off
+        this CanExecuteAs — cite, do not re-derive. A consumer that requires modifying its
+        CODE to run attacker logic is the execute-as-via-code-modify case, not this rule.
+      narrative: >-
+        {principal.name} can trigger {consumer.name} (via a message/event it publishes),
+        and {consumer.name} executes as {identity.name}; the delivered attacker-influenced
+        payload therefore runs as {identity.name}.
+
+  # --- 3) A schedule/rule that invokes a target as a passed identity => execute-as
+  # A scheduler or event rule (EventBridge Scheduler, Cloud Scheduler, EventBridge
+  # rule with a target role, an Automation schedule with a run-as identity) INVOKES
+  # a target and, crucially, does so AS a chosen identity the creator passes to it
+  # (a scheduler execution role via iam:PassRole, a Cloud Scheduler OIDC SA via
+  # actAs, an Automation run-as account). Creating such a schedule is BOTH persistence
+  # (it fires on a cadence the attacker no longer needs access to trigger) AND
+  # CanExecuteAs of the passed identity — the schedule runs the target with that
+  # identity's credentials. Requires the pass/actAs on the chosen identity.
+  - id: messaging-schedule-persists-executes-as
+    emits: CanExecuteAs
+    description: "Creating a schedule/rule that invokes a target as a passed execution identity is persistence and yields execution as that identity."
+    applies_to: ["*"]
+    match:
+      - [ ?principal, CanSchedule,     ?schedule ]
+      - [ ?principal, CanPassIdentity, ?identity ]
+    where:
+      # The schedule/rule is a Scheduler / EventRule / Workflow trigger surface.
+      - "node_type(?schedule) in [Scheduler, EventRule, Workflow]"
+      # The chosen identity is assignable to the schedule's invocation target for this
+      # service (scheduler execution role trusts scheduler.amazonaws.com / the target
+      # service; Cloud Scheduler OIDC SA; Automation run-as) — role_compatible gate.
+      - "role_compatible(?identity, ?schedule)"
+      # iam:PassRole / iam.serviceAccounts.actAs for ?identity permits the scheduler's
+      # invocation service (honor iam:PassedToService / actAs scope).
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: []
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when the principal can create/configure the schedule AND can pass
+        ?identity to the schedule's invocation service (iam:PassRole scoped to the
+        scheduler/target service, or actAs on the SA) AND the target the schedule invokes
+        runs the passed identity — the schedule then fires on its cadence executing as
+        ?identity with no further attacker action (persistence). POTENTIAL(role_compatibility)
+        when the identity's trust / PassedToService is unknown/unresolved. Never stronger
+        than the contributing CanSchedule / CanPassIdentity; a deny on PutTargets/
+        CreateSchedule or a PassRole condition excluding the scheduler service blocks it.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "?principal CanSchedule ?schedule", "?principal CanPassIdentity ?identity" ]
+      false_positive_note: >-
+        Honor the pass constraint: a role passable only to (say) ec2/ecs does NOT yield
+        execution via a scheduler that needs scheduler.amazonaws.com in
+        iam:PassedToService — downgrade to POTENTIAL(role_compatibility) when the trust /
+        PassedToService is unknown, BLOCKED when it explicitly excludes the scheduler's
+        service. The identity must be one the SCHEDULE runs its target as (a scheduler
+        execution role, a Cloud Scheduler OIDC SA, an Automation run-as account), not an
+        unrelated identity. This is the persistence framing of can-execute-as's
+        config-identity-swap / create-workload-as (a schedule is a workload the attacker
+        binds an identity to) — dedupes with those on (CanExecuteAs, ?principal, ?identity);
+        emit once. The escalation roll-up is can-execute-as / can-control's, not re-derived.
+      narrative: >-
+        {principal.name} can create a schedule/rule ({schedule.name}) that invokes a
+        target as {identity.name} ({perm:CanPassIdentity} to the scheduler's service);
+        the schedule fires on its cadence executing as {identity.name}, giving persistent
+        execution as that identity.
+
+  # --- 4) Cross-boundary messaging resource policy => cross-boundary trust -------
+  # A messaging RESOURCE POLICY (SQS queue policy, SNS topic policy, EventBridge bus
+  # policy / cross-account rule target, Pub/Sub topic IAM binding, Service Bus SAS
+  # shared with another tenant) that names a principal in ANOTHER account/project is
+  # cross-boundary publish/subscribe trust. Whoever holds that external principal can
+  # publish across the boundary (and, via rules 1-2, trigger compute in the target
+  # boundary — which can-control rolls up into CanEnter*). This rule ONLY asserts the
+  # cross-boundary TRUST fact from the messaging policy; the CanEnter* consequence is
+  # can-control's (enter-account-via-assume and its azure/gcp analogs), cited not
+  # re-derived. Conservative: a cross-account allow to publish/subscribe is trust, not
+  # automatic entry.
+  - id: messaging-resource-policy-cross-boundary-trust
+    emits: CrossAccountTrust
+    description: "A messaging resource policy that grants publish/subscribe to a principal in another account is cross-account trust (Pub/Sub topic IAM across projects emits CrossProjectTrust); feeds can-control's CanEnter* roll-up."
+    applies_to: ["*"]
+    match:
+      - [ ?msgpolicy, HasPolicy, ?src ]
+    where:
+      # ?src is the messaging/storage event source; ?msgpolicy is its resource policy.
+      - "node_class(?src) in [Messaging, Storage]"
+      - "node_type(?msgpolicy) == ResourcePolicy"
+      # The policy grants a send/subscribe action (sqs:SendMessage / sns:Publish /
+      # sns:Subscribe / events:PutEvents / pubsub.topics.publish / ServiceBus send) to a
+      # Principal in a DIFFERENT account/project/tenant than ?src's owner.
+      - "policy names a principal whose account/project/tenant != owner(?src)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: ?msgpolicy
+      target: "<external account/project/tenant named in the messaging policy>"
+      permissions: []
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the messaging resource policy unconditionally grants a cross-boundary
+        send/subscribe to a named external principal. CONDITIONAL(condition_expression)
+        when scoped by a condition the external principal must satisfy (aws:SourceArn /
+        aws:SourceAccount / aws:PrincipalOrgID on the statement, a Pub/Sub IAM condition,
+        a SAS scope). BLOCKED by an SCP/org-policy/deny that neutralizes the grant. On GCP
+        this same collapse emits CrossProjectTrust (Project target) rather than
+        CrossAccountTrust — emit the provider-appropriate cross-boundary edge.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?msgpolicy HasPolicy ?src (cross-boundary send/subscribe grant)" ]
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE can-control: this rule asserts ONLY the cross-boundary
+        messaging TRUST — it does NOT emit CanEnter*. The CanEnterAccount/Project/Tenant
+        consequence (cross-boundary publish -> trigger consumer in the target boundary ->
+        foothold) is produced by can-control (enter-account-via-assume and its analogs)
+        consuming this CrossAccountTrust/CrossProjectTrust together with rules 1-2's
+        CanTrigger/CanExecuteAs; never re-derive it here. Honor SourceArn/SourceAccount/
+        PrincipalOrgID scoping — a policy that only trusts a specific sibling account is
+        not open cross-account access (downgrade to CONDITIONAL). A publish-only grant that
+        reaches NO consumer in the target boundary is trust without an entry path — do not
+        let downstream infer entry unless a binding (rule 1) actually routes to compute.
+        Wildcard-Principal publish is internet/tenant exposure (ExposedToInternet/
+        ExposedToTenant), emitted by the network rules, not this cross-account edge.
+      narrative: >-
+        The resource policy on the messaging source {src.name} grants a principal in
+        another account/project publish/subscribe access; this cross-boundary trust lets
+        that external principal drive {src.name} (and, via its bound consumers, execution
+        inside {src.name}'s boundary — can-control rolls that up to CanEnter*).
+
+# ===========================================================================
+# WORKED EXAMPLES
+#
+# PUBLISH-TRIGGERS-CONSUMER -> EXECUTE-AS (rules 1 -> 2 -> can-execute-as):
+#   [dev CanWriteData orders-queue(Queue)]              (sqs:SendMessage granted)
+#   + [orders-queue CanTrigger order-fn(ServerlessFunction)]   (enabled ESM binding)
+#     => messaging-publish-triggers-consumer: [dev CanTrigger order-fn] ACTIVE
+#   + [order-fn ExecutesAs order-processor-role(Role)]
+#     => messaging-trigger-executes-as: [dev CanExecuteAs order-processor-role]
+#        CONDITIONAL(trigger_exists) -> ACTIVE (live binding, payload-parsing consumer)
+#     => can-control/can-execute-as: [dev CanEscalateTo order-processor-role]
+#        (CITED, not re-derived) when the role outranks dev.
+#
+# SCHEDULE PERSISTENCE (rule 3):
+#   [attacker CanSchedule nightly-schedule(Scheduler)]  (scheduler:CreateSchedule)
+#   + [attacker CanPassIdentity scheduler-exec-role(Role)]  (iam:PassRole to scheduler)
+#   + scheduler-exec-role trusts scheduler.amazonaws.com, role_compatible
+#     => messaging-schedule-persists-executes-as: [attacker CanExecuteAs scheduler-exec-role]
+#        ACTIVE — fires on cadence as the role (persistence); POTENTIAL if trust unknown.
+#
+# CROSS-ACCOUNT TOPIC POLICY (rule 4 -> can-control):
+#   [topic-policy(ResourcePolicy) HasPolicy events-topic(Topic)]  grants sns:Publish to
+#     arn:aws:iam::2222:root
+#     => messaging-resource-policy-cross-boundary-trust:
+#        [topic-policy CrossAccountTrust account-2222] ACTIVE (unconditioned)
+#   + a subscription binds events-topic to a consumer that ExecutesAs a role in the
+#     topic's account (rules 1-2)
+#     => can-control enter-account-via-*: account 2222 principal CanEnterAccount topic-owner
+#        (CITED, not re-derived). SourceAccount-scoped grant => CONDITIONAL.
+#
+# SECRET-IN-MESSAGE (credential-chains, NOT this file):
+#   [config-queue(Queue) ContainsSecret db-cred(Secret)] + [db-cred CredentialsFor db-role]
+#   + [reader CanReadData config-queue]  (sqs:ReceiveMessage) -> CanReadSecret
+#     => credential-chains read-secret-yields-identity: [reader CanImpersonate db-role]
+#        (OWNED by credential-chains; this file only relies on the adapter emitting the
+#        ContainsSecret/CanReadData facts).
+#
+# BLOCKED-edge guidance:
+#  - A disabled event-source-mapping / inactive subscription / disabled rule =>
+#    rule 1 CanTrigger CONDITIONAL(trigger_exists), never ACTIVE.
+#  - An event-pattern / subscription filter the attacker payload cannot satisfy =>
+#    rule 1 CONDITIONAL(condition_expression) or BLOCKED.
+#  - iam:PassRole with iam:PassedToService NOT including the scheduler/target service =>
+#    rule 3 BLOCKED (or POTENTIAL when unknown).
+#  - A resource policy scoped by aws:SourceAccount/SourceArn/PrincipalOrgID or an SCP
+#    denying the cross-account send => rule 4 CONDITIONAL/BLOCKED.
+#  - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ===========================================================================

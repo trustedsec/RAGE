@@ -1,0 +1,330 @@
+# Azure — Static Web Apps (Microsoft.Web/staticSites) rules (Phase 9 CI/CD)
+# ---------------------------------------------------------------------------
+# Azure Static Web Apps is a low-complexity static-hosting platform whose
+# principal attack surface is the BUILD/DEPLOY TOKEN — a symmetric secret
+# returned by listSecrets/action that the GitHub Actions / Azure Pipelines
+# build agent uses to push content to the CDN.
+#
+# The defining security primitives:
+#   1. Microsoft.Web/staticSites/listSecrets/action  → deployment token (APIKey).
+#      A principal with this ARM action can retrieve the token used by the
+#      CI/CD pipeline. The token is a long-lived symmetric secret; possession
+#      equals the ability to push attacker content to the site AND to impersonate
+#      the pipeline's build identity.
+#
+#   2. Linked Functions API backend (linkedBackends): if a SWA has a linked
+#      Microsoft.Web/sites (functionapp) backend, that backend runs AS a managed
+#      identity. Code execution paths into that backend follow the standard
+#      functions.yaml rules. This file emits only the CanReadSecret(deploy token)
+#      fact; all downstream execution-as-identity derivations are handled by the
+#      linchpins cited below.
+#
+# LINCHPINS CITED (DO NOT DUPLICATE):
+#   cicd-chains.yaml  — cicd-modify-buildspec-executes-as (rule 1):
+#       CanModifyCode(?p, ?runner) + ExecutesAs(?runner, ?identity)
+#       => CanExecuteAs(?p, ?identity).
+#       This file emits CanModifyCode(?p, ?runner) for a principal that holds
+#       the deploy token; cicd-chains rolls up the CanExecuteAs consequence
+#       for the build runner identity.
+#   cicd-chains.yaml  — cicd-external-ci-federates-as (rule 4):
+#       If the build pipeline uses OIDC/WIF federation into Azure, the
+#       federation trust is modeled separately (federation-chains.yaml).
+#   can-control.yaml  — escalate-via-execute-as:
+#       CanExecuteAs(?p, ?identity) where privilege(?identity) > privilege(?p)
+#       => CanEscalateTo(?p, ?identity). Cited, not re-derived.
+#   azure/functions.yaml — governs the linked API backend (CanModifyCode,
+#       CanExecuteAs via ExecutesAs, ExposesCredential).
+#
+# IMPORTANT SCOPE CONSTRAINTS:
+#   * A static-only SWA with NO linked Functions API backend has NO server-side
+#     managed identity. Content injection is phishing/XSS only — NOT a graph
+#     traversal edge. Rules that would emit CanExecuteAs MUST guard on the
+#     presence of a linked backend (or a build runner that ExecutesAs an identity).
+#   * The deployment token authorizes CDN content pushes only; it is NOT an
+#     ARM credential and does not directly yield ARM RBAC tokens.
+#   * All permissions verified against the Microsoft.Web resource-provider
+#     operations reference (learn.microsoft.com, 2026-09 snapshot).
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 9-cicd-pipelines
+applies_to: [azure]
+
+rules:
+
+  # --- 1) ARM RBAC: retrieve the SWA deployment token -----------------------
+  # The deployment token is the symmetric "API key" that the CI/CD pipeline uses
+  # to authenticate content pushes. Any principal with listSecrets/action at the
+  # SWA resource (or its parent resource group / subscription) can retrieve it.
+  # This is a CanReadSecret fact; the downstream CanModifyCode (rule 2) and
+  # CanExecuteAs (cicd-chains roll-up) are derived from it.
+  - id: azure-swa-list-secrets
+    emits: CanReadSecret
+    description: "Retrieve the SWA deployment token (AZURE_STATIC_WEB_APPS_API_TOKEN) via listSecrets/action."
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Web/staticSites/listSecrets/action"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: APIKey
+      source: "<principal>"
+      target: "<SWA deployment token (APIKey)>"
+      permissions: ["Microsoft.Web/staticSites/listSecrets/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal effectively holds listSecrets/action at the
+        SWA resource or a parent scope (resource group, subscription) and no deny
+        assignment blocks the action. BLOCKED if a deny assignment covers this action.
+      confidence: 0.95
+      derived_from: ["Microsoft.Web/staticSites/listSecrets/action effective permission"]
+      false_positive_note: >-
+        The deployment token returned by listSecrets is a symmetric secret scoped
+        to this SWA only; it does NOT yield ARM credentials or Entra tokens.
+        Website Contributor does NOT include listSecrets/action; only Contributor,
+        Owner, or a custom role explicitly granting this action qualifies. Verify
+        the effective permission at the specific scope — a deny assignment at a
+        narrower scope blocks even a higher-scope grant.
+      narrative: >-
+        {principal.name} can call listSecrets/action on Static Web App {target.name}
+        to retrieve the deployment token (AZURE_STATIC_WEB_APPS_API_TOKEN), the
+        symmetric secret used by the CI/CD pipeline to push content to the site.
+
+  # --- 2) Deploy-token holder can modify the build runner's deployment -------
+  # The SWA deployment token authorizes the official GitHub Actions /
+  # Azure Pipelines build tasks to push static content (and API definitions)
+  # to the CDN. A principal that holds this token can impersonate the CI pipeline
+  # and push arbitrary content. From the CI/CD perspective, this is equivalent to
+  # modifying what the build runner deploys — a CanModifyCode fact against the
+  # build runner (BuildWorker) that the CI/CD pipeline executes on.
+  #
+  # NOTE: This rule is CONDITIONAL(trigger_exists) because the token alone does not
+  # guarantee a running pipeline. The token enables direct CDN content pushes via the
+  # SWA deploy API (out-of-band, no runner needed), but that ONLY modifies CDN-hosted
+  # static content — NOT code a BuildWorker executes. CanModifyCode is only emitted
+  # when a CI/CD pipeline/runner actually exists (ExecutesAs check in where clause);
+  # otherwise the token is merely a static-content credential and does not feed
+  # cicd-chains escalation. When a runner exists, cicd-chains emits the CanExecuteAs
+  # roll-up (cicd-modify-buildspec-executes-as: CanModifyCode + ExecutesAs => CanExecuteAs).
+  #
+  # CITE cicd-chains: cicd-modify-buildspec-executes-as:
+  #   CanModifyCode(?p, ?runner) + ExecutesAs(?runner, ?identity)
+  #   => CanExecuteAs(?p, ?identity) [ACTIVE when a run path exists]
+  #
+  - id: azure-swa-token-enables-runner-code-modify
+    emits: CanModifyCode
+    description: "A holder of the SWA deployment token can modify the build runner's deployment when a runner with a service identity exists."
+    applies_to: [azure]
+    match:
+      - [ ?principal, CanReadSecret, ?token ]
+    where:
+      - "?token is the SWA deployment token of ?swa (SWA APIKey returned by listSecrets/action)"
+      - "node_type(?swa) == ApplicationPlatform   # Microsoft.Web/staticSites"
+      - "?runner exists and is a CI build worker (BuildWorker) that the SWA pipeline runs on, with ExecutesAs(?runner, ?identity) satisfied"
+    optional:
+      - [ ?principal, CanTrigger, ?runner ]
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?runner
+      permissions: []
+      # No ARM permission field: token-authenticated SWA CDN deploy API is not ARM-gated.
+      # Authentication = deploy token possession (CanReadSecret is the gating condition).
+      conditions: [trigger_exists]
+      state_logic: >-
+        ACTIVE when the token can be used to inject definitions the runner compiles/deploys
+        AND the attacker can also trigger the runner (matched(optional[0])), OR a pre-existing
+        trigger (branch webhook, schedule, PR build) will execute the modified content.
+        CONDITIONAL(trigger_exists) when the token is available but the attacker cannot
+        ensure the runner executes the injected definitions. Inherit weakest state with
+        contributing CanReadSecret: a CONDITIONAL/BLOCKED CanReadSecret yields at most
+        CONDITIONAL/BLOCKED. BLOCKED if a deny assignment covers listSecrets/action or the
+        runner has no ExecutesAs.
+      confidence: 0.80
+      derived_from: ["?principal CanReadSecret ?token (azure-swa-list-secrets)", "cicd-chains: cicd-modify-buildspec-executes-as"]
+      false_positive_note: >-
+        A direct/out-of-band CDN content push using this token (without a build runner)
+        is a static-content modification only — not CanModifyCode against a BuildWorker,
+        and NOT fed to cicd-chains. Only emit when a runner with ExecutesAs exists.
+        If the pipeline uses GitHub-hosted runners with no persistent identity (OIDC/WIF
+        only), the runner identity is the GitHub Actions OIDC subject; federation-chains
+        handles that separately. cicd-chains produces the CanExecuteAs roll-up for the
+        runner's service identity.
+      narrative: >-
+        {principal.name} holds the SWA deployment token of {swa.name} and can inject
+        deployment definitions into the build runner {runner.name} (via direct SWA CDN
+        deploy API), modifying what the runner compiles/deploys; cicd-chains rolls up
+        the CanExecuteAs consequence for the runner's service identity {identity.name}
+        when a run path exists.
+
+  # --- 2b) Admin can redirect SWA build to attacker-controlled repository -------
+  # Microsoft.Web/staticSites/sourcecontrols/write allows an admin to repoint the
+  # SWA's linked source repository to an attacker-controlled Git repo. The next
+  # build/sync will pull from the attacker repo and compile/deploy attacker code.
+  # This is a direct CanModifyCode against the SWA's build runner.
+  # CITE cicd-chains: cicd-modify-buildspec-executes-as (same semantics as rule 2).
+  #
+  - id: azure-swa-sourcecontrols-write
+    emits: CanModifyCode
+    description: "Repoint SWA's source repository to an attacker-controlled repo, modifying build code."
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Web/staticSites/sourcecontrols/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "?swa is the SWA (node_type == ApplicationPlatform)"
+      - "?runner exists: a BuildWorker or the SWA's default build runner (CI/CD platform)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: ?swa
+      permissions: []
+      # No ARM permission field here; sourcecontrols/write is the controlling ARM action,
+      # but the semantic effect is code modification, not permission-governed. The principal's
+      # effective possession of this action is the gating condition.
+      conditions: [service_state, trigger_exists]
+      state_logic: >-
+        ACTIVE when the principal effectively holds sourcecontrols/write, the SWA's build
+        is configured for continuous deployment (linked repo with auto-sync), and a trigger
+        will pull the attacker repo. CONDITIONAL(trigger_exists, service_state) when the
+        permission is present but continuous deployment is not enabled or build is paused.
+        BLOCKED if a deny assignment covers this action or if source control integration is
+        disabled on the SWA.
+      confidence: 0.95
+      derived_from: ["Microsoft.Web/staticSites/sourcecontrols/write effective permission"]
+      false_positive_note: >-
+        Only exploitable when the SWA has continuous deployment enabled and will pull from
+        the linked repository on next sync. A manual-only SWA with no auto-deploy remains
+        CONDITIONAL(trigger_exists) unless the attacker can also trigger the build. A
+        rotated/removed source-control link invalidates this edge. Requires the source
+        repository to be accessible to the SWA build agent (not a hard guarantee for
+        cross-provider repos; model as POTENTIAL if cross-org).
+      narrative: >-
+        {principal.name} can repoint the source control of Static Web App {swa.name} to an
+        attacker-controlled repository (Microsoft.Web/staticSites/sourcecontrols/write).
+        On the next build, the SWA will pull and deploy code from the attacker repository.
+
+  # --- 3) SWA exposes its deploy token for use by the CI/CD pipeline identity --
+  # The SWA deployment token is a long-lived symmetric secret bound to the SWA
+  # resource. Any principal that can read it holds a credential usable for the
+  # CI/CD pipeline service identity (GitHub Actions runner, Azure Pipelines agent,
+  # or their OIDC/WIF federated identities). This is an ExposesCredential fact that
+  # chains to identity: the token authenticates as a build runner's service account.
+  # credential-chains.yaml rolls up read-secret-yields-identity.
+  - id: azure-swa-exposes-deploy-token
+    emits: ExposesCredential
+    description: "A Static Web App exposes its deployment token as a credential for the CI/CD pipeline identity."
+    applies_to: [azure]
+    match:
+      - [ ?swa, ContainsSecret, ?token ]
+    where:
+      - "node_type(?swa) == ApplicationPlatform   # Microsoft.Web/staticSites"
+      - "?token is the SWA deployment token (APIKey) from listSecrets"
+      - "?pipeline_identity is the CI/CD pipeline service identity (GitHub Actions OIDC subject, Azure Pipelines service connection MI, or federated identity)"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: ?swa
+      target: ?pipeline_identity
+      permissions: []
+      # No ARM permission: the token is a symmetric secret credential, not RBAC-gated.
+      # Exposure semantics: possession of this credential = ability to authenticate as ?pipeline_identity.
+      state_logic: "ACTIVE when the SWA exists and the deploy token is not reset/rotated. BLOCKED if token is rotated."
+      confidence: 0.90
+      derived_from: ["?swa ContainsSecret ?token (azure-swa-deploy-token-contains-secret)"]
+      false_positive_note: >-
+        The deploy token authorizes CDN content pushes as the CI/CD pipeline; it does not
+        grant ARM RBAC roles or Entra app credentials. The token is a symmetric secret —
+        rotation invalidates it (emit BLOCKED or remove). Do not derive CanExecuteAs from
+        this edge alone; cicd-chains produces CanExecuteAs from the CanModifyCode edge
+        combined with ExecutesAs on a runner, not from ExposesCredential directly.
+        credential-chains may chain this to CredentialsFor(pipeline_identity) for
+        identity-centric queries.
+      narrative: >-
+        Static Web App {swa.name} exposes its build/deploy token as a long-lived CI/CD
+        credential (accessible via listSecrets/action). Any principal holding this token
+        can authenticate as the CI/CD pipeline identity {pipeline_identity.name}.
+
+# ---------------------------------------------------------------------------
+# WHAT IS DELIBERATELY NOT MODELED HERE:
+#
+#   * CanModifyConfiguration (staticwebapp.config.json / routing / auth):
+#       Microsoft.Web/staticSites/config/write changes routing rules and auth
+#       enforcement. This is a configuration change affecting browser-side
+#       behavior (header overrides, route rewrites, auth bypass for specific
+#       routes). It does NOT cause server-side code execution as an identity and
+#       has no CanExecuteAs consequence for the SWA itself. Analyst note: auth
+#       bypass via config can enable unauthenticated access to API routes, but
+#       that is an application-level finding, not a graph escalation edge.
+#
+#   * ExposedToInternet: SWA default hostname (*.azurestaticapps.net) is always
+#       public. This is structural metadata, not an attack-path edge; no secrets
+#       are exposed merely by being public. Emit this as a property on the node
+#       rather than an ExposedToInternet edge unless the SWA has an anonymous
+#       API endpoint that leaks sensitive data.
+#
+#   * Linked API backend escalation: the linked Functions API backend is a
+#       Microsoft.Web/sites (kind=functionapp) resource governed entirely by
+#       /rules/derived/azure/functions.yaml. No rules here duplicate those paths.
+#       The link between the SWA and the backend is a structural ContainsResourceReference
+#       (not traversal-relevant by itself); escalation happens through the backend's
+#       own CanModifyCode / ExecutesAs / CanExecuteAs chain in functions.yaml.
+#
+#   * GitHub / Azure DevOps OIDC federation: when the SWA CI/CD pipeline uses
+#       OIDC federation (Azure federated credential on the pipeline service
+#       connection / GitHub OIDC trust), that trust is modeled by
+#       federation-chains.yaml (cicd-external-ci-federates-as in cicd-chains.yaml).
+#       Not re-derived here.
+#
+# BLOCKED-edge guidance:
+#   * A deny assignment covering Microsoft.Web/staticSites/listSecrets/action at
+#     the SWA, resource group, or subscription scope => azure-swa-list-secrets
+#     emitted with state: BLOCKED and denied_by=<deny assignment>.
+#   * A principal with listSecrets/action BLOCKED by deny assignment also blocks
+#     azure-swa-token-enables-runner-code-modify (inherits BLOCKED from the
+#     contributing CanReadSecret edge).
+#   * Branch protection / required-reviewer gate on the source repository =>
+#     azure-swa-token-enables-runner-code-modify is CONDITIONAL(trigger_exists),
+#     not ACTIVE.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization (raw config -> explicit edges). These belong in
+# /rules/explicit/azure/ but are noted here for completeness; they emit the
+# ContainsSecret / ContainsResourceReference facts the derived rules consume.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: azure-swa-deploy-token-contains-secret
+    emits: ContainsSecret
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.Web/staticSites"
+      api: "Microsoft.Web/staticSites/listSecrets/action"
+      field: "properties.apiKey"
+    emit:
+      source: "<Microsoft.Web/staticSites>"
+      target: "<SWA deployment token (APIKey)>"
+      note: >-
+        The deployment token is the AZURE_STATIC_WEB_APPS_API_TOKEN value returned
+        by the listSecrets action. It is a symmetric secret; treat as a Credential /
+        APIKey node. If collection omits listSecrets (read-only collector), model
+        ContainsSecret as POTENTIAL when the RBAC allows it.
+      narrative: "Static Web App {swa.name} contains a deployment token credential used by its CI/CD build pipeline."
+
+  - id: azure-swa-linked-backend-reference
+    emits: ContainsResourceReference
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.Web/staticSites"
+      api: "Microsoft.Web/staticSites/linkedBackends"
+      field: "backendResourceId"
+    emit:
+      source: "<Microsoft.Web/staticSites>"
+      target: "<linked Microsoft.Web/sites (functionapp) resource>"
+      note: >-
+        The SWA references a linked Functions API backend. This is a structural
+        reference only; escalation into the backend follows functions.yaml rules.
+      narrative: "Static Web App {swa.name} references linked Functions API backend {backend.name}."

@@ -1,0 +1,102 @@
+# AWS EBS — Explicit (collector-sourced) edges
+# ---------------------------------------------------------------------------
+# These edges are emitted from AWS EC2 Snapshot descriptors collected via the
+# DescribeSnapshotAttribute and DescribeVolumes APIs. They record the observed
+# resource topology (snapshot sharing permissions, volume attachments) and feed
+# the derived rules in /rules/derived/aws/ebs.yaml that compute attack paths.
+#
+# source_type/target_type must match schema/edges.yaml declarations:
+#   CrossAccountTrust: source: [Account, Role, ResourcePolicy, Data, Snapshot, DataLake]
+#                      target: [Account, ExternalIdentity]
+#   ExposedToInternet: source: [Compute, Data, PublicEndpoint, LoadBalancer, Storage, Messaging, DNS]
+#                      target: [AnonymousIdentity]
+#   AttachedTo:        source: [NetworkInterface, BlockStorage, ManagedIdentity, IAMPolicy]
+#                      target: [Compute, VirtualNetwork, Identity]
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # Cross-account snapshot sharing (explicit normalization from EC2 API)
+  - id: aws-ebs-cross-account-snapshot-share
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    description: >-
+      A snapshot is shared to an external AWS account via ec2:DescribeSnapshotAttribute.
+    match_record:
+      resource_type: "AWS::EC2::Snapshot"
+      field: "createVolumePermission.Add[].UserId"
+    emit:
+      source_type: Snapshot
+      target_type: Account
+      source: "<snapshot node>"
+      target: "<Account node for the granted UserId>"
+      api_source: "ec2:DescribeSnapshotAttribute"
+      evidence_field: "createVolumePermission.Add[].UserId"
+      narrative: >-
+        {snapshot.name} grants createVolumePermission to external account {target.name},
+        enabling that account to create volumes from this snapshot (cross-account trust).
+
+  # Volume attachment (explicit normalization from EC2 API)
+  - id: aws-ebs-volume-attachment
+    emits: AttachedTo
+    applies_to: [aws]
+    description: >-
+      A volume is attached to an EC2 instance via ec2:DescribeVolumes.
+    match_record:
+      resource_type: "AWS::EC2::Volume"
+      field: "Attachments[].InstanceId"
+    emit:
+      source_type: BlockStorage
+      target_type: VirtualMachine
+      source: "<volume node>"
+      target: "<instance node>"
+      api_source: "ec2:DescribeVolumes"
+      evidence_field: "Attachments[].InstanceId"
+      narrative: >-
+        {volume.name} is attached to {instance.name} as device {Attachments[].Device};
+        the volume's data is accessible to the instance and its IAM role.
+
+  # Snapshot contains secret (explicit; forensic evidence only)
+  - id: aws-ebs-snapshot-contains-secret
+    emits: ContainsSecret
+    applies_to: [aws]
+    description: >-
+      A snapshot of a volume from an instance with an instance profile (IAM role)
+      may contain credentials, SSH keys, or other secrets on the disk. This edge
+      is ONLY emitted when forensic evidence confirms credential material on the
+      disk image, not from structural probability alone. The preconditions are:
+      (1) the volume was attached to an instance with an ExecutesAs role,
+      (2) a snapshot exists of that volume, and (3) forensic scanning or manual
+      inspection has detected credential patterns on the disk.
+    match_record:
+      # This matches when a forensic detector (credential-pattern-scan or manual
+      # analyst review) confirms credential material on a disk image. The source
+      # is structured as: "instance has role → volume attached to instance →
+      # snapshot taken of volume → forensic scan detects credentials ON snapshot".
+      # Without forensic confirmation, this edge should NOT be emitted.
+      resource_type: "AWS::EC2::Snapshot"
+      evidence_field: "detective:credential_pattern_scan"
+    emit:
+      source_type: Snapshot
+      target_type: Secret
+      source: "<snapshot node>"
+      target: "<Secret: detected credentials on snapshot>"
+      api_source: "forensic:credential-pattern-scan or manual analysis"
+      evidence_field: "detective:credential_pattern_scan (file path, pattern type, confidence)"
+      state_logic: >-
+        ACTIVE only when forensic evidence (yara, entropy-based detection, or manual
+        analysis) confirms credential material on the disk image. Until then, the edge
+        is not emitted. This is an explicit edge (nature: explicit in edges.yaml) and
+        must not be emitted by derived rules based on structural probability alone.
+      confidence: >-
+        Determined by the forensic detector: 0.95+ for high-confidence patterns
+        (e.g. AWS_ACCESS_KEY_ID=AKIA*), 0.75-0.95 for medium-confidence patterns
+        (SSH private key PEM header), 0.50-0.75 for low-confidence patterns (entropy spike).
+      narrative: >-
+        {snapshot.name} (of {volume.name} from {instance.name}) contains detected
+        credentials via forensic scan: {evidence_field}. The credentials can be
+        extracted by any principal who can read the snapshot data via CanReadData.

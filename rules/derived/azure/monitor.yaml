@@ -1,0 +1,487 @@
+# Azure Monitor (Microsoft.Insights + Microsoft.OperationalInsights)
+# Derived attack-path rules — Phase 12 security & logging
+# ---------------------------------------------------------------------------
+# Azure Monitor is the Azure observability umbrella: diagnostic settings,
+# Activity Log, Log Analytics workspaces, data collection rules, alert rules,
+# and action groups. The dominant attacker use-case is DEFENSE EVASION /
+# TAMPERING — deleting or replacing a diagnostic setting stops the export of
+# a resource's (or subscription's) audit logs. No permission modeled here grants
+# resource access, identity tokens, or execution capability.
+#
+# THREE THREAT MODES (per Phase-12 task brief):
+#   (1) DEFENSE EVASION / TAMPERING (dominant):
+#       Delete/write diagnostic settings, log profiles, alert rules, action groups,
+#       or Log Analytics workspaces to silence detective controls.
+#       -> CanModifyConfiguration (reversible write/disable) or CanDelete (destructive)
+#          on LoggingService / SecurityService nodes.
+#       This is COVER-TRACKS / weaken-detective-controls. Not privilege escalation.
+#       NEVER chain to CanExecuteAs / CanEnterSubscription / CanEscalateTo.
+#
+#   (2) DATA:
+#       Log Analytics workspace queries (KQL) can expose secrets/tokens logged
+#       by monitored workloads. -> CanReadData on LoggingService (workspace).
+#
+#   (3) EXECUTION: not applicable here. If an action group fires an Azure Function,
+#       Logic App, or Automation Runbook, those resources' own adapters handle the
+#       execution and ExecutesAs edges (azure:functions, azure:logicapps,
+#       azure:automation). This file does NOT re-derive that surface.
+#
+# LINCHPIN CITATIONS (not re-derived here):
+#   can-execute-as.yaml    — Monitor has NO ExecutesAs surface in this adapter.
+#   cicd-chains.yaml       — Monitor is not a CI/CD runner.
+#   credential-chains.yaml — CanReadData(workspace) + ContainsSecret + CredentialsFor
+#                            => CanImpersonate is credential-chains' roll-up; cite only.
+#   can-control.yaml       — No admin/control escalation path from Monitor perms.
+#
+# STATE NOTE: detective controls do NOT produce BLOCKED on capability edges.
+# BLOCKED is reserved for preventive guardrails (deny assignments, Conditional Access).
+# A deleted diagnostic setting reduces detection; it does not block any access edge.
+#
+# NODE CLASSES USED (schema/nodes.yaml ManagementService subtypes):
+#   LoggingService   — diagnostic settings, log profiles, LA workspaces, DCRs
+#   SecurityService  — alert rules (scheduled query / metric / activity log), action groups
+#
+# All permission strings verified against the Microsoft.Insights and
+# Microsoft.OperationalInsights resource-provider operations reference
+# (learn.microsoft.com, 2026-09 snapshot). No hallucinated permissions.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 12-security-logging
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # 1. Delete a diagnostic setting — headline defense-evasion primitive
+  # ===========================================================================
+
+  - id: azure-monitor-delete-diagnostic-setting
+    emits: CanDelete
+    description: >-
+      Delete a diagnostic setting on an Azure resource or at subscription scope,
+      stopping export of that resource's (or subscription's) Activity Log and
+      resource logs to a Log Analytics workspace, storage account, or Event Hub.
+      Headline defense-evasion primitive: subsequent attacker API activity goes
+      unrecorded in the monitored scope.
+    match_effective_permission:
+      action: "Microsoft.Insights/diagnosticSettings/delete"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: "<principal>"
+      target: "<diagnostic setting (LoggingService node)>"
+      permissions:
+        - "Microsoft.Insights/diagnosticSettings/delete"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE when the principal holds Microsoft.Insights/diagnosticSettings/delete
+        at the effective scope of the target diagnostic setting with no deny assignment
+        blocking it. Subscription-scope diagnostic settings require the delete permission
+        at subscription scope; resource-scope settings require it at the resource or
+        enclosing resource-group/subscription scope. BLOCKED if a deny assignment covers
+        diagnosticSettings/delete at the effective scope. Diagnostic settings on resources
+        in locked resource groups (CanNotDelete lock) are BLOCKED — the ARM lock prevents
+        deletion even if the RBAC action is present. Note: deleting a subscription-scope
+        diagnostic setting silences Activity Log export for the entire subscription —
+        annotate is_subscription_scope=true settings with elevated blast radius.
+      confidence: 0.97
+      derived_from:
+        - "effective permission: Microsoft.Insights/diagnosticSettings/delete"
+      false_positive_note: >-
+        DEFENSE EVASION ONLY — destruction of a diagnostic setting suppresses detection
+        of subsequent API activity but grants no resource access and no identity tokens.
+        Do NOT chain this edge to CanExecuteAs, CanEscalateTo, CanEnterSubscription, or
+        any access-escalation edge. Scope matters: Microsoft.Insights/diagnosticSettings/delete
+        at resource-group scope covers settings on resources in that RG but NOT
+        subscription-scope settings (different ARM scope); verify the effective
+        permission scope before asserting subscription-wide evasion. Monitoring Contributor
+        and Contributor / Owner roles include this action; the scoped Monitoring Reader
+        role does NOT — do not infer delete from read-only role assignments. A CanNotDelete
+        resource lock prevents deletion even with the RBAC action — emit BLOCKED if a lock
+        is confirmed on the resource.
+      narrative: >-
+        {principal.name} can delete the diagnostic setting {target.name}
+        (Microsoft.Insights/diagnosticSettings/delete), stopping all export of resource
+        logs and activity events from the monitored scope to the configured destination
+        (Log Analytics workspace, storage account, or Event Hub). While the setting is
+        absent, subsequent attacker actions in that scope go unrecorded. This is a
+        cover-tracks / weaken-detective-controls primitive that grants no resource access.
+
+  # ===========================================================================
+  # 2. Write/replace a diagnostic setting — redirect or selectively suppress
+  # ===========================================================================
+
+  - id: azure-monitor-write-diagnostic-setting
+    emits: CanModifyConfiguration
+    description: >-
+      Write or replace a diagnostic setting, redirecting log export to an
+      attacker-controlled destination or selectively excluding categories — a
+      stealthier evasion than deletion because the setting remains present.
+    match_effective_permission:
+      action: "Microsoft.Insights/diagnosticSettings/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: "<principal>"
+      target: "<diagnostic setting (LoggingService node)>"
+      permissions:
+        - "Microsoft.Insights/diagnosticSettings/write"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE when the principal holds Microsoft.Insights/diagnosticSettings/write at
+        the effective scope with no deny assignment. Write can create a new setting or
+        overwrite an existing one. Confidence 0.90 (slightly lower than delete) because
+        a write-only write that adds redundant logging is benign; threat requires either
+        (a) redirecting the storageAccountId/workspaceId/eventHubAuthorizationRuleId to
+        an attacker-controlled destination, or (b) setting enabled=false on selected log
+        categories or the overall setting. BLOCKED if a deny assignment covers
+        diagnosticSettings/write.
+      confidence: 0.90
+      derived_from:
+        - "effective permission: Microsoft.Insights/diagnosticSettings/write"
+      false_positive_note: >-
+        DEFENSE EVASION / REDIRECT. Write alone can be benign (adding a log destination)
+        or malicious (redirecting to an attacker-controlled storage account, disabling
+        categories). Emit CanModifyConfiguration regardless — the capability to redirect
+        is the threat surface; analyst should assess the destination change. This is
+        stealthier than delete because Azure Monitor does not generate an alert when a
+        diagnostic setting is modified unless an activity-log alert is configured for
+        Microsoft.Insights/diagnosticSettings/write operations. Do NOT chain to access
+        escalation edges.
+      narrative: >-
+        {principal.name} can create or overwrite the diagnostic setting {target.name}
+        (Microsoft.Insights/diagnosticSettings/write), redirecting log export to an
+        attacker-controlled destination or selectively disabling log categories.
+        The setting remains present but silenced or misdirected — a stealthy evasion.
+
+  # ===========================================================================
+  # 3. Delete log profile (legacy subscription Activity Log) — evasion
+  # ===========================================================================
+
+  - id: azure-monitor-delete-log-profile
+    emits: CanDelete
+    description: >-
+      Delete the subscription-level Activity Log export profile (legacy
+      Microsoft.Insights/logProfiles), stopping archive of all ARM management-plane
+      events for the entire subscription.
+    match_effective_permission:
+      action: "Microsoft.Insights/logProfiles/delete"
+      scope_type: "subscription"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: "<principal>"
+      target: "<log profile (LoggingService node) at subscription scope>"
+      permissions:
+        - "Microsoft.Insights/logProfiles/delete"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE when the principal holds Microsoft.Insights/logProfiles/delete at
+        subscription scope with no deny assignment. Log profiles are subscription-scoped;
+        the permission must be at subscription or management-group scope. BLOCKED if a
+        deny assignment covers logProfiles/delete. POTENTIAL if the subscription has no
+        log profile configured (check presence before emitting — many modern tenants have
+        migrated entirely to subscription-scope diagnostic settings and have no log profile).
+      confidence: 0.92
+      derived_from:
+        - "effective permission: Microsoft.Insights/logProfiles/delete"
+      false_positive_note: >-
+        DEFENSE EVASION ONLY — no access gained. Log profiles are the LEGACY subscription
+        Activity Log export mechanism (superseded by subscription-scope diagnostic settings).
+        Many tenants have migrated and have no log profile; emit POTENTIAL if no profile
+        is confirmed present, ACTIVE only if a log profile node exists. Do not emit for
+        tenants where the subscription Activity Log is exported only via diagnostic settings
+        (a separate pipeline unaffected by logProfiles deletion). Never chain to access
+        edges.
+      narrative: >-
+        {principal.name} can delete the log profile {target.name}
+        (Microsoft.Insights/logProfiles/delete), stopping export of the subscription-level
+        Activity Log to the configured storage account or Event Hub. All ARM management-plane
+        events in the subscription go unarchived until a new profile or diagnostic setting
+        is created. This is a subscription-wide cover-tracks primitive.
+
+  # ===========================================================================
+  # 4. Write/replace log profile — redirect Activity Log export
+  # ===========================================================================
+
+  - id: azure-monitor-write-log-profile
+    emits: CanModifyConfiguration
+    description: >-
+      Write or replace the subscription Activity Log profile, redirecting export
+      to an attacker-controlled destination or narrowing the captured regions and
+      categories.
+    match_effective_permission:
+      action: "Microsoft.Insights/logProfiles/write"
+      scope_type: "subscription"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: "<principal>"
+      target: "<log profile (LoggingService node)>"
+      permissions:
+        - "Microsoft.Insights/logProfiles/write"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE when the permission is confirmed at subscription scope with no deny
+        assignment. POTENTIAL if no log profile exists (write creates one, but creation
+        with an attacker-controlled destination requires confirmation). BLOCKED if deny
+        assignment covers logProfiles/write.
+      confidence: 0.85
+      derived_from:
+        - "effective permission: Microsoft.Insights/logProfiles/write"
+      false_positive_note: >-
+        DEFENSE EVASION / REDIRECT. Same caveats as azure-monitor-write-diagnostic-setting.
+        logProfiles/write is the legacy API; most modern evasion targets subscription-scope
+        diagnostic settings instead. Emit with lower priority than delete primitives. Do
+        NOT chain to access edges.
+      narrative: >-
+        {principal.name} can write or replace the subscription log profile {target.name}
+        (Microsoft.Insights/logProfiles/write), redirecting Activity Log export to an
+        attacker-controlled storage account or Event Hub, or narrowing the captured regions
+        and categories.
+
+  # ===========================================================================
+  # 5. Delete scheduled-query (log search) alert rule — silence detection
+  # ===========================================================================
+
+  - id: azure-monitor-delete-scheduled-query-alert
+    emits: CanDelete
+    description: >-
+      Delete a scheduled query (log search) alert rule, silencing automated detection
+      based on KQL log queries — disables alerting on specific threat patterns or
+      compliance baselines.
+    match_effective_permission:
+      action: "Microsoft.Insights/scheduledQueryRules/delete"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: "<principal>"
+      target: "<scheduled query alert rule (SecurityService node)>"
+      permissions:
+        - "Microsoft.Insights/scheduledQueryRules/delete"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE when the principal holds the delete action at the effective scope with no
+        deny assignment. The deletion silences the specific alert rule; if the rule's
+        action group is also deleted (see azure-monitor-delete-action-group), the response
+        is doubly disabled. BLOCKED if deny assignment covers scheduledQueryRules/delete.
+      confidence: 0.92
+      derived_from:
+        - "effective permission: Microsoft.Insights/scheduledQueryRules/delete"
+      false_positive_note: >-
+        DEFENSE EVASION ONLY. Deleting an alert rule silences automated detection of
+        whatever the rule was monitoring (e.g. 'alert on >3 sign-in failures from same IP
+        in 5 min'). It does not grant access to any resource. An analyst should note which
+        threat scenarios the deleted rule covered. Do NOT chain to access escalation edges.
+        Monitoring Contributor and Contributor/Owner roles include scheduledQueryRules/delete;
+        Monitoring Reader does NOT — verify the effective role before emitting.
+      narrative: >-
+        {principal.name} can delete scheduled query alert rule {target.name}
+        (Microsoft.Insights/scheduledQueryRules/delete), silencing automated detection
+        based on the rule's KQL query. Subsequent events matching the rule's pattern go
+        undetected until the rule is recreated. This is a detective-control evasion
+        primitive with no accompanying resource access.
+
+  # ===========================================================================
+  # 5a. Delete metric alert rule — silence metric threshold detection
+  # ===========================================================================
+
+  - id: azure-monitor-delete-metric-alert
+    emits: CanDelete
+    description: >-
+      Delete a metric alert rule, silencing automated detection triggered by
+      metric thresholds (CPU, memory, network, custom metrics). Metric alerts
+      fire independently of log-search alerts and are on distinct ARM resource types.
+    match_effective_permission:
+      action: "Microsoft.Insights/metricAlerts/delete"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: "<principal>"
+      target: "<metric alert rule (SecurityService node)>"
+      permissions:
+        - "Microsoft.Insights/metricAlerts/delete"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE when the principal holds the delete action at the effective scope with no
+        deny assignment. Metric alert rules are distinct ARM resources from scheduled
+        query rules and activity log alerts; deleting one does not affect the others.
+        BLOCKED if deny assignment covers metricAlerts/delete.
+      confidence: 0.92
+      derived_from:
+        - "effective permission: Microsoft.Insights/metricAlerts/delete"
+      false_positive_note: >-
+        DEFENSE EVASION ONLY. Deleting a metric alert rule silences threshold-based
+        detection (e.g., 'alert when CPU > 80%'). It does not grant access to any resource.
+        Metric alerts and scheduled-query alerts are on separate resource types; deleting
+        one does not affect the other. Do NOT chain to access escalation edges. Monitoring
+        Contributor and Contributor/Owner roles include metricAlerts/delete; Monitoring
+        Reader does NOT.
+      narrative: >-
+        {principal.name} can delete metric alert rule {target.name}
+        (Microsoft.Insights/metricAlerts/delete), silencing automated detection based on
+        metric thresholds (CPU, memory, network, custom metrics). Subsequent metric
+        violations matching the rule's conditions go undetected until the rule is
+        recreated. This is a detective-control evasion primitive with no accompanying
+        resource access.
+
+  # ===========================================================================
+  # 5b. Delete activity log alert rule — silence resource-plane event detection
+  # ===========================================================================
+
+  - id: azure-monitor-delete-activity-log-alert
+    emits: CanDelete
+    description: >-
+      Delete an activity log alert rule, silencing automated detection triggered by
+      Azure Resource Manager (ARM) control-plane events (resource creation, deletion,
+      policy changes, role assignments). Activity log alerts are distinct from
+      scheduled-query and metric alerts, on their own ARM resource type.
+    match_effective_permission:
+      action: "Microsoft.Insights/activityLogAlerts/delete"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: "<principal>"
+      target: "<activity log alert rule (SecurityService node)>"
+      permissions:
+        - "Microsoft.Insights/activityLogAlerts/delete"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE when the principal holds the delete action at the effective scope with no
+        deny assignment. Activity log alert rules are distinct ARM resources from scheduled
+        query and metric alerts; deleting one does not affect the others. BLOCKED if deny
+        assignment covers activityLogAlerts/delete.
+      confidence: 0.92
+      derived_from:
+        - "effective permission: Microsoft.Insights/activityLogAlerts/delete"
+      false_positive_note: >-
+        DEFENSE EVASION ONLY. Deleting an activity log alert rule silences detection of
+        Azure control-plane events (e.g., 'alert on resource deletion' or 'alert on new
+        role assignment'). It does not grant access to any resource. Activity log alerts
+        and scheduled-query alerts are on separate resource types; deleting one does not
+        affect the other. Do NOT chain to access escalation edges. Monitoring Contributor
+        and Contributor/Owner roles include activityLogAlerts/delete; Monitoring Reader
+        does NOT.
+      narrative: >-
+        {principal.name} can delete activity log alert rule {target.name}
+        (Microsoft.Insights/activityLogAlerts/delete), silencing automated detection based
+        on Azure Resource Manager control-plane events. Subsequent ARM events matching the
+        rule's conditions (e.g., resource deletion, role assignment, policy change) go
+        undetected until the rule is recreated. This is a detective-control evasion
+        primitive with no accompanying resource access.
+
+  # ===========================================================================
+  # 6. Delete action group — blast-radius evasion against alert responses
+  # ===========================================================================
+
+  - id: azure-monitor-delete-action-group
+    emits: CanDelete
+    description: >-
+      Delete an action group, silencing the response actions (email, SMS, webhook,
+      Azure Function, Logic App, Automation Runbook) for ALL alert rules that reference
+      it — a high-blast-radius evasion against automated incident response.
+    match_effective_permission:
+      action: "Microsoft.Insights/actionGroups/delete"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: "<principal>"
+      target: "<action group (SecurityService node)>"
+      permissions:
+        - "Microsoft.Insights/actionGroups/delete"
+      conditions: [iam_permission, deny_assignment]
+      state_logic: >-
+        ACTIVE when the principal holds the delete action at the effective scope with no
+        deny assignment. An action group may be referenced by many alert rules across the
+        scope; its deletion silences response for all of them simultaneously. BLOCKED if
+        deny assignment covers actionGroups/delete.
+      confidence: 0.95
+      derived_from:
+        - "effective permission: Microsoft.Insights/actionGroups/delete"
+      false_positive_note: >-
+        DEFENSE EVASION ONLY. An action group deletion is higher-blast-radius than a single
+        alert rule deletion because every alert rule referencing the group loses its response
+        actions simultaneously. The alert rules remain and may still trigger (and appear in
+        the portal/API), but none of their actions fire — a stealthy disarming of automated
+        response. No resource access is gained. Do NOT chain to CanExecuteAs or any access
+        edge. Note: if the action group's actions include an Azure Function or Logic App,
+        those downstream resources' own adapters model their ExecutesAs surface separately —
+        deleting the action group does not grant access to those resources.
+      narrative: >-
+        {principal.name} can delete action group {target.name}
+        (Microsoft.Insights/actionGroups/delete), silencing the response actions (email,
+        webhook, Azure Function invocation, Logic App trigger, Automation Runbook kick-off)
+        for every alert rule that references it. Alerts may still fire and appear in the
+        portal but no automated response executes — a high-blast-radius disarming of
+        incident-response workflows. No resource access is gained.
+
+  # ===========================================================================
+  # 7. Log Analytics workspace management — DELEGATED TO azure:loganalytics
+  # ===========================================================================
+  # WORKSPACE DELETION, PURGE, QUERY, AND CONFIGURATION are fully modeled in
+  # rules/derived/azure/loganalytics.yaml (Phase 12 Log Analytics & Sentinel adapter):
+  #   - azure-siem-workspace-delete   (Microsoft.OperationalInsights/workspaces/delete)
+  #   - azure-siem-workspace-purge    (Microsoft.OperationalInsights/workspaces/purge/action)
+  #   - azure-siem-workspace-query    (Microsoft.OperationalInsights/workspaces/query/*/action)
+  #   - azure-siem-workspace-admin    (Microsoft.OperationalInsights/workspaces/write + CanAdminister)
+  #   - azure-siem-workspace-write-config (workspace configuration tampering)
+  #
+  # These rules cover:
+  #   - Destruction (workspace deletion / soft-delete recovery / purge)
+  #   - Configuration tampering (daily cap, retention, pricing tier)
+  #   - Query access (KQL recon + credential extraction)
+  #   - Administrative control (full workspace management)
+  #
+  # The loganalytics.yaml adapter is the canonical source for all Log Analytics
+  # and Sentinel attack-path rules. Do not duplicate here. Direct queries to
+  # rules/derived/azure/loganalytics.yaml for workspace-related edges.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - A deny assignment covering Microsoft.Insights/diagnosticSettings/delete or
+#     /write at the resource/RG/subscription scope -> BLOCKED on
+#     azure-monitor-delete-diagnostic-setting / azure-monitor-write-diagnostic-setting.
+#   - A CanNotDelete resource lock on a resource or resource group prevents diagnostic
+#     setting deletion even with the RBAC action -> BLOCKED.
+#   - No log profile present -> azure-monitor-delete-log-profile POTENTIAL (not ACTIVE).
+#
+# ESCALATION NOTE (per Phase-12 task brief):
+#   None of the rules in this file produce CanExecuteAs, CanEscalateTo,
+#   CanEnterSubscription, CanEnterAccount, CanAssume, or CanImpersonate.
+#   Azure Monitor tampering is detective-control evasion ONLY. The downstream
+#   execution surface (action group -> Function / Logic App / Automation) is
+#   handled by azure:functions, azure:logicapps, azure:automation adapters.
+#
+# LINCHPIN CITATIONS:
+#   rules/derived/can-execute-as.yaml   — NOT used; Monitor has no ExecutesAs surface.
+#   rules/derived/cicd-chains.yaml      — NOT used; Monitor is not a CI/CD runner.
+#   rules/derived/credential-chains.yaml — Log Analytics workspace queries (via
+#     azure:loganalytics adapter) emit CanRead; if the workspace ContainsSecret
+#     (explicit rule), credential-chains read-secret-yields-identity rolls up to
+#     CanImpersonate. CITED via loganalytics.yaml.
+#   rules/derived/can-control.yaml      — NOT applicable; no admin/control path.
+#   rules/derived/azure/loganalytics.yaml — Workspace deletion, query, and config
+#     are fully modeled in the loganalytics adapter; do NOT duplicate here.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw config -> explicit edges).
+# These belong in /rules/explicit/azure-monitor.yaml if needed.
+# For Azure Monitor, the dominant explicit facts are:
+#   - HasPermission edges (from the effective-permission evaluator running
+#     diagnosticSettings/delete, diagnosticSettings/write, etc. against
+#     resource/subscription scope) — produced by the standard evaluator,
+#     NOT a separate explicit rule file.
+#   - ContainsSecret on a Log Analytics workspace (if a workspace is confirmed
+#     to retain credential-bearing logs) — evidence-dependent; emitted by the
+#     collector when log inspection or heuristic naming confirms secret content.
+# No separate /rules/explicit/azure-monitor.yaml is required for basic coverage.
+# ---------------------------------------------------------------------------
+explicit_rules: []

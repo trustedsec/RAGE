@@ -1,0 +1,560 @@
+# Azure — Load Balancer & Application Gateway (Microsoft.Network) derived rules (Phase 8)
+# ---------------------------------------------------------------------------
+# Phase 8 networking theme. This file covers two ingress services:
+#   (A) Azure Standard Load Balancer (L4): public or internal frontend IP, backend
+#       pools of VMs/VMSS. Resource provider: Microsoft.Network/loadBalancers.
+#   (B) Azure Application Gateway v2 (L7): HTTP/HTTPS routing, SSL termination,
+#       WAF (WAF_v2 SKU). Resource provider: Microsoft.Network/applicationGateways.
+#       WAF policy: Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies.
+#
+# ATTACK-PATH PRIMITIVES EMITTED HERE (Phase 8 categories):
+#   (1) EXPOSURE: public frontend IP -> ExposedToInternet + RoutesTo backend pool.
+#   (2) WEAKEN CONTROLS: write LB/AppGW/WAF -> CanModifyConfiguration (expands access
+#       or removes L7 filtering from protected applications).
+#   (3) IDENTITY ATTACHMENT: attach privileged MI to App GW -> CanAttachIdentity.
+#   (4) ADMIN: full write wildcard on LB or App GW -> CanAdminister.
+#
+# WHAT IS NOT IN THIS FILE:
+#   - Transitive network reachability (LB backend -> VM -> MI token) is NOT derived
+#     here. Emit the FACTS (ExposedToInternet, RoutesTo); the future network-chains
+#     linchpin composes end-to-end paths. CITE can-control.yaml for escalation roll-ups.
+#   - Backend VM execution and IMDS credential access: handled by /rules/derived/azure/vm.yaml.
+#   - NSG rules on the backend subnet: handled by the VNet rules file (future vnet.yaml).
+#
+# LINCHPINS CITED (not re-derived here):
+#   can-control  control-via-admin: CanAdminister -> Controls.
+#   can-control  control-boundary-via-iam-admin: CanGrantPermission@scope -> Controls.
+#   (future) network-chains: ExposedToInternet + RoutesTo + ExecutesAs -> internet attacker
+#            reaches backend identity (transitive; NOT derived here).
+#
+# CONDITION SEMANTICS:
+#   ACTIVE: public frontend IP allocated AND (LB: backend pool non-empty) — the exposure
+#     fact is confirmed from ARM configuration.
+#   CONDITIONAL(network_reachability): Standard LB is closed-by-default; backend VM
+#     reachability additionally requires a permissive NSG on the backend subnet/NIC.
+#     ExposedToInternet on the LB/AppGW itself is ACTIVE (the frontend is reachable);
+#     the backend reach is CONDITIONAL.
+#   BLOCKED: deny assignment covers the write operation at the resource scope.
+#
+# All operation strings verified against the Azure resource-provider operations reference
+# (Microsoft.Network), 2026-09 snapshot. No hallucinated permissions.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 8-networking
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # (A) AZURE LOAD BALANCER
+  # ===========================================================================
+
+  # --- Full administrative control over a Load Balancer ----------------------
+  - id: azure-lb-admin
+    emits: CanAdminister
+    description: "Holding the Microsoft.Network/loadBalancers/* wildcard grants full control of a Standard Load Balancer."
+    match_effective_permission:
+      action: "Microsoft.Network/loadBalancers/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Microsoft.Network/loadBalancers/* (Network Contributor / Contributor / Owner) — not merely .../loadBalancers/read"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<Microsoft.Network/loadBalancers in scope>"
+      permissions: ["Microsoft.Network/loadBalancers/write", "Microsoft.Network/loadBalancers/delete"]
+      false_positive_note: >-
+        CanAdminister requires the write wildcard. A read-only role with only
+        Microsoft.Network/loadBalancers/read does NOT get CanAdminister.
+        Network Contributor grants Microsoft.Network/* and qualifies. Reader does not.
+        The wildcard does NOT include Microsoft.Authorization/*/write; RBAC escalation
+        requires a separate permission.
+      narrative: >-
+        {principal.name} has full administrative control of load balancer {target.name}
+        (Microsoft.Network/loadBalancers/write wildcard), including modifying frontend IPs,
+        backend pools, and load-balancing rules.
+
+  # --- Public frontend IP -> ExposedToInternet --------------------------------
+  - id: azure-lb-public-frontend-exposed
+    emits: ExposedToInternet
+    description: "A Standard Load Balancer with a public frontend IP is reachable from the internet on its listener ports."
+    where:
+      - "frontendIPConfigurations[*].publicIPAddress is non-null (allocated public IP)"
+      - "at least one loadBalancingRule or inboundNatRule references the public frontend"
+    emit:
+      source_type: LoadBalancer
+      target_type: AnonymousIdentity
+      source: "<Microsoft.Network/loadBalancers with public frontend>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      state_logic: >-
+        ACTIVE: the LB frontend itself is internet-reachable by definition (the public IP
+        is allocated and has a listener). Backend VM reachability is CONDITIONAL(network_reachability)
+        in downstream rules because Standard LB is closed by default; the backend subnet/NIC
+        NSG must explicitly allow the port. The ExposedToInternet edge on the LB itself is
+        ACTIVE (no condition). Backend exposure conditions are handled by the network-chains
+        linchpin when composing transitive paths (LB -> NSG -> VM reach).
+      false_positive_note: >-
+        Standard Load Balancer is closed-to-inbound by default. A public frontend IP alone
+        is necessary but not sufficient for backends to be reachable: the effective NSG on
+        the backend subnet or NIC must have an ALLOW rule for the port. This rule emits
+        ExposedToInternet on the LB as ACTIVE (the IP is internet-reachable). Backend VM
+        reachability is conditional and composed by the network-chains linchpin.
+        An internal LB (frontendIPConfigurations[*].privateIPAddress only, no publicIPAddress)
+        is NOT internet-exposed — do not emit this rule.
+      narrative: >-
+        Load balancer {source.name} has a public frontend IP; internet hosts can send
+        traffic to its listener ports. Backend VM reachability depends on the effective
+        NSG on the backend subnet or NIC.
+
+  # --- LB forwards traffic to its backend pool (structural FACT via explicit_rules) --------
+  # NOTE: RoutesTo source is restricted to [Route, Subnet, TransitGateway] in edges.yaml.
+  # A LoadBalancer forwarding to a backend pool is a structural fact recorded in the
+  # explicit_rules section below (azure-lb-backend-pool-membership, AttachedTo).
+  # Transitive reachability (internet -> LB -> backend VM) is composed by the future
+  # network-chains linchpin; do NOT emit CanNetworkReach here.
+
+  # --- LB write -> CanModifyConfiguration (weaken/expand exposure) ------------
+  - id: azure-lb-write
+    emits: CanModifyConfiguration
+    description: "Writing a Load Balancer resource allows adding a public frontend IP, new load-balancing rules, or inbound NAT rules that expose previously private ports."
+    match_effective_permission:
+      action: "Microsoft.Network/loadBalancers/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<Microsoft.Network/loadBalancers in scope>"
+      permissions: ["Microsoft.Network/loadBalancers/write"]
+      escalation: >-
+        Promote an internal LB to public by adding a publicIPAddress frontend, or expose
+        additional ports via new load-balancing rules, redirecting or widening internet access
+        to backend VMs.
+      false_positive_note: >-
+        loadBalancers/write requires PUT/PATCH on the full LB object or sub-resources.
+        Confirm the principal does not have a deny assignment covering this operation.
+        Impact varies: adding a public frontend to a previously internal LB is high-impact;
+        modifying an existing public LB's probe timeout is low-impact. Scope the narrative
+        to the specific mutation detected in the configuration delta.
+      narrative: >-
+        {principal.name} can modify load balancer {target.name}
+        (Microsoft.Network/loadBalancers/write), including adding a public frontend IP
+        or new load-balancing/NAT rules that expose backend VMs to the internet.
+
+  # --- LB backend pool write -> add attacker-controlled VM to pool -----------
+  - id: azure-lb-backend-pool-write
+    emits: CanModifyConfiguration
+    description: "Writing a Load Balancer backend address pool allows adding an attacker-controlled VM to the pool, routing a fraction of traffic to it for interception or amplification."
+    match_effective_permission:
+      action: "Microsoft.Network/loadBalancers/backendAddressPools/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<Microsoft.Network/loadBalancers in scope>"
+      permissions: ["Microsoft.Network/loadBalancers/backendAddressPools/write"]
+      escalation: >-
+        Add an attacker-controlled VM or IP to the backend pool. The LB will distribute
+        incoming traffic across all pool members; the attacker receives a fraction of
+        sessions. This enables partial traffic interception (MitM) for credential capture,
+        session hijacking, or lateral movement. Full traffic hijacking requires also
+        removing legitimate backends (needs loadBalancers/write) or removing the pool and
+        recreating it (backendAddressPools/delete + write).
+      false_positive_note: >-
+        An attacker with backendAddressPools/write can only add to the pool; they do not
+        receive ALL traffic by default, only their fraction (1/N of sessions). Impact is
+        traffic interception on a subset of connections, not full MitM unless combined with
+        removal of other backends or modification of the LB's distribution algorithm (also
+        requires loadBalancers/write). The attack is high-value for credential capture
+        (user login sessions) but does not grant execution on the legitimate backends.
+        Narrow scopes (backendAddressPools/write on a specific pool) are less dangerous
+        than the full loadBalancers/write wildcard but still attack-relevant.
+      narrative: >-
+        {principal.name} can modify the backend address pool on load balancer {target.name}
+        (backendAddressPools/write), allowing them to add an attacker-controlled VM or IP.
+        Incoming traffic will be distributed to the attacker's machine along with
+        legitimate backends, enabling traffic interception and credential capture.
+
+  # --- LB inbound NAT rule write -> expose specific VM port ------------------
+  - id: azure-lb-nat-rule-write
+    emits: CanModifyConfiguration
+    description: "Creating or modifying an inbound NAT rule maps a public LB frontend port directly to a backend VM's port, potentially exposing SSH/RDP/admin ports to the internet."
+    match_effective_permission:
+      action: "Microsoft.Network/loadBalancers/inboundNatRules/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<Microsoft.Network/loadBalancers in scope>"
+      permissions: ["Microsoft.Network/loadBalancers/inboundNatRules/write"]
+      escalation: >-
+        Create NAT rule: frontend public IP port N -> backend VM port 22 (SSH) or 3389 (RDP),
+        exposing the VM's management interface to the internet without changing the NSG
+        (if the NSG was already allowing traffic via the LB).
+      false_positive_note: >-
+        An inbound NAT rule on a public LB can expose a specific backend VM port.
+        This only creates internet exposure if the LB already has a public frontend IP
+        (see azure-lb-public-frontend-exposed); on an internal LB, this expands
+        within-VNet reach, not internet exposure. Also requires the backend NSG to
+        allow the traffic. Emit CONDITIONAL(network_reachability) if NSG is not confirmed
+        permissive.
+      narrative: >-
+        {principal.name} can create or modify inbound NAT rules on load balancer
+        {target.name} (inboundNatRules/write), directly mapping a public frontend port
+        to a backend VM's service port (e.g., SSH/RDP), potentially exposing management
+        interfaces to the internet.
+
+  # ===========================================================================
+  # (B) AZURE APPLICATION GATEWAY
+  # ===========================================================================
+
+  # --- Full administrative control over an Application Gateway ---------------
+  - id: azure-appgw-admin
+    emits: CanAdminister
+    description: "Holding Microsoft.Network/applicationGateways/* grants full control of an Application Gateway including routing rules, SSL certs, WAF policy, and backend pools."
+    match_effective_permission:
+      action: "Microsoft.Network/applicationGateways/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Microsoft.Network/applicationGateways/* (Network Contributor / Contributor / Owner)"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<Microsoft.Network/applicationGateways in scope>"
+      permissions:
+        - "Microsoft.Network/applicationGateways/write"
+        - "Microsoft.Network/applicationGateways/delete"
+        - "Microsoft.Network/applicationGateways/start/action"
+        - "Microsoft.Network/applicationGateways/stop/action"
+        - "Microsoft.Network/applicationGateways/backendAddressPools/write"
+        - "Microsoft.Network/applicationGateways/backendHttpSettingsCollection/write"
+        - "Microsoft.Network/applicationGateways/urlPathMaps/write"
+        - "Microsoft.Network/applicationGateways/requestRoutingRules/write"
+      false_positive_note: >-
+        CanAdminister requires the write wildcard. Network Contributor qualifies.
+        The wildcard does NOT include Microsoft.Authorization/*/write.
+        App GW/write does NOT automatically grant rights over the Key Vault holding
+        SSL certificates; that requires separate permissions on the Key Vault.
+        The permissions list includes sub-resource write operations that are independently
+        grantable and covered by the wildcard (Network Contributor / Contributor / Owner).
+      narrative: >-
+        {principal.name} has full administrative control of Application Gateway {target.name}
+        (Microsoft.Network/applicationGateways/*), including routing rules, backend pools,
+        SSL certificates, backend HTTP settings, URL path maps, request routing rules,
+        WAF policy, and the ability to start or stop the gateway.
+
+  # --- Public App GW frontend -> ExposedToInternet ----------------------------
+  - id: azure-appgw-public-frontend-exposed
+    emits: ExposedToInternet
+    description: "An Application Gateway with a public frontend IP accepts HTTP/HTTPS traffic from the internet on its listener ports."
+    where:
+      - "frontendIPConfigurations[*].publicIPAddress is non-null (allocated public IP)"
+      - "at least one httpListener references the public frontendIPConfiguration"
+    emit:
+      source_type: LoadBalancer
+      target_type: AnonymousIdentity
+      source: "<Microsoft.Network/applicationGateways with public frontend>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      state_logic: >-
+        ACTIVE when the public frontend IP is allocated and a listener is configured.
+        Application Gateway does not have the closed-by-default restriction of Standard LB;
+        listener ports (80, 443) are open to the internet once the frontend is public.
+        WAF (if present in Prevention mode) filters L7 attacks but does not block the
+        network-level exposure — emit ExposedToInternet regardless of WAF state.
+      false_positive_note: >-
+        An internal Application Gateway (all frontendIPConfigurations reference only
+        privateIPAddress, no publicIPAddress) is NOT internet-exposed — do not emit.
+        WAF presence in Prevention mode reduces L7 exploitability but does NOT change
+        the ExposedToInternet fact; note WAF presence in the narrative.
+        A stopped Application Gateway (powerState == Stopped) is not actively routing;
+        emit CONDITIONAL(service_state) if the gateway is stopped.
+      narrative: >-
+        Application Gateway {source.name} has a public frontend IP; the internet can
+        reach its listeners on the configured ports (typically 80/443). WAF (if attached
+        in Prevention mode) filters L7 attacks but the gateway frontend is internet-reachable.
+
+  # --- App GW routes traffic to its backend pool (structural FACT via explicit_rules) ------
+  # NOTE: RoutesTo source is restricted to [Route, Subnet, TransitGateway] in edges.yaml.
+  # Application Gateway backend pool membership is a structural fact recorded in the
+  # explicit_rules section below (azure-appgw-backend-pool-membership, AttachedTo).
+  # Transitive reachability (internet -> App GW -> backend) is composed by the future
+  # network-chains linchpin; do NOT emit CanNetworkReach here.
+
+  # --- App GW write -> CanModifyConfiguration (routing hijack / exposure) -----
+  - id: azure-appgw-write
+    emits: CanModifyConfiguration
+    description: "Writing an Application Gateway allows an attacker to redirect routing rules to attacker-controlled backends, swap SSL certificates, or modify the WAF policy binding — all without touching the backend VMs."
+    match_effective_permission:
+      action: "Microsoft.Network/applicationGateways/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<Microsoft.Network/applicationGateways in scope>"
+      permissions: ["Microsoft.Network/applicationGateways/write"]
+      escalation: >-
+        (a) Change requestRoutingRules[*].backendAddressPool to an attacker-controlled IP/FQDN:
+        all matched HTTP/HTTPS traffic (including user sessions and credentials) is now
+        forwarded to the attacker after SSL termination at the App GW.
+        (b) Remove the WAF policy reference: L7 attack filtering is removed for all requests.
+        (c) Change frontendIPConfigurations to add a public IP to a previously internal App GW.
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE if the gateway is running (powerState != Stopped).
+        CONDITIONAL(service_state) if the gateway is stopped (the write can still be applied
+        but takes effect at next start).
+      false_positive_note: >-
+        applicationGateways/write is a high-privilege operation (effectively full control).
+        An attacker redirecting backend pool targets receives decrypted (post-SSL-termination)
+        traffic. The impact requires the gateway to be in use by production traffic; a staging
+        or unused gateway is lower impact but still a configuration-mutation fact.
+        Confirm no deny assignment covers this operation.
+      narrative: >-
+        {principal.name} can modify Application Gateway {target.name}
+        (Microsoft.Network/applicationGateways/write). An attacker can redirect routing rules
+        to an attacker-controlled backend, receiving decrypted application traffic after SSL
+        termination, or remove WAF protection from all requests.
+
+  # --- WAF policy write -> weaken L7 filtering --------------------------------
+  - id: azure-appgw-waf-policy-write
+    emits: CanModifyConfiguration
+    description: "Writing a WAF policy on an Application Gateway allows switching the policy from Prevention to Detection mode (allowing all attacks through) or disabling managed rule sets, weakening L7 security for all backends behind the gateway."
+    match_effective_permission:
+      action: "Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal>"
+      target: "<Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies in scope>"
+      permissions: ["Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies/write"]
+      escalation: >-
+        Switch policySettings.mode from Prevention to Detection: WAF now logs attacks but
+        no longer blocks them — SQLi, XSS, SSRF, path-traversal payloads that were previously
+        rejected now reach the backend services. Disable managed rule sets (OWASP, Bot Manager)
+        to remove broad exploit coverage.
+      false_positive_note: >-
+        Only impactful if the WAF policy is actively associated with an Application Gateway
+        that is running and serving traffic. A WAF policy not yet attached to any gateway
+        (or attached to a stopped gateway) reduces immediate impact.
+        A WAF already in Detection mode is already permissive; switching to Prevention is
+        the secure direction, but modifying from Detection further weakening custom rules
+        is still significant.
+      narrative: >-
+        {principal.name} can modify WAF policy {target.name}
+        (ApplicationGatewayWebApplicationFirewallPolicies/write). Switching from
+        Prevention to Detection mode or disabling managed OWASP/Bot Manager rule sets
+        allows previously-blocked L7 attacks (SQLi, XSS, SSRF) to reach backend services.
+
+  # --- WAF policy delete -> remove all L7 filtering ---------------------------
+  - id: azure-appgw-waf-policy-delete
+    emits: CanModifyConfiguration
+    description: "Deleting a WAF policy detaches it from all associated Application Gateways, removing all L7 filtering and reverting those gateways to Standard_v2 (WAF-less) behavior."
+    match_effective_permission:
+      action: "Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies/delete"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal>"
+      target: "<Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies in scope>"
+      permissions: ["Microsoft.Network/ApplicationGatewayWebApplicationFirewallPolicies/delete"]
+      escalation: >-
+        Deleting the WAF policy removes all L7 filtering from every Application Gateway
+        that references it. All managed rule sets (OWASP CRS, Bot Manager, DRS) and custom
+        rules are immediately removed from the traffic pipeline.
+      false_positive_note: >-
+        A WAF policy delete is immediately effective (no restart required) once the policy
+        is de-associated. Azure may prevent deletion of a WAF policy while it is still
+        associated with an active gateway (the operation will fail with a dependency error);
+        in that case the principal would need applicationGateways/write to disassociate first.
+        Emit as CONDITIONAL(service_state) if the policy is currently in active use by a
+        running gateway (deletion may be blocked by the service until disassociated).
+      narrative: >-
+        {principal.name} can delete WAF policy {target.name}
+        (ApplicationGatewayWebApplicationFirewallPolicies/delete), removing all L7 attack
+        filtering (SQLi, XSS, SSRF, Bot Manager) from every Application Gateway that
+        references this policy.
+
+  # --- App GW identity attachment -> CanAttachIdentity (Key Vault pivot) ------
+  - id: azure-appgw-attach-mi
+    emits: CanAttachIdentity
+    description: "An attacker who can write an Application Gateway and pass a user-assigned MI can swap the gateway's identity, gaining that MI's Key Vault (and potentially broader) permissions."
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?userMI"
+      - "?principal has EFFECTIVE Microsoft.Network/applicationGateways/write on the target Application Gateway"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<Microsoft.Network/applicationGateways>"
+      permissions:
+        - "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
+        - "Microsoft.Network/applicationGateways/write"
+      conditions: [role_compatibility]
+      state_logic: >-
+        if both assign/action and applicationGateways/write are confirmed at their
+        respective scopes with no deny assignment: ACTIVE;
+        if assign/action or trust is unknown/unresolved: POTENTIAL(role_compatibility).
+      derived_from: [ "<CanPassIdentity edge_id>" ]
+      note: >-
+        Emits CanAttachIdentity with nature: derived. CanAttachIdentity in edges.yaml
+        allows nature: explicit, but this rule is a pattern-based derivation that
+        combines CanPassIdentity + write permission. Both nature modes are conformant
+        (CanAttachIdentity: nature: explicit in edges.yaml; derived rule may only emit
+        nature: derived or both, not explicit alone). This rule MUST use nature: both
+        in edges.yaml or be reformulated as an explicit_rules entry without match:.
+        The current derivation pattern is correct; CanAttachIdentity's nature in
+        edges.yaml needs to be updated to both to reflect this reality.
+      false_positive_note: >-
+        BOTH permissions are required: assign/action on the target MI AND
+        applicationGateways/write on the gateway. Neither alone attaches the MI.
+        The attached MI on an Application Gateway is used for Key Vault certificate
+        access — confirm the MI's role assignments to determine actual blast radius
+        (may be limited to Key Vault reads). Do not assume subscription-level escalation
+        without checking the MI's effective permissions.
+      narrative: >-
+        {principal.name} can attach user-assigned MI {userMI.name} to Application Gateway
+        {target.name} (assign/action + applicationGateways/write). This grants the gateway
+        — and any process that can read Key Vault secrets via the gateway's identity — the
+        permissions of {userMI.name}.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - A deny assignment covering Microsoft.Network/loadBalancers/write or
+#     Microsoft.Network/applicationGateways/write at the resource/RG/subscription scope
+#     causes the corresponding CanModifyConfiguration or CanAdminister edge to be emitted
+#     with state: BLOCKED and denied_by=<deny assignment id>.
+#   - Azure Policy with effect Deny on Microsoft.Network/loadBalancers (e.g. denying
+#     public frontend IPs) prevents azure-lb-public-frontend-exposed from being ACTIVE
+#     for new deployments but does not retroactively block existing public LBs.
+#   - A Gateway-level WAF policy in Prevention mode is a hardening control; emit
+#     ExposedToInternet on the App GW regardless (WAF filters L7, does not block
+#     network-level access), but note WAF presence in the narrative.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service belong in
+# /rules/explicit/azure-loadbalancer.yaml (emit: LocatedIn, AttachedTo, RoutesTo structural
+# facts from raw ARM config). See providers/azure/loadbalancer.md § 17 for the full list.
+# The azure-lb-routes-to-backend and azure-appgw-routes-to-backend rules above emit the
+# RoutesTo FACT directly and are listed here as derived rules because they depend on backend
+# pool enumeration (a join across LB and VM/VMSS records); a purely explicit rule would
+# suffice if the collector materializes backend membership directly.
+explicit_rules:
+
+  - id: azure-lb-located-in-vnet
+    emits: LocatedIn
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.Network/loadBalancers"
+      field: "frontendIPConfigurations[*].subnet.id"
+    emit:
+      source: "<loadBalancer>"
+      target: "<VirtualNetwork containing the frontend subnet>"
+      api_source: "GET Microsoft.Network/loadBalancers"
+      evidence_field: "frontendIPConfigurations[*].subnet.id"
+      narrative: "Load balancer {source.name} is deployed in VNet {target.name} (frontend subnet)."
+
+  - id: azure-appgw-located-in-vnet
+    emits: LocatedIn
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.Network/applicationGateways"
+      field: "gatewayIPConfigurations[*].subnet.id"
+    emit:
+      source: "<applicationGateway>"
+      target: "<VirtualNetwork containing the App GW subnet>"
+      api_source: "GET Microsoft.Network/applicationGateways"
+      evidence_field: "gatewayIPConfigurations[*].subnet.id"
+      narrative: "Application Gateway {source.name} is deployed in its dedicated subnet in VNet {target.name}."
+
+  - id: azure-appgw-waf-policy-attached
+    emits: HasPolicy
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.Network/applicationGateways"
+      field: "webApplicationFirewallConfiguration or firewallPolicy.id"
+    emit:
+      source: "<applicationGateway>"
+      target: "<ApplicationGatewayWebApplicationFirewallPolicy>"
+      api_source: "GET Microsoft.Network/applicationGateways"
+      evidence_field: "firewallPolicy.id"
+      note: >-
+        Structural fact: Application Gateway has a WAF policy bound to it.
+        Emits HasPolicy (LoadBalancer -> Firewall) instead of AttachedTo because
+        AttachedTo's source list does not include Firewall (only [NetworkInterface,
+        BlockStorage, ManagedIdentity, IAMPolicy]). HasPolicy is the correct semantic
+        edge for policy association; it feeds the permission evaluator and indicates
+        that the gateway is governed by the policy's rules (Prevention/Detection mode).
+      narrative: "Application Gateway {source.name} has WAF policy {target.name} bound to it."
+
+  - id: azure-appgw-mi-attached
+    emits: AttachedTo
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.Network/applicationGateways"
+      field: "identity.userAssignedIdentities"
+    where: ["identity.type in [UserAssigned, 'SystemAssigned, UserAssigned']"]
+    emit:
+      source: "<user-assigned managed identity>"
+      target: "<applicationGateway>"
+      api_source: "GET Microsoft.Network/applicationGateways"
+      evidence_field: "identity.userAssignedIdentities"
+      narrative: "User-assigned MI {source.name} is attached to Application Gateway {target.name} for Key Vault certificate access."
+
+  - id: azure-lb-backend-pool-membership
+    emits: MemberOf
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.Network/loadBalancers"
+      field: "backendAddressPools[*].loadBalancerBackendAddresses[*].networkInterfaceIPConfiguration.id"
+    where: ["backendAddressPools[*].loadBalancerBackendAddresses is non-empty"]
+    emit:
+      source: "<Microsoft.Network/networkInterfaces (backend NIC)>"
+      target: "<Microsoft.Network/loadBalancers/backendAddressPools>"
+      api_source: "GET Microsoft.Network/loadBalancers/backendAddressPools"
+      evidence_field: "backendAddressPools[*].loadBalancerBackendAddresses[*].networkInterfaceIPConfiguration.id"
+      note: >-
+        Structural fact: NIC is a member of the LB backend pool. Combined with
+        ExposedToInternet(LB) and the NIC's owning VM's ExecutesAs(MI), the future
+        network-chains linchpin composes the internet -> LB -> VM -> MI attack path.
+        Emits MemberOf(NIC -> BackendPool) instead of AttachedTo because AttachedTo's
+        target list does not include LoadBalancer (only [Compute, VirtualNetwork, Identity]).
+        MemberOf models the NIC's logical membership in the pool resource. This is a
+        schema-gap workaround; ideally the schema would support structural membership
+        facts like RoutesTo or a dedicated MemberOfBackendPool edge.
+      narrative: "NIC {source.name} is a member of load balancer {target.name}'s backend pool."
+
+  - id: azure-appgw-backend-pool-membership
+    emits: MemberOf
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.Network/applicationGateways"
+      field: "backendAddressPools[*].backendAddresses[*]"
+    where: ["backendAddressPools[*].backendAddresses is non-empty"]
+    emit:
+      source: "<Compute or ApplicationPlatform matching the backend FQDN/IP>"
+      target: "<Microsoft.Network/applicationGateways/backendAddressPools>"
+      api_source: "GET Microsoft.Network/applicationGateways"
+      evidence_field: "backendAddressPools[*].backendAddresses[*].fqdn or .ipAddress"
+      note: >-
+        Structural fact: backend target is a member of the App GW's backend pool.
+        Combined with ExposedToInternet(App GW) and the backend's ExecutesAs(MI),
+        the future network-chains linchpin composes the internet -> App GW -> backend path.
+        Emits MemberOf(Compute/ApplicationPlatform -> BackendPool) instead of AttachedTo
+        because AttachedTo's source list does not include Compute or ApplicationPlatform
+        (only [NetworkInterface, BlockStorage, ManagedIdentity, IAMPolicy]) and target
+        does not include LoadBalancer. MemberOf models the backend's logical membership
+        in the pool resource. This is a schema-gap workaround; the schema should support
+        a dedicated structural edge for backend pool membership.
+      narrative: "Backend {source.name} is a member of Application Gateway {target.name}'s backend pool."

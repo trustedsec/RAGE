@@ -1,0 +1,344 @@
+# Azure — Batch (Microsoft.Batch) execution rules (Phase 4)
+# ---------------------------------------------------------------------------
+# Core Azure Batch escalation primitive:
+#   a Batch POOL can carry one or more user-assigned managed identities. Every
+#   compute node in the pool inherits them, so any code that runs on a node — a
+#   pool startTask, a job task, or an application package — can mint MI tokens
+#   from IMDS (169.254.169.254/metadata/identity/oauth2/token, header
+#   "Metadata: true"). Getting code onto a node therefore == executing as the
+#   pool MI.
+#
+# Two independent execution entry points:
+#   (a) MANAGEMENT plane (ARM RBAC): Microsoft.Batch/batchAccounts/pools/write
+#       sets the pool startTask/identity; applications/versions/write deploys code.
+#   (b) DATA plane: Microsoft.Batch/batchAccounts/jobs/write (a DATA action) OR a
+#       shared key from batchAccounts/listkeys/action authenticates to
+#       <account>.<region>.batch.azure.com to submit tasks with no further RBAC.
+#
+# All operation strings verified against the Microsoft.Batch resource-provider
+# operations reference, the Batch managed-identity-pools doc, and the Batch RBAC
+# doc. Every rule records the effective operation the evaluator must confirm at
+# the account / pool / MI scope. Deny assignments override -> BLOCKED. Escalation
+# edges require the pool MI (or key-reachable resources) to out-privilege caller.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 4-compute-serverless
+applies_to: [azure]
+
+rules:
+
+  # === Administrative control over the Batch account ========================
+  - id: azure-batch-account-contributor
+    emits: CanAdminister
+    match_effective_permission: {action: "Microsoft.Batch/batchAccounts/write", scope_type: "resource|resourceGroup|subscription"}
+    where: ["principal effectively holds Azure Batch Account Contributor / Contributor / Owner (or a custom role granting Microsoft.Batch/batchAccounts/*) at the scope"]
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<batchAccount in scope>"
+      permissions: ["Microsoft.Batch/batchAccounts/write"]
+      false_positive_note: "batchAccounts/* grants full control of the account, pools, jobs, applications and keys, but NOT Microsoft.Authorization/*/write. It is still sufficient for code execution via pools/write + startTask and for listkeys."
+      narrative: "{principal.name} has full control of Batch account {target.name} (Microsoft.Batch/batchAccounts/*)."
+
+  # === Shared-key credential access (data-plane pivot) ======================
+  - id: azure-batch-listkeys
+    emits: CanReadSecret
+    match_effective_permission:
+      any_of:
+        - {action: "Microsoft.Batch/batchAccounts/listkeys/action", scope_type: "resource|resourceGroup|subscription"}
+        - {action: "Microsoft.Batch/batchAccounts/regeneratekeys/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<principal>"
+      target: "<Batch account shared keys (AccessKey)>"
+      permissions: ["Microsoft.Batch/batchAccounts/listkeys/action", "Microsoft.Batch/batchAccounts/regeneratekeys/action"]
+      note: "Primary/secondary keys authenticate to the data plane (<account>.<region>.batch.azure.com) to submit jobs/tasks."
+      state_logic: "ACTIVE via listkeys/action OR regeneratekeys/action; regeneratekeys/action ALONE is sufficient because regenerating a key returns the new key value, so a principal with only regeneratekeys (and no listkeys) still obtains a usable shared key."
+      false_positive_note: "listkeys/regeneratekeys yield DATA-plane keys only; neither lets the holder change a pool identity block (management-plane + Entra only). regeneratekeys/action alone is a credential-access primitive: it returns the regenerated key value (and rotates the old one). It escalates to execution only when an identity-bearing pool already exists to submit tasks into."
+      narrative: "{principal.name} can retrieve or regenerate the shared keys of Batch account {target.name} (batchAccounts/listkeys/action or regeneratekeys/action) and authenticate to the data plane."
+
+  - id: azure-batch-sync-autostorage-keys
+    emits: CanReadSecret
+    match_effective_permission: {action: "Microsoft.Batch/batchAccounts/syncAutoStorageKeys/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<principal>"
+      target: "<linked auto-storage account>"
+      permissions: ["Microsoft.Batch/batchAccounts/syncAutoStorageKeys/action"]
+      note: "Syncs the linked storage account keys into Batch; gives access to the auto-storage account backing resource files / application packages."
+      false_positive_note: "Only meaningful if the account has an auto-storage account configured; otherwise do not emit."
+      narrative: "{principal.name} can sync the auto-storage keys of Batch account (syncAutoStorageKeys/action), reaching the linked storage account."
+
+  - id: azure-batch-config-secrets
+    emits: ExposesCredential
+    description: "Pool startTask / job env settings / resource-file SAS URLs frequently embed secrets, readable at Reader level."
+    match_effective_permission: {action: "Microsoft.Batch/batchAccounts/pools/read", scope_type: "resource|resourceGroup|subscription"}
+    where: ["pool startTask.environmentSettings, job env, or resource-file httpUrl (SAS) contains credential material"]
+    emit:
+      source: "<batchAccount/pool>"
+      target: "<embedded credential>"
+      permissions: ["Microsoft.Batch/batchAccounts/pools/read"]
+      false_positive_note: "Only emit when a secret is actually present in env settings / resource-file SAS; presence of the read permission alone is recon, not credential exposure."
+      narrative: "{pool.name} exposes a credential in its startTask environment / resource-file SAS URL, readable with pools/read."
+
+  # === Code / config modification on the pool (management plane) ============
+  - id: azure-batch-pool-write-starttask
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Batch/batchAccounts/pools/write", scope_type: "resource|resourceGroup|subscription"}
+    where: ["also matches Microsoft.Batch/batchAccounts/computePools/write for the newer pool API"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<batch pool>"
+      permissions: ["Microsoft.Batch/batchAccounts/pools/write"]
+      conditions: [service_state]
+      escalation: "Set/replace the pool startTask.commandLine (or container config) so every node runs attacker code at node start/scale-up."
+      false_positive_note: "startTask executes when nodes start / scale up; on a pool with zero nodes emit CONDITIONAL(service_state) and pair with a scale/create action."
+      narrative: "{principal.name} can set the startTask command of pool {target.name} (pools/write), running attacker code on every node."
+
+  - id: azure-batch-pool-write-config
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "Microsoft.Batch/batchAccounts/pools/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<batch pool>"
+      permissions: ["Microsoft.Batch/batchAccounts/pools/write"]
+      note: "Can change the pool identity block (attach user-assigned MI), startTask, env, and resource files; alters ExecutesAs and realizes execution at next node (re)create."
+      false_positive_note: "In-place identity updates do NOT propagate to already-running nodes; scale-to-zero then recreate is required, so realized execution may be CONDITIONAL(service_state)."
+      narrative: "{principal.name} can rewrite the configuration of pool {target.name} (pools/write) including its managed-identity block and startTask."
+
+  - id: azure-batch-application-version-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Batch/batchAccounts/applications/versions/write", scope_type: "resource|resourceGroup|subscription"}
+    optional_permission: "Microsoft.Batch/batchAccounts/applications/versions/activate/action"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<batch application package>"
+      permissions: ["Microsoft.Batch/batchAccounts/applications/versions/write", "Microsoft.Batch/batchAccounts/applications/versions/activate/action"]
+      conditions: [service_state]
+      escalation: "Upload + activate an application package that is deployed to pool nodes referencing it, executing on the node."
+      false_positive_note: "Only reaches execution on pools that reference the application (applicationPackageReferences) and that have (or will have) nodes; else POTENTIAL."
+      narrative: "{principal.name} can upload and activate an application package (applications/versions/write + activate/action) deployed to Batch nodes."
+
+  # === Data-plane task submission (run commandLine on nodes) ================
+  - id: azure-batch-submit-task
+    emits: CanExecuteCommand
+    description: "Submit a job/task whose commandLine runs on pool nodes."
+    match_effective_permission: {action: "Microsoft.Batch/batchAccounts/jobs/write", data_action: true, scope_type: "resource|resourceGroup|subscription"}
+    optional:
+      - [ ?principal, CanReadSecret, "<Batch account shared keys>" ]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<batch pool (ContainerCluster)>"
+      permissions: ["Microsoft.Batch/batchAccounts/jobs/write"]
+      conditions: [service_state]
+      state_logic: "ACTIVE via the jobs/write DATA action OR via a held shared key (optional[0]); else do not emit"
+      false_positive_note: "jobs/write is a DATA action - a narrow custom role with management actions only does NOT grant it. Either the data action OR possession of a shared key (listkeys/regeneratekeys) is required to submit a task. Emitted as CanExecuteCommand (not CanInvoke) because the pool is a ContainerCluster, which is outside the CanInvoke target set [ServerlessFunction, API, APIGateway, Workflow]; task submission runs an attacker-chosen commandLine on the pool nodes, which is the CanExecuteCommand semantic."
+      narrative: "{principal.name} can submit a task to pool {target.name} (jobs/write data action or shared key), executing its commandLine on the nodes."
+
+  - id: azure-batch-jobschedule-write
+    emits: CanSchedule
+    match_effective_permission: {action: "Microsoft.Batch/batchAccounts/jobSchedules/write", data_action: true, scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<batch job schedule>"
+      permissions: ["Microsoft.Batch/batchAccounts/jobSchedules/write"]
+      conditions: [service_state, trigger_exists]
+      note: "Creates a recurring schedule that submits jobs -> persistence + trigger for task execution on the pool."
+      false_positive_note: "CanSchedule here is persistence / trigger creation only; onward CanExecuteAs still requires an identity-bearing pool that has (or can scale) nodes. The schedule fires only when the target pool can actually run tasks, so emit CONDITIONAL(service_state, trigger_exists) when the pool has zero nodes or no MI."
+      narrative: "{principal.name} can create a recurring job schedule (jobSchedules/write) that repeatedly runs tasks on Batch nodes."
+
+  # === Identity attachment (Azure PassRole analog) ==========================
+  - id: azure-batch-attach-pool-mi
+    emits: CanAttachIdentity
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?userMI"
+      - "?principal has EFFECTIVE Microsoft.Batch/batchAccounts/pools/write on the target pool (existing or new)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<batch pool (existing or new)>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Batch/batchAccounts/pools/write"]
+      conditions: [role_compatibility, service_state]
+      false_positive_note: "BOTH permissions are required: assign/action on the MI AND pools/write on the pool. Neither alone attaches the MI. Honor the assign/action resource scope. In-place attach needs zero active nodes to propagate."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to pool {target.name} (assign/action + pools/write)."
+
+  # === IMDS credential exposure / token retrieval on nodes ==================
+  - id: azure-batch-node-imds-token
+    emits: CanRetrieveToken
+    description: "Any code on a Batch node can mint a bearer token for each pool user-assigned MI via IMDS."
+    match:
+      - [ ?pool, ExecutesAs, ?mi ]
+    emit:
+      source: "<batch pool / node>"
+      target: "<user-assigned MI bound to the pool>"
+      permissions: []
+      note: "IMDS: GET http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=<aud> with header 'Metadata: true'. The companion ExposesCredential(pool -> mi) edge is emitted by azure-batch-node-imds-exposescred."
+      false_positive_note: "Only fires when the pool actually has a user-assigned MI (identity.type == UserAssigned). The account system-assigned MI (CMK) is NOT the node identity. No pool MI => no token; do NOT emit."
+      narrative: "Any task running on pool {pool.name} can request a bearer token for {mi.name} from IMDS (169.254.169.254) with no node credential."
+
+  - id: azure-batch-node-imds-exposescred
+    emits: ExposesCredential
+    description: "A Batch pool that bears a user-assigned MI leaks that MI's credential to any code on its nodes via IMDS."
+    match:
+      - [ ?pool, ExecutesAs, ?mi ]
+    emit:
+      source: "<batch pool / node>"
+      target: "<user-assigned MI bound to the pool>"
+      permissions: []
+      note: "The pool exposes its MI credential to on-node code through IMDS; paired with azure-batch-node-imds-token (CanRetrieveToken) as the token-mint capability."
+      false_positive_note: "Only fires when the pool actually has a user-assigned MI (identity.type == UserAssigned). The account system-assigned MI (CMK) is NOT the node identity. No pool MI => do NOT emit."
+      narrative: "Batch pool {pool.name} exposes the credential of its user-assigned MI {mi.name} to any code running on its nodes (via IMDS)."
+
+  # === Derived: attacker code -> execute as the pool's managed identity ======
+  - id: azure-batch-execute-as-via-starttask
+    emits: CanExecuteAs
+    description: "Modify a pool startTask/config + the pool runs as an MI => execute as that MI (via IMDS)."
+    match:
+      - [ ?principal, CanModifyCode, ?pool ]
+      - [ ?pool, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?pool) in [ContainerCluster, BatchJob]"
+      - "?mi.privilege_level >= ?principal.privilege_level   # escalation only"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      state_logic: |
+        if ?pool has active nodes: ACTIVE
+        else: CONDITIONAL(service_state)   # needs nodes to start/scale to run the startTask
+      conditions_from: [ ?pool, ?mi ]
+      permissions: ["Microsoft.Batch/batchAccounts/pools/write"]
+      derived_from: [ "<CanModifyCode edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Emit only when the pool has a user-assigned MI that out-privileges the caller. On a zero-node pool -> CONDITIONAL(service_state) until nodes exist."
+      narrative: "{principal.name} can set the startTask of pool {pool.name} (pools/write) so its nodes run attacker code and mint the token of its identity {mi.name} from IMDS, executing as {mi.name}."
+
+  - id: azure-batch-execute-as-via-task
+    emits: CanExecuteAs
+    description: "Submit a data-plane task + the pool runs as an MI => execute as that MI (via IMDS)."
+    match:
+      - [ ?principal, CanExecuteCommand, ?pool ]
+      - [ ?pool, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?pool) in [ContainerCluster, BatchJob]"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      state_logic: |
+        if ?pool has active nodes: ACTIVE
+        else: CONDITIONAL(service_state)
+      conditions_from: [ ?pool, ?mi ]
+      permissions: ["Microsoft.Batch/batchAccounts/jobs/write"]
+      derived_from: [ "<CanExecuteCommand edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Requires a task-submit primitive (jobs/write data action OR shared key) AND a pool MI that out-privileges the caller. Zero-node pool -> CONDITIONAL(service_state)."
+      narrative: "{principal.name} can submit a task to pool {pool.name} (jobs/write or shared key) whose commandLine mints the token of its identity {mi.name} from IMDS, executing as {mi.name}."
+
+  - id: azure-batch-execute-as-via-sharedkey
+    emits: CanExecuteAs
+    description: "Shared key -> data-plane task submit on an identity-bearing pool => execute as the pool MI."
+    match:
+      - [ ?principal, CanReadSecret, ?keys ]
+      - [ ?pool, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?keys) == AccessKey  # Batch account shared keys"
+      - "?keys and ?pool belong to the same Batch account"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      state_logic: |
+        if ?pool has active nodes: ACTIVE
+        else: CONDITIONAL(service_state)
+      conditions_from: [ ?pool, ?mi ]
+      permissions: ["Microsoft.Batch/batchAccounts/listkeys/action"]
+      derived_from: [ "<CanReadSecret edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Only when the shared key belongs to the SAME account as an identity-bearing pool. The key cannot create/modify the pool identity; it only submits tasks into a pool that already has an MI."
+      narrative: "{principal.name} can retrieve the shared keys of the Batch account (listkeys) and submit a task to identity-bearing pool {pool.name}, executing as its MI {mi.name} via IMDS."
+
+  - id: azure-batch-create-workload-as-via-attach-mi
+    emits: CanCreateWorkloadAs
+    description: "Attach a privileged user-assigned MI to a controlled/new pool, add a startTask, and execute as the MI."
+    match:
+      - [ ?principal, CanAttachIdentity, ?pool ]
+      - [ ?principal, CanModifyCode, ?pool ]
+    where:
+      - "?userMI.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Batch/batchAccounts/pools/write"]
+      conditions: [role_compatibility, service_state]
+      derived_from: [ "<CanAttachIdentity edge_id>", "<CanModifyCode edge_id>" ]
+      false_positive_note: "Requires the attach chain (assign/action + pools/write) AND a startTask/task on that pool. Escalation only if the attached MI out-privileges the caller. Zero-node pool -> CONDITIONAL(service_state)."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to a pool it can set a startTask on, executing as {userMI.name}."
+
+  # === Network exposure of the data plane ===================================
+  - id: azure-batch-dataplane-exposed
+    emits: ExposedToAccount
+    description: "Batch account data-plane endpoint reachable by any key/token holder unless restricted to private endpoints."
+    where:
+      - "batchAccount publicNetworkAccess == Enabled (no private-endpoint-only restriction)"
+    emit:
+      source_type: "*"
+      target_type: Subscription
+      source: "<batchAccount>"
+      target: "<Subscription>"
+      conditions: [network_reachability]
+      false_positive_note: "Do not emit if publicNetworkAccess is Disabled or the account is restricted to private endpoints; reachability then requires an in-VNet foothold (PrivateReachability)."
+      narrative: "Batch account {batchAccount.name} exposes its data-plane endpoint (publicNetworkAccess Enabled); any shared-key/token holder can submit tasks."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: any action above covered by an applicable DENY
+# ASSIGNMENT (Azure Blueprint / Managed Application) or an explicit deny in a
+# custom role is emitted with state: BLOCKED and denied_by=<deny assignment>,
+# so the UI can explain why an otherwise-present execution path does not work.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization (raw config -> explicit edges). These belong in
+# /rules/explicit/azure/ but are noted here for completeness; they emit the
+# ExecutesAs / AttachedTo / ContainsCredential facts the derived rules consume.
+# ---------------------------------------------------------------------------
+explicit_rules:
+  - id: azure-batch-pool-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Microsoft.Batch/batchAccounts/pools", field: "identity"}
+    where: ["identity.type == UserAssigned (pools support user-assigned only)"]
+    emit:
+      source: "<batch pool>"
+      target: "<each user-assigned MI in identity.userAssignedIdentities>"
+      note: "userAssignedIdentities keys are Microsoft.ManagedIdentity/userAssignedIdentities resource ids; every node in the pool inherits them."
+      narrative: "Batch pool {pool.name} runs as user-assigned MI {mi.name}."
+
+  - id: azure-batch-pool-mi-attached
+    emits: AttachedTo
+    source_config: {resource_type: "Microsoft.Batch/batchAccounts/pools", field: "identity.userAssignedIdentities"}
+    emit:
+      source: "<user-assigned managed identity>"
+      target: "<batch pool>"
+      narrative: "User-assigned MI {mi.name} is attached to Batch pool {pool.name}."
+
+  - id: azure-batch-account-contains-keys
+    emits: ContainsCredential
+    source_config: {resource_type: "Microsoft.Batch/batchAccounts", field: "sharedKeys"}
+    emit:
+      source: "<batchAccount>"
+      target: "<AccessKey (primary/secondary shared keys)>"
+      note: "Retrievable via batchAccounts/listkeys/action; authenticate to the data plane."
+      narrative: "Batch account {batchAccount.name} holds shared keys that authenticate to its data plane."

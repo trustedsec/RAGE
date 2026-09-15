@@ -1,0 +1,406 @@
+# AWS EC2 — Compute execution / credential-exposure rules (Phase 4)
+# ---------------------------------------------------------------------------
+# Each rule emits a COMMON edge (from schema/edges.yaml). Permissions are the
+# EFFECTIVE actions the permission evaluator must confirm on the given resource
+# scope before the edge is emitted. Action identifiers are taken verbatim from
+# the AWS Service Authorization Reference (Amazon EC2 + EC2 Instance Connect).
+#
+# Central theme: an EC2 instance ExecutesAs the IAM role bound via its instance
+# profile. Any capability that (a) runs attacker code on that instance, or
+# (b) launches/attaches a new instance bound to a chosen role, or (c) reads the
+# role's credentials from IMDS, becomes a CanExecuteAs / credential-access edge.
+#
+# Scope discipline (false-positive control): honor iam:PassRole's
+# iam:PassedToService condition (must include ec2.amazonaws.com), the role trust
+# (must allow ec2.amazonaws.com), and IMDS reachability (HttpEndpoint enabled).
+# A wildcard grant (Resource:"*") widens the target set; a scoped grant restricts
+# it. The evaluator populates ?target from the effective scope only.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 4-compute
+applies_to: [aws]
+
+rules:
+
+  # --- Launch a NEW instance bound to a chosen role (classic privesc) --------
+  - id: aws-ec2-run-instances-as-role
+    emits: CanCreateWorkloadAs
+    description: "RunInstances + PassRole -> launch an instance running as a chosen role, then read IMDS."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE ec2:RunInstances (+ iam:AddRoleToInstanceProfile / iam:CreateInstanceProfile if no profile exists)"
+      - "?role trust policy allows Principal Service ec2.amazonaws.com"
+      - "iam:PassRole iam:PassedToService condition (if any) includes ec2.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<IAM role>"
+      permissions: ["iam:PassRole", "ec2:RunInstances", "iam:AddRoleToInstanceProfile"]
+      conditions: [role_compatibility, iam_permission, condition_expression]
+      escalation: "Launch an attacker-controlled instance bound to a privileged role; UserData runs as root and IMDS vends the role's STS credentials."
+      state_logic: "ACTIVE if role trusts ec2.amazonaws.com and PassedToService includes ec2 else POTENTIAL(role_compatibility)"
+      false_positive_note: "Only ACTIVE when the role trust allows ec2.amazonaws.com AND iam:PassRole is not scoped away from ec2 via iam:PassedToService. A role passable only to lambda/ecs does NOT yield EC2 execution."
+      narrative: "{principal.name} can pass {role.name} to EC2 and run a new instance (iam:PassRole + ec2:RunInstances), executing code as {role.name} and reading its credentials from IMDS."
+
+  # --- Attach / replace instance profile on an EXISTING instance ------------
+  - id: aws-ec2-associate-instance-profile
+    emits: CanAttachIdentity
+    description: "Attach an instance profile (role) to an instance the attacker can run code on."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE ec2:AssociateIamInstanceProfile on ?instance"
+      - "?instance has no existing profile OR attacker also has ec2:DisassociateIamInstanceProfile"
+      - "?role trust policy allows ec2.amazonaws.com; PassedToService includes ec2"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<EC2 instance>"
+      permissions: ["iam:PassRole", "ec2:AssociateIamInstanceProfile", "iam:AddRoleToInstanceProfile"]
+      conditions: [role_compatibility, iam_permission]
+      note: "Chains to CanExecuteAs(role) once the attacker can run code on the instance (SSM/Instance Connect/UserData) or read its IMDS."
+      false_positive_note: "AssociateIamInstanceProfile only succeeds on an instance without a profile; replacing one needs ReplaceIamInstanceProfileAssociation (see aws-ec2-replace-instance-profile). Honor PassedToService=ec2 and role trust."
+      narrative: "{principal.name} can attach instance profile role {role.name} to {instance.name} (ec2:AssociateIamInstanceProfile + iam:PassRole)."
+
+  - id: aws-ec2-replace-instance-profile
+    emits: CanAttachIdentity
+    description: "Swap the role an existing instance runs as."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE ec2:ReplaceIamInstanceProfileAssociation on ?instance"
+      - "?role trust policy allows ec2.amazonaws.com; PassedToService includes ec2"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<EC2 instance>"
+      permissions: ["iam:PassRole", "ec2:ReplaceIamInstanceProfileAssociation"]
+      conditions: [role_compatibility, iam_permission]
+      false_positive_note: "Same PassedToService/trust gating as associate. Newly attached creds surface on the next IMDS credential refresh, not instantly."
+      narrative: "{principal.name} can replace the instance profile on {instance.name} with role {role.name} (ec2:ReplaceIamInstanceProfileAssociation + iam:PassRole)."
+
+  # --- Derive CanExecuteAs from an attached profile + code-exec on the box ---
+  - id: aws-ec2-execute-as-attached-profile
+    emits: CanExecuteAs
+    description: "Run code on an instance that ExecutesAs a role -> execute as that role."
+    match:
+      - [ ?principal, CanExecuteCommand, ?instance ]
+      - [ ?instance,  ExecutesAs,        ?role ]
+    where:
+      - "node_type(?instance) == VirtualMachine"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<IAM role>"
+      permissions: ["<the CanExecuteCommand permission>"]
+      conditions: [network_reachability, service_state]
+      escalation: "OS command execution on a role-bearing instance yields the role's IMDS credentials."
+      state_logic: "ACTIVE if instance running and reachable else CONDITIONAL(service_state, network_reachability)"
+      narrative: "{principal.name} can run commands on {instance.name} which executes as {role.name}, therefore can act as {role.name}."
+
+  # --- EC2 Instance Connect: OS command exec primitive ----------------------
+  - id: aws-ec2-instance-connect-ssh
+    emits: CanExecuteCommand
+    match_effective_permission: {action: "ec2-instance-connect:SendSSHPublicKey", resource_type: "AWS::EC2::Instance"}
+    where:
+      - "?principal can reach the instance on tcp/22 (SG + route) -> CanReachPort"
+      - "instance running (service_state)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<EC2 instance>"
+      permissions: ["ec2-instance-connect:SendSSHPublicKey"]
+      conditions: [network_reachability, service_state]
+      state_logic: "ACTIVE if tcp/22 reachable else CONDITIONAL(network_reachability)"
+      false_positive_note: "SendSSHPublicKey only pushes a 60-second key; without network reachability to port 22 it grants nothing. Requires the OS user to exist and Instance Connect agent present (Amazon Linux 2+/Ubuntu)."
+      narrative: "{principal.name} can push an ephemeral SSH key to {instance.name} (ec2-instance-connect:SendSSHPublicKey) and log in to run commands."
+
+  - id: aws-ec2-instance-connect-serial
+    emits: CanExecuteCommand
+    match_effective_permission: {action: "ec2-instance-connect:SendSerialConsoleSSHPublicKey", resource_type: "AWS::EC2::Instance"}
+    where:
+      - "account/instance serial-console access enabled"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<EC2 instance>"
+      permissions: ["ec2-instance-connect:SendSerialConsoleSSHPublicKey"]
+      conditions: [service_state]
+      false_positive_note: "Serial console must be enabled at account level and the OS must have a password/console login; otherwise POTENTIAL."
+      narrative: "{principal.name} can access the serial console of {instance.name} (ec2-instance-connect:SendSerialConsoleSSHPublicKey)."
+
+  # --- UserData rewrite = boot-time RCE as the existing role -----------------
+  - id: aws-ec2-modify-userdata
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "ec2:ModifyInstanceAttribute", resource_type: "AWS::EC2::Instance"}
+    optional_permission: "ec2:StartInstances"
+    where:
+      - "attribute == userData"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<EC2 instance>"
+      permissions: ["ec2:ModifyInstanceAttribute", "ec2:StopInstances?", "ec2:StartInstances?"]
+      conditions: [service_state]
+      escalation: "Rewrite UserData with a payload that runs as root on next boot; chains to CanExecuteAs the instance-profile role."
+      state_logic: "ACTIVE if attacker also has ec2:StopInstances + ec2:StartInstances (can force boot) else CONDITIONAL(service_state - needs a reboot to trigger)"
+      false_positive_note: "UserData can only be modified while the instance is STOPPED, and by default runs only once per instance lifecycle. Without Stop/Start (or a natural reboot) the payload does not execute -> CONDITIONAL, not immediate RCE."
+      narrative: "{principal.name} can rewrite the UserData of {instance.name} (ec2:ModifyInstanceAttribute) so attacker code runs as root at next boot."
+
+  - id: aws-ec2-start-triggers-userdata
+    emits: CanStart
+    match_effective_permission: {action: "ec2:StartInstances", resource_type: "AWS::EC2::Instance"}
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<EC2 instance>"
+      permissions: ["ec2:StartInstances"]
+      conditions: [service_state]
+      note: "Realizer edge only: CanStart realizes a CONDITIONAL(service_state) execution edge (e.g. poisoned UserData from aws-ec2-modify-userdata) by forcing the boot that triggers it."
+      state_logic: "Not an escalation on its own. Contributes to a path ONLY when a CONDITIONAL(service_state) execution edge (e.g. poisoned UserData) exists on the SAME instance; on a clean instance ec2:StartInstances is inert."
+      false_positive_note: "On a clean instance StartInstances does nothing an attacker benefits from. Emit/walk this as an escalation contributor only in the presence of a pending CONDITIONAL execution edge on the same instance."
+      narrative: "{principal.name} can start {instance.name} (ec2:StartInstances), realizing any pending boot-time execution edge (e.g. poisoned UserData) on it."
+
+  # --- Launch template version: change what future/ASG instances run --------
+  - id: aws-ec2-launch-template-version
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "ec2:CreateLaunchTemplateVersion", resource_type: "AWS::EC2::LaunchTemplate"}
+    optional_permission: "ec2:ModifyLaunchTemplate"
+    where:
+      - "attacker can set the new version as default (ec2:ModifyLaunchTemplate) OR a consumer selects $Latest"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<launch template>"
+      permissions: ["ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate?"]
+      conditions: [role_compatibility]
+      escalation: "Set UserData and IamInstanceProfile in a new default template version; future launches (incl. Auto Scaling) run attacker code as a chosen role."
+      false_positive_note: "Only impactful if something consumes the template ($Latest/$Default or ASG). Setting IamInstanceProfile still requires iam:PassRole for that role at launch time -> pair with the passer, else POTENTIAL."
+      narrative: "{principal.name} can publish a new default launch-template version for {template.name} (ec2:CreateLaunchTemplateVersion), controlling UserData and instance-profile of future launches."
+
+  # --- AMI supply-chain: poison/share an image ------------------------------
+  - id: aws-ec2-modify-image-attr
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "ec2:ModifyImageAttribute", resource_type: "AWS::EC2::Image"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<AMI in scope>"
+      permissions: ["ec2:ModifyImageAttribute"]
+      conditions: [iam_permission]
+      note: "ModifyImageAttribute only changes launchPermission/imdsSupport/description, never the on-disk blocks. Cross-account sharing (launchPermission) is modeled by aws-ec2-share-ami; genuine AMI code control is aws-ec2-create-image."
+      false_positive_note: "ModifyImageAttribute changes launchPermission/imdsSupport/description, not the image blocks themselves; it does NOT poison the AMI's executable content. True in-place code poisoning requires ec2:CreateImage from a compromised instance (see aws-ec2-create-image). Treat this as configuration/launch influence, not a binary edit."
+      narrative: "{principal.name} can modify AMI {image.name} attributes (ec2:ModifyImageAttribute), influencing imdsSupport/launchPermission/description for future instances that boot from it."
+
+  # --- AMI supply-chain: bake attacker code into a new image ----------------
+  - id: aws-ec2-create-image
+    emits: CanModifyCode
+    description: "CreateImage from a compromised instance bakes attacker-controlled disk contents into an AMI consumed by future launches (supply chain)."
+    match_effective_permission: {action: "ec2:CreateImage", resource_type: "AWS::EC2::Instance"}
+    where:
+      - "?principal has EFFECTIVE ec2:CreateImage on a source instance whose disk the attacker controls (post-foothold) OR can register the resulting AMI as a launch source"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<AMI / launch template consumers of the new image>"
+      permissions: ["ec2:CreateImage"]
+      conditions: [iam_permission, service_state]
+      escalation: "Bake attacker code/backdoors into a new AMI; any future instance launched from it (RunInstances / launch template / ASG) boots the poisoned disk, yielding code execution as that instance's role."
+      state_logic: "ACTIVE only once a downstream consumer (RunInstances/launch-template/ASG) launches from the created AMI; else POTENTIAL(trigger_exists) - creating the image alone runs no code."
+      false_positive_note: "CreateImage snapshots an existing instance's volumes into a new AMI; it is only a code-poison primitive when the attacker already controls the source instance's disk contents AND something later launches from the new image. Absent a consumer it is a staged artifact, not execution."
+      narrative: "{principal.name} can create a new AMI from a controlled instance (ec2:CreateImage), baking attacker code into the image that future launches boot from."
+
+  # --- Credential exposure: IMDS token retrieval ----------------------------
+  - id: aws-ec2-imds-token
+    emits: CanRetrieveToken
+    description: "Code running on an instance can read the instance-profile role token from IMDS."
+    match:
+      - [ ?principal, CanExecuteCommand, ?instance ]
+      - [ ?instance,  ExecutesAs,        ?role ]
+    where:
+      - "instance metadata HttpEndpoint != disabled"
+    emit:
+      source: "<principal>"
+      target: "<IAM role>"
+      permissions: []
+      conditions: [service_state, network_reachability]
+      state_logic: "ACTIVE if HttpEndpoint enabled; BLOCKED if MetadataOptions.HttpEndpoint == disabled"
+      false_positive_note: "IMDS creds are only retrievable when the metadata endpoint is enabled. IMDSv2 required + HttpPutResponseHopLimit == 1 blocks SSRF/proxy theft from off-host; on-host code is still fine. If HttpEndpoint disabled -> BLOCKED."
+      narrative: "{principal.name}, able to run on {instance.name}, can query IMDS (169.254.169.254) to retrieve {role.name}'s temporary STS credentials."
+
+  - id: aws-ec2-imds-exposes-role
+    emits: ExposesCredential
+    description: "The instance itself exposes its role's credentials via IMDS."
+    match:
+      - [ ?instance, ExecutesAs, ?role ]
+    where:
+      - "instance MetadataOptions.HttpEndpoint == enabled"
+    emit:
+      source: "<EC2 instance>"
+      target: "<IAM role>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: "ACTIVE if HttpEndpoint enabled else BLOCKED"
+      false_positive_note: "Zero-value if HttpEndpoint disabled. Combined with ExposedToInternet + an SSRF-able app, off-host attackers can reach IMDS unless IMDSv2+hop-limit-1 enforced."
+      narrative: "{instance.name} exposes {role.name}'s STS credentials through the instance metadata service."
+
+  # --- Credential exposure: UserData secrets --------------------------------
+  - id: aws-ec2-userdata-secret
+    emits: ExposesCredential
+    match_effective_permission: {action: "ec2:DescribeInstanceAttribute", resource_type: "AWS::EC2::Instance"}
+    where:
+      - "attribute == userData AND UserData contains a credential/secret"
+    emit:
+      source: "<EC2 instance>"
+      target: "<embedded credential/identity>"
+      permissions: ["ec2:DescribeInstanceAttribute"]
+      false_positive_note: "Only emit when UserData actually contains secret material; most UserData is benign bootstrap. Requires content inspection, not mere presence of the permission."
+      narrative: "{instance.name} UserData (readable via ec2:DescribeInstanceAttribute) contains embedded credentials."
+
+  # --- Credential exposure: Windows password --------------------------------
+  - id: aws-ec2-get-password-data
+    emits: CanReadCredential
+    match_effective_permission: {action: "ec2:GetPasswordData", resource_type: "AWS::EC2::Instance"}
+    where:
+      - "attacker holds the instance key pair private key (to decrypt)"
+    emit:
+      source: "<principal>"
+      target: "<Windows admin credential>"
+      permissions: ["ec2:GetPasswordData"]
+      conditions: [key_permission]
+      state_logic: "ACTIVE only if attacker has the key pair private key else CONDITIONAL(key_permission)"
+      false_positive_note: "GetPasswordData returns the RSA-encrypted admin password; useless without the matching private key. Windows only, and only for the auto-generated password."
+      narrative: "{principal.name} can retrieve the encrypted Windows admin password of {instance.name} (ec2:GetPasswordData) and decrypt it with the key pair."
+
+  # --- Cross-account exfil via snapshot / AMI sharing -----------------------
+  - id: aws-ec2-share-snapshot
+    emits: CanExfiltrate
+    match_effective_permission: {action: "ec2:ModifySnapshotAttribute", resource_type: "AWS::EC2::Snapshot"}
+    emit:
+      source: "<principal>"
+      target: "<EBS snapshot in scope>"
+      permissions: ["ec2:ModifySnapshotAttribute"]
+      cross_account: "adding createVolumePermission for another account or 'all' moves disk data out of the boundary; also emits CrossAccountTrust-style exposure"
+      false_positive_note: "Exfil realized only when the added principal is an attacker-controlled account or 'all'. Sharing a snapshot with no sensitive data is low value; scope to snapshots of role/secret-bearing volumes."
+      narrative: "{principal.name} can share snapshot {snapshot.name} with an external account (ec2:ModifySnapshotAttribute createVolumePermission), exfiltrating its disk contents."
+
+  - id: aws-ec2-share-ami
+    emits: CanExfiltrate
+    match_effective_permission: {action: "ec2:ModifyImageAttribute", resource_type: "AWS::EC2::Image"}
+    where:
+      - "launchPermission add == external account or 'all'"
+    emit:
+      source: "<principal>"
+      target: "<AMI in scope>"
+      permissions: ["ec2:ModifyImageAttribute"]
+      cross_account: "adds launchPermission for another account / 'all'"
+      false_positive_note: "AMIs embed the source instance's disk (incl. any baked-in secrets/UserData). Emit exfil only when launchPermission is widened to an external/attacker account or 'all'."
+      narrative: "{principal.name} can share AMI {image.name} with an external account (ec2:ModifyImageAttribute launchPermission), exposing its baked-in disk data."
+
+  # --- Disk-mount credential theft: snapshot -> volume -> attach ------------
+  - id: aws-ec2-mount-snapshot
+    emits: CanReadData
+    description: "Snapshot a peer instance's volume, create a volume from it, attach to an attacker instance and mount -> read on-disk secrets/keys without running code on the victim."
+    match_effective_permission: {action: "ec2:CreateSnapshot", resource_type: "AWS::EC2::Volume"}
+    where:
+      - "?principal has EFFECTIVE ec2:CreateSnapshot on the target volume AND ec2:CreateVolume AND ec2:AttachVolume to an attacker-controlled instance"
+    emit:
+      source: "<principal>"
+      target: "<peer instance's EBS volume / on-disk data>"
+      permissions: ["ec2:CreateSnapshot", "ec2:CreateVolume", "ec2:AttachVolume"]
+      conditions: [iam_permission, key_permission]
+      escalation: "Copy a peer instance's disk (CreateSnapshot -> CreateVolume -> AttachVolume to an attacker instance -> OS mount) and read its filesystem, harvesting SSH keys, credential files, and application secrets without ever executing code on the victim."
+      state_logic: "ACTIVE if all three actions (CreateSnapshot, CreateVolume, AttachVolume) are effective and the volume is unencrypted or the attacker holds kms:Decrypt on its CMK; else CONDITIONAL(key_permission) when the volume is encrypted with a key the attacker cannot use, or POTENTIAL(iam_permission) when any action is missing."
+      false_positive_note: "Requires all three EBS actions plus an attacker-controlled instance to attach to. An encrypted volume also requires kms:Decrypt / kms:CreateGrant on its CMK to mount and read -> otherwise CONDITIONAL(key_permission). Reading the disk yields whatever secrets are stored on it; if none, low value."
+      narrative: "{principal.name} can snapshot volume {volume.name}, create a volume from it and attach it to an attacker instance (ec2:CreateSnapshot + ec2:CreateVolume + ec2:AttachVolume), then mount and read on-disk secrets/keys of {instance.name}."
+
+  - id: aws-ec2-mount-snapshot-exposes-cred
+    emits: ExposesCredential
+    description: "The mounted peer volume leaks any on-disk credentials/keys to the attacker who mounted it."
+    match:
+      - [ ?principal, CanReadData, ?volume ]
+    where:
+      - "the mounted volume contains credential material (SSH private keys, ~/.aws/credentials, app secrets)"
+    emit:
+      source: "<peer instance's EBS volume>"
+      target: "<embedded credential/identity on disk>"
+      permissions: []
+      conditions: [iam_permission]
+      false_positive_note: "Only emit when the disk actually holds secret material; requires content inspection of the mounted filesystem, not mere ability to mount. Chains from aws-ec2-mount-snapshot's CanReadData on the same volume."
+      narrative: "The mounted volume of {instance.name} exposes on-disk credentials (SSH keys / AWS credential files / app secrets) to {principal.name}."
+
+  # --- Network exposure: open a security group ------------------------------
+  - id: aws-ec2-open-security-group
+    emits: CanNetworkReach
+    match_effective_permission: {action: "ec2:AuthorizeSecurityGroupIngress", resource_type: "AWS::EC2::SecurityGroup"}
+    optional_permission: "ec2:ModifySecurityGroupRules"
+    emit:
+      source: "<principal>"
+      target: "<instances using the SG>"
+      permissions: ["ec2:AuthorizeSecurityGroupIngress", "ec2:ModifySecurityGroupRules?"]
+      conditions: [network_reachability]
+      note: "Realizes/creates CanReachPort to management ports (22/3389), gating CanExecuteCommand and lateral movement; if opened to 0.0.0.0/0 also feeds ExposedToInternet."
+      false_positive_note: "Only meaningful when the SG is attached to a target instance and the newly-allowed source includes the attacker (or 0.0.0.0/0). Route/NACL must also permit the path."
+      narrative: "{principal.name} can add an ingress rule to {sg.name} (ec2:AuthorizeSecurityGroupIngress), opening network reach to instances using it."
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw EC2 config -> explicit edges). These map
+# collected fields to the explicit edges the derived rules above match against.
+# (Belong under /rules/explicit/ in the pipeline; recorded here for cohesion.)
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: aws-ec2-executes-as-instance-profile
+    emits: ExecutesAs
+    match_record: {resource_type: "AWS::EC2::Instance", field: "IamInstanceProfile"}
+    where:
+      - "instance has an associated IamInstanceProfile whose role trust allows ec2.amazonaws.com"
+    emit:
+      source: "<EC2 instance>"
+      target: "<IAM role behind the instance profile>"
+      narrative: "{instance.name} runs as {role.name} via its instance profile."
+
+  - id: aws-ec2-sg-attached
+    emits: HasPolicy
+    match_record: {resource_type: "AWS::EC2::Instance", field: "SecurityGroups"}
+    emit:
+      source: "<security group>"
+      target: "<EC2 instance>"
+      narrative: "Security group {sg.name} governs ingress/egress for {instance.name}."
+
+  - id: aws-ec2-eni-attached
+    emits: AttachedTo
+    match_record: {resource_type: "AWS::EC2::NetworkInterface", field: "Attachment.InstanceId"}
+    emit:
+      source: "<ENI>"
+      target: "<EC2 instance>"
+      narrative: "ENI {eni.id} places {instance.name} in subnet {subnet.id}."
+
+  - id: aws-ec2-internet-exposed
+    emits: ExposedToInternet
+    match_record: {resource_type: "AWS::EC2::Instance", field: "PublicIpAddress"}
+    where:
+      - "instance has a public IP AND an attached SG allows inbound from 0.0.0.0/0 on a listening port"
+    emit:
+      source: "<EC2 instance>"
+      target: "<AnonymousIdentity>"
+      false_positive_note: "Require BOTH a public IP and a permissive SG rule; a public IP with no open ingress port is not exposed."
+      narrative: "{instance.name} is reachable from the internet on an open port."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: if an SCP / permission boundary denies any action
+# above at the effective scope (e.g. Deny ec2:RunInstances, Deny iam:PassRole,
+# or an org IMDS default forcing HttpEndpoint=disabled / IMDSv2), the evaluator
+# still emits the edge with state: BLOCKED and denied_by=<SCP arn/statement> so
+# the UI can explain why an otherwise-present path does not work.
+# ---------------------------------------------------------------------------

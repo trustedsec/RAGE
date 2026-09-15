@@ -1,0 +1,331 @@
+# GCP Compute Engine (GCE) — Phase 4 compute attack-path rules
+# ---------------------------------------------------------------------------
+# Central question: how does an attacker get code running as an instance's
+# service account (the ExecutesAs target)? The GCP-specific gate is
+# iam.serviceAccounts.actAs on that SA (the PassRole analog) — every
+# create/rebind execution edge is conditioned on it. Metadata primitives
+# (setMetadata ssh-keys / startup-script, setCommonInstanceMetadata) yield RCE;
+# the metadata server exposes the SA's OAuth token.
+#
+# Permissions are the EFFECTIVE actions the permission evaluator must confirm on
+# the given resource scope before the edge is emitted. state defaults to ACTIVE
+# unless a condition is unmet (CONDITIONAL/POTENTIAL) or an IAM deny / org policy
+# applies (BLOCKED). GCP IAM inheritance means a project/folder/org binding
+# applies to all descendant instances — honor scope to avoid over-claiming.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 4-compute
+applies_to: [gcp]
+
+rules:
+
+  # --- ExecutesAs (explicit fact; SA attached to the instance) ---------------
+  - id: gcp-gce-executes-as-sa
+    emits: ExecutesAs
+    description: "Instance runs as the SA in its serviceAccounts[] config."
+    match_record: {resource_type: "compute.googleapis.com/Instance", field: "serviceAccounts[].email"}
+    emit:
+      source_type: Compute
+      source: "<instance>"
+      target: "<attached service account>"
+      permissions: []
+      note: "Zero-cost fact. Default SA (PROJECT_NUMBER-compute@developer.gserviceaccount.com) often holds roles/editor."
+      narrative: "{instance.name} executes as service account {sa.name} (attached in serviceAccounts[]), whose OAuth token is vended by the metadata server."
+
+  # --- Identity attachment: rebind an existing instance to a chosen SA -------
+  - id: gcp-gce-set-service-account
+    emits: CanAttachIdentity
+    match_effective_permission: {action: "compute.instances.setServiceAccount", resource_type: "compute.googleapis.com/Instance"}
+    where:
+      - "?principal has iam.serviceAccounts.actAs on ?targetSA (roles/iam.serviceAccountUser)"
+      - "instance is STOPPED (setServiceAccount requires TERMINATED state)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<instance>"
+      permissions: ["compute.instances.setServiceAccount", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility, service_state]
+      state_logic: "ACTIVE if actAs held AND (instance stopped OR principal has compute.instances.stop+start) else CONDITIONAL(service_state)/POTENTIAL(iam_permission)"
+      false_positive_note: "compute.instances.setServiceAccount without iam.serviceAccounts.actAs on the target SA is refused by GCE -> POTENTIAL, not ACTIVE. Requires the instance stopped."
+      narrative: "{principal.name} can rebind {instance.name} to service account {sa.name} (compute.instances.setServiceAccount + iam.serviceAccounts.actAs), so code on it runs as that SA."
+
+  # --- Create a NEW instance bound to a chosen SA ---------------------------
+  - id: gcp-gce-create-instance-as-sa
+    emits: CanCreateWorkloadAs
+    description: "actAs + compute.instances.create -> launch instance as the SA, read metadata token."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has EFFECTIVE compute.instances.create"
+      - "?principal has compute.disks.create and compute.subnetworks.use (boot disk + network placement)"
+      - "?sa is actAs-able by ?principal (iam.serviceAccounts.actAs)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["compute.instances.create", "compute.disks.create", "compute.subnetworks.use", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      escalation: "Launch an instance bound to a privileged SA, then read the metadata server for its OAuth token."
+      false_positive_note: "compute.instances.create alone is not SA execution; it must be paired with iam.serviceAccounts.actAs on the chosen SA. Access scopes on the new instance can cap the token."
+      narrative: "{principal.name} can create a new instance bound to {sa.name} (compute.instances.create + iam.serviceAccounts.actAs) and read the metadata server to obtain the SA's token."
+
+  # --- Create an instance template + MIG bound to a chosen SA ---------------
+  - id: gcp-gce-create-template-as-sa
+    emits: CanCreateWorkloadAs
+    description: "actAs + compute.instanceTemplates.create + MIG create/setInstanceTemplate -> MIG launches instances as the SA, read metadata token."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has EFFECTIVE compute.instanceTemplates.create"
+      - "?sa is the template's serviceAccounts[].email and is actAs-able by ?principal (iam.serviceAccounts.actAs)"
+      - "?principal has compute.instanceGroupManagers.create OR compute.instanceGroupManagers.update OR compute.instanceGroupManagers.setInstanceTemplate (drive the MIG to launch from the template)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["compute.instanceTemplates.create", "compute.instanceGroupManagers.create", "compute.instanceGroupManagers.setInstanceTemplate", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      escalation: "Create an instance template bound to a privileged SA, then create/point a MIG at it so autoscaling launches run as the SA; read the metadata token from a launched instance."
+      false_positive_note: "compute.instanceTemplates.create alone is not SA execution; it must be paired with iam.serviceAccounts.actAs on the template's serviceAccounts[].email. Access scopes on the template can cap the token. setInstanceTemplate does not re-check actAs the way setServiceAccount does, so it can bypass the stopped-instance constraint, but a MIG launch/resize must still occur."
+      narrative: "{principal.name} can create an instance template bound to {sa.name} (compute.instanceTemplates.create + iam.serviceAccounts.actAs) and drive a MIG (compute.instanceGroupManagers.create/setInstanceTemplate) to launch instances that run as the SA and expose its metadata token."
+
+  # --- Code/config modification via metadata (startup-script = RCE) ---------
+  - id: gcp-gce-set-metadata-startup-script
+    emits: CanModifyCode
+    match_effective_permission: {action: "compute.instances.setMetadata", resource_type: "compute.googleapis.com/Instance"}
+    where:
+      - "?principal has iam.serviceAccounts.actAs on the instance's current SA (GCE refuses setMetadata otherwise)"
+    optional:
+      - "?principal has compute.instances.reset OR (compute.instances.stop AND compute.instances.start)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<instance>"
+      permissions: ["compute.instances.setMetadata", "iam.serviceAccounts.actAs", "compute.instances.reset?"]
+      conditions: [iam_permission, service_state]
+      state_logic: "ACTIVE if reset/stop+start also held (script runs now) else CONDITIONAL(service_state) (fires at next boot)"
+      false_positive_note: "startup-script executes at boot only. setMetadata is refused without actAs on the instance's current SA -> POTENTIAL. If OS Login is enforced it does not affect startup-script (that path still works)."
+      narrative: "{principal.name} can write a startup-script to {instance.name}'s metadata (compute.instances.setMetadata); on next boot/reset it runs as root as {sa.name}."
+
+  - id: gcp-gce-set-metadata-ssh-keys
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "compute.instances.setMetadata", resource_type: "compute.googleapis.com/Instance"}
+    where:
+      - "?principal has iam.serviceAccounts.actAs on the instance's current SA"
+      - "OS Login is NOT enforced on the instance/project (enable-oslogin != TRUE)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<instance>"
+      permissions: ["compute.instances.setMetadata", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, service_state]
+      escalation: "Add an ssh-keys entry -> immediate interactive login on a running instance."
+      state_logic: "ACTIVE if instance running (ssh-keys login is immediate) else CONDITIONAL(service_state) (takes effect once started)"
+      false_positive_note: "If OS Login is enforced (enable-oslogin=TRUE) the ssh-keys metadata is ignored -> BLOCKED for this path; use gcp-gce-os-login instead. Requires actAs on the current SA. Realized OS access still requires tcp/22 reachability (handled in gcp-gce-ssh-metadata)."
+      narrative: "{principal.name} can add an SSH key to {instance.name}'s metadata (compute.instances.setMetadata) and log in immediately."
+
+  - id: gcp-gce-set-common-instance-metadata
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "compute.projects.setCommonInstanceMetadata", resource_type: "compute.googleapis.com/Project"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<project (all non-opted-out instances)>"
+      permissions: ["compute.projects.setCommonInstanceMetadata"]
+      conditions: [iam_permission]
+      escalation: "Set project-wide ssh-keys / startup-script -> access to every instance that does not block project SSH keys."
+      false_positive_note: "Instances with block-project-ssh-keys=TRUE or enforced OS Login ignore project SSH keys; those targets are BLOCKED for this path. Broad blast radius otherwise."
+      narrative: "{principal.name} can set project-wide SSH keys/startup metadata (compute.projects.setCommonInstanceMetadata), reaching all non-opted-out instances in the project."
+
+  # --- OS-level command execution -------------------------------------------
+  - id: gcp-gce-ssh-metadata
+    emits: CanExecuteCommand
+    description: "SSH-key metadata (instance or project) yields interactive command exec."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?instance ]
+    where:
+      - "the CanModifyConfiguration derivation was the ssh-keys metadata path (gcp-gce-set-metadata-ssh-keys or -set-common-instance-metadata)"
+      - "?principal (or attacker host) can reach the instance on tcp/22"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<instance>"
+      permissions: ["compute.instances.setMetadata OR compute.projects.setCommonInstanceMetadata"]
+      conditions: [network_reachability]
+      state_logic: "ACTIVE if tcp/22 reachable else CONDITIONAL(network_reachability)"
+      narrative: "{principal.name} can run OS commands on {instance.name} via an injected SSH key over tcp/22."
+
+  - id: gcp-gce-os-login
+    emits: CanExecuteCommand
+    match_effective_permission: {action: "compute.instances.osAdminLogin", resource_type: "compute.googleapis.com/Instance"}
+    alt_permission: "compute.instances.osLogin"
+    where:
+      - "OS Login is enabled on the instance/project (enable-oslogin=TRUE)"
+      - "?principal (or attacker host) can reach the instance on tcp/22"
+      - "?principal has iam.serviceAccounts.actAs on the instance's SA (serviceAccountUser needed to connect)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<instance>"
+      permissions: ["compute.instances.osAdminLogin", "compute.instances.osLogin", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, service_state, network_reachability]
+      state_logic: "ACTIVE if OS Login enabled AND tcp/22 reachable AND actAs held else CONDITIONAL"
+      false_positive_note: "osAdminLogin/osLogin only apply when OS Login is enabled; otherwise BLOCKED (use ssh-keys metadata). Connecting also requires serviceAccountUser (actAs) on the instance SA."
+      narrative: "{principal.name} can log into {instance.name} via OS Login (compute.instances.osAdminLogin), gaining sudo command execution."
+
+  # --- Trigger a poisoned startup-script ------------------------------------
+  - id: gcp-gce-start-triggers-startup-script
+    emits: CanStart
+    match_effective_permission: {action: "compute.instances.start", resource_type: "compute.googleapis.com/Instance"}
+    alt_permission: "compute.instances.reset"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<instance>"
+      permissions: ["compute.instances.start", "compute.instances.reset"]
+      note: "Realizes CONDITIONAL(service_state) startup-script code paths (see gcp-gce-set-metadata-startup-script)."
+      narrative: "{principal.name} can start/reset {instance.name} (compute.instances.start/reset), triggering a poisoned startup-script."
+
+  # --- Metadata-server credential exposure ----------------------------------
+  - id: gcp-gce-metadata-token
+    emits: ExposesCredential
+    description: "Metadata server vends the attached SA's OAuth token to on-host code."
+    match:
+      - [ ?instance, ExecutesAs, ?sa ]
+    where:
+      - "instance has a service account attached (serviceAccounts[] non-empty)"
+      - "access scopes permit the target API (cloud-platform by default on modern SAs)"
+    emit:
+      source: "<instance>"
+      target: "<service account>"
+      permissions: []
+      conditions: [service_state, network_reachability]
+      false_positive_note: "No SA attached -> no token (BLOCKED). Legacy/narrow access scopes cap the token even if the SA holds the role (access scopes are not an enumerated condition_type, so this caveat is prose-only). Metadata server must be reachable from the executing context (network_reachability)."
+      narrative: "{instance.name} exposes {sa.name}'s OAuth token at the metadata server (computeMetadata/v1/instance/service-accounts/default/token) to any code running on it."
+
+  - id: gcp-gce-metadata-token-retrieve
+    emits: CanRetrieveToken
+    description: "Any principal with code exec on the instance can read the metadata token."
+    match:
+      - [ ?principal, CanExecuteCommand, ?instance ]
+      - [ ?instance, ExposesCredential, ?sa ]
+    emit:
+      source: "<principal>"
+      target: "<service account>"
+      permissions: []
+      note: "Chains CanExecuteCommand + metadata exposure into direct token theft; feeds CanExecuteAs."
+      narrative: "{principal.name} can execute on {instance.name} and read the metadata server to obtain {sa.name}'s access token."
+
+  - id: gcp-gce-serial-port-output
+    emits: ExposesCredential
+    match_effective_permission: {action: "compute.instances.getSerialPortOutput", resource_type: "compute.googleapis.com/Instance"}
+    emit:
+      source: "<instance>"
+      target: "<credential in serial console output>"
+      permissions: ["compute.instances.getSerialPortOutput"]
+      conditions: [iam_permission]
+      false_positive_note: "Only leaks a credential if secrets are actually printed to the serial console/boot log. constraints/compute.disableSerialPortAccess org policy -> BLOCKED. Recon-value even when empty."
+      narrative: "{principal.name} can read {instance.name}'s serial console output (compute.instances.getSerialPortOutput), which may leak boot-time secrets."
+
+  - id: gcp-gce-metadata-secret
+    emits: ExposesCredential
+    description: "startup-script / custom metadata frequently embeds secrets, readable via instances.get."
+    match_effective_permission: {action: "compute.instances.get", resource_type: "compute.googleapis.com/Instance"}
+    emit:
+      source: "<instance>"
+      target: "<credential in metadata>"
+      permissions: ["compute.instances.get"]
+      conditions: [iam_permission]
+      false_positive_note: "Only a real ExposesCredential when the metadata actually contains a secret; otherwise recon only."
+      narrative: "{principal.name} can read {instance.name}'s metadata (compute.instances.get), which may embed credentials in startup-script or custom keys."
+
+  # --- Cross-project disk/image exfiltration --------------------------------
+  - id: gcp-gce-snapshot-cross-project
+    emits: CanExfiltrate
+    description: "Snapshot a disk and reuse it from another project."
+    match_effective_permission: {action: "compute.snapshots.create", resource_type: "compute.googleapis.com/Disk"}
+    where:
+      - "?principal (or a cross-project principal it controls) has compute.snapshots.useReadOnly / compute.disks.create from the snapshot"
+    emit:
+      source: "<principal>"
+      target: "<disk data via snapshot>"
+      permissions: ["compute.snapshots.create", "compute.disks.create", "compute.snapshots.useReadOnly"]
+      conditions: [iam_permission]
+      false_positive_note: "Cross-boundary only if the snapshot/image is actually shared (setIamPolicy) to a principal outside the source project; same-project snapshotting is not exfiltration."
+      narrative: "{principal.name} can snapshot {disk.name} and create a disk from it in another project, exfiltrating its contents."
+
+  - id: gcp-gce-image-share
+    emits: CanExfiltrate
+    match_effective_permission: {action: "compute.images.setIamPolicy", resource_type: "compute.googleapis.com/Image"}
+    alt_permission: "compute.machineImages.setIamPolicy"
+    emit:
+      source: "<principal>"
+      target: "<image/machine-image data>"
+      permissions: ["compute.images.setIamPolicy", "compute.machineImages.setIamPolicy"]
+      conditions: [iam_permission]
+      false_positive_note: "Only cross-boundary when the grant names a principal in another project/org; granting within the same project is not exfiltration."
+      narrative: "{principal.name} can grant an external principal use of image {image.name} (compute.images.setIamPolicy), enabling cross-project disk data reuse."
+
+  # --- Image / machine-image supply-chain poisoning -------------------------
+  - id: gcp-gce-image-poison
+    emits: CanModifyCode
+    description: "Create a poisoned image/machine-image that future instances/templates boot from (supply chain)."
+    match_effective_permission: {action: "compute.images.create", resource_type: "compute.googleapis.com/Image"}
+    alt_permission: "compute.machineImages.create"
+    where:
+      - "the poisoned image/machine-image is (or will be) referenced by an instance template / MIG / future instance launch"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<image / machine-image (code supply for future launches)>"
+      permissions: ["compute.images.create", "compute.machineImages.create"]
+      conditions: [iam_permission, trigger_exists]
+      state_logic: "CONDITIONAL(trigger_exists) -- realized only when a future instance/template/MIG launch boots from the poisoned image; creating the image alone is not execution."
+      false_positive_note: "Creating an image is not execution by itself. It becomes CanExecuteAs only when a template/MIG/new instance references the poisoned image and launches. Lower-frequency but real code-supply path."
+      narrative: "{principal.name} can create a poisoned image/machine-image (compute.images.create / compute.machineImages.create) that seeds code into future instance launches referencing it."
+
+  # --- Terminal execution edge: get code running as the attached SA ----------
+  - id: gcp-gce-execute-as-attached-sa
+    emits: CanExecuteAs
+    description: "Any code-exec/rebind/create primitive on a SA-bearing instance -> execute as its SA."
+    match:
+      - [ ?principal, CanExecuteCommand, ?instance ]
+      - [ ?instance, ExecutesAs, ?sa ]
+    where:
+      - "?sa.privilege_level >= ?principal.privilege_level (escalation)"
+    optional:
+      - [ ?principal, CanRetrieveToken, ?sa ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["<contributing exec permission>"]
+      conditions: [service_state, network_reachability]
+      state_logic: "ACTIVE if CanExecuteCommand ACTIVE and ExecutesAs present and sa.privilege_level > principal.privilege_level (code on the box already runs AS the SA) else CONDITIONAL. Metadata token retrieval (optional CanRetrieveToken) is enrichment, not a gate."
+      false_positive_note: "Only an escalation when the SA is more privileged than the principal. No SA attached -> not ACTIVE. Access scopes/deny may cap what the SA token can do downstream but do not negate execution-as-SA on the box."
+      narrative: "{principal.name} can run code on {instance.name}, which executes as {sa.name}, and read the metadata token to act with all of the SA's permissions."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: if an IAM deny policy or org policy neutralizes an
+# action above at the effective scope (e.g. constraints/compute.
+# disableSerialPortAccess, constraints/compute.vmExternalIpAccess,
+# constraints/iam.disableServiceAccountKeyCreation, enforced OS Login blocking
+# ssh-keys metadata, or a missing iam.serviceAccounts.actAs), emit the edge with
+# state: BLOCKED (or POTENTIAL) and denied_by=<deny policy / org constraint>, so
+# the UI explains why an otherwise-present technique does not work.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw config -> explicit edges) that GCE needs
+# belong in rules/explicit/. Summary of what the collector must emit there:
+#   - ExecutesAs(instance -> SA)          from serviceAccounts[].email
+#   - AttachedTo(disk/NIC -> instance)    from disks[] / networkInterfaces[]
+#   - LocatedIn(instance -> subnet)       from networkInterfaces[].subnetwork
+#   - ContainsCredential(instance -> token/secret) from metadata + metadata server

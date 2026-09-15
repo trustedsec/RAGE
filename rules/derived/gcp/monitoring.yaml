@@ -1,0 +1,279 @@
+# GCP Cloud Monitoring — Derived attack-path rules (Phase 12 — security & logging)
+# ---------------------------------------------------------------------------
+# Cloud Monitoring is a LoggingService (ManagementService class) that provides
+# metrics collection, alerting (alert policies), and notification routing
+# (notification channels). An attacker with write access to alerting or
+# notification objects can silence detection entirely — a defense-evasion /
+# cover-tracks primitive. This is Phase 12 Mode (1): DEFENSE EVASION only.
+#
+# PHASE 12 CLASSIFICATION:
+#   Mode (1) — DEFENSE EVASION / TAMPERING (all rules here):
+#     monitoring.alertPolicies.update/delete
+#       -> disable or delete alerting rules -> CanModifyConfiguration on
+#          the LoggingService node. Silences detection without any access.
+#     monitoring.notificationChannels.delete/update
+#       -> destroy notification routing so alert firings are unreported
+#          -> CanModifyConfiguration on the LoggingService node.
+#
+# IMPORTANT SCOPE LIMITS (false-positive discipline):
+#   - Cloud Monitoring controls are DETECTIVE, not PREVENTIVE. Setting
+#     BLOCKED on graph edges for Cloud Monitoring is NEVER correct; evasion
+#     reduces detection, it does not block any access path.
+#   - Do NOT chain these edges to CanExecuteAs, CanEscalateTo,
+#     CanEnterProject, or any execution/privilege-escalation edge.
+#   - Cloud Monitoring has NO execution identity (no ExecutesAs), NO
+#     PassRole / actAs surface, and NO CanModifyCode path. The
+#     can-execute-as, cicd-chains, credential-chains, and can-control
+#     linchpins are NOT cited here — none of those patterns apply.
+#   - Multi-project scoping (a scoping project aggregating metrics from
+#     multiple projects) gives read-only metric access to scoped projects.
+#     Do NOT emit CanEnterProject from monitoring permissions.
+#
+# PERMISSIONS are the exact action names from the official GCP Cloud
+# Monitoring IAM permissions reference:
+#   https://cloud.google.com/monitoring/access-control#monitoring_iam_permissions
+#
+# Source/target node classes:
+#   source: Identity (any principal with Cloud Monitoring write permissions)
+#   target: LoggingService (ManagementService class subtype)
+#           confirmed in schema/nodes.yaml: ManagementService.types.LoggingService
+#           provider_type: google.monitoring.Workspace
+# ---------------------------------------------------------------------------
+
+provider: gcp
+service: monitoring
+phase: 12-security-logging
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1. Disable or delete alert policies (defense evasion)
+  #    monitoring.alertPolicies.update can set `enabled: false` on an alert
+  #    policy, preventing it from firing without deleting it (stealthier).
+  #    monitoring.alertPolicies.delete permanently removes the alerting rule.
+  #    Both actions blind the project to the metric-based conditions that
+  #    policy covered (CPU anomalies, login failures, quota changes, etc.).
+  #    The predefined roles that grant these are:
+  #      roles/monitoring.admin -> monitoring.alertPolicies.*
+  #      roles/monitoring.editor -> monitoring.alertPolicies.create/update/delete
+  #      roles/monitoring.alertPolicyEditor -> monitoring.alertPolicies.*
+  # ---------------------------------------------------------------------------
+  - id: gcp-monitoring-disable-alert-policy
+    emits: CanModifyConfiguration
+    description: >-
+      Principal can disable or delete Cloud Monitoring alert policies
+      (monitoring.alertPolicies.update / monitoring.alertPolicies.delete),
+      preventing alerting rules from firing on anomalies — a defense-evasion
+      primitive that does not grant access to any resource.
+    match:
+      - [ ?principal, HasPermission, ?monitoring ]
+    where:
+      - "node_type(?monitoring) == LoggingService"
+      - "node_class(?monitoring) == ManagementService"
+      - "?monitoring.provider_type == 'google.monitoring.Workspace'"
+      - "?principal has EFFECTIVE monitoring.alertPolicies.update OR monitoring.alertPolicies.delete on ?monitoring (project scope)"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?monitoring
+      permissions:
+        - "monitoring.alertPolicies.update"
+        - "monitoring.alertPolicies.delete"
+      conditions: [iam_permission, api_enabled]
+      state_logic: >-
+        ACTIVE if monitoring.alertPolicies.update or monitoring.alertPolicies.delete
+        is in the principal's effective IAM grants for the project scope and the
+        Cloud Monitoring API is enabled; BLOCKED if an IAM deny policy or org policy
+        denies both actions; CONDITIONAL(api_enabled) if Cloud Monitoring API
+        enablement is unknown.
+      confidence: 0.90
+      derived_from:
+        - "?principal HasPermission ?monitoring (monitoring.alertPolicies.update or monitoring.alertPolicies.delete effective)"
+      false_positive_note: >-
+        Alert policies are a DETECTIVE control — disabling them reduces detection
+        fidelity but does not block any access path in the graph. Do NOT chain to
+        CanExecuteAs, CanEscalateTo, or CanEnterProject. monitoring.alertPolicies.update
+        can set `enabled: false` (a stealthy disable) or weaken conditions without
+        deletion; monitoring.alertPolicies.delete permanently removes the policy.
+        Both are captured by this single rule because the attacker impact (silencing
+        the alert) is the same regardless of method. The monitoring.snoozes.create
+        permission (temporary silence for a time window) is a weaker variant subsumed
+        by this rule's narrative; emit this edge when snoozes.create is the only
+        confirmed permission but note the lower persistence in the evidence record.
+        roles/monitoring.viewer and roles/monitoring.metricWriter do NOT grant either
+        action — verify effective grants before emitting. Cloud Monitoring IAM bindings
+        are project-scoped; there are no resource-level policies on individual alert
+        policies, so any project-level binding applies to all alert policies in the
+        project.
+      narrative: >-
+        {principal.name} can disable or delete Cloud Monitoring alert policies
+        in project {monitoring.project} (monitoring.alertPolicies.update /
+        monitoring.alertPolicies.delete). Setting an alert policy to `enabled: false`
+        or deleting it prevents Cloud Monitoring from generating incidents for the
+        conditions that policy covered (e.g. anomalous metric spikes, login failures,
+        quota exhaustion), silencing detection for attacker activity without granting
+        any resource access. This is a defense-evasion / cover-tracks action.
+
+  # ---------------------------------------------------------------------------
+  # 2. Delete or corrupt notification channels (defense evasion)
+  #    Even if alert policies remain active, destroying all notification channels
+  #    means fired alerts are never delivered to on-call engineers, PagerDuty,
+  #    Slack, or Pub/Sub subscribers. The alert incident is recorded internally
+  #    but no human or automated system is notified.
+  #    monitoring.notificationChannels.delete removes a channel entirely.
+  #    monitoring.notificationChannels.update can change the endpoint to an
+  #    attacker-controlled address (email, Pub/Sub topic, webhook) — more
+  #    subtle than deletion and harder to detect.
+  #    Predefined roles that grant these:
+  #      roles/monitoring.admin
+  #      roles/monitoring.editor
+  #      roles/monitoring.notificationChannelEditor
+  # ---------------------------------------------------------------------------
+  - id: gcp-monitoring-delete-notification-channel
+    emits: CanModifyConfiguration
+    description: >-
+      Principal can delete or modify Cloud Monitoring notification channels
+      (monitoring.notificationChannels.delete / monitoring.notificationChannels.update),
+      ensuring that even when an alert policy fires its notifications are not
+      delivered — a defense-evasion primitive that does not grant resource access.
+    match:
+      - [ ?principal, HasPermission, ?monitoring ]
+    where:
+      - "node_type(?monitoring) == LoggingService"
+      - "node_class(?monitoring) == ManagementService"
+      - "?monitoring.provider_type == 'google.monitoring.Workspace'"
+      - "?principal has EFFECTIVE monitoring.notificationChannels.delete OR monitoring.notificationChannels.update on ?monitoring (project scope)"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?monitoring
+      permissions:
+        - "monitoring.notificationChannels.delete"
+        - "monitoring.notificationChannels.update"
+      conditions: [iam_permission, api_enabled]
+      state_logic: >-
+        ACTIVE if monitoring.notificationChannels.delete or
+        monitoring.notificationChannels.update is in the principal's effective IAM
+        grants for the project scope and the Cloud Monitoring API is enabled;
+        BLOCKED if an IAM deny policy or org policy denies both actions;
+        CONDITIONAL(api_enabled) if Cloud Monitoring API enablement is unknown.
+      confidence: 0.88
+      derived_from:
+        - "?principal HasPermission ?monitoring (monitoring.notificationChannels.delete or monitoring.notificationChannels.update effective)"
+      false_positive_note: >-
+        Notification channels are the delivery mechanism for alert firings — they are
+        a DETECTIVE control component, not a preventive guardrail. Destroying them
+        does not set BLOCKED on any graph edge; it reduces the probability that
+        attacker activity triggers an on-call response. Do NOT chain to CanExecuteAs
+        or CanEnterProject. monitoring.notificationChannels.update is a subtler
+        evasion than deletion: it can redirect notifications to an attacker-controlled
+        Pub/Sub topic, email, or webhook, capturing alert metadata without producing
+        visible operational noise. Both actions are captured here because the
+        security impact (silencing notification delivery) is equivalent. A Pub/Sub-
+        backed notification channel changed to an attacker-controlled topic does NOT
+        enable code execution in Monitoring itself — any downstream Pub/Sub subscriber
+        execution is modeled in pubsub.yaml. Verify effective grants at the project
+        level; roles/monitoring.viewer does not grant either action.
+      narrative: >-
+        {principal.name} can delete or modify Cloud Monitoring notification channels
+        in project {monitoring.project}
+        (monitoring.notificationChannels.delete / monitoring.notificationChannels.update).
+        Deleting all notification channels for an alert policy means that when the
+        policy fires an incident, no on-call engineer, PagerDuty integration, Slack
+        webhook, or Pub/Sub subscriber receives the notification. Updating a channel
+        endpoint to an attacker-controlled address is a subtler variant: alert
+        metadata continues flowing but reaches the attacker, not the defender.
+        Neither action grants access to any GCP resource — this is a defense-evasion
+        / cover-tracks primitive.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An IAM deny policy (iam.deny) explicitly denying monitoring.alertPolicies.update,
+#     monitoring.alertPolicies.delete, monitoring.notificationChannels.delete, or
+#     monitoring.notificationChannels.update at the project scope -> emit the
+#     relevant edge with state: BLOCKED and denied_by=<deny policy resource name>.
+#   - An org policy constraint preventing Cloud Monitoring modifications (rare;
+#     check constraints/gcp.resourceLocations and any custom constraints) ->
+#     CONDITIONAL(scp_or_org_policy) or BLOCKED depending on enforcement mode.
+#   - If the Cloud Monitoring API is disabled for the project (APIs & Services ->
+#     monitoring.googleapis.com disabled), no Monitoring workspace exists and no
+#     edges should be emitted (no node to target).
+#
+# DELIBERATELY OMITTED (out of scope / over-claim):
+#   - monitoring.uptimeCheckConfigs.delete: uptime check deletion removes a
+#     specific availability signal but is a subset of the alert-policy evasion
+#     surface; subsumed by gcp-monitoring-disable-alert-policy for graph purposes.
+#   - monitoring.dashboards.delete: dashboards are visualization, not detection
+#     logic; deleting one has no security-alerting impact. Excluded.
+#   - monitoring.snoozes.create: temporarily silences one alert policy for a
+#     configurable window. Lower persistence than permanent policy deletion.
+#     INCLUDED in gcp-monitoring-explicit-write as a low-signal CanModifyConfiguration
+#     edge to surface snooze-only principals in the graph. Confidence is inherited
+#     from the derived rule (0.90). If distinct low-confidence prioritization is
+#     needed in future, a separate rule with confidence: 0.70 can be added.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization (sufficient inline; no separate /rules/explicit/gcp-monitoring.yaml).
+explicit_rules:
+
+  - id: gcp-monitoring-explicit-write
+    emits: CanModifyConfiguration
+    applies_to: [gcp]
+    match_effective_permission:
+      action:
+        - "monitoring.alertPolicies.update"
+        - "monitoring.notificationChannels.update"
+        - "monitoring.snoozes.create"
+      resource_type: "google.monitoring.Workspace"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: "<principal>"
+      target: "<Cloud Monitoring workspace node in project>"
+      permissions: ["<matched action>"]
+      narrative: >-
+        {principal.name} holds an effective Cloud Monitoring write action
+        ({matched_action}) on the Monitoring workspace in {project}, enabling
+        defense evasion against Cloud Monitoring detective controls.
+
+  - id: gcp-monitoring-explicit-delete
+    emits: CanDelete
+    applies_to: [gcp]
+    match_effective_permission:
+      action:
+        - "monitoring.alertPolicies.delete"
+        - "monitoring.notificationChannels.delete"
+      resource_type: "google.monitoring.Workspace"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: "<principal>"
+      target: "<Cloud Monitoring workspace node in project>"
+      permissions: ["<matched action>"]
+      narrative: >-
+        {principal.name} can delete Cloud Monitoring alert policies or notification
+        channels ({matched_action}) on the Monitoring workspace in {project} —
+        a destructive action that silences alerts and notification delivery permanently.
+
+  - id: gcp-monitoring-explicit-read
+    emits: CanRead
+    applies_to: [gcp]
+    match_effective_permission:
+      action:
+        - "monitoring.alertPolicies.list"
+        - "monitoring.alertPolicies.get"
+        - "monitoring.timeSeries.list"
+      resource_type: "google.monitoring.Workspace"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: "<principal>"
+      target: "<Cloud Monitoring workspace node in project>"
+      permissions: ["<matched action>"]
+      narrative: >-
+        {principal.name} can enumerate Cloud Monitoring alert policies and time-series
+        data ({matched_action}) on the Monitoring workspace in {project} —
+        low-value recon that may reveal monitored metric labels.

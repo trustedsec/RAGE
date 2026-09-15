@@ -1,0 +1,218 @@
+# AWS Bedrock — Derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (ExecutesAs, CanPassIdentity, CanModifyConfiguration, CanTrigger, CanInvoke)
+# for Bedrock Agent resources lives in /rules/explicit/aws-bedrock.yaml.
+#
+# Bedrock attack surface summary (Phase 11 theme):
+#   The DOMINANT primitive is Bedrock Agents: an Agent runs an orchestration
+#   loop AS its agentResourceRoleArn and invokes action-group Lambdas. Whoever
+#   can (a) swap the agent role via UpdateAgent+PassRole, or (b) redirect the
+#   action-group Lambda via UpdateAgentActionGroup+PrepareAgent, executes code
+#   AS a privileged role. This mirrors the can-execute-as and cicd-chains
+#   linchpins — EMIT the facts, CITE the roll-ups.
+#
+# bedrock:InvokeModel is LOW relevance (model inference, not OS-level code
+# execution); kept intentionally out of these rules.
+#
+# LINCHPIN CITATIONS (do not re-derive their roll-ups):
+#   /rules/derived/can-execute-as.yaml       — CanModifyCode + ExecutesAs => CanExecuteAs
+#   /rules/derived/cicd-chains.yaml          — CanModifyCode(runner) + ExecutesAs => CanExecuteAs
+#   /rules/derived/can-control.yaml          — CanExecuteAs escalation roll-up
+#   /rules/derived/credential-chains.yaml    — ExposesCredential pivot
+#   Action-group Lambda escalation chains:   — /rules/derived/aws/lambda.yaml
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 11-data-analytics-ml
+applies_to: [aws]
+
+rules:
+
+  # --- Agent role swap -> CanExecuteAs(agentRole) ---------------------------
+  # PHASE 11 DOMINANT PRIMITIVE: update an Agent's agentResourceRoleArn to a
+  # chosen privileged role. The Agent then runs its entire orchestration loop
+  # (model calls, action-group Lambda invocations, Knowledge Base retrievals)
+  # as that role. Requires bedrock:UpdateAgent + iam:PassRole on the new role
+  # scoped to bedrock.amazonaws.com.
+  - id: aws-bedrock-agent-swap-role
+    emits: CanExecuteAs
+    description: "Swap a Bedrock Agent's execution role via UpdateAgent+PassRole to execute the orchestration loop as an attacker-chosen role."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?agent ]
+      - [ ?principal, CanPassIdentity,        ?role ]
+    where:
+      - "node_type(?agent) == GenericCompute"
+      - "?agent.provider_type == 'AWS::Bedrock::Agent'"
+      - "?role trust policy allows bedrock.amazonaws.com (or is unknown -> POTENTIAL)"
+      - "iam:PassRole for ?role permits iam:PassedToService bedrock.amazonaws.com (or is unconditioned)"
+    optional:
+      - [ ?principal, CanTrigger, ?agent ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["bedrock:UpdateAgent", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        if ?role trust policy or iam:PassedToService is unknown/unresolved:
+          POTENTIAL(role_compatibility);
+        elif matched(optional[0]) or InvokeAgent path exists for ?agent:
+          ACTIVE;
+        else:
+          CONDITIONAL(trigger_exists) — the role is bound but no run path is
+          established yet; the agent must be invoked to realize the escalation.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "<CanModifyConfiguration edge_id for ?principal -> ?agent>"
+        - "<CanPassIdentity edge_id for ?principal -> ?role>"
+        - "<CanTrigger edge_id for ?principal -> ?agent (optional)>"
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to lambda.amazonaws.com or
+        ec2.amazonaws.com does NOT yield a Bedrock execution role — downgrade to
+        POTENTIAL(role_compatibility) when PassedToService is absent or scoped to an
+        incompatible service. The agent role trust policy must allow
+        bedrock.amazonaws.com; without that, CreateAgent/UpdateAgent rejects the role.
+        An SCP denying bedrock:UpdateAgent or iam:PassRole at the effective scope makes
+        this BLOCKED. NOTE: This rule duplicates the provider-agnostic linchpin
+        execute-as-via-config-identity-swap in can-execute-as.yaml. The Bedrock-specific
+        state_logic adds nuance (trigger_exists gating for CONDITIONAL), but the base
+        CanExecuteAs emission is handled by the linchpin. Deduplication is automatic on
+        (type=CanExecuteAs, source, target, scope).
+      narrative: >-
+        {principal.name} can update Bedrock Agent {agent.name} to run as {role.name}
+        (bedrock:UpdateAgent + iam:PassRole to bedrock.amazonaws.com); when the Agent
+        is invoked, its orchestration loop executes with {role.name}'s credentials,
+        giving {principal.name} effective execution as {role.name}.
+
+  # --- Action-group Lambda redirect -> CanModifyCode on Agent ---------------
+  # A principal that can redirect the Agent's action-group Lambda ARN to an
+  # attacker-controlled Lambda effectively controls what code the Agent invokes.
+  # This is CanModifyCode targeting the Agent (GenericCompute), which feeds the
+  # canonical can-execute-as execute-as-via-code-modify when combined with
+  # ExecutesAs(Lambda -> LambdaRole). The full escalation to the Lambda execution
+  # role is deferred to aws-lambda-execute-as-via-code (lambda rules) via the
+  # Agent CanTrigger Lambda fact — CITE, do not re-derive.
+  - id: aws-bedrock-action-group-lambda-redirect
+    emits: CanModifyCode
+    description: "Redirect a Bedrock Agent action group's backing Lambda to an attacker-controlled Lambda, injecting code into the agent's execution path."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?agent ]
+    where:
+      - "node_type(?agent) == GenericCompute"
+      - "?agent.provider_type == 'AWS::Bedrock::Agent'"
+      - "?principal has EFFECTIVE bedrock:UpdateAgentActionGroup on ?agent"
+      - "?principal has EFFECTIVE bedrock:PrepareAgent on ?agent"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?agent
+      permissions: ["bedrock:UpdateAgentActionGroup", "bedrock:PrepareAgent"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds both bedrock:UpdateAgentActionGroup and
+        bedrock:PrepareAgent on the Agent (the change requires PrepareAgent to take
+        effect); CONDITIONAL(iam_permission) if PrepareAgent is missing or scope is
+        ambiguous. An SCP or explicit deny on either action makes this BLOCKED.
+        Note: an existing InvokeAgent trigger means the redirected Lambda fires on
+        the next agent turn without further attacker action (run path established).
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from:
+        - "<CanModifyConfiguration edge_id for ?principal -> ?agent>"
+      false_positive_note: >-
+        Changing only the action group's OpenAPI schema (not the Lambda ARN field)
+        does NOT yield code control — do not emit this edge for schema-only changes.
+        Verify that the principal's effective permissions cover the Lambda ARN field
+        in UpdateAgentActionGroup (the API updates the whole action group object, so
+        IAM-level this is all-or-nothing, but check SCP/boundary restricting the
+        call). PrepareAgent is required to deploy the draft; without it the change
+        sits in DRAFT state and the agent continues running the old action group.
+        Escalation to the Lambda execution role: cite aws-lambda-execute-as-via-code
+        (lambda rules) which fires on CanModifyCode(?principal, ?lambda) +
+        ExecutesAs(?lambda, ?lambdaRole); do not re-derive CanExecuteAs here.
+      narrative: >-
+        {principal.name} can redirect Bedrock Agent {agent.name}'s action group to
+        point at an attacker-controlled Lambda (bedrock:UpdateAgentActionGroup +
+        bedrock:PrepareAgent); when the Agent runs, it invokes that Lambda, executing
+        attacker code in the action-group Lambda's execution role. See lambda rules
+        for the full CanExecuteAs derivation.
+
+
+  # --- Knowledge Base role swap via CanModifyConfiguration + CanPassIdentity --
+  # A principal that can update a Knowledge Base's service role via UpdateKnowledgeBase
+  # and iam:PassRole can escalate to execute code as that service role. The KB service
+  # role accesses S3 data sources and can write to the vector store backend. This feeds
+  # can-execute-as.yaml execute-as-via-config-identity-swap.
+  # Note: This rule is primarily for flagging the capability; the linchpin in
+  # can-execute-as.yaml handles CanModifyConfiguration + CanPassIdentity -> CanExecuteAs.
+  - id: aws-bedrock-knowledge-base-role-swap
+    emits: CanExecuteAs
+    description: "Swap a Bedrock Knowledge Base's service role via UpdateKnowledgeBase+PassRole to access data sources as an attacker-chosen role."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?kb ]
+      - [ ?principal, CanPassIdentity,        ?role ]
+    where:
+      - "node_type(?kb) == AnalyticsService"
+      - "?kb.provider_type == 'AWS::Bedrock::KnowledgeBase'"
+      - "?role trust policy allows bedrock.amazonaws.com (or is unknown -> POTENTIAL)"
+      - "iam:PassRole for ?role permits iam:PassedToService bedrock.amazonaws.com (or is unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["bedrock:UpdateKnowledgeBase", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        if ?role trust policy or iam:PassedToService is unknown/unresolved:
+          POTENTIAL(role_compatibility);
+        else:
+          ACTIVE — the Knowledge Base immediately accesses data sources as the new role.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "<CanModifyConfiguration edge_id for ?principal -> ?kb>"
+        - "<CanPassIdentity edge_id for ?principal -> ?role>"
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to lambda.amazonaws.com or
+        ec2.amazonaws.com does NOT yield a Bedrock KB role — downgrade to
+        POTENTIAL(role_compatibility) when PassedToService is absent or scoped to an
+        incompatible service. The KB role trust policy must allow bedrock.amazonaws.com.
+        An SCP denying bedrock:UpdateKnowledgeBase or iam:PassRole at the effective scope
+        makes this BLOCKED. This rule duplicates execute-as-via-config-identity-swap in
+        can-execute-as.yaml for Bedrock Knowledge Bases; deduplication is automatic on
+        (CanExecuteAs, source, target, scope).
+      narrative: >-
+        {principal.name} can update Bedrock Knowledge Base {kb.name} to use a service
+        role (bedrock:UpdateKnowledgeBase + iam:PassRole to bedrock.amazonaws.com);
+        the KB immediately accesses its data sources and vector store as {role.name},
+        giving {principal.name} effective execution as {role.name}.
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP denying bedrock:UpdateAgent or iam:PassRole -> aws-bedrock-agent-swap-role BLOCKED.
+#   - SCP denying bedrock:UpdateAgentActionGroup or bedrock:PrepareAgent ->
+#     aws-bedrock-action-group-lambda-redirect BLOCKED.
+#   - iam:PassRole scoped by iam:PassedToService != bedrock.amazonaws.com ->
+#     aws-bedrock-agent-swap-role downgraded to POTENTIAL(role_compatibility).
+#   - bedrock:InvokeModel alone is not a code-execution surface; do not emit
+#     CanExecuteAs or CanModifyCode for InvokeModel.
+#
+# LINCHPIN ROLL-UPS (these fire on the emitted edges; do not re-derive):
+#   can-execute-as.yaml execute-as-via-config-identity-swap:
+#     CanModifyConfiguration(?principal, ?agent) + CanPassIdentity(?principal, ?role)
+#     => CanExecuteAs(?principal, ?role) — dedupes with aws-bedrock-agent-swap-role.
+#   can-execute-as.yaml execute-as-via-code-modify:
+#     CanModifyCode(?principal, ?agent) + ExecutesAs(?agent, ?agentRole)
+#     => CanExecuteAs(?principal, ?agentRole) — fires on agent's ExecutesAs.
+#   aws/lambda.yaml aws-lambda-execute-as-via-code:
+#     CanModifyCode(?principal, ?lambda) + ExecutesAs(?lambda, ?lambdaRole)
+#     => CanExecuteAs(?principal, ?lambdaRole)
+#     When the action-group Lambda's code is modified (via lambda rules) AND the Agent
+#     has a CanTrigger edge to that Lambda (explicit), this fires for the Lambda role.
+#   can-control.yaml escalate-via-execute-as:
+#     CanExecuteAs(?principal, ?role) where role.privilege > principal.privilege
+#     => CanEscalateTo(?principal, ?role).
+# ---------------------------------------------------------------------------

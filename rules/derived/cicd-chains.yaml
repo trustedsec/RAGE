@@ -1,0 +1,366 @@
+# Provider-agnostic CI/CD chain rules (Phase 9 — build & deployment pipelines)
+# ===========================================================================
+# THE PHASE-9 LINCHPIN. Written as the provider-agnostic roll-up that the
+# per-service CI/CD adapters (aws:codebuild / codepipeline / codedeploy,
+# gcp:cloudbuild / clouddeploy, azure:pipelines / devops, plus SSM/runbook/
+# Automation-account and self-hosted GitHub/GitLab runners) target. Each
+# adapter only has to emit a handful of NORMALIZED facts and inherits full
+# path-finding here, exactly as container-chains does for registries/k8s and
+# federation-chains does for OIDC/WIF.
+#
+# THE PHASE-9 IDEA (CI/CD as identity confusion):
+#   A build/deploy RUNNER is a Compute node (BuildWorker / ContainerTask /
+#   ServerlessFunction / VirtualMachine) that EXECUTES AS a service identity —
+#   the CodeBuild service role, the Cloud Build SA, the Azure DevOps deployment
+#   identity, the runner's IRSA/Managed Identity. Whatever the runner runs, it
+#   runs with that identity's credentials.
+#
+#   The runner runs a DEFINITION the attacker may control: a buildspec, a
+#   pipeline/stage spec, an Automation runbook, a deployment template, a
+#   Dockerfile, a Makefile/`npm run` target invoked by the build. Therefore:
+#     * whoever can MODIFY that definition (source in repo, pipeline YAML,
+#       runbook body, template, env/hook) can inject code -> runs AS the
+#       runner's identity. This is CanModifyCode into the runner. (rule 1)
+#     * whoever can TRIGGER/START the runner runs its CURRENT definition AS the
+#       runner's identity — weaker, because it only helps if the current
+#       definition already contains attacker-influenced code (a poisoned
+#       dependency, an attacker-authored branch, an already-tampered spec).
+#       (rule 2)
+#     * a PIPELINE orchestrates downstream stage runners; triggering the
+#       pipeline reaches each stage's runner (and thus each stage's
+#       ExecutesAs). (rule 3)
+#     * an EXTERNAL CI system (GitHub Actions / GitLab CI / Azure DevOps hosted)
+#       federates into the cloud via OIDC/WIF; that is a federation trust, handled
+#       by federation-chains — this file only bridges the CI-provider node to it.
+#       (rule 4)
+#
+# NORMALIZED FACTS THIS FILE CONSUMES (what the adapters emit):
+#   [?p, CanModifyCode, ?runner]     principal can edit the definition the runner
+#                                     executes (repo source, buildspec, pipeline
+#                                     YAML, runbook, template, Dockerfile). The
+#                                     adapter targets the runner Compute node (or a
+#                                     ContainerRegistry/ArtifactRepository the runner
+#                                     pulls — container-chains propagates that).
+#   [?runner, ExecutesAs, ?identity] the runner runs as its service identity
+#                                     (CodeBuild role, Cloud Build SA, DevOps MI).
+#   [?p, CanTrigger|CanStart, ?runner]  principal can cause the runner to run.
+#   [?pipeline, CanTrigger, ?stage_runner]  a pipeline invokes its stage runners
+#                                     (the adapter models orchestration as CanTrigger
+#                                     from the pipeline Compute node to each stage).
+#   external-CI OIDC/WIF trust is normalized by the federation adapters to
+#     TrustsExternalIdentity + ExternalIdentityMapsTo — see federation-chains.
+#
+# WHAT THIS FILE PRODUCES (the collapse):
+#   CanModifyCode(runner) + ExecutesAs        => CanExecuteAs(?p -> ?identity)   (rule 1, ACTIVE)
+#   CanTrigger/CanStart(runner) + ExecutesAs  => CanExecuteAs(?p -> ?identity)   (rule 2, CONDITIONAL)
+#   CanTrigger(pipeline) + pipeline->stage    => CanTrigger(?p -> ?stage_runner) (rule 3, propagation)
+#   external-CI OIDC/WIF                       => CanFederateAs (rule 4 bridges; federation-chains rolls up)
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE:
+#   * can-execute-as.yaml — the CanExecuteAs PRIMITIVE. execute-as-via-code-modify
+#     already collapses CanModifyCode(?compute) + ExecutesAs into CanExecuteAs for
+#     ANY Compute. Rule 1 here is the CI/CD-SPECIFIC framing of that same collapse
+#     (runner Compute + its build definition) so the pipeline narrative is explicit
+#     and the trigger/pipeline weakenings (rules 2-3) have a first-class home; it
+#     dedupes with execute-as-via-code-modify on (CanExecuteAs, ?p, ?identity). The
+#     escalation roll-up (CanExecuteAs -> CanEscalateTo) is NOT re-derived here — it
+#     is can-execute-as / can-control's job. iam:PassRole / actAs on the runner's
+#     role is the execute-as-via-config-identity-swap case in can-execute-as; not
+#     re-derived.
+#   * container-chains.yaml — registry PUSH = supply chain: a runner that PULLS an
+#     image the attacker can push already gets CanModifyCode(runner) from
+#     container-chains; this file consumes that CanModifyCode (rule 1) rather than
+#     re-deriving the registry->workload propagation.
+#   * federation-chains.yaml — external-CI OIDC/WIF => CanFederateAs and its
+#     CanEnter*/CanImpersonate roll-ups are OWNED by federation-chains. Rule 4 only
+#     asserts the bridge fact (the external CI provider IS a FederatedIdentity whose
+#     trust federation-chains consumes); we do NOT re-derive federate-then-enter-* or
+#     federate-inherits-capabilities.
+#   * credential-chains.yaml — a runner that ExposesCredential of its identity to
+#     job code is the credential-chains discipline; consumed downstream, not re-derived.
+#
+# STATE PROPAGATION (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. The CI/CD-specific gates:
+#   * MODIFY path (rule 1): ACTIVE when the principal can edit a definition that
+#     the runner WILL execute AND a run path exists (the runner runs on a trigger
+#     the modification arms, e.g. push-to-branch webhook, or the attacker can also
+#     trigger). CONDITIONAL(run_path) when no run path is established.
+#   * TRIGGER-only path (rule 2): CONDITIONAL(attacker_influenced_definition) —
+#     triggering only yields the identity if the CURRENT definition already runs
+#     attacker-controllable code. Strictly weaker than modify.
+# ===========================================================================
+
+applies_to: ["*"]
+phase: 9-cicd-pipelines
+
+rules:
+
+  # --- 1) Modify what the runner executes => execute as its identity ----------
+  # THE core CI/CD primitive. A build/deploy runner is a Compute node that runs
+  # as a service identity; editing the definition it executes (buildspec,
+  # pipeline/stage spec, runbook, deployment template, Dockerfile, or the repo
+  # source the build compiles/runs) injects attacker code into that identity.
+  # This is the CI/CD framing of can-execute-as execute-as-via-code-modify —
+  # cited, deduped, not re-derived for escalation.
+  - id: cicd-modify-buildspec-executes-as
+    emits: CanExecuteAs
+    description: "Modify the buildspec/pipeline/runbook/template a runner executes, then run it, to execute as the runner's service identity."
+    applies_to: ["*"]
+    match:
+      - [ ?principal, CanModifyCode, ?runner ]
+      - [ ?runner,    ExecutesAs,    ?identity ]
+    where:
+      # The runner is a CI/CD execution surface: a build agent, a container task,
+      # a serverless/VM runner, or a k8s workload that runs pipeline steps.
+      - "node_type(?runner) in [BuildWorker, ContainerTask, ContainerService, ServerlessFunction, VirtualMachine, KubernetesWorkload]"
+      # CanModifyCode here means the attacker controls the DEFINITION the runner
+      # executes (buildspec/pipeline YAML/runbook/template/Dockerfile/repo source),
+      # not merely metadata. The adapter targets ?runner (the Compute node); a
+      # registry-push CanModifyCode into ?runner (container-chains) also qualifies.
+    optional:
+      # A run path the modification arms or the attacker can pull: the attacker can
+      # also start the runner, OR a trigger already runs it (branch webhook, schedule,
+      # upstream stage). Present => ACTIVE; absent => CONDITIONAL(run_path).
+      - [ ?principal, CanTrigger, ?runner ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: []
+      conditions: [run_path]
+      state_logic: >-
+        ACTIVE if a run path exists for the modified definition — the attacker can
+        also trigger/start the runner (matched(optional[0])), OR the runner runs on a
+        trigger the modification arms (push-to-branch webhook, PR build, schedule,
+        upstream pipeline stage) so the injected code runs without further action.
+        Otherwise CONDITIONAL(run_path): the code is planted but has no established
+        way to run. Inherit weakest with the contributing CanModifyCode / ExecutesAs:
+        a CONDITIONAL/BLOCKED CanModifyCode (branch protection, required review,
+        protected pipeline, deny on the definition store) caps or blocks this edge.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?principal CanModifyCode ?runner", "?runner ExecutesAs ?identity" ]
+      false_positive_note: >-
+        The judgment is (a) that CanModifyCode truly reaches the EXECUTED definition
+        and (b) that a run path exists. Do NOT emit ACTIVE when a branch-protection /
+        required-reviewer / protected-pipeline control gates the merge that would run
+        the code (that CanModifyCode should itself be CONDITIONAL/BLOCKED, and this
+        edge inherits it). Editing a definition on a branch/stage the runner never
+        executes is not this edge — scope CanModifyCode to the ref/stage the runner
+        actually runs. This dedupes with can-execute-as execute-as-via-code-modify on
+        (CanExecuteAs, ?principal, ?identity) — same collapse, CI/CD framing; do not
+        double-count weight where both fire. The escalation consequence (identity more
+        privileged than the principal) is produced by can-execute-as / can-control off
+        this CanExecuteAs — cite, do not duplicate. iam:PassRole / actAs that lets the
+        runner assume a DIFFERENT privileged role is the config-identity-swap case in
+        can-execute-as, not this rule.
+      narrative: >-
+        {principal.name} can modify the definition {runner.name} executes (its
+        buildspec/pipeline/runbook/template or the source it builds) and run it,
+        executing attacker code as the runner's identity {identity.name}.
+
+  # --- 2) Trigger the runner => execute as its identity (weaker than modify) ---
+  # Merely being able to run the pipeline yields the runner's identity ONLY if
+  # the CURRENT definition already executes attacker-influenceable code — a
+  # poisoned dependency, an attacker-authored branch the trigger builds, an
+  # already-tampered spec, or a build step that runs untrusted PR content. Kept
+  # CONDITIONAL by default: a trigger over a clean, pinned, trusted definition is
+  # not by itself code execution as the identity.
+  - id: cicd-trigger-runner-executes-as
+    emits: CanExecuteAs
+    description: "Trigger/start a runner whose current definition already runs attacker-influenced code, executing as the runner's identity."
+    applies_to: ["*"]
+    match:
+      - [ ?principal, CanTrigger, ?runner ]
+      - [ ?runner,    ExecutesAs, ?identity ]
+    where:
+      - "node_type(?runner) in [BuildWorker, ContainerTask, ContainerService, ServerlessFunction, VirtualMachine, KubernetesWorkload]"
+    optional:
+      # Attacker can also START the runner (stronger trigger surface). Modeled as an
+      # optional CanStart; it does not by itself upgrade past the definition gate.
+      - [ ?principal, CanStart, ?runner ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?identity
+      permissions: []
+      conditions: [attacker_influenced_definition]
+      state_logic: >-
+        CONDITIONAL(attacker_influenced_definition) by default — triggering runs the
+        CURRENT definition, which yields the identity to the attacker only if that
+        definition already executes attacker-controllable code (a mutable/unpinned
+        dependency the attacker can poison, a build of an untrusted PR/fork with
+        pwn-request semantics, an attacker-authored branch the trigger targets, or an
+        already-tampered spec). ACTIVE only when such attacker influence over the
+        current definition is established (then it is effectively the modify path). A
+        trigger over a fully pinned, trusted, reviewed definition => stays CONDITIONAL
+        and is NOT an ACTIVE execute-as. Inherit weakest with CanTrigger / ExecutesAs.
+      confidence: "min(contributing_confidences) * 0.7"
+      derived_from: [ "?principal CanTrigger ?runner", "?runner ExecutesAs ?identity" ]
+      false_positive_note: >-
+        Strictly weaker than rule 1 (0.7 prior): a trigger is not code control. Do NOT
+        emit ACTIVE merely because the principal can start a build — the current
+        definition must already run attacker-influenceable code. The classic ACTIVE
+        cases are pwn-request-style PR builds (untrusted fork code runs with the
+        trusted identity) and unpinned-dependency supply-chain (the attacker poisons a
+        dependency the build resolves). If the runner builds only trusted, pinned,
+        reviewed source with no untrusted input, keep CONDITIONAL. Dedupes with rule 1
+        on (CanExecuteAs, ?principal, ?identity): when the principal can BOTH modify
+        and trigger, rule 1's ACTIVE dominates — do not double-count.
+      narrative: >-
+        {principal.name} can trigger {runner.name}, which executes as {identity.name};
+        if the runner's current definition already runs attacker-influenceable code
+        (poisoned dependency, untrusted PR build, tampered spec), the run executes as
+        {identity.name}.
+
+  # --- 3) A pipeline start reaches each stage's runner (orchestration) ---------
+  # A pipeline is a Compute node that orchestrates downstream stage runners; the
+  # adapter models orchestration as CanTrigger(?pipeline -> ?stage_runner). If a
+  # principal can trigger the pipeline, that trigger reaches each stage runner, so
+  # CanTrigger propagates to them and rule 2 (and, where the principal also
+  # controls a stage definition, rule 1) fires on each stage's ExecutesAs. This is
+  # a pure propagation so pipeline-level triggers do not miss per-stage identities.
+  - id: cicd-pipeline-orchestrates-stages
+    emits: CanTrigger
+    description: "Triggering a pipeline reaches each downstream stage runner it orchestrates; propagate CanTrigger to those runners."
+    applies_to: ["*"]
+    match:
+      - [ ?principal, CanTrigger, ?pipeline ]
+      - [ ?pipeline,  CanTrigger, ?stage_runner ]
+    where:
+      # ?pipeline orchestrates stages; ?stage_runner is a downstream execution surface.
+      - "node_type(?pipeline) in [BuildWorker, ContainerService, ServerlessFunction, VirtualMachine]"
+      - "node_type(?stage_runner) in [BuildWorker, ContainerTask, ContainerService, ServerlessFunction, VirtualMachine, KubernetesWorkload]"
+      - "?stage_runner != ?pipeline"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?stage_runner
+      permissions: []
+      conditions: [stage_reachable]
+      state_logic: >-
+        inherit from the two CanTrigger contributors: ACTIVE when the principal's
+        trigger of the pipeline is ACTIVE and the pipeline genuinely invokes
+        ?stage_runner unconditionally (not gated by a manual approval / stage
+        condition the attacker cannot satisfy); CONDITIONAL(stage_reachable) when the
+        stage is gated by an approval or a condition that must first be met; BLOCKED if
+        either contributing trigger is BLOCKED. Never stronger than the weaker of the
+        two CanTrigger edges.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?principal CanTrigger ?pipeline", "?pipeline CanTrigger ?stage_runner" ]
+      false_positive_note: >-
+        Only propagate for stages the pipeline actually reaches from the triggered
+        entry point. A stage behind a MANUAL APPROVAL gate, a protected-environment
+        wait, or a stage condition (branch filter, `when: manual`) the attacker cannot
+        satisfy => CONDITIONAL(stage_reachable), not ACTIVE. This is orchestration
+        propagation only; it does NOT itself grant an identity — it feeds rules 1/2 on
+        each ?stage_runner's ExecutesAs. Do not emit CanExecuteAs here.
+      narrative: >-
+        {principal.name} can trigger the pipeline {pipeline.name}, which orchestrates
+        {stage_runner.name}; the pipeline start therefore reaches {stage_runner.name},
+        propagating the ability to run it (and thus its execution identity).
+
+  # --- 4) External CI (GitHub/GitLab/DevOps) OIDC/WIF => federates into cloud ---
+  # Self-hosted or SaaS CI outside the cloud (GitHub Actions, GitLab CI, Azure
+  # DevOps hosted) authenticates to the cloud with NO static key via OIDC/WIF: the
+  # workflow presents a short-lived OIDC token the cloud role/SA trusts. That trust
+  # is a FEDERATION and is OWNED by federation-chains. This rule ONLY asserts the
+  # bridge fact — the external CI provider is a FederatedIdentity whose token
+  # federates in — so the CanFederateAs roll-up and its CanEnter*/CanImpersonate
+  # consequences are produced by federation-chains, NOT re-derived here.
+  - id: cicd-external-ci-federates-as
+    emits: CanFederateAs
+    description: "An external CI system (GitHub Actions/GitLab CI/Azure DevOps) with an OIDC/WIF trust into a cloud role/SA can federate in as that identity; escalation roll-ups are federation-chains'."
+    applies_to: ["*"]
+    match:
+      # The normalized federation trust the federation adapters emit for the external
+      # CI OIDC issuer -> cloud identity (GitHub Actions token.actions.githubusercontent.com,
+      # GitLab OIDC, Azure DevOps WIF). ?ci_ext is the external CI principal.
+      - [ ?ci_ext, ExternalIdentityMapsTo, ?internal ]
+    where:
+      - "node_type(?ci_ext) in [ExternalIdentity, FederatedIdentity]  # the CI provider's OIDC identity"
+      - "?ci_ext is an external CI issuer (GitHub Actions / GitLab CI / Azure DevOps OIDC)"
+      - "node_type(?internal) in [Role, ServiceAccount, MachineIdentity]  # the cloud identity the CI deploys as"
+      - "exists TrustsExternalIdentity(?anchor -> ?ci_ext) backing this mapping (the role/SA OIDC trust)"
+    emit:
+      source_type: FederatedIdentity
+      target_type: Role
+      source: ?ci_ext
+      target: ?internal
+      permissions: []
+      conditions: [trust_condition]
+      state_logic: >-
+        DELEGATED to federation-chains federation-maps-to-identity: ACTIVE when the CI
+        OIDC trust condition is BROAD/UNPINNED (no `sub` pin so any repo/project/branch
+        workflow token matches, a wildcard/shared `aud`, an attacker-runnable branch),
+        CONDITIONAL(trust_condition) when pinned to a specific repo:owner/repo:ref /
+        project / pipeline the attacker cannot run, BLOCKED if the OIDC provider is
+        disabled/deleted. This rule inherits that exact state — it is the same collapse
+        keyed to a CI-provider ?ci_ext; do not compute a stronger state here.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?ci_ext ExternalIdentityMapsTo ?internal", "?anchor TrustsExternalIdentity ?ci_ext (CI OIDC trust)" ]
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE federation-chains: this rule exists only to name the
+        external-CI case explicitly and dedupes with federation-chains
+        federation-maps-to-identity on (CanFederateAs, ?ci_ext, ?internal) — emit once.
+        The CanEnter*/CanImpersonate/escalation roll-ups off this CanFederateAs are
+        federation-chains' (federate-then-enter-*, federate-inherits-capabilities) —
+        never re-derive them here. The entire judgment is the OIDC `sub`/`aud`/issuer
+        pin: a correctly pinned GitHub-Actions trust (sub == repo:owner/repo:ref:...) is
+        a legitimate control => CONDITIONAL, not ACTIVE. Do not treat the mere existence
+        of a CI federation as compromise. If ?internal is a plain User, CanFederateAs's
+        target set excludes it — keep it as FederatesTo (see federation-chains).
+      narrative: >-
+        The external CI system {ci_ext.name} holds an OIDC/WIF trust into the cloud
+        identity {internal.name}; a workflow it runs presents a token {internal.name}'s
+        trust accepts, letting the CI federate in as {internal.name} with no static
+        credential (federation-chains rolls up the foothold/impersonation).
+
+# ===========================================================================
+# WORKED EXAMPLES
+#
+# MODIFY BUILDSPEC (rule 1 -> can-execute-as escalation):
+#   [dev CanModifyCode codebuild-proj(BuildWorker)]   (write to the repo/buildspec)
+#   + [codebuild-proj ExecutesAs codebuild-service-role(Role)]
+#   + codebuild-proj runs on a push-to-branch webhook the dev's commit arms
+#     => cicd-modify-buildspec-executes-as: [dev CanExecuteAs codebuild-service-role] ACTIVE
+#     => can-control/can-execute-as: [dev CanEscalateTo codebuild-service-role]
+#        (CITED, not re-derived) when the role outranks dev.
+#
+# TRIGGER-ONLY (rule 2, stays CONDITIONAL unless PR-poisonable):
+#   [contributor CanTrigger ci-runner(ContainerTask)]  (can open a PR that builds)
+#   + [ci-runner ExecutesAs deploy-sa(ServiceAccount)]
+#     => cicd-trigger-runner-executes-as: [contributor CanExecuteAs deploy-sa]
+#        CONDITIONAL(attacker_influenced_definition) — ACTIVE only if the PR build runs
+#        untrusted fork code with the trusted identity (pwn-request) or an unpinned dep.
+#
+# PIPELINE ORCHESTRATION (rule 3 -> rule 1/2 per stage):
+#   [releaser CanTrigger release-pipeline(ServerlessFunction)]
+#   + [release-pipeline CanTrigger deploy-stage(ContainerService)]
+#     => cicd-pipeline-orchestrates-stages: [releaser CanTrigger deploy-stage] ACTIVE
+#   + [deploy-stage ExecutesAs prod-deployer-role(Role)]
+#     => rule 2 fires on deploy-stage's ExecutesAs (CONDITIONAL unless its def is
+#        attacker-influenced); if releaser also CanModifyCode deploy-stage, rule 1 ACTIVE.
+#   A manual-approval gate before deploy-stage => CanTrigger CONDITIONAL(stage_reachable).
+#
+# EXTERNAL CI OIDC (rule 4 -> federation-chains):
+#   adapter normalizes a GitHub-Actions AWS role trust with NO sub pin:
+#     [gha-oidc(FederatedIdentity) ExternalIdentityMapsTo ci-deploy-role(Role)]
+#     backed by [ci-deploy-role TrustsExternalIdentity gha-oidc], aud-only condition
+#     => cicd-external-ci-federates-as: [gha-oidc CanFederateAs ci-deploy-role] ACTIVE
+#     => federation-chains federate-then-enter-account + federate-inherits-capabilities
+#        produce the account foothold and impersonation (CITED, not re-derived).
+#   sub pinned to repo:acme/app:ref:refs/heads/main => CONDITIONAL(trust_condition).
+#
+# BLOCKED-edge guidance:
+#  - Branch protection / required review / protected pipeline gating the merge that
+#    runs the code => the contributing CanModifyCode is CONDITIONAL/BLOCKED and rule 1
+#    inherits it (never an ACTIVE execute-as over a gated definition).
+#  - A manual-approval / protected-environment gate on a pipeline stage =>
+#    rule 3 CanTrigger CONDITIONAL(stage_reachable), never ACTIVE.
+#  - A disabled/deleted CI OIDC provider or a correctly pinned sub/aud/issuer =>
+#    federation-chains does not fire ACTIVE; rule 4 inherits CONDITIONAL/BLOCKED.
+#  - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ===========================================================================

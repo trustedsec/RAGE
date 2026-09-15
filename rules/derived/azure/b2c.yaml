@@ -1,0 +1,464 @@
+# Azure AD B2C — Derived attack-path rules (Phase 2 — identity/federation)
+# ---------------------------------------------------------------------------
+# Azure AD B2C is a separate Entra tenant (type AADB2C) that manages consumer
+# identity via user flows and Identity Experience Framework (IEF) custom
+# policies. The attack surface is concentrated in its external-IdP trust
+# configuration: an attacker-controlled external OIDC or SAML identity provider
+# that B2C trusts unconditionally (or with a broad/unpinned subject claim) can
+# federate into B2C-protected relying party applications as any consumer.
+#
+# ATTACK PRIMITIVES THIS FILE EMITS (service FACTS):
+#   TrustsExternalIdentity — explicit normalized trust the linchpin consumes
+#   ExternalIdentityMapsTo — the resulting claim→identity mapping
+#   CanModifyConfiguration — policy-write access over custom policy XML
+#   CanModifyTrust         — keyset admin replacing a signing key; user-flow IdP injection
+#   CanResetCredential     — B2C user admin password reset
+#   CanCreateCredentialFor — app registration credential addition (deferred to
+#                            azure/identity-escalation.yaml azure-app-add-credential)
+#
+# LINCHPIN OUTPUTS (NOT directly emitted; produced by federation-chains.yaml):
+#   CanFederateAs          — NOT directly emitted; produced by federation-chains.yaml
+#                            federation-maps-to-identity off TrustsExternalIdentity +
+#                            ExternalIdentityMapsTo
+#
+# LINCHPIN CITATIONS (do NOT re-derive these):
+#   federation-chains.yaml     — federation-maps-to-identity (TrustsExternalIdentity +
+#                                ExternalIdentityMapsTo → CanFederateAs)
+#                              — federate-inherits-capabilities (CanFederateAs →
+#                                CanImpersonate for ServiceAccount/MachineIdentity targets)
+#   azure/identity-escalation.yaml — azure-app-add-credential (app cred addition)
+#                                  — azure-federated-credential-write (CanModifyTrust on apps)
+#
+# PHASE 2 DISCIPLINE: emit service FACTS (TrustsExternalIdentity, ExternalIdentityMapsTo,
+# CanModifyCode, CanModifyTrust) and the direct CanFederateAs collapse where the
+# derivation logic is B2C-specific (policy-write path); let federation-chains roll up
+# the normalized trust pair. Do NOT re-derive CanExecuteAs, CanEscalateTo, or
+# CanEnterTenant — those come from can-control and hierarchy-chains off our outputs.
+#
+# ATTACK VALUE: medium-low. B2C tokens are valid for consumer-facing relying party
+# apps, not the corporate Entra tenant. The primary impact is consumer account
+# impersonation in the B2C-protected application, not cloud resource escalation.
+#
+# Official docs:
+#   https://learn.microsoft.com/azure/active-directory-b2c/
+#   https://learn.microsoft.com/azure/active-directory-b2c/custom-policy-overview
+#   https://learn.microsoft.com/azure/active-directory-b2c/identity-provider-generic-oidc
+#   https://learn.microsoft.com/azure/active-directory-b2c/identity-provider-saml
+#   MS Graph reference: /beta/trustFramework/policies, /beta/identityProviders,
+#     /beta/identity/b2cUserFlows/{id}/identityProviders
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 2-identity-authorization
+applies_to: [azure]
+
+rules:
+
+  # --- 1) Policy write = trust injection (CanModifyTrust as the fact) -----------
+  # A principal who can WRITE custom policy XML (B2C IEF Policy Administrator or
+  # Global Administrator) can insert a Technical Profile that trusts an IdP they
+  # control. This is a write-to-trust-injection path and is B2C-specific. We emit
+  # CanModifyTrust (the fact that the admin rewrites the trust). Once the custom
+  # policy is redeployed with the injected IdP, the explicit azure-b2c-idp-trusts-external
+  # rule will emit TrustsExternalIdentity on the next collection cycle, and
+  # federation-chains will roll that up to CanFederateAs. This preserves separation
+  # of concerns: policy write is about modifying configuration, not directly about
+  # federating (which is the linchpin's role).
+  - id: azure-b2c-policy-write-trust-injection
+    emits: CanModifyTrust
+    description: "A principal who can write B2C custom policy XML can inject a Technical Profile trusting an attacker-controlled OIDC/SAML IdP."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?policy ]
+    where:
+      - "node_type(?policy) == TrustPolicy  # B2C IEF custom policy"
+      - "?policy.provider_type in ['Microsoft.AzureActiveDirectory/b2cDirectories/trustFramework/policies']"
+    emit:
+      source_type: Identity
+      target_type: TrustPolicy
+      source: ?principal
+      target: ?policy
+      permissions: ["Policy.ReadWrite.TrustFramework"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds effective B2C IEF Policy Administrator or
+        Global Administrator directory role in the B2C tenant (CanModifyConfiguration
+        on the policy is ACTIVE). CONDITIONAL if the policy write permission is itself
+        CONDITIONAL (e.g. behind MFA / PIM / Just-In-Time activation). BLOCKED if the
+        policy upload API is restricted by a Conditional Access policy blocking the
+        principal.
+      confidence: 0.80
+      derived_from:
+        - "azure-b2c-policy-admin-can-modify-config (rule 5, derived)"
+      false_positive_note: >-
+        Requires confirmed B2C IEF Policy Administrator or Global Administrator role
+        INSIDE the B2C tenant (not just ARM Contributor on the subscription resource).
+        ARM Contributor on Microsoft.AzureActiveDirectory/b2cDirectories does NOT confer
+        directory roles — do not emit if only ARM permissions are observed. Once the
+        attacker rewrites the policy to inject an IdP they control, the explicit
+        azure-b2c-idp-trusts-external rule produces TrustsExternalIdentity on the next
+        collection, and federation-chains will roll this up to CanFederateAs.
+      narrative: >-
+        {principal.name} can write B2C custom policy XML (IEF Policy Administrator /
+        Global Admin), effectively modifying the trust configuration. An attacker can
+        inject a Technical Profile trusting an external OIDC/SAML identity provider
+        they control, which will then be accepted by all relying party applications
+        served by {policy.name}.
+
+  # --- 2) Keyset Administrator replaces signing key -> token forgery ----------
+  # The B2C IEF Keyset Administrator can manage the cryptographic keysets used by
+  # custom policies to sign tokens. If an attacker holds this role, they can replace
+  # or add a signing key they control via the MS Graph uploadSecret API. This is a
+  # CanModifyTrust rather than CanSignAs because the attacker replaces the key at
+  # rest (not signs directly); once replaced, any code that holds the private key
+  # can forge tokens accepted by all RPs that validate against this keyset.
+  - id: azure-b2c-keyset-admin-replace-signing-key
+    emits: CanModifyTrust
+    description: "The B2C IEF Keyset Administrator can replace the signing keyset used by custom policies, enabling token forgery for all relying party applications."
+    match:
+      - [ ?principal, CanAdminister, ?keyset ]
+      - [ ?policy, HasPolicy, ?keyset ]
+    where:
+      - "node_type(?keyset) == SigningKey"
+      - "?keyset.provider_type == 'Microsoft.AzureActiveDirectory/b2cDirectories/trustFramework/keysets'"
+      - "?keyset.use == 'sig'  # signing keyset, not encryption"
+      - "node_type(?policy) == TrustPolicy"
+      - "principal holds B2C IEF Keyset Administrator or Global Administrator in the B2C tenant"
+    emit:
+      source_type: Identity
+      target_type: TrustPolicy
+      source: ?principal
+      target: ?policy
+      permissions: ["microsoft.directory/b2cTrustFrameworkKeySet/allProperties/allTasks", "Policy.ReadWrite.TrustFramework"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        CONDITIONAL(key_permission) when the principal has confirmed B2C IEF Keyset
+        Administrator or Global Administrator directory role in the B2C tenant. Upgrade
+        to ACTIVE if the uploadSecret API path (POST /beta/trustFramework/keysets/{id}/uploadSecret)
+        with attacker-supplied PEM is confirmed available. Downgrade to POTENTIAL(key_permission)
+        if only the generateKey API (/beta/trustFramework/keysets/{id}/generateKey) is
+        available — the attacker adds a key but cannot use it offline. CONDITIONAL if
+        the role requires PIM activation. BLOCKED if a Conditional Access policy prevents
+        the principal from authenticating to the B2C tenant's MS Graph endpoint.
+      confidence: 0.70
+      derived_from:
+        - "azure-b2c-keyset-admin-role (explicit)"
+      false_positive_note: >-
+        The MS Graph API /beta/trustFramework/keysets/{id}/uploadSecret allows importing
+        an attacker-supplied PEM-encoded signing key. If only the generateKey API is
+        available, downgrade to POTENTIAL(key_permission) because the attacker adds a
+        key they cannot use offline. B2C IEF Keyset Administrator requires a directory
+        role INSIDE the B2C tenant, not ARM permissions on the subscription. The attack
+        is only ACTIVE if the uploadSecret path is confirmed available.
+      narrative: >-
+        {principal.name} holds the B2C IEF Keyset Administrator (or Global Admin) role
+        and can replace the signing keyset {keyset.name} used by B2C custom policies via
+        POST /beta/trustFramework/keysets/{id}/uploadSecret (Policy.ReadWrite.TrustFramework).
+        Replacing the signing key with an attacker-controlled key allows forging tokens
+        accepted by all relying party applications that validate tokens against this B2C tenant.
+
+  # --- 3) User-flow IdP injection (distinct from custom policy write) -----------
+  # A principal with IdentityProvider.ReadWrite.All (or Global Administrator) can
+  # PATCH /beta/identity/b2cUserFlows/{id}/identityProviders to inject a malicious
+  # OIDC or SAML IdP into a live user flow — this is distinct from the custom-policy
+  # write path (rule 5). This rule covers the attack vector of adding a new IdP to
+  # an existing flow that may already be in use.
+  - id: azure-b2c-userflow-idp-inject
+    emits: CanModifyConfiguration
+    description: "A principal with IdentityProvider.ReadWrite.All or Global Admin can inject a malicious external IdP into a B2C user flow."
+    match_effective_permission:
+      action: "IdentityProvider.ReadWrite.All"
+      api: "MS Graph PATCH /beta/identity/b2cUserFlows/{id}/identityProviders"
+    where:
+      - "principal holds 'Global Administrator' or has effective 'IdentityProvider.ReadWrite.All' permission in the B2C tenant"
+    emit:
+      source_type: Identity
+      target_type: GenericPolicy
+      source: "<principal>"
+      target: "<B2C user flow (GenericPolicy node with provider_type Microsoft.AzureActiveDirectory/b2cDirectories/userFlows)>"
+      permissions: ["IdentityProvider.ReadWrite.All"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds Global Administrator or effective
+        IdentityProvider.ReadWrite.All in the B2C tenant. CONDITIONAL if the
+        permission is behind PIM activation. BLOCKED if a Conditional Access policy
+        prevents Graph API access to the B2C tenant.
+      confidence: 0.80
+      derived_from:
+        - "B2C tenant directory role (Global Administrator or IdentityProvider.ReadWrite.All app permission)"
+      false_positive_note: >-
+        IdentityProvider.ReadWrite.All is the only required permission for PATCH
+        /beta/identity/b2cUserFlows/{id}/identityProviders. Do not confuse with
+        Policy.ReadWrite.TrustFramework, which is for custom policy XML upload
+        (PUT /beta/trustFramework/policies). Only emit if the principal holds
+        IdentityProvider.ReadWrite.All directly (or inherits it from a Global
+        Administrator directory role). The attack requires the principal to PATCH the
+        user flow configuration to add a new IdP; without this permission, the user
+        flow's IdP list is read-only.
+      narrative: >-
+        {principal.name} can modify B2C user flow {target.name} configuration via
+        PATCH /beta/identity/b2cUserFlows/{id}/identityProviders (IdentityProvider.ReadWrite.All
+        or Global Admin), allowing injection of a malicious external OIDC or SAML IdP
+        that will be offered as a sign-in option to all consumers using this flow.
+
+  # --- 4) CanModifyConfiguration: Policy Administrator writes custom policy XML --
+  # Derived fact: a principal with B2C IEF Policy Administrator or Global Admin
+  # role can upload/overwrite custom policy XML via MS Graph. Emitted as
+  # CanModifyConfiguration (target: TrustPolicy objects) so rule 1
+  # (azure-b2c-policy-write-trust-injection) can consume it. CanModifyCode is
+  # reserved for compute/registry targets per schema; custom policy XML is
+  # configuration of an authentication pipeline, making CanModifyConfiguration
+  # the correct fit.
+  - id: azure-b2c-policy-admin-can-modify-config
+    emits: CanModifyConfiguration
+    description: "B2C IEF Policy Administrator or Global Admin can upload/replace custom policy XML, effectively reconfiguring the entire authentication and federation pipeline."
+    match_effective_permission:
+      action: "Policy.ReadWrite.TrustFramework"
+      api: "MS Graph PUT /beta/trustFramework/policies/{policyId}/$value"
+    where:
+      - "principal holds 'B2C IEF Policy Administrator' or 'Global Administrator' directory role in the B2C tenant"
+    emit:
+      source_type: Identity
+      target_type: TrustPolicy
+      source: "<principal>"
+      target: "<B2C custom policy (TrustPolicy node)>"
+      permissions: ["Policy.ReadWrite.TrustFramework"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when directory role confirmed. CONDITIONAL if behind PIM activation.
+        BLOCKED if a deny assignment or Conditional Access policy prevents Graph
+        API access to the B2C tenant.
+      confidence: 0.85
+      derived_from:
+        - "Azure B2C IEF Policy Administrator or Global Administrator directory role assignment"
+      false_positive_note: >-
+        ARM Contributor on the b2cDirectories ARM resource does NOT grant
+        Policy.ReadWrite.TrustFramework inside the B2C tenant. Only directory roles
+        B2C IEF Policy Administrator and Global Administrator in the B2C tenant
+        authorize this action. Do not confuse the ARM subscription role with the
+        B2C directory role.
+      narrative: >-
+        {principal.name} can upload custom policy XML to B2C tenant {tenant.name}
+        (Policy.ReadWrite.TrustFramework via B2C IEF Policy Administrator or Global Admin),
+        effectively reconfiguring the entire authentication pipeline — including which
+        external identity providers are trusted — for all user flows implemented as
+        custom policies.
+
+  # --- 5) User Administrator resets B2C consumer passwords -----
+  # User Administrator role inside the B2C tenant can reset passwords of B2C
+  # consumer accounts (HumanIdentity nodes). This is an account-takeover primitive
+  # for any consumer account in the B2C tenant. Distinct from the corporate Entra
+  # tenant password reset (azure/identity-escalation.yaml azure-reset-password).
+  - id: azure-b2c-user-admin-reset-password
+    emits: CanResetCredential
+    description: "User Administrator role in B2C tenant can reset B2C consumer account passwords, enabling account takeover."
+    match_effective_permission:
+      action: "microsoft.directory/users/password/update"
+      api: "MS Graph POST /beta/users/{id}/resetPassword OR /beta/users/{id}/revokeSignInSessions"
+    where:
+      - "principal holds 'User Administrator' directory role inside the B2C tenant"
+    emit:
+      source_type: Identity
+      target_type: HumanIdentity
+      source: "<principal>"
+      target: "<B2C consumer user account (HumanIdentity)>"
+      permissions: ["microsoft.directory/users/password/update", "UserAuthenticationMethod.ReadWrite.All"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds the User Administrator directory role inside
+        the B2C tenant. CONDITIONAL if the role is behind PIM activation. BLOCKED if
+        a Conditional Access policy or deny assignment prevents the principal from
+        accessing the MS Graph password reset API.
+      confidence: 0.90
+      derived_from:
+        - "B2C tenant User Administrator directory role assignment"
+        - "azure/identity-escalation.yaml: azure-reset-password (corporate Entra analogue)"
+      false_positive_note: >-
+        User Administrator applies only to the B2C tenant directory where it is
+        assigned, not the corporate Entra tenant. Resetting a B2C consumer password
+        enables account takeover in B2C-protected applications; it does not grant
+        access to corporate cloud resources. Confirm the role assignment is in the
+        B2C directory (Microsoft.AzureActiveDirectory/b2cDirectories), not the
+        corporate Entra tenant. The directory role action 'microsoft.directory/users/password/update'
+        or the MS Graph delegated/app permission 'UserAuthenticationMethod.ReadWrite.All'
+        are required for password reset via API.
+      narrative: >-
+        {principal.name} holds the User Administrator role in B2C tenant {tenant.name}
+        and can reset the password of any B2C consumer account via POST
+        /beta/users/{id}/resetPassword, effectively taking over that consumer's account
+        in all B2C-protected applications.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A Conditional Access policy in the B2C tenant requiring MFA or compliant
+#    device for MS Graph API access -> CONDITIONAL(condition_expression) for all
+#    directory-role-based rules.
+#  - B2C IEF Policy/Keyset Administrator roles gated behind PIM (Privileged
+#    Identity Management) -> CONDITIONAL(iam_permission) until activated.
+#  - ARM Contributor on Microsoft.AzureActiveDirectory/b2cDirectories without a
+#    matching directory role inside the B2C tenant -> the escalation is BLOCKED
+#    (no path from ARM to directory roles exists without explicit role assignment
+#    inside the B2C tenant).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service:
+#   /rules/explicit/azure-b2c.yaml — emits:
+#     TrustsExternalIdentity (from IdP config objects)
+#     ExternalIdentityMapsTo (from claim transformation / user flow IdP mapping)
+#     CanAdminister           (from keyset admin role assignment)
+#     HasPolicy               (user flow → IdP, policy → IdP references)
+# These explicit rules consume MS Graph collection data; they are defined
+# separately so the collector emits them.
+#
+# App registration credential addition (CanCreateCredentialFor) is already
+# handled by azure/identity-escalation.yaml (azure-app-add-credential); do not
+# duplicate for B2C app registrations.
+explicit_rules:
+
+  - id: azure-b2c-idp-trusts-external
+    emits: TrustsExternalIdentity
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.AzureActiveDirectory/b2cDirectories/identityProviders"
+      field: "issuerUri OR metadataUrl OR oidcIssuer"
+    emit:
+      source_type: [TrustPolicy, GenericPolicy]
+      target_type: FederatedIdentity
+      source: "<B2C custom policy or user flow object (TrustPolicy or GenericPolicy) that references this IdP>"
+      target: "<external IdP node (FederatedIdentity)>"
+      api_source: "MS Graph GET /beta/identityProviders OR /beta/directory/federationConfigurations"
+      evidence_field: "issuerUri | metadataUrl | type"
+      state_logic: >-
+        ACTIVE if the IdP's issuer endpoint is attacker-controllable or the subject
+        claim mapping lacks a binding constraint. CONDITIONAL(trust_condition) if the
+        issuer is pinned to a well-known public provider (Google, Facebook, Microsoft,
+        Apple, Twitter) and subject claim is restricted. BLOCKED if the IdP is disabled
+        in the policy/flow.
+      false_positive_note: >-
+        Only emit ACTIVE for custom OIDC or SAML IdPs with attacker-reachable issuers.
+        Pinned social IdPs are CONDITIONAL; attacker must first compromise an account
+        at that provider.
+      narrative: >-
+        {source.name} (B2C custom policy or user flow) trusts external identity provider
+        {target.name} via its OIDC issuer or SAML metadata endpoint.
+
+  - id: azure-b2c-idp-maps-to-consumer
+    emits: ExternalIdentityMapsTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.AzureActiveDirectory/b2cDirectories/identityProviders"
+      field: "claimsMapping.userId OR subjectClaimType"
+    emit:
+      source_type: FederatedIdentity
+      target_type: Role
+      source: "<external IdP node>"
+      target: "<B2C consumer identity role (or HumanIdentity if direct mapping is observed)>"
+      api_source: "MS Graph GET /beta/identityProviders/{id}"
+      evidence_field: "claimsMapping"
+      state_logic: >-
+        ACTIVE by default; records the normalized claim mapping used by the IdP to
+        establish a B2C consumer identity. State is inherited from the
+        TrustsExternalIdentity edge on the same IdP (trust_condition breadth flag).
+      false_positive_note: >-
+        If the subject claim is pinned to a specific external user attribute the
+        attacker cannot forge (e.g. a UUID tied to a real account at that IdP), set
+        trust_condition_breadth to 'pinned' so federation-chains.yaml
+        federation-maps-to-identity emits CanFederateAs as CONDITIONAL, not ACTIVE.
+        The semantic target of this mapping is the INTERNAL identity (B2C consumer role
+        or HumanIdentity), not the relying party application — applications consume
+        tokens carrying the mapped consumer identity.
+      narrative: >-
+        External IdP {source.name} maps its subject claim to B2C consumer identity
+        via claim transformation {evidence_field}.
+
+  - id: azure-b2c-keyset-admin-role
+    emits: CanAdminister
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.AzureActiveDirectory/b2cDirectories/trustFramework/keysets"
+      field: "role_assignment.displayName"
+      value_in: ["B2C IEF Keyset Administrator", "Global Administrator"]
+    emit:
+      source_type: Identity
+      target_type: SigningKey
+      source: "<principal holding the keyset role>"
+      target: "<B2C keyset node (SigningKey)>"
+      api_source: "MS Graph GET /beta/trustFramework/keysets"
+      evidence_field: "role_assignment.displayName"
+      state_logic: >-
+        ACTIVE when the directory role assignment is confirmed in the B2C tenant.
+        CONDITIONAL if the role is behind PIM activation. BLOCKED if the principal
+        is denied access via a deny assignment or Conditional Access policy.
+      false_positive_note: >-
+        B2C IEF Keyset Administrator or Global Administrator must be assigned in the
+        B2C tenant directory, not the corporate Entra tenant or ARM subscription. Do
+        not confuse ARM resource permissions on Microsoft.AzureActiveDirectory/b2cDirectories
+        with directory roles inside the B2C tenant.
+      narrative: >-
+        {source.name} holds {role} in the B2C tenant and can administer keyset {target.name}.
+
+# ---------------------------------------------------------------------------
+# NEW DERIVED RULE (Phase 2 missing escalation): Multi-tenant B2C app → corporate tenant
+# ---------------------------------------------------------------------------
+
+  # --- 6) Multi-tenant B2C app registration cross-tenant trust -----------
+  # An organization may register a B2C app in the B2C tenant with signInAudience
+  # set to multi-tenant (AzureADMultipleOrgs, AzureADandPersonalMicrosoftAccount, or
+  # explicit corporate tenant inclusion). If this app has high-privilege Graph app
+  # roles (e.g. Directory.ReadWrite.All, Application.ReadWrite.All) assigned in the
+  # corporate Entra tenant, an attacker who compromises the B2C app or a B2C consumer
+  # account can pivot to the corporate tenant. This is the highest-impact B2C
+  # escalation vector because it bridges the consumer boundary to the corporate
+  # cloud infrastructure.
+  - id: azure-b2c-multitenant-app-cross-tenant-trust
+    emits: CrossTenantTrust
+    description: "A multi-tenant B2C app registration with high-privilege Graph app roles in the corporate Entra tenant enables cross-tenant pivot from B2C to corporate resources."
+    match:
+      - [ ?b2c_app, ExecutesAs, ?b2c_tenant ]
+      - [ ?b2c_app, HasPermission, ?high_perms ]
+      - [ ?corporate_tenant, Contains, ?b2c_app ]
+    where:
+      - "node_type(?b2c_app) == ApplicationIdentity  # B2C app registration"
+      - "?b2c_app.provider_type in ['Microsoft.AzureActiveDirectory/applications', 'Entra app']"
+      - "?b2c_app.signInAudience in ['AzureADMultipleOrgs', 'AzureADandPersonalMicrosoftAccount'] OR ?b2c_app.isMultiTenantSupported == true"
+      - "node_type(?high_perms) == Role OR node_type(?high_perms) == ApplicationIdentity"
+      - "?high_perms.permissions include one or more of [Directory.ReadWrite.All, Application.ReadWrite.All, ServicePrincipal.ReadWrite.All, Policy.ReadWrite.ConditionalAccess, RoleManagement.ReadWrite.Directory]"
+      - "?b2c_app.home_tenant_id == ?b2c_tenant (B2C tenant)"
+      - "?high_perms are assigned or scoped to a different tenant (corporate tenant, not B2C)"
+    emit:
+      source_type: ApplicationIdentity
+      target_type: Tenant
+      source: ?b2c_app
+      target: "<corporate Entra tenant where ?b2c_app has high Graph app roles>"
+      permissions: ["Directory.ReadWrite.All", "Application.ReadWrite.All", "ServicePrincipal.ReadWrite.All", "Policy.ReadWrite.ConditionalAccess", "RoleManagement.ReadWrite.Directory"]
+      conditions: [trust_relationship]
+      state_logic: >-
+        ACTIVE if the B2C app's signInAudience is explicitly set to multi-tenant AND
+        the app has been granted high-privilege Graph app roles in the corporate
+        tenant (confirmed via app role assignments in the corporate Entra admin center).
+        CONDITIONAL(trust_relationship) if the app registration exists in the B2C
+        tenant but the app role assignments are behind PIM activation or require
+        admin consent re-validation. POTENTIAL(trust_relationship) if the B2C app is
+        registered as multi-tenant but has not yet been assigned Graph app roles
+        (attacker must first obtain a token for the B2C app, then trigger consent
+        for high-privilege roles). BLOCKED if a Conditional Access policy in the
+        corporate tenant denies all B2C app authentication attempts.
+      confidence: 0.85
+      derived_from:
+        - "B2C app registration multi-tenancy flag + corporate tenant app role assignments"
+        - "azure/identity-escalation.yaml: app-role-assignments (app roles as escalation vector)"
+        - "federation-chains.yaml: federate-inherits-capabilities (attacker federated to B2C can then impersonate B2C app)"
+      false_positive_note: >-
+        Only emit ACTIVE when the B2C app's signInAudience explicitly includes other
+        tenants (not single-tenant within B2C). Pinned social IdP B2C apps or internal
+        B2C-only apps do not cross tenant boundaries — do not emit. Do not confuse
+        B2C app home_tenant with the corporate tenant it has permissions in; they are
+        distinct. Verify the high-privilege Graph app roles are assigned in the
+        corporate Entra tenant, not just requested in the app registration manifest.
+      narrative: >-
+        {source.name} is a multi-tenant B2C app registration with high-privilege
+        Graph app roles ({permissions}) assigned in the corporate Entra tenant
+        {target.name}. An attacker who compromises a B2C consumer account authenticated
+        by this app, or who compromises the B2C app's credentials, can pivot to the
+        corporate tenant and perform privileged operations (e.g., directory modification,
+        app registration, policy changes) on behalf of the B2C app service principal
+        in the corporate tenant.

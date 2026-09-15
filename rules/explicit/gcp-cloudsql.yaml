@@ -1,0 +1,274 @@
+# GCP Cloud SQL — Explicit normalization rules
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:cloudsql. Explicit edges from effective permissions and
+# resource configuration. These match raw Cloud SQL API records or effective
+# permissions (from Cloud Asset Inventory) and emit explicit-nature edges.
+#
+# RULE FORMAT: explicit normalization rules per /rules/explicit/RULE-FORMAT.md.
+# Emits only edges with nature: explicit or both (not derived).
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 6-storage-databases
+service: cloudsql
+applies_to: [gcp]
+
+rules:
+
+  # --- CanResetCredential: cloudsql.users.update on Cloud SQL instances ------
+  # Root/admin DB users are engine-internal principals with no GCP IAM backing;
+  # modeled as GenericIdentity (the explicitly-defined fallback for internal/
+  # unclassified identities), not HumanIdentity (which is "interactive user backed
+  # by a human"). This matters for downstream conformance.
+  - id: gcp-cloudsql-explicit-can-reset-credential
+    emits: CanResetCredential
+    description: "cloudsql.users.update on a Cloud SQL instance lets a principal reset any DB user's password, including root/admin DB users."
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "cloudsql.users.update"
+      resource_type: "google.sql.Instance"
+    where:
+      - "target is a root or admin-level built-in DB user (internal engine identity)"
+    emit:
+      source_type: Identity
+      target_type: GenericIdentity
+      source: "<principal>"
+      target: "<Cloud SQL root/admin DB user node (GenericIdentity)>"
+      permissions: ["cloudsql.users.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when cloudsql.users.update is confirmed effective on the instance scope
+        (project-level role binding without restricting IAM Condition, or IAM Condition
+        scopes to this instance); CONDITIONAL(iam_permission) when uncertain;
+        BLOCKED when IAM deny policy explicitly denies cloudsql.users.update.
+      false_positive_note: >-
+        cloudsql.users.update is included in roles/cloudsql.editor and
+        roles/cloudsql.admin, both granted at project level. Password reset yields
+        full DB access ONLY when targeting root/admin with all-database grants.
+        VPC Service Controls enclosing sqladmin.googleapis.com block the API call for
+        out-of-perimeter principals -> BLOCKED(resource_policy).
+      narrative: >-
+        {principal.name} holds cloudsql.users.update on instance {instance.name}
+        and can reset the root DB user password, taking over that DB user identity.
+      api_source: "Cloud Asset Inventory analyzeIamPolicy (cloudsql.users.update) + sqladmin.users.list (root user record)"
+      evidence_field: "cloudsql.users.update effective permission + root user record in sqladmin.users.list"
+      derived_from: ["cloudsql.users.update effective permission on google.sql.Instance"]
+
+  # --- CanModifyConfiguration: enable IAM database authentication --------------
+  # cloudsql.instances.update can enable the IAM auth flag (database_flags:
+  # cloudsql.iam_authentication=on), which is a configuration change that unlocks
+  # passwordless DB login for principals with cloudsql.instances.login.
+  - id: gcp-cloudsql-explicit-enable-iam-auth
+    emits: CanModifyConfiguration
+    description: "cloudsql.instances.update can enable IAM database authentication (cloudsql.iam_authentication database flag), unlocking passwordless DB login for instanceUser principals."
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "cloudsql.instances.update"
+      resource_type: "google.sql.Instance"
+    where:
+      - "instance.settings.databaseFlags does NOT already have cloudsql.iam_authentication=on (toggling it on is the security-relevant change)"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: "<principal>"
+      target: "<Cloud SQL Instance node>"
+      permissions: ["cloudsql.instances.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when cloudsql.instances.update is confirmed effective on the instance
+        and IAM auth flag is currently off; CONDITIONAL(iam_permission) when uncertain;
+        BLOCKED when org policy or IAM deny blocks cloudsql.instances.update.
+      false_positive_note: >-
+        cloudsql.instances.update covers many config changes (network, tier, disk, backup).
+        This rule specifically identifies IAM auth flag toggle as a security-relevant change.
+        Flag change requires instance restart for PostgreSQL (not MySQL). After enabling,
+        attacker must ALSO create IAM DB user record (cloudsql.users.create or IAM group
+        feature) to actually use it — enabling the flag alone does not create DB users.
+        Downgrade to POTENTIAL when no instanceUser-level principal would benefit.
+      narrative: >-
+        {principal.name} holds cloudsql.instances.update on {instance.name} and can
+        enable IAM database authentication (cloudsql.iam_authentication=on), unlocking
+        passwordless DB login for any principal with roles/cloudsql.instanceUser.
+      api_source: "Cloud Asset Inventory analyzeIamPolicy (cloudsql.instances.update) + sqladmin.instances.get (databaseFlags)"
+      evidence_field: "cloudsql.instances.update permission + databaseFlags state"
+      derived_from: ["cloudsql.instances.update effective permission on google.sql.Instance"]
+
+  # --- ContainsSecret: DB stores credential material (heuristic) --------------
+  # Emits ContainsSecret (nature: explicit) based on schema/table name heuristics
+  # that suggest credential storage. The credential-chains linchpin handles
+  # the downstream CredentialsFor + CanReadSecret -> CanImpersonate roll-up.
+  - id: gcp-cloudsql-explicit-contains-secret
+    emits: ContainsSecret
+    description: "A Cloud SQL instance may store application secrets (API keys, SA keys, connection strings, tokens) in its databases based on schema/table metadata heuristics."
+    applies_to: [gcp]
+    match_record:
+      api: "sqladmin.databases.list"
+      resource_type: "google.sql.Database"
+      field: "name"
+    where:
+      - "database or table name suggests credential storage (heuristic: api_keys, credentials, secrets, oauth, service_accounts, tokens)"
+    emit:
+      source_type: Data
+      target_type: Secret
+      source: "<Cloud SQL Instance / Database node>"
+      target: "<Secret / Credential node (classified from schema heuristic)>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when application context or schema names strongly suggest credential
+        storage (known app, documented schema); CONDITIONAL when only naming heuristics
+        (confidence 0.5–0.65); UNKNOWN when no schema metadata available.
+      false_positive_note: >-
+        ContainsSecret is inherently heuristic — table/column names suggest but do not
+        prove credential storage. Never read DB content during collection (that is active
+        exploitation). Evidence from cloudsql.databases.list (database names) and
+        application context. credential-chains linchpin (read-secret-yields-identity)
+        rolls ContainsSecret + CredentialsFor + CanReadSecret into CanImpersonate —
+        CITE that rule, do not re-derive. Carry confidence 0.5–0.65 for heuristic;
+        0.8+ only when app identity confirmed + credential schema documented.
+      narrative: >-
+        {instance.name} is assessed to contain application secrets (API keys,
+        connection strings, or service account credentials) based on schema metadata;
+        a principal with DB read access can extract those secrets and pivot.
+      api_source: "sqladmin.databases.list"
+      evidence_field: "database name heuristic + application context"
+      derived_from: ["google.sql.Instance/Database schema metadata heuristic"]
+
+  # --- CanAdminister: roles/cloudsql.admin grants full instance control -------
+  # cloudsql.instances.* admin role (permissions covering all instance operations)
+  # emits CanAdminister(Identity -> RelationalDatabase) so can-control.yaml can
+  # derive Controls without duplication. This is the explicit realization of
+  # admin-level control.
+  - id: gcp-cloudsql-explicit-can-administer
+    emits: CanAdminister
+    description: "roles/cloudsql.admin (including cloudsql.instances.* permissions) grants full administrative control over Cloud SQL instances."
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "cloudsql.instances.*"
+      resource_type: "google.sql.Instance"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: "<principal>"
+      target: "<Cloud SQL Instance node>"
+      permissions: ["cloudsql.instances.*"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when cloudsql.instances.* is confirmed effective (via wildcard or explicit
+        enumeration of admin-level actions); CONDITIONAL(iam_permission) when uncertain;
+        BLOCKED when IAM deny policy denies the admin action set.
+      false_positive_note: >-
+        The cloudsql.instances.* wildcard permission (or explicit enumeration of all
+        admin actions) appears in roles/cloudsql.admin and is granted at project scope.
+        This implies: password reset (users.update), data export (instances.export),
+        public IP change (instances.update), and all other instance management operations.
+        Downgrade to CONDITIONAL if only a subset of admin actions is confirmed.
+      narrative: >-
+        {principal.name} holds roles/cloudsql.admin (cloudsql.instances.* admin actions)
+        on {instance.name} and can administer the instance (reset passwords, export data,
+        modify configuration, delete/recreate).
+      api_source: "Cloud Asset Inventory analyzeIamPolicy (cloudsql.instances.*)"
+      evidence_field: "roles/cloudsql.admin or explicit cloudsql.instances.* permission"
+      derived_from: ["cloudsql.instances.* effective permission on google.sql.Instance"]
+
+  # --- CanReadCredential: SSL certificate private key exposure ------------------
+  # cloudsql.sslCerts.create returns a client SSL certificate + private key (in the
+  # API response field certPrivateKey). This is a one-time credential exposure at
+  # cert-creation time, not a persistent ACTIVE state. The private key is never
+  # re-readable after creation (sslCerts.get/list do not return it). Model as
+  # CanReadCredential(Identity -> Credential) emitted at cert-creation time with
+  # state POTENTIAL (attacker can create the cert and receive the key in response).
+  # The downstream credential-chains rules then model the path from Certificate
+  # -> DB user authentication -> CanReadData, accounting for PostgreSQL CN->user
+  # mapping requirements. This is more precise than the old over-claiming rule.
+  - id: gcp-cloudsql-explicit-ssl-cert-exposes-credential-explicit
+    emits: CanReadCredential
+    description: "cloudsql.sslCerts.create returns a client SSL certificate private key (one-time in the API response), which serves as a database authentication credential."
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "cloudsql.sslCerts.create"
+      resource_type: "google.sql.Instance"
+    where:
+      - "the principal calls cloudsql.sslCerts.create and receives the private key in the API response (certPrivateKey field)"
+    emit:
+      source_type: Identity
+      target_type: Credential
+      source: "<principal>"
+      target: "<SSL Certificate (private key)>"
+      permissions: ["cloudsql.sslCerts.create"]
+      conditions: [iam_permission]
+      state_logic: >-
+        POTENTIAL when cloudsql.sslCerts.create is confirmed effective. The attacker can
+        CREATE a client certificate and receive the private key in the API response (a
+        one-time event). The key is NOT retrievable after creation (sslCerts.get/list
+        do not return the private key). CONDITIONAL(iam_permission) when the permission
+        is uncertain; BLOCKED when VPC-SC perimeter blocks sqladmin.googleapis.com.
+      false_positive_note: >-
+        The private key is returned ONLY at cert creation time in the API response field
+        certPrivateKey as a one-shot event. Listing existing certs (sslCerts.list/get)
+        returns only the public certificate and common name, NOT the private key.
+        This is a POTENTIAL edge (attacker can create the cert and get the key),
+        not ACTIVE (which would imply persistent re-access). After obtaining the
+        private key, the attacker still must satisfy DB-level cert auth requirements:
+        - MySQL: REQUIRE X509 clause on the user account (the CN is NOT a username in MySQL)
+        - PostgreSQL: pg_hba.conf cert method + CN mapped to a DB user account
+        These DB-level configs are not visible via the sqladmin API; they must be confirmed
+        via data-plane queries or application documentation. The Certificate node represents
+        the exposed credential. Refer to credential-chains.yaml for the downstream
+        CredentialsFor -> CanReadData roll-up (PostgreSQL-specific auth paths).
+      narrative: >-
+        {principal.name} holds cloudsql.sslCerts.create on instance {instance.name}
+        and can create a client SSL certificate, receiving the private key in the API
+        response. The private key serves as a database authentication credential.
+      api_source: "sqladmin.sslCerts.create response (certPrivateKey field)"
+      evidence_field: "cloudsql.sslCerts.create permission + API response certPrivateKey field present"
+      derived_from: ["cloudsql.sslCerts.create effective permission on google.sql.Instance"]
+
+  # --- CrossProjectTrust: read replica in different project -----------------
+  # A Cloud SQL read replica in a different project creates a cross-project trust
+  # relationship: principals in the replica's project can query the replica and read
+  # source database data without source project's IAM bindings covering that access.
+  - id: gcp-cloudsql-explicit-read-replica-cross-project
+    emits: CrossProjectTrust
+    description: "A Cloud SQL read replica created in a different project enables cross-project access: principals in the replica's project can query the replica and read source database data."
+    applies_to: [gcp]
+    match_record:
+      api: "sqladmin.instances.get"
+      resource_type: "google.sql.Instance"
+      field: "replicaConfiguration"
+    where:
+      - "instance.kind == REPLICA_INSTANCE"
+      - "instance.replicaConfiguration.masterInstanceName is in a different project"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<source instance's project>"
+      target: "<replica instance's project>"
+      permissions: ["cloudsql.instances.create (with replicaConfiguration)", "cloudsql.instances.connect on replica"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when a read replica is confirmed in a different project, both instances
+        are RUNNABLE, and the replication is active; CONDITIONAL(service_state) when
+        instance states cannot be confirmed or replication is suspended.
+      false_positive_note: >-
+        A read replica in a different project is a valid Cloud SQL replication path
+        (documented in cloudsql.md Sections 10 & 15). The replica replicates data from
+        the source instance to the replica's project. Principals in the replica's project
+        can query the replica via standard Cloud SQL access controls
+        (cloudsql.instances.connect, cloudsql.instances.login if IAM auth enabled).
+        This creates a cross-project read access path: a principal controlling the
+        replica's project (or holding cloudsql.instanceUser on the replica) can read
+        all source data replicated there, OUTSIDE the source project's IAM policies.
+        Model as CrossProjectTrust(source_project -> replica_project). The replica's
+        replication service account must hold cross-project permissions to read from
+        the source instance; this is typically granted by the source project admin.
+      narrative: >-
+        Cloud SQL read replica {replica.name} is located in project {replica_project.name}
+        and replicates data from source instance {source_instance.name} in project
+        {source_project.name}. Principals in the replica's project can query the replica
+        and read source database data without source-project IAM bindings covering that access.
+      api_source: "sqladmin.instances.get (replicaConfiguration and masterInstanceName)"
+      evidence_field: "instance.kind == REPLICA_INSTANCE + replicaConfiguration cross-project masterInstanceName"
+      derived_from:
+        - "google.sql.Instance.kind == REPLICA_INSTANCE"
+        - "google.sql.Instance.replicaConfiguration.masterInstanceName in different project"

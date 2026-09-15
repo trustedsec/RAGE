@@ -1,0 +1,268 @@
+# AWS Config — Derived attack-path rules (Phase 12 — security & logging)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (ExecutesAs, CanPassIdentity, CanTrigger, CanModifyConfiguration, CanDelete)
+# belongs in /rules/explicit/aws-config.yaml; these rules combine those explicit
+# edges with the linchpins to derive execution and escalation capabilities.
+#
+# PHASE 12 FRAMING — AWS Config has three orthogonal attack surfaces:
+#
+# (1) DEFENSE EVASION / TAMPERING (dominant mode):
+#     Stopping or deleting the Config Recorder / Delivery Channel halts
+#     configuration recording and compliance monitoring without affecting runtime
+#     resources. Deleting Config Rules removes specific detective controls.
+#     → CanModifyConfiguration / CanDelete on ConfigurationService nodes.
+#     This is a COVER-TRACKS / weaken-defenses primitive ONLY — it does NOT
+#     grant access to any resource, does NOT chain to CanEnter*/CanExecuteAs,
+#     and does NOT set the ConfigurationService node to BLOCKED state (Config is
+#     a detective, not preventive, control).
+#
+# (2) EXECUTION via remediation automation:
+#     config:PutRemediationConfigurations + iam:PassRole sets the
+#     AutomationAssumeRole on an SSM Automation remediation runner. When Auto
+#     Remediation fires (on NON_COMPLIANT evaluation) or on-demand via
+#     config:StartRemediationExecution, Config invokes ssm:StartAutomationExecution
+#     with that role. The SSM Automation runner (BuildWorker) executes as the
+#     AutomationAssumeRole. This follows the cicd-chains runner pattern.
+#     → CanModifyConfiguration(caller -> RemediationConfig) [config:PutRemediationConfigurations]
+#     → CanPassIdentity(caller -> role) [iam:PassRole to ssm.amazonaws.com]
+#     → ExecutesAs(runner -> role) [from explicit rules / SSM collect]
+#     → CanTrigger(caller -> runner) [config:StartRemediationExecution or Auto]
+#     cicd-chains:cicd-modify-buildspec-executes-as and
+#     can-execute-as:execute-as-via-config-identity-swap collapse these to
+#     CanExecuteAs — CITE, do NOT re-derive here.
+#
+# (3) DATA / RECON:
+#     Config Aggregators expose cross-account resource inventory. Reading aggregated
+#     data is primarily recon — 1 conservative CanRead rule.
+#
+# LINCHPINS CITED (do NOT re-derive their roll-ups here):
+#   can-execute-as.yaml    — execute-as-via-config-identity-swap
+#                            (CanModifyConfiguration + CanPassIdentity -> CanExecuteAs)
+#   cicd-chains.yaml       — cicd-modify-buildspec-executes-as, cicd-trigger-runner-executes-as
+#   can-control.yaml       — escalate-via-execute-as (CanEscalateTo roll-up)
+#   credential-chains.yaml — execute-then-read-secret (inherited secret-read from role)
+#
+# Official docs:
+#   https://docs.aws.amazon.com/config/latest/developerguide/
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsconfig.html
+#   https://docs.aws.amazon.com/config/latest/developerguide/remediation.html
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 12-security-logging
+applies_to: [aws]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # (1) DEFENSE EVASION — tampering with detective controls
+  # ---------------------------------------------------------------------------
+  # Note: Explicit normalization (CanDelete, CanModifyConfiguration emitters) for
+  # StopConfigurationRecorder, DeleteConfigurationRecorder, DeleteDeliveryChannel,
+  # PutDeliveryChannel, PutConfigurationRecorder, and DeleteConfigRule belongs in
+  # /rules/explicit/aws-config.yaml. This derived file references those explicit
+  # edges as foundational facts and combines them with linchpins for escalation.
+  #
+  # CITE (do NOT re-derive):
+  #   - /rules/explicit/aws-config.yaml:aws-config-delete-recorder
+  #   - /rules/explicit/aws-config.yaml:aws-config-delete-delivery-channel
+  #   - /rules/explicit/aws-config.yaml:aws-config-put-delivery-channel-redirect
+  #   - /rules/explicit/aws-config.yaml:aws-config-put-recorder-narrow-scope
+  #
+  # The derived rules here focus on EXECUTION via remediation, not defense evasion.
+
+  # ---------------------------------------------------------------------------
+  # (2) EXECUTION via remediation — PutRemediationConfigurations + PassRole
+  # ---------------------------------------------------------------------------
+
+  # --- PutRemediationConfigurations + PassRole -> CanCreateWorkloadAs --------
+  # Config remediation runner pattern: the caller sets AutomationAssumeRole on a
+  # remediation configuration (CanModifyConfiguration from /rules/explicit/aws-config.yaml)
+  # and passes a privileged role (CanPassIdentity). When Auto Remediation fires or
+  # the caller invokes StartRemediationExecution, Config calls
+  # ssm:StartAutomationExecution with that role. The SSM runner is a BuildWorker
+  # that ExecutesAs the AutomationAssumeRole. can-execute-as:execute-as-via-new-workload
+  # collapses CanCreateWorkloadAs to CanExecuteAs — CITED, NOT re-derived here.
+  # This rule emits CanCreateWorkloadAs to capture the path at the point of
+  # remediation configuration creation (where PassRole occurs).
+  - id: aws-config-remediation-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "config:PutRemediationConfigurations + iam:PassRole sets the AutomationAssumeRole on a Config remediation configuration; when triggered, Config invokes SSM Automation as that role, yielding code execution as the passed role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE config:PutRemediationConfigurations (resource scope covers the target rule's remediation ARN or '*')"
+      - "?role trust policy allows ssm.amazonaws.com (the remediation runner is an SSM Automation BuildWorker)"
+      - "iam:PassRole for ?role permits iam:PassedToService including ssm.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: ?principal
+      target: ?role
+      permissions: ["config:PutRemediationConfigurations", "iam:PassRole"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        if ?role trust policy or iam:PassedToService is unknown/unresolved:
+        POTENTIAL(role_compatibility) — the PutRemediationConfigurations call would
+        be rejected because the role does not trust ssm.amazonaws.com;
+        elif both config:PutRemediationConfigurations and iam:PassRole are ACTIVE:
+        ACTIVE — the caller can write a remediation configuration binding ?role to
+        an SSM Automation runner; a trigger (Auto Remediation on first
+        NON_COMPLIANT evaluation, or config:StartRemediationExecution) makes the
+        runner execute as ?role. When Auto Remediation is enabled on the target rule,
+        the first non-compliant evaluation provides an automatic trigger — ACTIVE.
+        When only on-demand execution (config:StartRemediationExecution) is available,
+        CONDITIONAL(trigger_exists) unless the caller also holds that permission.
+        BLOCKED when an SCP denies config:PutRemediationConfigurations or iam:PassRole.
+      confidence: 0.88
+      derived_from: ["?principal CanPassIdentity ?role", "effective config:PutRemediationConfigurations"]
+      false_positive_note: >-
+        CITE can-execute-as:execute-as-via-new-workload — do NOT re-derive CanExecuteAs
+        here. The CanExecuteAs collapse (CanCreateWorkloadAs -> CanExecuteAs) is already
+        owned by can-execute-as.yaml. This rule emits only CanCreateWorkloadAs: the act of
+        CREATING the remediation configuration binding with a passed role. Honor
+        iam:PassedToService: a role passable only to ec2.amazonaws.com does NOT work here —
+        the remediation runner is SSM Automation (ssm.amazonaws.com). The SSM document used
+        for remediation must exist and be accessible; if the caller specifies a custom
+        document they also control, the path is ACTIVE (they control both the definition and
+        the role). AWS-provided remediation documents (AWS-* prefixed) cannot be modified —
+        no additional CanModifyCode risk from those. RemediationConfiguration nodes are typed
+        as AutomationService (ManagementService subclass), NOT as Compute; the execute-as
+        roll-up via execute-as-via-config-identity-swap (which requires Compute node class)
+        does NOT apply. The execution consequence derives from execute-as-via-new-workload
+        (which only requires CanCreateWorkloadAs, no node class gate).
+      narrative: >-
+        {principal.name} can configure automated remediation for a Config rule
+        (config:PutRemediationConfigurations), binding {role.name} as the
+        AutomationAssumeRole (iam:PassRole to ssm.amazonaws.com). When remediation
+        fires — automatically on NON_COMPLIANT evaluation or on-demand via
+        config:StartRemediationExecution — Config invokes SSM Automation as {role.name},
+        executing attacker-controlled remediation steps with {role.name}'s privileges.
+
+  # ---------------------------------------------------------------------------
+  # (3) DATA / RECON — Config Aggregator cross-account inventory read
+  # ---------------------------------------------------------------------------
+  # Note: The CanTrigger explicit normalization (aws-config-remediation-trigger-explicit)
+  # belongs in /rules/explicit/aws-config.yaml. cicd-chains consumes that explicit
+  # CanTrigger edge + remediation runner's ExecutesAs to derive CanExecuteAs. Do NOT
+  # re-derive CanTrigger here.
+
+  # --- ListAggregateDiscoveredResources / BatchGetAggregateResourceConfig ----
+  # Recon-only. This derives from the explicit permission edge
+  # aws-config-aggregator-read-inventory in /rules/explicit/aws-config.yaml.
+  # CanRead (nature: both) is permitted in explicit rules.
+  - id: aws-config-aggregator-read-inventory
+    emits: CanRead
+    description: "config:ListAggregateDiscoveredResources or config:BatchGetAggregateResourceConfig on a Config Aggregator exposes cross-account resource inventory and configurations — recon primitive."
+    match:
+      - [ ?principal, HasPermission, ?aggregator ]
+    where:
+      - "effective_action in ['config:ListAggregateDiscoveredResources', 'config:BatchGetAggregateResourceConfig', 'config:GetAggregateConfigRuleComplianceSummary']"
+      - "node_type(?aggregator) == ConfigurationService"
+      - "?aggregator.provider_type == 'AWS::Config::ConfigurationAggregator'"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: ?principal
+      target: ?aggregator
+      permissions:
+        - "config:ListAggregateDiscoveredResources"
+        - "config:BatchGetAggregateResourceConfig"
+        - "config:GetAggregateConfigRuleComplianceSummary"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when any of the listed actions is EFFECTIVE on the aggregator ARN or
+        '*'. BLOCKED when an SCP denies all listed actions. The aggregator must be
+        populated (source accounts authorized) for the read to return data;
+        CONDITIONAL(service_state) when the aggregator exists but has no authorized
+        source accounts.
+      confidence: 0.8
+      derived_from: ["effective config:ListAggregateDiscoveredResources or similar on ?aggregator"]
+      false_positive_note: >-
+        This derives from the explicit permission edge aws-config-aggregator-read-inventory.
+        Recon only — reading aggregator data does not grant access to the resources
+        it describes; it only reveals their configuration state. Downgrade significance
+        when the aggregator covers only the attacker's own account (no cross-account
+        value). High value when the aggregator covers the entire AWS Organization —
+        it exposes resource types, IDs, configurations, and compliance status across
+        all member accounts without requiring access to those accounts. This is a
+        1-rule conservative treatment per Phase 12 LOW-relevance guidance for recon
+        services. Do NOT chain this to CanEnter* or CanExecuteAs.
+      narrative: >-
+        {principal.name} can read cross-account resource inventory from Config
+        Aggregator {aggregator.name} (config:ListAggregateDiscoveredResources /
+        config:BatchGetAggregateResourceConfig), exposing configuration metadata for
+        resources across all aggregated accounts — enabling large-scale reconnaissance
+        without direct access to those accounts.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP denying config:PutRemediationConfigurations or iam:PassRole
+#     -> CanCreateWorkloadAs BLOCKED (remediation path unavailable).
+#   - SCP denying config:StartRemediationExecution
+#     -> CanTrigger on remediation runner BLOCKED.
+#   - Role trust policy not including ssm.amazonaws.com -> CanCreateWorkloadAs
+#     POTENTIAL(role_compatibility) — PutRemediationConfigurations call would fail.
+#   - iam:PassedToService condition on PassRole not including ssm.amazonaws.com
+#     -> CanPassIdentity BLOCKED for SSM use -> CanCreateWorkloadAs POTENTIAL.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service belong in
+# /rules/explicit/aws-config.yaml. See that file for:
+#   - aws-config-delete-recorder (CanDelete)
+#   - aws-config-delete-delivery-channel (CanDelete)
+#   - aws-config-remediation-trigger-explicit (CanTrigger)
+#   - aws-config-put-remediation-config-modify (CanModifyConfiguration)
+#   - aws-config-aggregator-read-inventory (CanRead)
+#   - aws-config-put-delivery-channel-redirect (CanModifyConfiguration)
+#   - aws-config-put-recorder-narrow-scope (CanModifyConfiguration)
+
+# Infrastructure facts (SSM Automation runner identity binding):
+explicit_rules:
+
+  - id: aws-config-executes-as-remediation-role
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::Config::RemediationConfiguration", field: "AutomationAssumeRole"}
+    emit:
+      source_type: BuildWorker
+      target_type: Role
+      source: "<SSM BuildWorker (AutomationExecution) node for this remediation>"
+      target: "<IAM Role node resolved from AutomationAssumeRole ARN>"
+      api_source: "config:DescribeRemediationConfigurations"
+      evidence_field: "AutomationAssumeRole"
+      narrative: "Config remediation runner for rule {rule.name} runs SSM Automation as {role.name} (AutomationAssumeRole)."
+
+  - id: aws-config-pass-role-remediation
+    emits: CanPassIdentity
+    applies_to: [aws]
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "iam:PassedToService condition includes ssm.amazonaws.com or config.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: "<principal>"
+      target: "<IAM role passable to ssm.amazonaws.com for Config remediation>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["iam:PassRole"]
+      conditions: [role_compatibility]
+      narrative: "{principal.name} can pass {role.name} to SSM (iam:PassRole → ssm.amazonaws.com), enabling its use as AutomationAssumeRole in Config remediation."
+
+  - id: aws-config-recorder-node
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      action: "config:StopConfigurationRecorder"
+      resource_type: "AWS::Config::ConfigurationRecorder"
+    emit:
+      source_type: Identity
+      target_type: ConfigurationService
+      source: "<principal>"
+      target: "<ConfigurationRecorder node>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation"
+      permissions: ["config:StopConfigurationRecorder"]
+      narrative: "{principal.name} can stop the Config recorder (config:StopConfigurationRecorder)."

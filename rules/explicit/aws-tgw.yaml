@@ -1,0 +1,321 @@
+# Explicit (normalization) rules for AWS Transit Gateway (TGW).
+# ---------------------------------------------------------------------------
+# Turns raw collected TGW configuration into explicit edges conforming to
+# schema/edges.yaml. These feed the derived rules in /rules/derived/aws/tgw.yaml.
+#
+# ANTI-DUPLICATION:
+#   - CrossAccountTrust for RAM-shared TGW resources is normalized in
+#     /rules/explicit/aws-ram.yaml (aws-ram-share-crossaccount-trust). This
+#     file does NOT emit CrossAccountTrust; it emits routing FACTS and
+#     IAM control-plane capabilities.
+#   - CanNetworkReach derivation from CrossAccountTrust (shared TGW via RAM)
+#     is in /rules/derived/aws/ram.yaml (aws-ram-shared-tgw-network-reach).
+#     This file emits the per-attachment and per-route RoutesTo structural facts
+#     that the future network-chains linchpin will compose into CanNetworkReach.
+#   - PeeredWith between two VPCs via peering attachment is emitted as explicit
+#     RoutesTo (TGW -> remote TGW subnet facts); a separate PeeredWith edge
+#     between VirtualNetwork nodes is not emitted here because TGW peering
+#     connects TGWs, not VPCs directly — the network-chains linchpin handles
+#     TGW-mediated reachability composition.
+#
+# NATURE: RoutesTo (nature: explicit) and CanModifyConfiguration (nature: explicit)
+# MUST be normalized in /rules/explicit/. They are consumed by derived rules in
+# /rules/derived/aws/tgw.yaml and (for RoutesTo) by the future network-chains
+# linchpin.
+#
+# Collection APIs required:
+#   ec2:DescribeTransitGateways
+#   ec2:DescribeTransitGatewayVpcAttachments
+#   ec2:DescribeTransitGatewayPeeringAttachments
+#   ec2:DescribeTransitGatewayRouteTables
+#   ec2:SearchTransitGatewayRoutes (per route table)
+#   ec2:GetTransitGatewayRouteTableAssociations
+#   ec2:GetTransitGatewayRouteTablePropagations
+# ---------------------------------------------------------------------------
+
+rules:
+
+  # --- TGW attachment places subnets on the TGW routing fabric ----------------
+  # An active VPC attachment registers the VPC's designated subnets on the TGW.
+  # RoutesTo schema: source [Route, Subnet, TransitGateway], target [Network, Subnet].
+  # Source = TransitGateway node; target = Subnet node (each subnet in SubnetIds).
+  - id: aws-tgw-attachment-routes-to-subnet
+    emits: RoutesTo
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::EC2::TransitGatewayVpcAttachment"
+      field: "SubnetIds"
+    where:
+      - "attachment.State == 'available'"
+    emit:
+      source_type: TransitGateway
+      target_type: Subnet
+      source: "<TransitGateway node for attachment.TransitGatewayId>"
+      target: "<Subnet node for each SubnetId in attachment.SubnetIds>"
+      api_source: "ec2:DescribeTransitGatewayVpcAttachments"
+      evidence_field: "TransitGatewayVpcAttachment.SubnetIds + State"
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when attachment.State == 'available'. CONDITIONAL(service_state)
+        when State == 'pendingAcceptance' (cross-account attachment awaiting owner
+        acceptance). Omit for State in [failed, rejected, deleting, deleted,
+        rolledBack]. This is a routing TOPOLOGY fact; it does not assert L4
+        reachability (SGs still apply at destination) — annotate
+        CONDITIONAL(network_reachability) for linchpin evaluation.
+      false_positive_note: >-
+        Emit only for State == 'available'. 'pendingAcceptance' attachments have
+        no routing effect until accepted (CONDITIONAL(service_state)). Each
+        SubnetId in SubnetIds generates a separate RoutesTo edge. The attachment
+        joins the VPC's subnets to the TGW fabric but does NOT guarantee routes
+        in any TGW route table — a matching propagation or static route must also
+        exist (resolved by aws-tgw-route-table-routes-to-subnet).
+      narrative: >-
+        TGW {tgw.name} has an active VPC attachment including subnet {subnet.name}.
+        This is a structural routing fact: the subnet is enrolled on the TGW
+        fabric (attachment state: available). Full reachability requires route
+        table evaluation.
+
+  # --- TGW route table entry -> RoutesTo per static/propagated route ----------
+  # Each non-blackhole route in a TGW route table specifies a CIDR and an
+  # attachment target. RoutesTo schema: source [Route], target [Subnet].
+  # Source = Route (TGW Route Table node); target = Subnet in the attachment's VPC.
+  - id: aws-tgw-route-table-routes-to-subnet
+    emits: RoutesTo
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::EC2::TransitGatewayRouteTable"
+      field: "Routes"
+    where:
+      - "route.State != 'blackhole'   # attachment is active, not deleted/failed"
+      - "route.TransitGatewayAttachments[].ResourceType in ['vpc', 'vpn', 'direct-connect-gateway', 'tgw-peering']"
+      - "route.DestinationCidrBlock is resoluble to one or more Subnet nodes"
+    emit:
+      source_type: Route
+      target_type: Subnet
+      source: "<Route node for the TGW Route Table (TransitGatewayRouteTableId)>"
+      target: "<Subnet node(s) within the CIDR destination resolved from route.DestinationCidrBlock>"
+      api_source: "ec2:SearchTransitGatewayRoutes (filter State != blackhole)"
+      evidence_field: "TransitGatewayRoute.DestinationCidrBlock + TransitGatewayAttachments[].ResourceId"
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when route.State == 'active' and the referenced attachment is
+        'available'. CONDITIONAL(network_reachability) because this is an L3
+        routing fact — destination SGs gate L4. CONDITIONAL(service_state) if
+        the attachment State is 'pendingAcceptance'. Omit for route.State ==
+        'blackhole' (no valid attachment, traffic dropped).
+      false_positive_note: >-
+        'blackhole' routes (State == 'blackhole') MUST NOT generate RoutesTo
+        edges. CIDR-to-subnet resolution requires the VPC CIDR/subnet ranges
+        collected from ec2:DescribeSubnets; only emit when the CIDR match is
+        confirmed. A route pointing to a VPN or Direct Connect attachment
+        targets on-premises CIDR space; model the target as a Subnet node
+        only when a matching on-premises subnet record exists in the graph.
+        If no subnet node exists for the destination CIDR, use the VPC node
+        (VirtualNetwork) as the target instead. Preserve the distinction between
+        static (type=static) and propagated (type=propagated) routes in
+        evidence but treat them identically for edge emission.
+      narrative: >-
+        TGW route table {route_table.name} has a route for {cidr} (type:
+        {route.type}) pointing to attachment {attachment.name} ({resource_type}),
+        routing toward subnet(s) within {cidr}. This is an L3 routing fact;
+        L4 reachability requires security group evaluation at the destination.
+
+  # --- IAM: route injection capability -> CanModifyConfiguration (route table) -
+  # ec2:CreateTransitGatewayRoute and ec2:ReplaceTransitGatewayRoute on a TGW
+  # route table ARN allow a principal to inject or overwrite routes, redirecting
+  # inter-VPC or on-prem traffic. Modeled as CanModifyConfiguration on the
+  # Route (TGW route table) node.
+  - id: aws-tgw-modify-route-inject
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      actions:
+        - "ec2:CreateTransitGatewayRoute"
+        - "ec2:ReplaceTransitGatewayRoute"
+      resource_type: "AWS::EC2::TransitGatewayRouteTable"
+      resource_arn_pattern: "arn:aws:ec2:*:*:transit-gateway-route-table/*"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: "<principal>"
+      target: "<TransitGatewayRouteTable node (generic_type: Route)>"
+      permissions:
+        - "ec2:CreateTransitGatewayRoute"
+        - "ec2:ReplaceTransitGatewayRoute"
+      api_source: "IAM effective-permission evaluator"
+      evidence_field: "effective policy allows ec2:CreateTransitGatewayRoute or ec2:ReplaceTransitGatewayRoute on route-table ARN"
+      narrative: >-
+        {principal.name} can inject or replace routes in TGW route table
+        {route_table.name} (ec2:CreateTransitGatewayRoute /
+        ec2:ReplaceTransitGatewayRoute), enabling traffic redirection between
+        attached VPCs or toward on-premises endpoints.
+
+  # --- IAM: route table association / propagation enable -> CanModifyConfiguration
+  # ec2:AssociateTransitGatewayRouteTable and
+  # ec2:EnableTransitGatewayRouteTablePropagation alter which attachments share
+  # routing visibility. Modeled as CanModifyConfiguration on the TransitGateway.
+  - id: aws-tgw-assoc-route-table
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      actions:
+        - "ec2:AssociateTransitGatewayRouteTable"
+        - "ec2:EnableTransitGatewayRouteTablePropagation"
+      resource_type: "AWS::EC2::TransitGateway"
+      resource_arn_pattern: "arn:aws:ec2:*:*:transit-gateway/*"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: "<principal>"
+      target: "<TransitGateway node>"
+      permissions:
+        - "ec2:AssociateTransitGatewayRouteTable"
+        - "ec2:EnableTransitGatewayRouteTablePropagation"
+      api_source: "IAM effective-permission evaluator"
+      evidence_field: "effective policy allows ec2:AssociateTransitGatewayRouteTable or ec2:EnableTransitGatewayRouteTablePropagation on TGW ARN"
+      narrative: >-
+        {principal.name} can re-associate TGW attachments to different route
+        tables or enable CIDR propagation on {tgw.name}
+        (ec2:AssociateTransitGatewayRouteTable /
+        ec2:EnableTransitGatewayRouteTablePropagation), silently opening routing
+        between otherwise-isolated VPCs.
+
+  # --- IAM: CreateTransitGatewayVpcAttachment -> CanModifyConfiguration (TGW) -
+  # A principal with ec2:CreateTransitGatewayVpcAttachment on a TGW can attach
+  # an attacker-controlled VPC to the routing fabric. This is the consumer-side
+  # attachment creation permission (used with a RAM-shared TGW).
+  - id: aws-tgw-create-vpc-attachment
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      actions:
+        - "ec2:CreateTransitGatewayVpcAttachment"
+      resource_type: "AWS::EC2::TransitGateway"
+      resource_arn_pattern: "arn:aws:ec2:*:*:transit-gateway/*"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: "<principal>"
+      target: "<TransitGateway node>"
+      permissions:
+        - "ec2:CreateTransitGatewayVpcAttachment"
+      api_source: "IAM effective-permission evaluator"
+      evidence_field: "effective policy allows ec2:CreateTransitGatewayVpcAttachment on TGW ARN"
+      narrative: >-
+        {principal.name} can create a VPC attachment to {tgw.name}
+        (ec2:CreateTransitGatewayVpcAttachment), joining an attacker-controlled
+        VPC to the TGW routing fabric and gaining routing-level access to other
+        attached VPCs.
+
+  # --- IAM: ec2:ModifyTransitGateway -> CanModifyConfiguration (AutoAccept option) -
+  # ec2:ModifyTransitGateway allows a principal to modify TGW options, including
+  # AutoAcceptSharedAttachments. When set to true, this option automatically
+  # accepts any consumer VPC attachment (state 'available' immediately instead of
+  # 'pendingAcceptance'), materializing cross-account attachments into ACTIVE
+  # routing paths without manual owner approval. This is a high-value capability:
+  # it promotes CONDITIONAL(service_state) cross-account attachment edges to ACTIVE.
+  # Modeled as CanModifyConfiguration on the TransitGateway node.
+  - id: aws-tgw-modify-tgw
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      actions:
+        - "ec2:ModifyTransitGateway"
+      resource_type: "AWS::EC2::TransitGateway"
+      resource_arn_pattern: "arn:aws:ec2:*:*:transit-gateway/*"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: "<principal>"
+      target: "<TransitGateway node>"
+      permissions:
+        - "ec2:ModifyTransitGateway"
+      api_source: "IAM effective-permission evaluator"
+      evidence_field: "effective policy allows ec2:ModifyTransitGateway on TGW ARN"
+      narrative: >-
+        {principal.name} can modify TGW options on {tgw.name}
+        (ec2:ModifyTransitGateway), including enabling AutoAcceptSharedAttachments.
+        When AutoAcceptSharedAttachments is true, consumer-account VPC attachments
+        automatically transition from 'pendingAcceptance' to 'available' without
+        owner approval, materializing cross-account network pivots into ACTIVE
+        routing paths. This is an escalation primitive that weakens attachment
+        isolation.
+
+  # --- IAM: ec2:AcceptTransitGatewayVpcAttachment -> CanModifyConfiguration (TGW) -
+  # An owner-account principal with ec2:AcceptTransitGatewayVpcAttachment can
+  # silently accept a pending cross-account VPC attachment, transitioning it from
+  # 'pendingAcceptance' to 'available' and materializing the consumer's routing
+  # access. This is a high-value capability that promotes CONDITIONAL(service_state)
+  # edges to ACTIVE. Modeled as CanModifyConfiguration on the TransitGateway node.
+  - id: aws-tgw-accept-attachment
+    emits: CanModifyConfiguration
+    applies_to: [aws]
+    match_effective_permission:
+      actions:
+        - "ec2:AcceptTransitGatewayVpcAttachment"
+      resource_type: "AWS::EC2::TransitGateway"
+      resource_arn_pattern: "arn:aws:ec2:*:*:transit-gateway/*"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: "<principal>"
+      target: "<TransitGateway node>"
+      permissions:
+        - "ec2:AcceptTransitGatewayVpcAttachment"
+      api_source: "IAM effective-permission evaluator"
+      evidence_field: "effective policy allows ec2:AcceptTransitGatewayVpcAttachment on TGW ARN"
+      narrative: >-
+        {principal.name} can accept pending VPC attachments to {tgw.name}
+        (ec2:AcceptTransitGatewayVpcAttachment). An owner-account principal with
+        this permission can silently accept a pending cross-account consumer
+        attachment, transitioning it to 'available' and materializing the consumer
+        VPC's routing access to owner-account resources. This is an escalation
+        primitive enabling cross-account network pivots.
+
+  # --- TGW peering attachment -> RoutesTo (TGW-to-TGW routing fact) -----------
+  # A TGW peering attachment in state 'available' connects two TGW hubs
+  # (cross-region or cross-account). Routes propagated or statically added
+  # across the peering make the peer TGW's attached VPCs mutually routable.
+  # RoutesTo schema: source [TransitGateway], target [Network, Subnet].
+  # Emit RoutesTo from the local TGW to the peer TGW's VirtualNetwork (the
+  # peer TGW is the target's containing network; subnet-level resolution
+  # requires the peer TGW's attachment and route table facts from the peer account).
+  - id: aws-tgw-peering-routes-to-peer
+    emits: RoutesTo
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::EC2::TransitGatewayPeeringAttachment"
+      field: "State"
+    where:
+      - "peering_attachment.State == 'available'"
+    emit:
+      source_type: TransitGateway
+      target_type: Network
+      source: "<local TransitGateway node (RequesterTgwInfo.TransitGatewayId)>"
+      target: "<peer VirtualNetwork (AccepterTgwInfo.TransitGatewayId's attached VPCs — modeled as a Network placeholder until peer account facts are available)>"
+      api_source: "ec2:DescribeTransitGatewayPeeringAttachments"
+      evidence_field: "TransitGatewayPeeringAttachment.AccepterTgwInfo + RequesterTgwInfo + State"
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when peering_attachment.State == 'available' (both TGW owners
+        have accepted). CONDITIONAL(service_state) when State ==
+        'pendingAcceptance' (peer TGW owner has not yet accepted). Omit for
+        State in [rejected, failed, deleted]. Routes across the peering are
+        ONLY present if the respective TGW route tables have been updated to
+        include the peer CIDR — annotate CONDITIONAL(network_reachability) for
+        the linchpin to evaluate.
+      false_positive_note: >-
+        Peering attachment creation (ec2:CreateTransitGatewayPeeringAttachment)
+        does NOT automatically add routes between the peer TGWs; static routes
+        must be added to each TGW's route table after the peering is established.
+        Without those route table entries, the peering does not create reachability.
+        Emit CONDITIONAL(network_reachability) and note that route table entries
+        are required. Cross-account peering (AccepterTgwInfo.OwnerId !=
+        RequesterTgwInfo.OwnerId) is an additional cross-account reachability
+        fact; the CrossAccountTrust for the RAM share (if used) is separate
+        (see /rules/explicit/aws-ram.yaml).
+      narrative: >-
+        TGW {local_tgw.name} (account {requester_account}) has an active peering
+        attachment to TGW {peer_tgw_id} (account {accepter_account}). This is a
+        routing topology fact — routes must be added to each TGW's route tables
+        for traffic to flow across the peering (CONDITIONAL(network_reachability)).

@@ -1,0 +1,884 @@
+# AWS CodeArtifact — Derived attack-path rules (Phase 9 — CI/CD / supply chain)
+# ---------------------------------------------------------------------------
+# CodeArtifact is a managed package repository (npm/pip/Maven/NuGet/cargo/gems)
+# that acts as a supply-chain pivot point, not a compute resource.  The attack
+# model is:
+#
+#   (a) PUBLISH = supply-chain code modification
+#       A principal with codeartifact:PublishPackageVersion over a repository
+#       node can inject code into every consumer (BuildWorker, ContainerTask,
+#       ServerlessFunction, …) that resolves and installs the poisoned package.
+#       This is CanModifyCode(publisher -> ArtifactRepository), and the
+#       cicd-chains / container-chains linchpins propagate it to
+#       CanModifyCode(publisher -> consumer) via ContainsResourceReference
+#       edges, then to CanExecuteAs(publisher -> consumer's execution identity)
+#       exactly as for CodeBuild or ECR.
+#
+#   (b) POLICY REWRITE = cross-account publish grant
+#       A principal with codeartifact:PutDomainPermissionsPolicy can rewrite
+#       who may publish across all repositories in the domain — CanModifyPolicy
+#       that widens the publish surface, then feeds path (a).
+#
+#   (c) UPSTREAM CONFIGURATION = dependency confusion / upstream poisoning
+#       A principal with codeartifact:AssociateExternalConnection or
+#       codeartifact:UpdateRepository can add an external connection or a
+#       malicious upstream repository, enabling dependency confusion into all
+#       consumers of the downstream repository — CanModifyConfiguration.
+#
+#   (d) CROSS-ACCOUNT DOMAIN/REPO POLICIES
+#       Domain and repository resource policies that name a cross-account
+#       principal emit CrossAccountTrust.  The hierarchy-chains / can-control
+#       linchpin rolls these up to CanEnterAccount when the cross-account
+#       principal can subsequently publish and reach a consumer with an
+#       ExecutesAs edge inside the domain-owner account.
+#
+# LINCHPINS CONSUMED (CITE, DO NOT DUPLICATE):
+#   * cicd-chains cicd-modify-buildspec-executes-as: consumes
+#     CanModifyCode(? -> BuildWorker) + ExecutesAs(BuildWorker -> identity)
+#     => CanExecuteAs.  This file emits the CanModifyCode fact; cicd-chains
+#     does the collapse.
+#   * container-chains image-push-poisons-consumers: consumes
+#     CanModifyCode(? -> ArtifactRepository) +
+#     ContainsResourceReference(consumer -> ArtifactRepository) =>
+#     CanModifyCode(? -> consumer).  Explicitly handles ArtifactRepository
+#     in its node_type guard; this file emits the upstream-propagation
+#     CanModifyCode fact so that linchpin fires for direct-publish cases too.
+#   * can-control / can-execute-as escalate-via-execute-as: takes
+#     CanExecuteAs(? -> identity where priv(identity) > priv(?)) =>
+#     CanEscalateTo.  Not re-derived here.
+#   * hierarchy-chains / can-control: CrossAccountTrust + downstream
+#     CanEnterAccount roll-ups are those linchpins' responsibility.
+#
+# STATE DEFAULTS: ACTIVE unless an unmet condition applies (CONDITIONAL) or
+# an explicit deny / SCP blocks (BLOCKED).
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-supply-chain
+applies_to: [aws]
+
+rules:
+
+  # -----------------------------------------------------------------------
+  # (a) PUBLISH = supply-chain CanModifyCode
+  # -----------------------------------------------------------------------
+
+  # --- Direct publish access -> CanModifyCode over the repository ----------
+  # A principal with effective codeartifact:PublishPackageVersion on a
+  # repository (or package ARN within it) can inject code into every consumer
+  # of that repository.  This is the primary supply-chain primitive.
+  #
+  # The emitted CanModifyCode edge targets the ArtifactRepository node.
+  # container-chains image-push-poisons-consumers (which guards for
+  # ArtifactRepository in its node_type check) and cicd-chains
+  # cicd-modify-buildspec-executes-as will propagate this to each consuming
+  # workload's ExecutesAs identity — cited, not re-derived here.
+  - id: aws-ca-publish-is-modify-code
+    emits: CanModifyCode
+    description: "Publishing a package version to a CodeArtifact repository injects code into every consumer that installs the package — supply-chain CanModifyCode."
+    match:
+      - [ ?principal, HasPermission, ?repository ]
+    where:
+      - "node_type(?repository) == ArtifactRepository"
+      - "provider_type(?repository) in [AWS::CodeArtifact::Repository, AWS::CodeArtifact::Package]"
+      - "effective permission includes codeartifact:PublishPackageVersion on ?repository (or the package ARN within it)"
+      # Maven also requires codeartifact:PutPackageMetadata; NuGet also requires
+      # codeartifact:ReadFromRepository.  Treat codeartifact:PublishPackageVersion
+      # as the gating action; format-specific extras are noted in permissions.
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: ?principal
+      target: ?repository
+      permissions:
+        - "codeartifact:PublishPackageVersion"
+        - "codeartifact:GetAuthorizationToken?"  # domain-scoped; verified separately
+        - "codeartifact:PutPackageMetadata?"    # Maven only
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the principal holds effective codeartifact:PublishPackageVersion
+        on the repository (or package) scope AND codeartifact:GetAuthorizationToken
+        on the domain — both required for an actual publish (the token is the HTTP
+        bearer credential for the package-manager endpoint).
+        CONDITIONAL(resource_policy) when the permission is granted via a cross-account
+        resource policy and the caller's identity policy has not been confirmed to also
+        allow the action (standard cross-account IAM evaluation: both sides must allow).
+        BLOCKED when an SCP or permission boundary explicitly denies
+        codeartifact:PublishPackageVersion or codeartifact:GetAuthorizationToken.
+        When the scope is a SPECIFIC PACKAGE ARN (not a wildcard), restrict this edge
+        to that package node; the broader repository node is only appropriate when the
+        resource scope covers all packages (`package/domain/repo/*` or `*`).
+      confidence: 0.9
+      derived_from:
+        - "effective codeartifact:PublishPackageVersion on ?repository (permission evaluator)"
+        - "effective codeartifact:GetAuthorizationToken on the domain containing ?repository"
+      false_positive_note: >-
+        codeartifact:GetAuthorizationToken alone (without PublishPackageVersion) is
+        NOT CanModifyCode — it only authenticates; do not emit this edge for auth-token-
+        only grants.  codeartifact:ReadFromRepository is read-only; never equate it with
+        write access.  When PublishPackageVersion is scoped to a specific package ARN
+        (e.g., `package/domain/repo/npm//react`), emit CanModifyCode targeting that
+        package node, not the entire repository.  Maven publish also requires
+        codeartifact:PutPackageMetadata; without it, the publish will fail -> downgrade
+        to POTENTIAL if PutPackageMetadata is absent on a Maven repository.
+        NuGet publish also requires codeartifact:ReadFromRepository on the repository.
+        Honor iam:ResourceTag / aws:RequestedRegion / aws:PrincipalOrgID conditions
+        on resource policies that narrow the effective grant.
+      narrative: >-
+        {principal.name} can publish a package version to {repository.name}
+        (codeartifact:PublishPackageVersion + codeartifact:GetAuthorizationToken).
+        Any consumer that resolves and installs this package version will execute the
+        attacker-controlled code in its build or runtime environment, acquiring
+        CanModifyCode over each such consumer (cicd-chains / container-chains propagate
+        this to CanExecuteAs the consumer's execution identity).
+
+  # --- GetAuthorizationToken -> CanRetrieveToken (credential access) --------
+  # Obtaining an authorization token from CodeArtifact grants a short-lived
+  # (up to 12 hours) bearer credential equivalent to the caller's AWS credentials
+  # for repository operations. These tokens are frequently stolen from CI/CD
+  # environment variables and used to pivot to package access from external
+  # networks or long-lived external tooling.
+  - id: aws-ca-get-auth-token
+    emits: CanRetrieveToken
+    description: "CodeArtifact GetAuthorizationToken returns a short-lived bearer credential (up to 12 hours) for authenticated repository access — a credential-access primitive often exfiltrated from CI/CD environments."
+    match:
+      - [ ?principal, HasPermission, ?domain ]
+    where:
+      - "node_type(?domain) == ArtifactRepository"
+      - "provider_type(?domain) == AWS::CodeArtifact::Domain"
+      - "effective permission includes codeartifact:GetAuthorizationToken on ?domain"
+    emit:
+      source_type: Identity
+      target_type: Token
+      source: ?principal
+      target: "<authorization token issued for ?domain>"
+      permissions:
+        - "codeartifact:GetAuthorizationToken"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective codeartifact:GetAuthorizationToken
+        on the domain. The token is immediately usable for repository operations
+        (read and write depending on principal's other permissions) against all
+        repositories within the domain.
+        BLOCKED when an SCP or permission boundary explicitly denies the action.
+      confidence: 0.9
+      derived_from:
+        - "effective codeartifact:GetAuthorizationToken on ?domain (permission evaluator)"
+      false_positive_note: >-
+        The token is domain-scoped, not account-scoped; it is valid for the specific
+        domain only and does not grant full AWS API access. However, for package
+        repository operations it is functionally equivalent to the caller's AWS
+        credentials and frequently appears in build environment variables, making
+        it a high-value exfiltration target. The token has a maximum lifetime of
+        12 hours; long-lived CI/CD environments may request tokens repeatedly.
+      narrative: >-
+        {principal.name} can obtain a domain-scoped authorization token for {domain.name}
+        (codeartifact:GetAuthorizationToken). The token is a short-lived bearer credential
+        (up to 12 hours) that authenticates as the principal for package operations. In CI/CD
+        environments, these tokens are exposed in build logs, environment variables, and
+        artifact caches, making them high-value exfiltration targets that enable
+        out-of-band package access and downstream credential chains.
+
+  # --- Upstream-chain propagation of publish access --------------------------
+  # When a principal can publish to a repository (upstream_repo) that is
+  # configured as an upstream of a downstream repository (downstream_repo),
+  # packages published to upstream_repo can be resolved by consumers of
+  # downstream_repo (when not found locally).  This is the dependency-chain
+  # propagation: CanModifyCode fans out through the upstream chain, just as
+  # container-chains fans out registry pushes to every pulling workload.
+  #
+  # The ContainsResourceReference edge (upstream_repo -> downstream_repo)
+  # is emitted by the explicit normalizer from DescribeRepository.upstreams[].
+  # The emitted CanModifyCode targets the downstream repository; container-chains
+  # and cicd-chains then propagate to its consumers.
+  - id: aws-ca-upstream-propagation
+    emits: CanModifyCode
+    description: "Publishing to an upstream repository propagates CanModifyCode to every downstream repository in the upstream chain whose consumers resolve packages through it."
+    match:
+      - [ ?principal,       CanModifyCode,              ?upstream_repo   ]
+      - [ ?downstream_repo, ContainsResourceReference,  ?upstream_repo   ]
+    where:
+      - "node_type(?upstream_repo)   == ArtifactRepository"
+      - "node_type(?downstream_repo) == ArtifactRepository"
+      - "provider_type(?upstream_repo)   in [AWS::CodeArtifact::Repository, AWS::CodeArtifact::Package]"
+      - "provider_type(?downstream_repo) == AWS::CodeArtifact::Repository"
+      # The ContainsResourceReference edge has reference_kind == upstream_repository,
+      # meaning downstream_repo lists upstream_repo in its upstreams[].
+      - "reference_kind(?downstream_repo -> ?upstream_repo) == upstream_repository"
+      - "?upstream_repo != ?downstream_repo"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: ?principal
+      target: ?downstream_repo
+      permissions:
+        - "codeartifact:PublishPackageVersion"    # on ?upstream_repo
+        - "codeartifact:GetAuthorizationToken"    # on the domain
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        Inherit state from the contributing CanModifyCode(?principal -> ?upstream_repo):
+        if that edge is ACTIVE and the upstream relationship is confirmed (the downstream
+        repo's upstreams[] list contains upstream_repo), emit ACTIVE — a package published
+        to upstream_repo will be served to consumers of downstream_repo when not found
+        locally.
+        CONDITIONAL(package_name_collision) when no specific name collision between the
+        attacker's package and a package expected by downstream consumers is confirmed —
+        the resolution only occurs if the attacker's package name matches one that the
+        consumer requests.
+        BLOCKED if the contributing CanModifyCode is BLOCKED, or if the downstream
+        repository has an explicit DENY on inbound package resolution from upstream_repo
+        (uncommon but possible via package-origin-control).
+      confidence: 0.75
+      derived_from:
+        - "?principal CanModifyCode ?upstream_repo"
+        - "?downstream_repo ContainsResourceReference ?upstream_repo (upstream_repository)"
+      false_positive_note: >-
+        Upstream propagation only reaches consumers that request a package name that
+        exists in upstream_repo (or could be published there by the attacker) and is NOT
+        already present in downstream_repo or a higher-priority upstream.  If downstream_repo
+        already has a pinned, immutable version of every package the attacker could publish,
+        the propagation does not reach the consumer — downgrade to CONDITIONAL.
+        AWS CodeArtifact introduced BLOCK origin-control in 2023: if the downstream repo
+        has package origin control set to BLOCK for the upstream, new versions from that
+        upstream cannot be ingested -> emit BLOCKED for that combination.
+        This rule does not re-derive the consumer-level CanModifyCode or CanExecuteAs —
+        container-chains image-push-poisons-consumers consumes this CanModifyCode and
+        fans out to each consuming workload via ContainsResourceReference(consumer -> downstream_repo).
+      narrative: >-
+        {principal.name} can publish to {upstream_repo.name}, which is configured as an
+        upstream of {downstream_repo.name}. A package version published to {upstream_repo.name}
+        will be resolved by consumers of {downstream_repo.name} when the package is not
+        found locally, injecting attacker-controlled code into those consumers' build or
+        runtime environments.
+
+  # --- CopyPackageVersions -> CanModifyCode (copy-based injection) ----------
+  # A principal with codeartifact:CopyPackageVersions on a target repository can
+  # copy a package version from any source repository they control (or a public
+  # registry via external connection) into the target repository. This propagates
+  # code injection to every consumer of the target repository, reaching all
+  # downstream users without requiring direct PublishPackageVersion on the target.
+  - id: aws-ca-copy-is-modify-code
+    emits: CanModifyCode
+    description: "Copying a package version into a CodeArtifact repository via CopyPackageVersions injects code into every consumer of that repository — supply-chain CanModifyCode."
+    match:
+      - [ ?principal, HasPermission, ?repository ]
+    where:
+      - "node_type(?repository) == ArtifactRepository"
+      - "provider_type(?repository) == AWS::CodeArtifact::Repository"
+      - "effective permission includes codeartifact:CopyPackageVersions on ?repository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: ?principal
+      target: ?repository
+      permissions:
+        - "codeartifact:CopyPackageVersions"
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        POTENTIAL by default — the attacker must also have control over a source package
+        (either in another repository they control via CanModifyCode, or in a public
+        registry accessible via the target's external connection). Once they have both
+        CopyPackageVersions on the target and a malicious package in a source, they can
+        inject it into the target repository.
+        ACTIVE when the attacker also has CanModifyCode over a source repository that is
+        configured as an upstream of this repository, or when the attacker can publish to
+        a public registry connected via external connection.
+        BLOCKED when an SCP or permission boundary explicitly denies
+        codeartifact:CopyPackageVersions.
+      confidence: 0.8
+      derived_from:
+        - "effective codeartifact:CopyPackageVersions on ?repository (permission evaluator)"
+      false_positive_note: >-
+        CopyPackageVersions alone (without control of a source package) is POTENTIAL.
+        The attack requires the principal to also have a source of malicious packages.
+        If the principal has CopyPackageVersions but no CanModifyCode over any upstream
+        or source repository, and no ability to publish to external registries, the edge
+        should remain POTENTIAL until such capability is confirmed.
+      narrative: >-
+        {principal.name} can copy package versions to {repository.name}
+        (codeartifact:CopyPackageVersions). By copying a malicious package version
+        they control from an upstream repository or external registry into {repository.name},
+        they can inject attacker-controlled code into every consumer that installs the
+        package from {repository.name}, without requiring direct publish permission on
+        the target.
+
+  # -----------------------------------------------------------------------
+  # (b) POLICY REWRITE = CanModifyPolicy over domain/repo policies
+  # -----------------------------------------------------------------------
+
+  # --- PutDomainPermissionsPolicy -> CanModifyPolicy (domain) ---------------
+  # Rewriting the domain policy can grant arbitrary principals (including the
+  # attacker) publish access (codeartifact:PublishPackageVersion) across all
+  # repositories in the domain.  This is the highest-impact policy action:
+  # a single domain policy change expands the publish surface account-wide.
+  - id: aws-ca-modify-domain-policy
+    emits: CanModifyPolicy
+    description: "Rewriting the CodeArtifact domain resource policy can grant arbitrary principals publish access to all repositories in the domain — CanModifyPolicy over the domain policy node."
+    match:
+      - [ ?principal, HasPermission, ?domain ]
+    where:
+      - "node_type(?domain) == ArtifactRepository"
+      - "provider_type(?domain) == AWS::CodeArtifact::Domain"
+      - "effective permission includes codeartifact:PutDomainPermissionsPolicy on ?domain"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: ?principal
+      target: "<domain ResourcePolicy node of ?domain>"
+      permissions:
+        - "codeartifact:PutDomainPermissionsPolicy"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective codeartifact:PutDomainPermissionsPolicy
+        on the domain. Note: this action ignores the existing domain policy when evaluated
+        (the domain policy is not consulted for PutDomainPermissionsPolicy), so no resource
+        policy condition can block it — only identity-policy and SCP/boundary denials apply.
+        BLOCKED when an SCP or permission boundary explicitly denies the action.
+      confidence: 0.95
+      derived_from:
+        - "effective codeartifact:PutDomainPermissionsPolicy on ?domain (permission evaluator)"
+      false_positive_note: >-
+        This action cannot be granted via a resource policy to principals in another account
+        (the domain policy is ignored when calling PutDomainPermissionsPolicy; therefore a
+        cross-account principal cannot receive this permission via the domain policy alone —
+        it must be granted via identity policy in the domain-owner account or via an org-level
+        mechanism). Do not emit for cross-account principals whose only grant is via the
+        domain resource policy.
+      narrative: >-
+        {principal.name} can rewrite the domain-level resource policy of {domain.name}
+        (codeartifact:PutDomainPermissionsPolicy), enabling them to grant any principal
+        (including themselves) publish access to all repositories in the domain, creating a
+        domain-wide supply-chain write path.
+
+  # --- DeleteDomainPermissionsPolicy -> CanModifyPolicy (domain deletion) ----
+  # Deleting the domain policy removes all access controls, fully opening the
+  # publish surface. This is equally impactful to rewriting it.
+  - id: aws-ca-delete-domain-policy
+    emits: CanModifyPolicy
+    description: "Deleting the CodeArtifact domain resource policy removes all access controls and opens the publish surface to all principals with domain access — CanModifyPolicy via deletion."
+    match:
+      - [ ?principal, HasPermission, ?domain ]
+    where:
+      - "node_type(?domain) == ArtifactRepository"
+      - "provider_type(?domain) == AWS::CodeArtifact::Domain"
+      - "effective permission includes codeartifact:DeleteDomainPermissionsPolicy on ?domain"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: ?principal
+      target: "<domain ResourcePolicy node of ?domain>"
+      permissions:
+        - "codeartifact:DeleteDomainPermissionsPolicy"
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective codeartifact:DeleteDomainPermissionsPolicy
+        on the domain. Deletion removes the policy entirely, opening all repositories in
+        the domain to any principal that can authenticate to the CodeArtifact domain service.
+        BLOCKED when an SCP or permission boundary explicitly denies the action.
+      confidence: 0.95
+      derived_from:
+        - "effective codeartifact:DeleteDomainPermissionsPolicy on ?domain (permission evaluator)"
+      false_positive_note: >-
+        Deletion is irreversible without a backup/snapshot of the previous policy;
+        many organizations use auto-recovery / Config rules to restore it. However,
+        the immediate impact (removing the policy) is real and enables temporary
+        access. Do not emit for cross-account principals whose only grant is via the
+        domain resource policy (deletion cannot be granted cross-account via policy).
+      narrative: >-
+        {principal.name} can delete the domain-level resource policy of {domain.name}
+        (codeartifact:DeleteDomainPermissionsPolicy). Deletion removes all
+        policy-based access controls, opening publish access to all authenticated
+        principals and creating an immediate supply-chain write path.
+
+  # --- PutRepositoryPermissionsPolicy -> CanModifyPolicy (repository) -------
+  - id: aws-ca-modify-repo-policy
+    emits: CanModifyPolicy
+    description: "Rewriting a CodeArtifact repository resource policy can grant arbitrary principals publish access to that repository — CanModifyPolicy over the repository policy node."
+    match:
+      - [ ?principal, HasPermission, ?repository ]
+    where:
+      - "node_type(?repository) == ArtifactRepository"
+      - "provider_type(?repository) == AWS::CodeArtifact::Repository"
+      - "effective permission includes codeartifact:PutRepositoryPermissionsPolicy on ?repository"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: ?principal
+      target: "<repository ResourcePolicy node of ?repository>"
+      permissions:
+        - "codeartifact:PutRepositoryPermissionsPolicy"
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the principal has effective codeartifact:PutRepositoryPermissionsPolicy
+        on the repository (granted via identity policy or domain policy; the existing
+        repository policy is ignored when calling this action).
+        CONDITIONAL(resource_policy) when the grant is cross-account and both the resource-
+        policy and the caller's identity-policy sides have not been confirmed.
+        BLOCKED when an SCP or permission boundary explicitly denies the action.
+      confidence: 0.9
+      derived_from:
+        - "effective codeartifact:PutRepositoryPermissionsPolicy on ?repository (permission evaluator)"
+      false_positive_note: >-
+        Scoped to the specific repository; does not grant domain-wide access.  A principal
+        with this permission on one repository cannot rewrite the policy of another repository
+        in the same domain (unless the domain policy also grants this across all repositories).
+        Cross-account grantees cannot receive this via the existing repository policy alone
+        (the repo policy is ignored at call time); honor the standard IAM cross-account rules.
+      narrative: >-
+        {principal.name} can rewrite the resource policy of {repository.name}
+        (codeartifact:PutRepositoryPermissionsPolicy), enabling them to grant any principal
+        (including themselves or a cross-account identity) publish or read access to
+        {repository.name}.
+
+  # --- DeleteRepositoryPermissionsPolicy -> CanModifyPolicy (repository deletion) --
+  # Deleting the repository policy removes all access controls, fully opening the
+  # publish surface for that repository. This is equally impactful to rewriting it.
+  - id: aws-ca-delete-repo-policy
+    emits: CanModifyPolicy
+    description: "Deleting a CodeArtifact repository resource policy removes all access controls and opens the publish surface for that repository — CanModifyPolicy via deletion."
+    match:
+      - [ ?principal, HasPermission, ?repository ]
+    where:
+      - "node_type(?repository) == ArtifactRepository"
+      - "provider_type(?repository) == AWS::CodeArtifact::Repository"
+      - "effective permission includes codeartifact:DeleteRepositoryPermissionsPolicy on ?repository"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: ?principal
+      target: "<repository ResourcePolicy node of ?repository>"
+      permissions:
+        - "codeartifact:DeleteRepositoryPermissionsPolicy"
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the principal has effective codeartifact:DeleteRepositoryPermissionsPolicy
+        on the repository. Deletion removes the policy entirely, opening {repository.name}
+        to any principal that can authenticate to the CodeArtifact domain service.
+        CONDITIONAL(resource_policy) when the grant is cross-account and both sides
+        have not been confirmed.
+        BLOCKED when an SCP or permission boundary explicitly denies the action.
+      confidence: 0.9
+      derived_from:
+        - "effective codeartifact:DeleteRepositoryPermissionsPolicy on ?repository (permission evaluator)"
+      false_positive_note: >-
+        Deletion is irreversible without backup; many organizations use Config rules
+        to restore it. The immediate impact (removing the policy) is real and enables
+        temporary access. Scoped to a single repository (does not affect other repositories
+        in the domain unless they share the same policy document).
+      narrative: >-
+        {principal.name} can delete the resource policy of {repository.name}
+        (codeartifact:DeleteRepositoryPermissionsPolicy). Deletion removes all
+        policy-based access controls, opening publish access to any authenticated
+        principal and creating an immediate supply-chain write path to {repository.name}.
+
+  # -----------------------------------------------------------------------
+  # (c) UPSTREAM CONFIGURATION = CanModifyConfiguration
+  # -----------------------------------------------------------------------
+
+  # --- AssociateExternalConnection -> CanModifyConfiguration ----------------
+  # Adding an external connection to a public registry (npmjs, PyPI, Maven
+  # Central, NuGet, etc.) on a repository that does not already have one enables
+  # dependency confusion: a package published to the public registry with the
+  # same name as a private package can be resolved by downstream consumers.
+  # This is also needed for upstream-poisoning via a public registry.
+  # NOTE: Only emit POTENTIAL/ACTIVE if the repository does NOT already have an
+  # external connection of the same type — adding a duplicate does not change the
+  # attack surface.
+  - id: aws-ca-modify-config-external-conn
+    emits: CanModifyConfiguration
+    description: "Adding an external connection to a CodeArtifact repository can enable dependency confusion by allowing public-registry packages to be resolved by downstream consumers."
+    match:
+      - [ ?principal, HasPermission, ?repository ]
+    where:
+      - "node_type(?repository) == ArtifactRepository"
+      - "provider_type(?repository) == AWS::CodeArtifact::Repository"
+      - "effective permission includes codeartifact:AssociateExternalConnection on ?repository"
+      - "external_connection_count(?repository) == 0 (no existing external connection to this registry format)"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: ?principal
+      target: ?repository
+      permissions:
+        - "codeartifact:AssociateExternalConnection"
+      conditions: [iam_permission]
+      state_logic: >-
+        POTENTIAL by default — adding an external connection creates the precondition for
+        dependency confusion but does not by itself execute attacker code; the attacker
+        must additionally publish to the external registry a package whose name collides
+        with a private package consumed by downstream consumers (or the consumers must
+        request a package not present locally that the attacker can publish externally).
+        ACTIVE when a specific exploitable name collision is confirmed (a private package
+        name also exists under the attacker's control on the connected public registry)
+        AND the downstream consumer resolves through this repository.
+        BLOCKED when an SCP or permission boundary explicitly denies
+        codeartifact:AssociateExternalConnection OR the repository already has an
+        external connection of the same type (the attacker adds no new attack surface).
+      confidence: 0.6
+      derived_from:
+        - "effective codeartifact:AssociateExternalConnection on ?repository (permission evaluator)"
+      false_positive_note: >-
+        DO NOT emit if the repository already has an external connection to the relevant
+        public registry — the attacker adds no new attack surface in that case.
+        This is POTENTIAL unless a specific exploitable package-name collision is confirmed.
+        Many repositories already have external connections configured legitimately; the
+        attack surface only opens when (1) the external connection is NEW (the repo previously
+        had no external connection to this registry), and (2) a package name used privately
+        is also registerable on the public registry by the attacker.  AWS CodeArtifact package
+        origin control (ALLOW vs. BLOCK for EXTERNAL sources) may mitigate: if origin control
+        is set to BLOCK for external sources on a specific package, that package cannot be
+        sourced from the external connection -> downgrade the affected package's path to BLOCKED.
+      narrative: >-
+        {principal.name} can add an external connection to the public package registry from
+        {repository.name} (codeartifact:AssociateExternalConnection). If the attacker
+        publishes a package to the public registry whose name matches a private package
+        consumed by {repository.name}'s downstream consumers, those consumers will resolve
+        the attacker's version (dependency confusion), executing attacker-controlled code in
+        their build or runtime environments.
+
+  # --- UpdateRepository (add malicious upstream) -> CanModifyConfiguration ---
+  # Adding a malicious CodeArtifact repository as an upstream for a victim
+  # repository causes the victim's consumers to resolve packages from the
+  # attacker's repository when not found locally.  This is CanModifyConfiguration
+  # because it changes the repository's upstream chain (configuration), not the
+  # package content directly.  The actual code injection arrives through
+  # aws-ca-upstream-propagation (rule above) which fires once the upstream
+  # relationship is established.
+  - id: aws-ca-modify-config-update-upstream
+    emits: CanModifyConfiguration
+    description: "UpdateRepository can add a malicious upstream repository to a victim repository's upstream chain, enabling packages from the attacker's repository to be resolved by the victim's consumers."
+    match:
+      - [ ?principal, HasPermission, ?repository ]
+    where:
+      - "node_type(?repository) == ArtifactRepository"
+      - "provider_type(?repository) == AWS::CodeArtifact::Repository"
+      - "effective permission includes codeartifact:UpdateRepository on ?repository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: ?principal
+      target: ?repository
+      permissions:
+        - "codeartifact:UpdateRepository"
+      conditions: [iam_permission]
+      state_logic: >-
+        POTENTIAL by default — the attacker must also have a repository to add as an upstream
+        (or add an existing one they can publish to) AND the consumers must request packages
+        from that upstream.  ACTIVE when the attacker also controls (CanModifyCode over) a
+        repository they can insert as upstream AND the victim's consumers are confirmed to
+        resolve packages through the upstream chain.  BLOCKED when an SCP or permission
+        boundary denies codeartifact:UpdateRepository.
+      confidence: 0.7
+      derived_from:
+        - "effective codeartifact:UpdateRepository on ?repository (permission evaluator)"
+      false_positive_note: >-
+        UpdateRepository also covers non-harmful configuration changes (description, tags).
+        The relevant attack vector requires the attacker to (a) have UpdateRepository on the
+        victim repo AND (b) have or create a repository they control with packages whose names
+        the victim's consumers request.  Do not emit ACTIVE unless both conditions are
+        confirmed; POTENTIAL is the correct default.  The code-injection consequence arrives
+        via aws-ca-upstream-propagation once the malicious upstream is established (that rule
+        will emit CanModifyCode from the publisher to the downstream repo's consumers).
+      narrative: >-
+        {principal.name} can update {repository.name}'s configuration
+        (codeartifact:UpdateRepository), including adding a new upstream repository. If the
+        attacker adds a repository they control as an upstream, packages published there will
+        be resolved by {repository.name}'s consumers when not found locally, enabling
+        upstream poisoning.
+
+  # -----------------------------------------------------------------------
+  # (d) CROSS-ACCOUNT DOMAIN/REPO POLICIES = CrossAccountTrust
+  # -----------------------------------------------------------------------
+
+  # --- Domain resource policy grants cross-account principal ----------------
+  # A domain resource policy that names a principal in another account creates
+  # a CrossAccountTrust edge.  When combined with the cross-account principal
+  # also having effective PublishPackageVersion (via their own identity policy
+  # in their account), this enables cross-account supply-chain writes into the
+  # domain-owner account.
+  # The hierarchy-chains / can-control linchpin rolls CrossAccountTrust +
+  # downstream CanEnterAccount up; not re-derived here.
+  - id: aws-ca-domain-policy-cross-account
+    emits: CrossAccountTrust
+    description: "A CodeArtifact domain resource policy that names a principal in another account creates a CrossAccountTrust that, combined with that principal's identity-policy grants, enables cross-account package publishing into this domain."
+    match:
+      - [ ?domain, HasPolicy, ?domain_policy ]
+    where:
+      - "node_type(?domain) == ArtifactRepository"
+      - "provider_type(?domain) == AWS::CodeArtifact::Domain"
+      - "?domain_policy is the domain ResourcePolicy node of ?domain"
+      - "?domain_policy contains a Statement that names a Principal in an account different from the domain-owner account"
+      - "the Statement Effect is Allow and the Action includes codeartifact:PublishPackageVersion OR codeartifact:GetAuthorizationToken OR codeartifact:CreateRepository"
+    emit:
+      source_type: ResourcePolicy
+      target_type: ExternalIdentity
+      source: ?domain_policy
+      target: "<cross-account principal named in the domain policy>"
+      permissions:
+        - "codeartifact:GetAuthorizationToken"
+        - "codeartifact:PublishPackageVersion"
+      conditions: [resource_policy, iam_permission]
+      state_logic: >-
+        ACTIVE when the domain policy statement allows the cross-account principal and
+        the cross-account principal's own identity policy in their account also allows the
+        action (standard IAM cross-account: both sides must allow, any explicit deny blocks).
+        CONDITIONAL(iam_permission) when the cross-account principal's identity-policy side
+        has not been confirmed to also grant the action.
+        BLOCKED when an explicit Deny in any evaluated policy overrides the Allow.
+      confidence: 0.8
+      derived_from:
+        - "codeartifact:GetDomainPermissionsPolicy -> domain policy document inspection"
+        - "cross-account principal identified in domain policy Statement.Principal"
+      false_positive_note: >-
+        A principal named in the domain policy from another account does NOT automatically
+        have publish access — they also need codeartifact:PublishPackageVersion on the
+        relevant repository/package resource (either via the domain policy, a repository
+        policy, or their own identity policy).  GetAuthorizationToken alone grants
+        authentication but not publish.  aws:PrincipalOrgID conditions narrow the effective
+        grant to org members only — this may significantly reduce the blast radius.
+        Note: PutDomainPermissionsPolicy cannot be granted cross-account via the domain
+        policy itself (the policy is ignored at call time), so a cross-account principal
+        cannot receive that action via this mechanism.
+      narrative: >-
+        The domain resource policy of {domain.name} grants cross-account principal
+        {cross_account_principal.name} (in account {cross_account_principal.account})
+        access to the domain. If that principal's own identity policy also allows
+        codeartifact:PublishPackageVersion and codeartifact:GetAuthorizationToken, they can
+        publish packages into repositories within {domain.name} from their account,
+        enabling cross-account supply-chain poisoning.
+
+  # --- Repository resource policy grants cross-account principal ------------
+  - id: aws-ca-repo-policy-cross-account
+    emits: CrossAccountTrust
+    description: "A CodeArtifact repository resource policy that names a principal in another account creates a CrossAccountTrust enabling cross-account package reads or writes to that repository."
+    match:
+      - [ ?repository, HasPolicy, ?repo_policy ]
+    where:
+      - "node_type(?repository) == ArtifactRepository"
+      - "provider_type(?repository) == AWS::CodeArtifact::Repository"
+      - "?repo_policy is the repository ResourcePolicy node of ?repository"
+      - "?repo_policy contains a Statement that names a Principal in an account different from the domain-owner account"
+      - "the Statement Effect is Allow and the Action includes codeartifact:PublishPackageVersion OR codeartifact:ReadFromRepository"
+    emit:
+      source_type: ResourcePolicy
+      target_type: ExternalIdentity
+      source: ?repo_policy
+      target: "<cross-account principal named in the repository policy>"
+      permissions:
+        - "codeartifact:PublishPackageVersion"
+        - "codeartifact:ReadFromRepository"
+      conditions: [resource_policy, iam_permission]
+      state_logic: >-
+        ACTIVE when the repository policy allows the cross-account principal AND the
+        cross-account principal's own identity policy allows the action AND the domain policy
+        (if present) does not explicitly deny.
+        CONDITIONAL(iam_permission) when the cross-account principal's identity-policy side
+        has not been confirmed.
+        BLOCKED when any explicit Deny overrides the Allow.
+      confidence: 0.8
+      derived_from:
+        - "codeartifact:GetRepositoryPermissionsPolicy -> repository policy document inspection"
+        - "cross-account principal identified in repository policy Statement.Principal"
+      false_positive_note: >-
+        For cross-account publish (PublishPackageVersion), the cross-account principal also
+        needs effective GetAuthorizationToken on the domain (granted via the domain policy
+        or — if the caller's account is the domain owner — via identity policy).
+        ReadFromRepository alone does not imply publish capability — it is a read-only grant.
+        Honor aws:PrincipalOrgID and other condition keys that narrow the effective grant.
+      narrative: >-
+        The resource policy of {repository.name} grants cross-account principal
+        {cross_account_principal.name} (in account {cross_account_principal.account}) access
+        to the repository. If that principal also holds effective GetAuthorizationToken on the
+        domain, they can publish packages to {repository.name} from their account (if granted
+        PublishPackageVersion), enabling cross-account supply-chain poisoning.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP denying codeartifact:PublishPackageVersion at the OU/account scope
+#    blocks aws-ca-publish-is-modify-code (emit as BLOCKED with denied_by=<SCP arn>).
+#  - An SCP denying codeartifact:GetAuthorizationToken at the OU/account scope
+#    blocks all publish paths that require a token endpoint (emit as BLOCKED).
+#  - An SCP denying codeartifact:PutDomainPermissionsPolicy blocks
+#    aws-ca-modify-domain-policy (BLOCKED).
+#  - A permission boundary capping codeartifact:PublishPackageVersion on the
+#    publishing principal blocks aws-ca-publish-is-modify-code (BLOCKED).
+#  - CodeArtifact package origin control set to BLOCK for EXTERNAL sources
+#    blocks the dependency-confusion consequence of aws-ca-modify-config-external-conn
+#    for affected packages (emit the CanModifyConfiguration as ACTIVE but the
+#    downstream supply-chain path as BLOCKED for those packages).
+#  - Resource-policy explicit Deny on PublishPackageVersion for a principal
+#    blocks that principal's aws-ca-publish-is-modify-code edge (BLOCKED).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/aws-codeartifact.yaml (HasPermission for PublishPackageVersion,
+# PutDomainPermissionsPolicy, PutRepositoryPermissionsPolicy,
+# AssociateExternalConnection, UpdateRepository; CrossAccountTrust from policy
+# documents; ContainsResourceReference for upstream relationships).
+explicit_rules:
+
+  - id: aws-ca-publish-permission
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codeartifact:PublishPackageVersion"
+      resource_type: "AWS::CodeArtifact::Repository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<repository or package node>"
+      permissions: ["codeartifact:PublishPackageVersion"]
+      narrative: "{principal.name} has effective codeartifact:PublishPackageVersion on {repository.name}."
+
+  - id: aws-ca-put-domain-policy-permission
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codeartifact:PutDomainPermissionsPolicy"
+      resource_type: "AWS::CodeArtifact::Domain"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<domain node>"
+      permissions: ["codeartifact:PutDomainPermissionsPolicy"]
+      narrative: "{principal.name} has effective codeartifact:PutDomainPermissionsPolicy on {domain.name}."
+
+  - id: aws-ca-put-repo-policy-permission
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codeartifact:PutRepositoryPermissionsPolicy"
+      resource_type: "AWS::CodeArtifact::Repository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<repository node>"
+      permissions: ["codeartifact:PutRepositoryPermissionsPolicy"]
+      narrative: "{principal.name} has effective codeartifact:PutRepositoryPermissionsPolicy on {repository.name}."
+
+  - id: aws-ca-associate-external-connection-permission
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codeartifact:AssociateExternalConnection"
+      resource_type: "AWS::CodeArtifact::Repository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<repository node>"
+      permissions: ["codeartifact:AssociateExternalConnection"]
+      narrative: "{principal.name} has effective codeartifact:AssociateExternalConnection on {repository.name}."
+
+  - id: aws-ca-update-repository-permission
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codeartifact:UpdateRepository"
+      resource_type: "AWS::CodeArtifact::Repository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<repository node>"
+      permissions: ["codeartifact:UpdateRepository"]
+      narrative: "{principal.name} has effective codeartifact:UpdateRepository on {repository.name}."
+
+  - id: aws-ca-delete-domain-policy-permission
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codeartifact:DeleteDomainPermissionsPolicy"
+      resource_type: "AWS::CodeArtifact::Domain"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<domain node>"
+      permissions: ["codeartifact:DeleteDomainPermissionsPolicy"]
+      narrative: "{principal.name} has effective codeartifact:DeleteDomainPermissionsPolicy on {domain.name}."
+
+  - id: aws-ca-delete-repo-policy-permission
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codeartifact:DeleteRepositoryPermissionsPolicy"
+      resource_type: "AWS::CodeArtifact::Repository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<repository node>"
+      permissions: ["codeartifact:DeleteRepositoryPermissionsPolicy"]
+      narrative: "{principal.name} has effective codeartifact:DeleteRepositoryPermissionsPolicy on {repository.name}."
+
+  - id: aws-ca-copy-package-versions-permission
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codeartifact:CopyPackageVersions"
+      resource_type: "AWS::CodeArtifact::Repository"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<repository node>"
+      permissions: ["codeartifact:CopyPackageVersions"]
+      narrative: "{principal.name} has effective codeartifact:CopyPackageVersions on {repository.name}."
+
+  - id: aws-ca-get-auth-token-permission
+    emits: HasPermission
+    applies_to: [aws]
+    match_effective_permission:
+      action: "codeartifact:GetAuthorizationToken"
+      resource_type: "AWS::CodeArtifact::Domain"
+    emit:
+      source_type: Identity
+      target_type: ArtifactRepository
+      source: "<principal>"
+      target: "<domain node>"
+      permissions: ["codeartifact:GetAuthorizationToken"]
+      narrative: "{principal.name} has effective codeartifact:GetAuthorizationToken on {domain.name}."
+
+  - id: aws-ca-upstream-relationship
+    emits: ContainsResourceReference
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodeArtifact::Repository"
+      field: "upstreams"
+    emit:
+      source: "<downstream repository node>"
+      target: "<upstream repository node (resolved from repositoryName in upstreams[])>"
+      api_source: "codeartifact:DescribeRepository"
+      evidence_field: "repository.upstreams[].repositoryName"
+      reference_kind: "upstream_repository"
+      narrative: "{downstream.name} has {upstream.name} configured as an upstream repository."
+
+  - id: aws-ca-domain-policy-cross-account-trust
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodeArtifact::Domain"
+      field: "policy.document.Statement[].Principal"
+    emit:
+      source: "<domain ResourcePolicy node>"
+      target: "<external identity node (cross-account principal from Statement.Principal)>"
+      api_source: "codeartifact:GetDomainPermissionsPolicy"
+      evidence_field: "policy.document.Statement[].Principal"
+      narrative: "Domain policy of {domain.name} grants cross-account access to {principal.name}."
+
+  - id: aws-ca-repo-policy-cross-account-trust
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::CodeArtifact::Repository"
+      field: "policy.document.Statement[].Principal"
+    emit:
+      source: "<repository ResourcePolicy node>"
+      target: "<external identity node (cross-account principal from Statement.Principal)>"
+      api_source: "codeartifact:GetRepositoryPermissionsPolicy"
+      evidence_field: "policy.document.Statement[].Principal"
+      narrative: "Repository policy of {repository.name} grants cross-account access to {principal.name}."

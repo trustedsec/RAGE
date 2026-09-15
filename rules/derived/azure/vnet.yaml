@@ -1,0 +1,539 @@
+# Azure — Virtual Network (Microsoft.Network/virtualNetworks) — Phase 8 networking rules
+# ---------------------------------------------------------------------------
+# Core attack surface: VNets define the network isolation boundary for Azure
+# resources. The rules here emit FACTS about:
+#   (1) EXPOSURE — NSG inbound allows for Internet/0.0.0.0/0 -> CanReachPort /
+#       ExposedToInternet. DNS dangling records -> ExposedToInternet.
+#   (2) REACHABILITY PIVOTS — VNet peerings (incl. cross-sub/tenant) -> PeeredWith;
+#       UDR route table entries -> RoutesTo; private endpoints -> PrivateReachability.
+#   (3) WEAKEN CONTROLS — write access to NSG rules, peerings, route tables, DNS
+#       records -> CanModifyConfiguration on those control objects.
+#   (4) CROSS-BOUNDARY — cross-subscription / cross-tenant peering -> CrossAccountTrust /
+#       CrossTenantTrust.
+#
+# Transitive end-to-end CanNetworkReach (SG-allows + route + peering composing
+# into reachability) is a FUTURE provider-agnostic network-chains linchpin. Do NOT
+# derive it here. Emit per-service FACTS only.
+#
+# Permissions are verified against the Azure resource-provider operations reference
+# (Microsoft.Network). Deny assignments override -> BLOCKED. All operation strings
+# taken verbatim from the Microsoft.Network operations reference (2026-09 snapshot).
+#
+# can-control.yaml is CITED, not duplicated: CanAdminister -> Controls derivations
+# are handled there and apply equally to VNet/NSG/RT objects.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 8-networking
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # SECTION 1 — EXPOSURE: NSG inbound rules opening ports to the internet
+  # ===========================================================================
+
+  - id: azure-vnet-nsg-inbound-open
+    emits: CanReachPort
+    description: >-
+      An NSG effective inbound rule allowing a source of Internet or 0.0.0.0/0 on a
+      specific port/range means that port is reachable from the internet at the network layer.
+      Source is the NSG/Subnet (a Network node), target is the compute resource behind it.
+    where:
+      - "NSG effective inbound rule: source == 'Internet' OR source == '0.0.0.0/0' (AnySource wildcard)"
+      - "action == 'Allow', priority lower than any conflicting Deny rule at the same or higher priority"
+      - "the NSG is associated with a subnet or NIC hosting at least one resource"
+    emit:
+      source_type: Network
+      target_type: Compute
+      source: "<NSG or Subnet node (Network class) associated with the rule>"
+      target: "<compute resource (instance, App Service, LB, etc.) in that subnet/NIC>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability) by default: the port is open at the NSG layer
+        but requires a public IP or load-balancer frontend for actual internet reachability.
+        Emit ACTIVE only when (1) confirmed public IP (PublicEndpoint node) is attached to
+        the target resource or its NIC, AND (2) the effective NSG rule allows Internet/Any
+        on a service port (not ephemeral). Match against optional PublicEndpoint attachment
+        to upgrade from CONDITIONAL to ACTIVE.
+      false_positive_note: >-
+        Always evaluate EFFECTIVE NSG rules (use Microsoft.Network/networkInterfaces/
+        effectiveNetworkSecurityGroups/action or the subnet-level effective rules API),
+        not raw rule objects. A raw allow rule may be shadowed by a higher-priority
+        Deny. The default DenyAllInbound rule has priority 65500; any explicit allow with
+        lower priority (higher precedence) overrides it. The internet source tag
+        matches all public IPs but not RFC-1918 ranges; AnySource (0.0.0.0/0 or '*')
+        matches all including private. Emit only when the effective rule allows
+        inbound from the internet source. Do not emit if resource has no public
+        IP and is not behind a public load balancer (the port may be open in the NSG but
+        unreachable without a public entry point). Also check for resource-level
+        publicNetworkAccess: Disabled (overrides NSG).
+      narrative: >-
+        NSG {source.name} has an effective inbound allow rule for source Internet/Any
+        on the specified port; {target.name} in that subnet can be reached from the
+        public internet at the firewall layer.
+      derived_from: ["<effective NSG inbound rule record>"]
+
+  - id: azure-vnet-nsg-internet-exposed
+    emits: ExposedToInternet
+    description: >-
+      A compute resource or load balancer with a public IP AND an NSG rule that allows
+      inbound Internet/0.0.0.0/0 on a port is internet-exposed.
+    match:
+      - [ ?resource, CanReachPort, ?something ]  # azure-vnet-nsg-inbound-open must have fired
+    where:
+      - "?resource has an associated PublicEndpoint node (public IP address or public LB frontend)"
+      - "the NSG effective inbound rule allows Internet/Any on a service port (not just ephemeral)"
+    emit:
+      source_type: Compute
+      target_type: AnonymousIdentity
+      source: "<compute resource or load balancer>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when: (1) effective NSG inbound allows Internet/Any on the service port, AND
+        (2) a public IP (or public LB frontend) is associated with the resource or its NIC.
+        CONDITIONAL(network_reachability) if either condition is uncertain from collected data.
+      derived_from: ["<CanReachPort edge_id>", "<PublicEndpoint node linkage>"]
+      false_positive_note: >-
+        Do not emit if publicNetworkAccess is Disabled at the resource level (e.g., Storage
+        Account, Key Vault, SQL with publicNetworkAccess=Disabled) even if the NSG rule
+        appears open. The resource-level firewall overrides NSG. Only emit for resources
+        that actually bind a public IP address (or are fronted by a public load balancer /
+        Application Gateway with a public frontend). A private-endpoint-only resource
+        behind an open NSG is NOT internet-exposed.
+      narrative: >-
+        {resource.name} is exposed to the public internet: it has a public IP (or public
+        load balancer frontend) and an NSG inbound allow rule for Internet/Any on a service
+        port.
+
+  # ===========================================================================
+  # SECTION 2 — REACHABILITY PIVOTS: peering, routes, private endpoints
+  # ===========================================================================
+
+  # NOTE: PeeredWith edges are emitted directly by the explicit rule (azure-vnet-peering-record)
+  # and do not need re-emission in derived. Cross-subscription and cross-tenant boundaries
+  # are identified by matching on the explicit PeeredWith edge and checking subscription/tenant IDs.
+
+  - id: azure-vnet-cross-sub-peering
+    emits: [PeeredWith, CrossAccountTrust]
+    description: >-
+      A Connected VNet peering that crosses Azure subscriptions (emitted from explicit
+      azure-vnet-peering-record) extends network reachability AND establishes a cross-subscription
+      trust boundary — a critical lateral-movement fact.
+    match:
+      - [ ?localVNet, PeeredWith, ?remoteVNet ]  # azure-vnet-peering-record must have fired
+    where:
+      - "?localVNet.subscription_id != ?remoteVNet.subscription_id (subscription boundary crossed)"
+      - "?localVNet.tenant_id == ?remoteVNet.tenant_id (same tenant; for cross-tenant see azure-vnet-cross-tenant-peering)"
+      - "peeringState == Connected on both sides (from explicit record)"
+    # Multi-edge: PeeredWith connects the two VNets (network layer); CrossAccountTrust
+    # connects the two Subscriptions (boundary layer). Each block carries its own edge_type
+    # so the linter validates each against its own edge's declared source/target set.
+    emit:
+      - edge_type: PeeredWith
+        source_type: VirtualNetwork
+        target_type: VirtualNetwork
+        source: "<local VNet node>"
+        target: "<remote VNet node, peered across the subscription boundary>"
+        permissions: []
+        state_logic: >-
+          ACTIVE when peeringState is Connected on both sides. CONDITIONAL(network_reachability)
+          if remote-side state is unconfirmed (collection gap on remote subscription).
+        derived_from: ["azure-vnet-peering-record"]
+      - edge_type: CrossAccountTrust
+        source_type: Account
+        target_type: Account
+        source: "<Subscription node (Account class) containing local VNet>"
+        target: "<Subscription node (Account class) containing remote VNet>"
+        permissions: []
+        properties:
+          cross_subscription: true
+          local_subscription: "{localVNet.subscription_id}"
+          remote_subscription: "{remoteVNet.subscription_id}"
+        state_logic: >-
+          ACTIVE when peeringState is Connected on both sides and subscription mismatch is
+          confirmed. CONDITIONAL(network_reachability) if remote-side state is unconfirmed
+          (collection gap on remote subscription).
+        derived_from: ["azure-vnet-peering-record"]
+        false_positive_note: >-
+          This rule emits TWO edges: (1) PeeredWith (network-layer reachability, already in
+          explicit), (2) CrossAccountTrust (subscription boundary crossing). ARM control does
+          not cross subscription boundaries via peering. An attacker with a foothold in the
+          remote subscription's VNet gains network-layer reach into this VNet subject to NSG rules.
+          Peering is non-transitive — do not chain these edges.
+        narrative: >-
+          VNet {localVNet.name} (subscription {source.id}) is peered with VNet {remoteVNet.name}
+          (subscription {target.id}); a foothold in that subscription grants network-layer reach
+          across the account boundary.
+
+  - id: azure-vnet-cross-tenant-peering
+    emits: [PeeredWith, CrossTenantTrust]
+    description: >-
+      A Connected VNet peering that crosses Entra tenant boundaries (emitted from explicit
+      azure-vnet-peering-record) extends network reachability AND establishes a cross-tenant
+      trust boundary — a critical lateral-movement fact.
+    match:
+      - [ ?localVNet, PeeredWith, ?remoteVNet ]  # azure-vnet-peering-record must have fired
+    where:
+      - "?localVNet.tenant_id != ?remoteVNet.tenant_id (tenant boundary crossed)"
+      - "peeringState == Connected on both sides (from explicit record)"
+    # Multi-edge: PeeredWith connects the two VNets (network layer); CrossTenantTrust
+    # connects the two Tenants (boundary layer). Per-block edge_type for linter validation.
+    emit:
+      - edge_type: PeeredWith
+        source_type: VirtualNetwork
+        target_type: VirtualNetwork
+        source: "<local VNet node>"
+        target: "<remote VNet node, peered across the tenant boundary>"
+        permissions: []
+        state_logic: >-
+          ACTIVE when cross-tenant peering is confirmed Connected on both sides.
+          CONDITIONAL(network_reachability) if remote-side state is unconfirmed (collection
+          gap — remote tenant not in collection scope).
+        derived_from: ["azure-vnet-peering-record"]
+      - edge_type: CrossTenantTrust
+        source_type: Tenant
+        target_type: Tenant
+        source: "<Tenant node containing local VNet>"
+        target: "<Tenant node containing remote VNet>"
+        permissions: []
+        properties:
+          cross_tenant: true
+          local_tenant: "{localVNet.tenant_id}"
+          remote_tenant: "{remoteVNet.tenant_id}"
+        state_logic: >-
+          ACTIVE when cross-tenant peering is confirmed Connected on both sides.
+          CONDITIONAL(network_reachability) if remote-side state is unconfirmed (collection
+          gap — remote tenant not in collection scope). Cross-tenant peering requires
+          explicit role grant (peer/action or Contributor) on the local VNet to the
+          remote-tenant principal; this is a prerequisite for peering to complete, not
+          a differentiator between ACTIVE and CONDITIONAL.
+        derived_from: ["azure-vnet-peering-record"]
+        false_positive_note: >-
+          The peering bridges network paths only; it does NOT grant ARM control in either
+          direction. Use the properties.cross_tenant flag for analyst-query filtering. Verify
+          tenant enrollment by comparing subscription tenant IDs from both peering sides.
+          Cross-tenant peering with ApplicationIdentity principals (B2B service principals)
+          is a common integration pattern; assess the trust relationship separately.
+        narrative: >-
+          VNet {localVNet.name} (tenant {source.id}) is peered with VNet {remoteVNet.name}
+          (tenant {target.id}); a foothold in that tenant grants network-layer reach
+          across the tenant boundary without crossing any internet boundary.
+
+  # NOTE: RoutesTo edges are emitted directly by the explicit rule (azure-vnet-route-record)
+  # and do not need re-emission in derived. The network-chains linchpin consumes these facts.
+
+  - id: azure-vnet-private-endpoint-fact
+    emits: PrivateReachability
+    description: >-
+      A private endpoint (emitted from explicit azure-vnet-private-endpoint-record) makes a
+      PaaS service (Key Vault, Storage, SQL, Service Bus, etc.) reachable at a private
+      VNet IP. Compute resources located in the endpoint's VNet (via LocatedIn edges) gain
+      network-layer access to that service without traversing the internet.
+    match:
+      - [ ?compute, LocatedIn, ?subnet ]         # compute must be in a subnet
+      - [ ?subnet, LocatedIn, ?vnet ]            # subnet must be in a VNet
+      - [ ?privateEndpoint, PrivateReachability, ?paaService ]  # PE from explicit record
+      - [ ?privateEndpoint, AttachedTo, ?peSubnet ]  # PE attached to its subnet
+      - [ ?peSubnet, LocatedIn, ?peVNet ]        # PE's subnet in its VNet
+    where:
+      - "?vnet == ?peVNet OR ?vnet.PeeredWith(?peVNet) (compute VNet is same or peered with PE VNet)"
+      - "no effective NSG rule on ?peSubnet or ?compute's NIC blocks traffic to the PE's private IP"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: ?compute
+      target: ?privateEndpoint
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): the private endpoint exists and DNS resolves within
+        the VNet, but actual reachability from ?compute requires (1) ?compute in same VNet as PE
+        or in a peered VNet, (2) no NSG blocking the PE's private IP, (3) PaaS resource firewall
+        rules include the PE's subnet/VNet (check networkAcls). Emit ACTIVE only when all
+        conditions are confirmed.
+      derived_from: ["azure-vnet-private-endpoint-record", "LocatedIn(Compute->Subnet)", "LocatedIn(Subnet->VNet)", "LocatedIn(Subnet->VNet) for PE"]
+      false_positive_note: >-
+        A private endpoint with provisioningState != Succeeded or connection status !=
+        Approved is NOT active; do not emit. Service-level firewall rules on the PaaS
+        resource (e.g., Storage Account networkAcls.bypass) may still block access even
+        over private endpoints if the resource does not list the PE's subnet. Confirm the
+        resource's network rules include the PE's VNet/subnet or allow all virtual networks.
+        Private endpoint networking is layer-3; the PaaS resource's own auth (RBAC, SAS, etc.)
+        is still required — PrivateReachability gates network access, not data-plane auth.
+      narrative: >-
+        Private endpoint {target.name} makes service {linkedService.name} reachable at a
+        private IP in VNet {peVNet.name}; {source.name} located in that VNet (or a peered
+        VNet) can reach it without an internet path.
+
+  # ===========================================================================
+  # SECTION 3 — WEAKEN CONTROLS: write access to network and DNS control objects
+  # ===========================================================================
+
+  - id: azure-vnet-nsg-rule-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to NSG security rules lets an attacker add an inbound allow rule
+      (e.g., source=Any, port=*, action=Allow) to open previously blocked network paths.
+    match_effective_permission:
+      action: "Microsoft.Network/networkSecurityGroups/securityRules/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal>"
+      target: "<NSG>"
+      permissions: ["Microsoft.Network/networkSecurityGroups/securityRules/write"]
+      state_logic: >-
+        ACTIVE: the principal can add or modify a security rule immediately; no secondary
+        condition required. Effect is realized when an existing or new rule is written.
+      false_positive_note: >-
+        A deny assignment covering networkSecurityGroups/securityRules/write at the NSG or
+        RG scope blocks this capability -> emit BLOCKED. Network Contributor includes this
+        action; custom roles may scope it more narrowly. The write action alone does not
+        open traffic; it enables the ATTACKER to open it — this edge records the capability,
+        not an existing open rule.
+      narrative: >-
+        {principal.name} can add or modify NSG security rules on {target.name}
+        (networkSecurityGroups/securityRules/write), enabling them to open inbound
+        allow rules and expand network reachability.
+      derived_from: ["<effective permission record: networkSecurityGroups/securityRules/write>"]
+
+  - id: azure-vnet-nsg-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to the NSG object itself (create/replace) gives equivalent capability to
+      rewrite all security rules, effectively bypassing any existing rule set.
+    match_effective_permission:
+      action: "Microsoft.Network/networkSecurityGroups/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal>"
+      target: "<NSG>"
+      permissions: ["Microsoft.Network/networkSecurityGroups/write"]
+      state_logic: ACTIVE
+      false_positive_note: >-
+        networkSecurityGroups/write allows creating a new NSG or replacing an existing one's
+        metadata; combined with securityRules/write (or included via wildcard) it allows full
+        rule replacement. If the effective permission is only /write without /securityRules/write,
+        the attacker can still create a new NSG object — associating it with a subnet requires
+        virtualNetworks/subnets/write. Honor the scope of the grant.
+      narrative: >-
+        {principal.name} can write the NSG object {target.name} (networkSecurityGroups/write),
+        enabling rule replacement or wholesale NSG substitution.
+      derived_from: ["<effective permission record: networkSecurityGroups/write>"]
+
+  - id: azure-vnet-peering-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to VNet peerings lets an attacker create or modify peerings, extending
+      network reachability from an attacker-controlled VNet into this VNet.
+    match_effective_permission:
+      action: "Microsoft.Network/virtualNetworks/virtualNetworkPeerings/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal has effective Microsoft.Network/virtualNetworks/virtualNetworkPeerings/write on the local VNet"
+    emit:
+      source_type: Identity
+      target_type: VirtualNetwork
+      source: "<principal>"
+      target: "<VNet>"
+      permissions: ["Microsoft.Network/virtualNetworks/virtualNetworkPeerings/write"]
+      state_logic: >-
+        ACTIVE: the principal can create or modify peerings on this VNet immediately.
+        To complete the peering the remote VNet must also accept (requires
+        Microsoft.Network/virtualNetworks/peer/action or Contributor on the remote side);
+        emit CONDITIONAL(network_reachability) when the remote-side grant is unconfirmed.
+      false_positive_note: >-
+        Creating a peering only completes when the REMOTE VNet also has
+        Microsoft.Network/virtualNetworks/peer/action granted to the initiating principal.
+        An attacker controlling their own VNet in a different subscription automatically
+        satisfies the remote-side acceptance if they own that VNet. Cross-tenant peering
+        additionally requires an Entra B2B role grant on the remote side. Do not conflate
+        the write capability (modeled here as CanModifyConfiguration) with a completed
+        peering (PeeredWith); the latter requires both sides.
+      narrative: >-
+        {principal.name} can create or modify peerings on VNet {target.name}
+        (virtualNetworkPeerings/write), potentially extending reachability from an
+        attacker-controlled VNet into {target.name}'s address space.
+      derived_from: ["<effective permission record: virtualNetworkPeerings/write>"]
+
+  - id: azure-vnet-route-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to route table routes lets an attacker add a UDR redirecting traffic
+      through an attacker-controlled next hop (NVA) — enabling traffic interception.
+    match_effective_permission:
+      action: "Microsoft.Network/routeTables/routes/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "route table is already associated with at least one subnet (existing association takes effect immediately)"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: "<principal>"
+      target: "<route table>"
+      permissions: ["Microsoft.Network/routeTables/routes/write"]
+      state_logic: >-
+        ACTIVE when the route table is already associated with a subnet (modifying existing
+        routes takes effect immediately on next route refresh). CONDITIONAL(iam_permission)
+        when a NEW route table is not yet associated with a subnet (requires additional
+        Microsoft.Network/virtualNetworks/subnets/write to associate and take effect).
+      false_positive_note: >-
+        routeTables/routes/write alone enables route manipulation on existing tables.
+        Associating a NEW route table with a subnet additionally requires
+        Microsoft.Network/virtualNetworks/subnets/write. Modifying an existing route table
+        associated with a subnet takes effect immediately on the next route refresh (BGP
+        propagation or system refresh). Honor deny assignments.
+      narrative: >-
+        {principal.name} can add or modify route entries in route table {target.name}
+        (routeTables/routes/write), enabling traffic redirection through an attacker-controlled
+        next hop for MitM or lateral-movement purposes.
+      derived_from: ["<effective permission record: routeTables/routes/write>"]
+
+  - id: azure-vnet-dns-public-record-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to public DNS zone record sets lets an attacker create or modify A/CNAME/alias
+      records — enabling DNS hijack, redirect, or dangling-record takeover.
+    match_effective_permission:
+      action: "Microsoft.Network/dnsZones/*/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal>"
+      target: "<public DNS zone>"
+      permissions: ["Microsoft.Network/dnsZones/*/write"]
+      state_logic: ACTIVE
+      false_positive_note: >-
+        DNS Zone Contributor grants write on all record types; custom roles may scope to
+        specific record types. Public zone record write (dnsZones/*/write) affects public
+        DNS resolution globally. Do not conflate the capability (CanModifyConfiguration on
+        the zone) with an existing dangling record (ExposedToInternet from
+        azure-vnet-dns-dangling-takeover).
+      narrative: >-
+        {principal.name} can write DNS record sets in public zone {target.name} (dnsZones/*/write),
+        enabling DNS hijack, redirect, or creation of dangling records for subdomain takeover.
+      derived_from: ["<effective permission record: dnsZones/*/write>"]
+
+  - id: azure-vnet-dns-private-record-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to private DNS zone record sets lets an attacker create or modify records
+      — enabling DNS hijack or redirect within linked VNets.
+    match_effective_permission:
+      action: "Microsoft.Network/privateDnsZones/*/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: DNS
+      source: "<principal>"
+      target: "<private DNS zone>"
+      permissions: ["Microsoft.Network/privateDnsZones/*/write"]
+      state_logic: ACTIVE
+      false_positive_note: >-
+        Private DNS Zone Contributor grants write on all record types. Private DNS zone
+        record write only affects name resolution within linked VNets (not public DNS).
+        Do not conflate the capability (CanModifyConfiguration on the zone) with an
+        existing dangling record (which only applies to public zones).
+      narrative: >-
+        {principal.name} can write DNS record sets in private zone {target.name}
+        (privateDnsZones/*/write), enabling DNS hijack or redirect within VNets linked
+        to the zone.
+      derived_from: ["<effective permission record: privateDnsZones/*/write>"]
+
+  # ===========================================================================
+  # SECTION 4 — MISSING RULE: Private endpoint write
+  # ===========================================================================
+
+  - id: azure-vnet-pe-write
+    emits: CanModifyConfiguration
+    description: >-
+      Write access to Microsoft.Network/privateEndpoints lets an attacker create a new private
+      endpoint connecting a sensitive PaaS resource (Storage, Key Vault, SQL, etc.) to an
+      in-VNet IP address — enabling a foothold in the VNet to reach that resource via
+      PrivateReachability without internet traversal.
+    match_effective_permission:
+      action: "Microsoft.Network/privateEndpoints/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: "<principal>"
+      target: "<VirtualNetwork>"
+      permissions: ["Microsoft.Network/privateEndpoints/write"]
+      state_logic: ACTIVE
+      false_positive_note: >-
+        privateEndpoints/write allows creating and managing private endpoints. An attacker
+        with this permission can create a PE connecting any PaaS resource (within their
+        scope) to a VNet, bypassing internet-layer isolation. Combined with network access
+        to the VNet (LocatedIn a Compute in that VNet), the attacker gains unfiltered
+        access to the PaaS resource. Honor deny assignments.
+      narrative: >-
+        {principal.name} can create or modify private endpoints in {target.name}
+        (Microsoft.Network/privateEndpoints/write), enabling them to expose sensitive
+        PaaS resources (Key Vault, Storage, SQL) to an in-VNet IP for lateral movement.
+      derived_from: ["<effective permission record: privateEndpoints/write>"]
+
+  # ===========================================================================
+  # SECTION 5 — DNS TAKEOVER: dangling records
+  # ===========================================================================
+
+  - id: azure-vnet-dns-dangling-takeover
+    emits: ExposedToInternet
+    description: >-
+      A CNAME or alias DNS record (in a public zone) pointing to a deprovisioned Azure
+      resource enables subdomain takeover: an attacker can claim the target resource
+      and inherit DNS resolution for the dangling name.
+    where:
+      - "DNS zone record type is CNAME, ALIAS, or A (with azure-specific alias target)"
+      - "the record target (CNAME value / alias target resource ID) resolves to a resource that no longer exists in ARM inventory"
+      - "the target resource type is one known to be claimable by external parties (Azure Blob, App Service, Traffic Manager, Azure CDN, Azure Front Door, Static Web App, API Management, etc.)"
+    emit:
+      source_type: PublicEndpoint
+      target_type: AnonymousIdentity
+      source: "<DNS zone / dangling record (modeled as PublicEndpoint — the public FQDN is the internet-facing surface)>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      state_logic: >-
+        ACTIVE when the dangling record target is confirmed deprovisioned (resource not found
+        in ARM inventory) AND the resource type is known to be claimable (see false_positive_note).
+        POTENTIAL when the target resource is not confirmed in ARM inventory but may simply be
+        in a different subscription not collected (collection gap).
+      derived_from: ["<DNS record ARM record>", "<ARM inventory cross-reference (resource not found)>"]
+      false_positive_note: >-
+        Only claimable resource types yield a real takeover surface. Blob storage endpoint
+        (<account>.blob.core.windows.net), App Service (<name>.azurewebsites.net), Azure CDN
+        (<profile>.azureedge.net), Front Door (<name>.azurefd.net), Traffic Manager
+        (<name>.trafficmanager.net), Static Web Apps (<name>.azurestaticapps.net) are
+        confirmed claimable. Azure IP ranges / managed IP resources (Microsoft.Network/publicIPAddresses
+        owned by the subscription) that are merely deallocated but still in the subscription
+        are NOT claimable externally — do not emit. Confirm the target resource does NOT exist
+        in collected ARM inventory (across all subscriptions in scope) before emitting ACTIVE;
+        downgrade to POTENTIAL if the subscription is not in collection scope.
+      narrative: >-
+        DNS record {record.name} in zone {source.name} is a dangling CNAME/alias pointing to
+        a deprovisioned resource ({targetFqdn}). An external party can claim that resource
+        and resolve {record.name} to attacker-controlled infrastructure (subdomain takeover).
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - Any deny assignment (Azure Blueprint / Managed Application) covering the
+#     relevant write action at the VNet / NSG / RT / DNS scope -> emit with
+#     state: BLOCKED and denied_by=<deny assignment id>.
+#   - Azure Policy (deny effect) blocking networkSecurityGroups/securityRules/write
+#     or virtualNetworks/virtualNetworkPeerings/write -> BLOCKED.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw config -> explicit edges) are now in
+# /rules/explicit/azure-vnet.yaml. Derived rules here consume those explicit
+# facts and emit additional derived edges per the attack-path derivation logic.
+# ---------------------------------------------------------------------------

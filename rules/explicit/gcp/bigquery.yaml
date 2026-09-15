@@ -1,0 +1,488 @@
+# GCP BigQuery — Explicit normalization rules (Phase 11 — data / analytics / ML)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:bigquery. Emits ONLY explicit-nature edges from schema/edges.yaml.
+# Runs the effective-permission evaluator + raw API artifact normalization.
+#
+# All rules in this file match either:
+#   (1) Raw API records (match_record) after collection, OR
+#   (2) Effective-permission decisions (match_effective_permission) from the
+#       permission evaluator, which runs after initial graph construction.
+#
+# Explicit edges have nature='explicit' in edges.yaml and serve as facts feeding
+# derived rules. They are NOT re-derivable from other edges — they are materializations
+# of API / policy / permission state.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 11-data-analytics-ml
+service: bigquery
+applies_to: [gcp]
+
+rules:
+
+  # =====================================================================
+  # EXECUTION EDGES (explicit)
+  # =====================================================================
+
+  - id: gcp-bigquery-explicit-executes-as
+    emits: ExecutesAs
+    description: "A scheduled query with serviceAccountName set runs as that SA; zero-cost fact enabling cicd-chains derivation."
+    match_record:
+      resource_type: "google.bigquery.datatransfer.TransferConfig"
+      field: "serviceAccountName"
+    where:
+      - "serviceAccountName is non-empty"
+    emit:
+      source_type: Messaging
+      target_type: Identity
+      source: "<TransferConfig node>"
+      target: "<service account named in serviceAccountName>"
+      permissions: []
+      conditions: []
+      state_logic: "ACTIVE when serviceAccountName is set and the SA exists; UNKNOWN when the SA cannot be resolved."
+      false_positive_note: >-
+        When serviceAccountName is NOT set, the scheduled query runs as the
+        creating user's delegated credentials (OAuth refresh token stored
+        server-side by Google). Do NOT emit ExecutesAs to a service account
+        when the field is absent. When set, the BigQuery Data Transfer Service
+        executes server-side using the SA; the attacker's SQL runs under the SA's
+        data-plane permissions. The SA token is NOT accessible via metadata server
+        or any API call — do not emit ExposesCredential(TransferConfig -> SA).
+      narrative: >-
+        Scheduled query {transferconfig.name} executes as service account
+        {sa.name} (serviceAccountName field); its SQL runs with {sa.name}'s
+        data-plane IAM grants.
+      derived_from: ["google.bigquery.datatransfer.TransferConfig.serviceAccountName"]
+      api_source: "bigquery.projects.transferConfigs.list + bigquery.projects.transferConfigs.get"
+      evidence_field: "serviceAccountName"
+
+  # =====================================================================
+  # CODE MODIFICATION (explicit)
+  # =====================================================================
+
+  - id: gcp-bigquery-explicit-can-modify-code-scheduled-query
+    emits: CanModifyCode
+    description: "bigquery.transfers.update lets a principal change a scheduled query's SQL — the code the Transfer Service runs as the attached SA."
+    match_effective_permission:
+      action: "bigquery.transfers.update"
+      resource_type: "google.bigquery.datatransfer.TransferConfig"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<TransferConfig Scheduler node>"
+      permissions: ["bigquery.transfers.update"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE when bigquery.transfers.update is confirmed on the TransferConfig scope; CONDITIONAL(iam_permission) when the permission is inherited only at project scope but a VPC-SC perimeter limits the DTS API."
+      false_positive_note: >-
+        bigquery.transfers.update allows modifying the query SQL AND the scheduled
+        trigger, NOT the serviceAccountName alone (that additionally requires
+        iam.serviceAccounts.actAs on the target SA). Modifying the SQL of a
+        scheduled query that runs as the CREATING USER (no serviceAccountName set)
+        does not yield SA credentials — emit CanModifyCode only; the ExecutesAs
+        target is the creating user, not a service account. The data-plane impact
+        of injected SQL is the SA's (or user's) own IAM grants — the attacker does
+        not get a raw token, only effective data reach via server-side execution.
+      narrative: >-
+        {principal.name} can update the SQL of scheduled query {transferconfig.name}
+        (bigquery.transfers.update), modifying what it executes as the attached
+        service account. The cicd-chains linchpin (cicd-modify-buildspec-executes-as)
+        rolls this CanModifyCode + ExecutesAs up to CanExecuteAs(principal, SA).
+      derived_from: ["bigquery.transfers.update effective permission on TransferConfig"]
+      api_source: "Cloud Asset Inventory analyzeIamPolicy"
+      evidence_field: "bigquery.transfers.update effective permission"
+
+  - id: gcp-bigquery-explicit-can-modify-code-remote-function
+    emits: CanModifyCode
+    description: "bigquery.routines.update on a REMOTE_FUNCTION Routine lets a principal change the Cloud Run endpoint the function invokes — effectively modifying the code/target at runtime."
+    match_effective_permission:
+      action: "bigquery.routines.update"
+      resource_type: "google.bigquery.Routine"
+    where:
+      - "Routine.routineType == 'REMOTE_FUNCTION' (not a UDF or standard routine)"
+      - "Routine.remoteFunctionOptions.endpoint is set to a Cloud Run service or HTTPS URL"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<BigQuery Routine (REMOTE_FUNCTION) node>"
+      permissions: ["bigquery.routines.update"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE when bigquery.routines.update is confirmed on the Routine and the Routine is of type REMOTE_FUNCTION; CONDITIONAL(iam_permission) when the permission is inherited at project scope but may be scoped away."
+      false_positive_note: >-
+        bigquery.routines.update allows modifying the routine definition, including
+        the remoteFunctionOptions.endpoint (the Cloud Run URL or HTTPS endpoint).
+        By changing the endpoint to an attacker-controlled service, any query calling
+        this remote function will invoke the attacker's code with the query's data.
+        This is a cross-service lateral movement vector: if the remote function
+        originally called a Cloud Run service (which ExecutesAs a SA), rerouting it
+        to an attacker-controlled endpoint bypasses the original SA's trust and access
+        controls. Note: updating a routine of type FUNCTION or TABLE_VALUED_FUNCTION
+        (SQL UDFs) also modifies code but does not have external invoke implications
+        — those are pure SQL UDF updates.
+      narrative: >-
+        {principal.name} can modify remote function {routine.name} (bigquery.routines.update),
+        changing its Cloud Run endpoint to an attacker-controlled service. Any query
+        calling this function will POST to the attacker's URL, enabling data exfiltration
+        and lateral movement. The cicd-chains linchpin (cicd-modify-buildspec-executes-as)
+        or can-execute-as linchpin captures downstream CanExecuteAs if the attacker's
+        endpoint itself ExecutesAs a privileged identity.
+      derived_from: ["bigquery.routines.update effective permission on google.bigquery.Routine (REMOTE_FUNCTION)"]
+      api_source: "Cloud Asset Inventory analyzeIamPolicy"
+      evidence_field: "bigquery.routines.update effective permission"
+
+  # =====================================================================
+  # IDENTITY / PERMISSION GRANT EDGES (explicit)
+  # =====================================================================
+
+  - id: gcp-bigquery-explicit-can-read-data
+    emits: CanReadData
+    description: "Effective data-plane query access from bigquery.tables.getData + bigquery.jobs.create combined."
+    match_effective_permission:
+      action: "bigquery.tables.getData"
+      resource_type: "google.bigquery.Dataset"
+    where:
+      - "principal ALSO holds bigquery.jobs.create at the project scope (Policy Analyzer or iam.effectivePolicy)"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Dataset node>"
+      permissions: ["bigquery.tables.getData", "bigquery.jobs.create"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE when both bigquery.tables.getData and bigquery.jobs.create are confirmed ACTIVE at the same project scope and no VPC-SC perimeter blocks the bigquery API; CONDITIONAL(iam_permission) when one perm is missing or a VPC-SC perimeter is in place; BLOCKED when VPC-SC enforces and the caller is outside the perimeter."
+      false_positive_note: >-
+        BOTH permissions are required: bigquery.jobs.create alone submits a query
+        but returns a permission error if bigquery.tables.getData is absent.
+        bigquery.tables.getData alone without a job-creation path is unreachable.
+        BigQuery has TWO access-control layers: project-level IAM bindings AND
+        dataset-level ACL entries (the access[] array on the Dataset). Effective
+        permission must unify both layers. VPC-SC perimeters can BLOCK the BigQuery
+        API for callers outside the perimeter even with valid IAM — check perimeter
+        membership. Column-level security (Data Catalog policy tags) may restrict
+        a subset of columns; emit as CONDITIONAL(iam_permission) when column
+        policies exist. Row-level access policies filter rows for the principal;
+        emit the edge and note the filter — it does not negate CanReadData for
+        the accessible rows. Public datasets (bigquery-public-data project) are
+        intentionally public — do not flag as vulnerabilities unless customer
+        data is involved.
+      narrative: >-
+        {principal.name} holds bigquery.tables.getData on {dataset.name} and
+        bigquery.jobs.create; it can submit queries to read arbitrary rows from
+        any table in {dataset.name}.
+      derived_from: ["bigquery.tables.getData effective permission", "bigquery.jobs.create effective permission"]
+      api_source: "Cloud Asset Inventory analyzeIamPolicy, bigquery.datasets.get (access[] array)"
+      evidence_field: "bigquery.tables.getData effective permission + bigquery.jobs.create"
+
+  - id: gcp-bigquery-explicit-can-grant-permission
+    emits: CanGrantPermission
+    description: "bigquery.datasets.setIamPolicy lets a principal grant data access to any principal (including itself) for all tables in the dataset."
+    match_effective_permission:
+      action: "bigquery.datasets.setIamPolicy"
+      resource_type: "google.bigquery.Dataset"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<any principal>"
+      permissions: ["bigquery.datasets.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE when bigquery.datasets.setIamPolicy is confirmed at the dataset or project scope and no org policy or VPC-SC perimeter blocks IAM mutations; CONDITIONAL(scp_or_org_policy) if an org policy restricts setIamPolicy calls."
+      false_positive_note: >-
+        bigquery.datasets.setIamPolicy is present in roles/bigquery.admin
+        (project-scope) and roles/bigquery.dataOwner (dataset-scope). It allows
+        modifying the Cloud IAM policy on the dataset resource. Note: dataset ACL
+        entries (the access[] array) are modified via bigquery.datasets.update, NOT
+        setIamPolicy; they represent the BigQuery-native ACL layer. setIamPolicy
+        governs the resource-level Cloud IAM policy. Both layers must be
+        distinguished in the permission evaluator. Org policy
+        iam.disableServiceAccountKeyCreation does NOT block setIamPolicy; a
+        project-scope deny policy on resourcemanager.*setIamPolicy WOULD block it.
+      narrative: >-
+        {principal.name} holds bigquery.datasets.setIamPolicy on {dataset.name} and
+        can grant itself or any principal full data access (e.g. roles/bigquery.dataViewer
+        or roles/bigquery.dataOwner), reading all tables in the dataset.
+      derived_from: ["bigquery.datasets.setIamPolicy effective permission on Dataset"]
+      api_source: "Cloud Asset Inventory analyzeIamPolicy"
+      evidence_field: "bigquery.datasets.setIamPolicy effective permission"
+
+  # =====================================================================
+  # CROSS-PROJECT TRUST (explicit)
+  # =====================================================================
+
+  - id: gcp-bigquery-explicit-cross-project-trust
+    emits: CrossProjectTrust
+    description: "A dataset ACL entry naming a dataset, view, or SA from another project grants cross-project data read access — a BigQuery-native cross-project trust."
+    match_record:
+      resource_type: "google.bigquery.Dataset"
+      field: "access[].dataset | access[].userByEmail (cross-project SA)"
+    where:
+      - "ACL entry references a dataset, view, or SA whose project != the source dataset's project"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<project owning the source dataset>"
+      target: "<foreign project owning the authorized dataset/view/SA>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: "ACTIVE when the authorized dataset or cross-project SA entry is present in the access[] array; CONDITIONAL(resource_policy) when the entry exists but the foreign principal's IAM cannot be confirmed."
+      false_positive_note: >-
+        Authorized views / authorized datasets (access[].dataset entries) grant
+        the DATASET in project B read-only access to the source dataset in project A
+        WITHOUT requiring direct IAM bindings in project A for the views' users. This
+        is a data trust, not a management-plane trust. An attacker who controls
+        project B's dataset can create views that read project A's tables. This edge
+        does NOT allow cross-project IAM escalation — only data-plane read of the
+        authorized tables. Authorized views CANNOT EXPORT data (EXPORT DATA fails
+        without getData + storage.objects.create held by the querying principal
+        independently). Cross-project SA entries (access[].userByEmail = SA from
+        another project) grant that SA READER/WRITER/OWNER access in the source
+        dataset — a broader trust.
+      narrative: >-
+        Dataset {dataset.name} (project {projectA.name}) grants cross-project data
+        access to a principal in project {projectB.name} via an authorized dataset
+        or cross-project ACL entry; {projectB.name} can read {dataset.name} tables
+        without holding IAM bindings in project {projectA.name}.
+      derived_from: ["google.bigquery.Dataset.access[] cross-project entry"]
+      api_source: "bigquery.datasets.get (access[] array)"
+      evidence_field: "access[].dataset.projectId or cross-project SA email"
+
+  # =====================================================================
+  # POLICY MODIFICATION (explicit)
+  # =====================================================================
+
+  - id: gcp-bigquery-explicit-can-modify-policy-dataset-acl
+    emits: CanModifyPolicy
+    description: "bigquery.datasets.update lets a principal modify the dataset-native ACL (access[] entries), including adding authorized views and broad access entries."
+    match_effective_permission:
+      action: "bigquery.datasets.update"
+      resource_type: "google.bigquery.Dataset"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Dataset ResourcePolicy node>"
+      permissions: ["bigquery.datasets.update"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE when bigquery.datasets.update is confirmed at the dataset or project scope; CONDITIONAL(iam_permission) when inherited only via a project-level role that may be scoped away by VPC-SC."
+      false_positive_note: >-
+        bigquery.datasets.update modifies the dataset-native access[] ACL entries
+        (READER/WRITER/OWNER semantic roles, authorized views, authorized datasets,
+        domain-level grants). This is DISTINCT from bigquery.datasets.setIamPolicy
+        which governs the Cloud IAM resource policy layer. An attacker with
+        bigquery.datasets.update can add allUsers (public), allAuthenticatedUsers
+        (any Google user), or a cross-project SA — these produce ExposedToInternet,
+        ExposedToTenant, and CrossProjectTrust edges respectively (see explicit
+        normalization rules). This edge fires the CanModifyPolicy; the downstream
+        exposure edges are explicit.
+      narrative: >-
+        {principal.name} can modify the BigQuery-native ACL of {dataset.name}
+        (bigquery.datasets.update), adding access entries including allUsers,
+        allAuthenticatedUsers, or cross-project service accounts.
+      derived_from: ["bigquery.datasets.update effective permission on Dataset"]
+      api_source: "Cloud Asset Inventory analyzeIamPolicy"
+      evidence_field: "bigquery.datasets.update effective permission"
+
+  - id: gcp-bigquery-explicit-can-modify-policy-row-access
+    emits: CanModifyPolicy
+    description: "bigquery.rowAccessPolicies.update or .delete lets a principal delete or broaden row-level security policies, gaining full-table access for themselves or others."
+    match_effective_permission:
+      action: ["bigquery.rowAccessPolicies.update", "bigquery.rowAccessPolicies.delete"]
+      resource_type: "google.bigquery.Dataset"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Dataset / Table row access policy node>"
+      permissions: ["bigquery.rowAccessPolicies.update", "bigquery.rowAccessPolicies.delete"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE when bigquery.rowAccessPolicies.update OR bigquery.rowAccessPolicies.delete is confirmed effective; CONDITIONAL(iam_permission) when the effective permission is uncertain."
+      false_positive_note: >-
+        Row-level security in BigQuery is implemented as RowAccessPolicy resources
+        that filter rows returned to a querying principal. bigquery.rowAccessPolicies.update
+        allows modifying these filters; bigquery.rowAccessPolicies.delete allows
+        deleting them entirely, both achieving row-policy bypass. The attacker's
+        actual ability to read the formerly-restricted rows then depends on their
+        also holding bigquery.tables.getData (the CanReadData condition). Only emit
+        CanModifyPolicy; do not emit CanReadData directly from this rule — the
+        existing CanReadData rule (gcp-bigquery-read-data) handles the data-access
+        gate. Both permissions are present in roles/bigquery.admin and
+        roles/bigquery.dataOwner.
+      narrative: >-
+        {principal.name} can modify or delete row-level access policies on
+        {dataset.name} tables (bigquery.rowAccessPolicies.update or .delete),
+        removing row-level filters and potentially exposing all rows to principals
+        with getData.
+      derived_from: ["bigquery.rowAccessPolicies.update or .delete effective permission"]
+      api_source: "Cloud Asset Inventory analyzeIamPolicy"
+      evidence_field: "bigquery.rowAccessPolicies update/delete effective permission"
+
+  # =====================================================================
+  # NETWORK EXPOSURE (explicit)
+  # =====================================================================
+
+  - id: gcp-bigquery-explicit-exposed-to-internet
+    emits: ExposedToInternet
+    description: "A dataset ACL entry for allUsers makes it queryable by unauthenticated public principals — internet-accessible data."
+    match_record:
+      resource_type: "google.bigquery.Dataset"
+      field: "access[].specialGroup == 'allUsers'"
+    emit:
+      source_type: Data
+      target_type: AnonymousIdentity
+      source: "<BigQuery Dataset node>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: "ACTIVE when access[].specialGroup == 'allUsers' is present; BLOCKED when a VPC-SC perimeter that blocks allUsers queries is confirmed."
+      false_positive_note: >-
+        allUsers grants unauthenticated access — any internet user can query the
+        dataset without any Google credentials. This is the strongest form of
+        exposure. Only emit for datasets whose access[] contains specialGroup==allUsers;
+        do NOT emit for access[].specialGroup==allAuthenticatedUsers (that is
+        ExposedToTenant, not internet). BigQuery public datasets (bigquery-public-data)
+        are intentionally public — analyst should mark them not-a-finding unless the
+        source project is a customer project unexpectedly granting allUsers.
+      narrative: >-
+        Dataset {dataset.name} is publicly accessible via a BigQuery allUsers ACL
+        entry; any unauthenticated internet user can query its tables.
+      derived_from: ["google.bigquery.Dataset.access[].specialGroup == 'allUsers'"]
+      api_source: "bigquery.datasets.get (access[] array)"
+      evidence_field: "access[].specialGroup == 'allUsers'"
+
+  - id: gcp-bigquery-explicit-exposed-to-tenant
+    emits: ExposedToTenant
+    description: "A dataset ACL entry for allAuthenticatedUsers makes it readable by any Google-authenticated user — org-wide or tenant-wide exposure."
+    match_record:
+      resource_type: "google.bigquery.Dataset"
+      field: "access[].specialGroup == 'allAuthenticatedUsers'"
+    emit:
+      source_type: Data
+      target_type: Organization
+      source: "<BigQuery Dataset node>"
+      target: "<GCP Organization / Tenant node>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: "ACTIVE when access[].specialGroup == 'allAuthenticatedUsers' is present and no org policy restricts this; CONDITIONAL(scp_or_org_policy) if an org policy disallows allAuthenticatedUsers grants."
+      false_positive_note: >-
+        allAuthenticatedUsers grants read to any Google-authenticated principal —
+        this includes Google accounts outside the organization. It is broader than
+        an org-level grant. Do not treat as equivalent to domain-level grants
+        (access[].domain = 'example.com') which restrict to a single domain.
+        allAuthenticatedUsers is considered a serious misconfiguration for sensitive
+        datasets. Org policy constraints.gcp.restrictCloudRunRegion is unrelated;
+        the relevant org policy is iam.allowedPolicyMemberTypes which can restrict
+        allAuthenticatedUsers usage.
+      narrative: >-
+        Dataset {dataset.name} grants access to allAuthenticatedUsers — any Google-
+        authenticated account (including those outside the organization) can query
+        its tables.
+      derived_from: ["google.bigquery.Dataset.access[].specialGroup == 'allAuthenticatedUsers'"]
+      api_source: "bigquery.datasets.get (access[] array)"
+      evidence_field: "access[].specialGroup == 'allAuthenticatedUsers'"
+
+  # =====================================================================
+  # CREDENTIAL / SECRET EXPOSURE (explicit)
+  # =====================================================================
+
+  - id: gcp-bigquery-explicit-exposes-credential
+    emits: ExposesCredential
+    description: "A BigQuery Connection resource stores or proxies credentials to an external data source (Cloud SQL, JDBC, Spark); a principal with bigquery.connections.use gains effective access to that external system."
+    match_record:
+      resource_type: "google.bigquery.Connection"
+      field: "cloudSql | spark | aws | azure | cloudResource"
+    where:
+      - "Connection type is cloudSql (username/password), aws (cross-cloud SA), azure (cross-cloud MI), or cloudResource (GCP SA impersonation)"
+    emit:
+      source_type: Secret
+      target_type: Credential
+      source: "<BigQuery Connection node>"
+      target: "<external credential / SA / DB credential>"
+      permissions: ["bigquery.connections.use"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE when bigquery.connections.use is confirmed on the Connection and the Connection type exposes usable credential material; CONDITIONAL(iam_permission) when connections.use is uncertain."
+      false_positive_note: >-
+        For IAM-based connections (cloudResource type), the Connection creates a
+        GCP-managed SA; the API returns the SA email but NOT a raw credential. The
+        SA email enables downstream CanImpersonate derivation via credential-chains
+        only if the caller also holds iam.serviceAccounts.actAs on that SA — the
+        connection.use alone does not grant impersonation. For cloudSql connections,
+        the username/password is stored encrypted server-side; the BigQuery Connections
+        API does NOT return raw credentials (it returns only a credential ID). Model
+        this edge as ExposesCredential(Connection -> Credential) with a note that the
+        credential is accessed SERVER-SIDE by queries using the connection; do not
+        assert the attacker can extract the raw password via API. JDBC connections
+        (bigquery.connections.create with a JDBC URL + credentials) store credentials
+        encrypted; same caveat. bigquery.connections.get metadata does not expose
+        secret material.
+      narrative: >-
+        BigQuery Connection {connection.name} proxies credentials to {target.name};
+        a principal with bigquery.connections.use can run queries that access the
+        external system under those credentials.
+      derived_from: ["google.bigquery.Connection resource field (cloudSql/aws/azure/cloudResource)"]
+      api_source: "bigquery.projects.locations.connections.list + bigquery.projects.locations.connections.get"
+      evidence_field: "cloudSql.credential.username, cloudResource.serviceAccountId, aws.accessRole.iamRoleId"
+
+  - id: gcp-bigquery-explicit-contains-credential
+    emits: ContainsCredential
+    description: "A BigQuery Connection of type cloudSql or JDBC contains encrypted database credentials stored in the connection resource."
+    match_record:
+      resource_type: "google.bigquery.Connection"
+      field: "cloudSql.credential | spark.properties (JDBC with password)"
+    where:
+      - "Connection type stores a username/password credential (cloudSql.credential.username/password, JDBC connection string with embedded credentials)"
+    emit:
+      source_type: Messaging
+      target_type: Credential
+      source: "<BigQuery Connection node>"
+      target: "<DB credential / secret>"
+      permissions: []
+      conditions: []
+      state_logic: "ACTIVE when the Connection resource is of type cloudSql with credential field, or a Spark/JDBC connection with embedded credentials; UNKNOWN when credential presence cannot be confirmed from metadata alone."
+      false_positive_note: >-
+        BigQuery Connection API responses do NOT return raw credential values;
+        they return a credential_id (cloudSql) or omit the password. This edge
+        asserts the FACT that a credential is stored server-side, which feeds
+        credential-chains ExposesCredential derivations. Do NOT assert CanReadSecret
+        from this edge alone — reading the stored credential requires a code-execution
+        path server-side (inside a query using the connection). The stored credential
+        is accessible ONLY via the BigQuery execution path (a query that uses the
+        connection), not directly via the API.
+      narrative: >-
+        BigQuery Connection {connection.name} stores database credentials for
+        {target.name} server-side; these credentials are used by any query that
+        references this connection.
+      derived_from: ["google.bigquery.Connection.cloudSql.credential or JDBC credential presence"]
+      api_source: "bigquery.projects.locations.connections.list + bigquery.projects.locations.connections.get"
+      evidence_field: "cloudSql.credential field, Spark/JDBC connection string with password"
+
+  # =====================================================================
+  # IDENTITY ATTACHMENT / PASS (explicit)
+  # =====================================================================
+
+  - id: gcp-bigquery-explicit-can-pass-identity
+    emits: CanPassIdentity
+    description: "iam.serviceAccounts.actAs on a target SA enables re-binding which SA a scheduled query runs as."
+    match_effective_permission:
+      action: "iam.serviceAccounts.actAs"
+      resource_type: "google.iam.ServiceAccount"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "<principal>"
+      target: "<target service account>"
+      permissions: ["iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: "ACTIVE when iam.serviceAccounts.actAs on the target SA is ACTIVE effective permission; CONDITIONAL(iam_permission) when the permission is uncertain or scoped away."
+      false_positive_note: >-
+        actAs is per-SA: actAs on SA-A does not allow binding SA-B. Only emit for
+        each SA the principal has explicit iam.serviceAccounts.actAs on. Without
+        actAs, the BigQuery DTS API rejects the serviceAccountName update with a
+        403. When combined with bigquery.transfers.update, this enables CanPassIdentity
+        to re-bind the scheduled query to run as a different (privileged) SA.
+      narrative: >-
+        {principal.name} can impersonate {sa.name} via iam.serviceAccounts.actAs,
+        enabling re-binding of scheduled queries or other workloads to run as {sa.name}.
+      derived_from: ["iam.serviceAccounts.actAs effective permission on target SA"]
+      api_source: "Cloud Asset Inventory analyzeIamPolicy"
+      evidence_field: "iam.serviceAccounts.actAs effective permission"

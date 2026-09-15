@@ -1,0 +1,596 @@
+# GCP Datastream & Cloud Data Fusion — Derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# SCOPE: Covers two related GCP data-integration services:
+#   1. Datastream — serverless CDC / replication (stream, connectionProfile,
+#      privateConnection). Primary attack surface: stream redirect → exfil;
+#      connection-profile credential storage.
+#   2. Cloud Data Fusion — managed ETL/pipeline platform (instance + CDAP).
+#      Primary attack surface: pipeline code injection → execute as
+#      dataprocServiceAccount (Phase 11 dominant primitive: analytics compute
+#      runs as an SA; modify what it executes → CanExecuteAs).
+#
+# LINCHPIN DELEGATION (cite, do not re-derive):
+#   can-execute-as.yaml     execute-as-via-code-modify: CanModifyCode + ExecutesAs
+#                           → CanExecuteAs. This file emits the normalized
+#                           CanModifyCode / ExecutesAs facts; the collapse lives there.
+#   can-execute-as.yaml     execute-as-via-config-identity-swap: CanModifyConfiguration
+#                           + CanPassIdentity → CanExecuteAs for the SA-swap path.
+#   can-execute-as.yaml     execute-as-via-new-workload: CanCreateWorkloadAs →
+#                           CanExecuteAs. This file emits CanCreateWorkloadAs; collapse
+#                           is there.
+#   cicd-chains.yaml        cicd-modify-buildspec-executes-as: CanModifyCode(runner)
+#                           + ExecutesAs → CanExecuteAs (CI/CD framing, dedupes with
+#                           execute-as-via-code-modify on (CanExecuteAs, p, identity)).
+#   credential-chains.yaml  read-secret-yields-identity: CanReadSecret + CredentialsFor
+#                           → CanImpersonate. Credential chain for harvested DB creds.
+#   can-control.yaml        escalate-via-execute-as: CanExecuteAs + privilege check
+#                           → CanEscalateTo. Roll-up; not re-derived here.
+#
+# PERMISSIONS are exact identifiers from:
+#   cloud.google.com/datastream/docs/access-control  (datastream.*)
+#   cloud.google.com/data-fusion/docs/access-control  (datafusion.*)
+#   cloud.google.com/iam/docs/understanding-roles#service-accounts  (iam.serviceAccounts.actAs)
+# No permissions are hallucinated.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 11-data-analytics-ml
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # DATA FUSION — SECTION 1: Pipeline code injection → execute as pipeline SA
+  # ---------------------------------------------------------------------------
+  # The Phase 11 dominant primitive: whoever can deploy or update a Data Fusion
+  # pipeline definition injects arbitrary Spark/Java/plugin code that executes
+  # on the ephemeral Dataproc cluster as the instance's dataprocServiceAccount.
+  # The collapse (CanModifyCode + ExecutesAs → CanExecuteAs) lives in
+  # can-execute-as / cicd-chains; this rule emits the normalized CanModifyCode
+  # fact targeting the Data Fusion instance (the "runner" Compute node).
+
+  - id: gcp-datafusion-pipeline-deploy-modifies-code
+    emits: CanModifyCode
+    description: "datafusion.instances.update (GCP IAM) + CDAP pipeline write access lets a principal deploy or replace a pipeline definition, injecting arbitrary code executed as the instance's dataprocServiceAccount on an ephemeral Dataproc cluster."
+    match_effective_permission:
+      action: "datafusion.instances.update"
+      resource_type: "google.datafusion.Instance"
+    where:
+      - "principal also holds CDAP-level pipeline write access (Editor or Admin role within the CDAP namespace, or equivalent internal RBAC)"
+      - "node_type(datafusion-instance) == AnalyticsService or GenericCompute  # modeled as Compute for cicd-chains compatibility"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Cloud Data Fusion instance (AnalyticsService / GenericCompute node)>"
+      permissions: ["datafusion.instances.update"]
+      conditions: [iam_permission, api_enabled]
+      state_logic: >-
+        ACTIVE if datafusion.instances.update is confirmed in the effective grant AND
+        CDAP-level pipeline write access is confirmed (CDAP namespace Editor/Admin). If
+        only the GCP IAM permission is confirmed but CDAP-level access is unresolved:
+        CONDITIONAL(iam_permission) — the GCP IAM gate is satisfied but the CDAP gate
+        is unknown. BLOCKED if a deny policy (IAM deny or org policy) applies to
+        datafusion.instances.update. The downstream CanExecuteAs collapse (from
+        can-execute-as execute-as-via-code-modify + cicd-chains) is ACTIVE when both
+        this CanModifyCode and the ExecutesAs structural edge are ACTIVE.
+      confidence: 0.88
+      derived_from: ["<datafusion.instances.update effective permission on principal>"]
+      false_positive_note: >-
+        GCP IAM `datafusion.instances.update` controls the instance control-plane
+        (SA binding, network, version). CDAP pipeline deployment uses the CDAP REST
+        API inside the instance, governed by CDAP-internal namespace RBAC (separate
+        from GCP IAM). Do NOT emit ACTIVE when only the GCP IAM permission is
+        confirmed — CDAP-level pipeline write access must also be established.
+        Downgrade to CONDITIONAL(iam_permission) when CDAP access is unresolved.
+        This rule emits the CanModifyCode fact only; the CanExecuteAs collapse is
+        produced by can-execute-as execute-as-via-code-modify (cited, not re-derived).
+      narrative: >-
+        {principal.name} can deploy or replace a Cloud Data Fusion pipeline definition
+        (datafusion.instances.update + CDAP pipeline write), injecting arbitrary
+        Spark/Java/plugin code. The pipeline executes on an ephemeral Dataproc cluster
+        as the instance's dataprocServiceAccount, granting {principal.name} code
+        execution as that SA.
+
+  # ---------------------------------------------------------------------------
+  # DATA FUSION — SECTION 2: Structural ExecutesAs fact
+  # ---------------------------------------------------------------------------
+  # Every Data Fusion pipeline run provisions an ephemeral Dataproc cluster in
+  # the customer project that runs as the instance's dataprocServiceAccount
+  # (or the default Compute Engine SA if none is set). This is the zero-cost
+  # structural fact that feeds can-execute-as and cicd-chains.
+
+
+  # ---------------------------------------------------------------------------
+  # DATA FUSION — SECTION 3: dataprocServiceAccount swap (SA attachment)
+  # ---------------------------------------------------------------------------
+  # datafusion.instances.update + iam.serviceAccounts.actAs on a new target SA
+  # allows replacing the dataprocServiceAccount — all future pipeline runs will
+  # execute as the new SA. The CanExecuteAs collapse from
+  # can-execute-as execute-as-via-config-identity-swap requires a CanModifyConfiguration
+  # + CanPassIdentity match; this rule emits CanModifyConfiguration so the linchpin fires.
+
+  - id: gcp-datafusion-swap-pipeline-sa
+    emits: CanModifyConfiguration
+    description: "datafusion.instances.update + iam.serviceAccounts.actAs on a target SA lets a principal replace the dataprocServiceAccount; all future pipeline runs execute as the new SA."
+    match:
+      - [ "?principal", "CanPassIdentity", "?sa" ]
+    where:
+      - "?principal has effective datafusion.instances.update on the instance"
+      - "node_type(?sa) in [ServiceAccount, MachineIdentity]"
+      - "?sa is an acceptable dataprocServiceAccount (roles/datafusion.runner + roles/dataproc.worker granted, or equivalent)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Cloud Data Fusion instance>"
+      permissions: ["datafusion.instances.update", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE if datafusion.instances.update AND iam.serviceAccounts.actAs on ?sa are
+        both confirmed in the effective grant. The downstream CanExecuteAs
+        (can-execute-as execute-as-via-config-identity-swap: CanModifyConfiguration +
+        CanPassIdentity → CanExecuteAs) is ACTIVE once both contributing edges are ACTIVE
+        and role_compatible(?sa, instance) holds. CONDITIONAL(iam_permission) if actAs
+        is unresolved. BLOCKED if a deny policy applies to either permission.
+      confidence: 0.92
+      derived_from: ["<CanPassIdentity edge_id for ?principal -> ?sa>", "<datafusion.instances.update effective permission>"]
+      false_positive_note: >-
+        Requires both IAM permissions to be confirmed: datafusion.instances.update (GCP
+        control-plane) AND iam.serviceAccounts.actAs on the target SA. Additionally, the
+        Data Fusion service agent must be able to actAs the target SA to create the
+        Dataproc cluster — if the service agent lacks that grant, the swap API call will
+        succeed but pipeline runs will fail. Model the service-agent actAs requirement as
+        a role_compatibility condition. Without actAs, the instance update is BLOCKED at
+        Dataproc cluster provisioning time, not at the API level.
+      narrative: >-
+        {principal.name} can update the Cloud Data Fusion instance {instance.name}
+        (datafusion.instances.update) to replace its dataprocServiceAccount with {sa.name}
+        (iam.serviceAccounts.actAs confirmed); all future pipeline runs execute as {sa.name},
+        granting {principal.name} effective code execution as {sa.name} via the next run.
+
+  # ---------------------------------------------------------------------------
+  # DATA FUSION — SECTION 4: Create a new Data Fusion instance bound to a chosen SA
+  # ---------------------------------------------------------------------------
+  # datafusion.instances.create + iam.serviceAccounts.actAs on the target SA
+  # creates a new instance whose pipelines run as that SA. This is the
+  # CanCreateWorkloadAs pattern (can-execute-as execute-as-via-new-workload).
+
+  - id: gcp-datafusion-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "datafusion.instances.create + iam.serviceAccounts.actAs on a target SA: create a new Data Fusion instance whose pipelines execute as that SA."
+    match:
+      - [ "?principal", "CanPassIdentity", "?sa" ]
+    where:
+      - "?principal has effective datafusion.instances.create on the project"
+      - "node_type(?sa) in [ServiceAccount, MachineIdentity]"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<target SA (?sa)>"
+      permissions: ["datafusion.instances.create", "iam.serviceAccounts.actAs"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE if both datafusion.instances.create and iam.serviceAccounts.actAs on ?sa
+        are confirmed and role_compatible(?sa, new-datafusion-instance) holds. The
+        downstream CanExecuteAs (can-execute-as execute-as-via-new-workload:
+        CanCreateWorkloadAs → CanExecuteAs) is then ACTIVE. CONDITIONAL(iam_permission)
+        if actAs is unresolved. BLOCKED if a deny policy applies.
+      confidence: 0.90
+      derived_from: ["<CanPassIdentity edge_id for ?principal -> ?sa>", "<datafusion.instances.create effective permission>"]
+      false_positive_note: >-
+        This emits CanCreateWorkloadAs for a NEW instance not yet existing. The SA must
+        satisfy role_compatibility (hold roles/datafusion.runner + roles/dataproc.worker
+        or equivalent). Executing pipelines on the new instance requires additional steps
+        (pipeline deployment + trigger); model the CanExecuteAs as ACTIVE once the new
+        instance exists and the pipeline code path is established.
+      narrative: >-
+        {principal.name} can create a new Cloud Data Fusion instance (datafusion.instances.create)
+        with dataprocServiceAccount={sa.name} (iam.serviceAccounts.actAs confirmed); any
+        pipeline deployed to this instance will execute as {sa.name}.
+
+  # ---------------------------------------------------------------------------
+  # DATA FUSION — SECTION 5: Pipeline SA credential exposure via metadata server
+  # ---------------------------------------------------------------------------
+  # All Dataproc nodes in a pipeline's ephemeral cluster can retrieve an OAuth 2.0
+  # token for the dataprocServiceAccount from the GCE metadata server. This is
+  # a structural fact that becomes an attack step when combined with CanModifyCode.
+
+  - id: gcp-datafusion-exposes-pipeline-sa-cred
+    emits: ExposesCredential
+    description: "All Dataproc nodes in a Data Fusion pipeline cluster can retrieve OAuth tokens for the dataprocServiceAccount from the GCE metadata server; code execution in any pipeline step yields those credentials."
+    match:
+      - [ "?instance", "ExecutesAs", "?sa" ]
+    where:
+      - "node_type(?instance) in [AnalyticsService, GenericCompute]  # Data Fusion instance"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: "<Cloud Data Fusion instance>"
+      target: "<dataprocServiceAccount (?sa)>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE: structural fact. The GCE metadata server is always reachable from Dataproc
+        cluster nodes. This edge only becomes an attack step when combined with a
+        CanModifyCode or CanExecuteAs edge on the instance. Not a standalone escalation.
+      confidence: 1.0
+      derived_from: ["<ExecutesAs edge_id for ?instance -> ?sa>"]
+      false_positive_note: >-
+        Not an escalation by itself — expresses that code execution in a pipeline step equals
+        holding the dataprocServiceAccount's credentials. Attack value is gated by an upstream
+        CanModifyCode or CanExecuteAs capability. The ephemeral Dataproc cluster is torn down
+        after the pipeline run; the credential exposure is transient but real during execution.
+      narrative: >-
+        Code running in any {instance.name} pipeline step can retrieve an OAuth 2.0 access
+        token for {sa.name} from the GCE metadata server
+        (http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token),
+        granting all of {sa.name}'s IAM roles to any pipeline code.
+
+  # ---------------------------------------------------------------------------
+  # DATASTREAM — SECTION 6: Stream destination redirect → data exfiltration
+  # ---------------------------------------------------------------------------
+  # datastream.streams.update lets a principal replace the stream's
+  # destinationConfig (BigQuery dataset, GCS path). Redirecting to an
+  # attacker-controlled destination exfiltrates all CDC data (ongoing + backfill).
+  # This is the primary Datastream attack path.
+
+  - id: gcp-datastream-stream-update-exfil
+    emits: CanExfiltrate
+    description: "datastream.streams.update lets a principal redirect the stream's destination (BigQuery dataset or GCS path) to an attacker-controlled sink, exfiltrating all CDC data from the source database."
+    match_effective_permission:
+      action: "datastream.streams.update"
+      resource_type: "google.datastream.Stream"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: "<principal>"
+      target: "<attacker-controlled destination: ObjectStorage (GCS bucket) or DataWarehouse (BigQuery dataset)>"
+      permissions: ["datastream.streams.update"]
+      conditions: [iam_permission, api_enabled]
+      state_logic: >-
+        ACTIVE if datastream.streams.update is confirmed in the effective grant and
+        the principal can also create a destination connection profile pointing to an
+        attacker-controlled sink (requires datastream.connectionProfiles.create or access
+        to an existing attacker-controlled profile). If the principal can only update the
+        stream (not create new profiles), the attack is CONDITIONAL on an existing
+        attacker-controlled connection profile being available. BLOCKED if a deny policy
+        applies to datastream.streams.update or if a VPC Service Controls perimeter blocks
+        the API call. Note: stopping and restarting the stream (streams.start/stop)
+        triggers a backfill — a FULL copy of the source database to the new destination.
+      confidence: 0.90
+      derived_from: ["<datastream.streams.update effective permission on principal>"]
+      false_positive_note: >-
+        The exfiltration requires: (1) the stream is RUNNING or can be started
+        (datastream.streams.start); (2) the new destination connection profile is
+        reachable from Datastream's service network; (3) the principal has write access
+        to create or reference the attacker-controlled destination connection profile.
+        Do NOT emit ACTIVE for a paused / stopped stream unless the principal also has
+        datastream.streams.start. A VPC Service Controls perimeter restricting
+        datastream.googleapis.com can block this path (emit BLOCKED with the perimeter
+        as denied_by). Redirecting the stream does not provide the SOURCE database
+        credentials — only the data flowing through the stream. The target_type is Storage
+        because the actual exfiltration sink is an attacker-controlled GCS bucket or BigQuery
+        dataset (both Storage class), not the stream's source database.
+      narrative: >-
+        {principal.name} can update the Datastream stream {stream.name}
+        (datastream.streams.update) to replace its destination configuration with an
+        attacker-controlled BigQuery dataset or GCS bucket; ongoing CDC data and any
+        triggered backfill (full historical copy of {stream.name}'s source tables)
+        will be written to the attacker-controlled destination.
+
+  # ---------------------------------------------------------------------------
+  # DATASTREAM — SECTION 7: Stream creation → data exfiltration
+  # ---------------------------------------------------------------------------
+  # datastream.streams.create + datastream.connectionProfiles.create (or reuse of
+  # existing profiles) lets a principal create a new stream from an accessible
+  # source to an attacker-controlled destination. Requires connection to the source
+  # DB (private connectivity or direct access from Datastream IPs).
+
+  - id: gcp-datastream-stream-create-exfil
+    emits: CanExfiltrate
+    description: "datastream.streams.create + datastream.connectionProfiles.create lets a principal create a new CDC stream from an existing source database to an attacker-controlled destination, exfiltrating source data."
+    match_effective_permission:
+      action: "datastream.streams.create"
+      resource_type: "google.datastream.Stream"
+    where:
+      - "principal also has effective datastream.connectionProfiles.create (to create a destination profile) OR can reference an existing attacker-controlled connection profile"
+      - "Datastream can reach the source database (via private connection, forward SSH tunnel, or static IP allowlist on the source)"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<source database data accessible via existing connection profiles>"
+      permissions: ["datastream.streams.create", "datastream.connectionProfiles.create"]
+      conditions: [iam_permission, network_reachability, api_enabled]
+      state_logic: >-
+        ACTIVE if both permissions are confirmed AND network_reachability to the source DB
+        via Datastream is established (an existing connection profile for the source DB
+        can be referenced, or the source DB is reachable from Datastream's public IPs).
+        CONDITIONAL(network_reachability) if source reachability is unconfirmed.
+        CONDITIONAL(iam_permission) if connectionProfiles.create is missing (must use an
+        existing source connection profile the principal can reference).
+        BLOCKED if a deny policy or VPC Service Controls perimeter blocks either permission.
+      confidence: 0.85
+      derived_from: ["<datastream.streams.create effective permission>", "<datastream.connectionProfiles.create effective permission (if present)>"]
+      false_positive_note: >-
+        Creating a stream requires a SOURCE connection profile (the database the stream
+        reads from). If the principal cannot create a new source profile AND cannot
+        reference an existing one that points to a reachable database, no new exfil
+        stream can be established. Do NOT emit ACTIVE if there are no reachable source
+        connection profiles. Also requires datastream.streams.start to actually begin
+        replication; if the principal lacks streams.start, the stream is created but
+        paused (CONDITIONAL). This is a slightly weaker path than streams.update (which
+        hijacks an existing stream's output); prefer streams.update rules for running
+        streams.
+      narrative: >-
+        {principal.name} can create a new Datastream stream (datastream.streams.create)
+        with a new destination connection profile pointing to an attacker-controlled
+        BigQuery dataset or GCS path, replicating data from an accessible source database
+        to that destination. A full backfill exfiltrates the entire source database contents.
+
+  # ---------------------------------------------------------------------------
+  # DATASTREAM — SECTION 8: Connection profile credential harvesting
+  # ---------------------------------------------------------------------------
+  # Connection profiles store source DB credentials (username + encrypted password,
+  # or a secretManagerStoredPassword reference, or SSH private key). While the
+  # password field is not returned by connectionProfiles.get, an attacker with
+  # write access can create/update a profile pointing to a controlled DB host —
+  # when Datastream tests the connection, it sends the credentials to that host.
+  # Additionally, connectionProfiles.get reveals the secretManagerStoredPassword
+  # Secret Manager path, which combined with secretmanager.versions.access gives
+  # the actual credential.
+
+  - id: gcp-datastream-connection-profile-exposes-cred
+    emits: ExposesCredential
+    description: "Datastream ConnectionProfile resources store source DB credentials (username/password or SSH private key). An attacker with write access (connectionProfiles.create/update) can harvest credentials by redirecting a test connection to a controlled host; secretManagerStoredPassword references expose Secret Manager paths."
+    match:
+      - [ "?principal", "CanModifyConfiguration", "?connectionProfile" ]
+    where:
+      - "node_type(?connectionProfile) == Secret (or ConnectionString generic_type with class Secret)"
+      - "?connectionProfile has credential-type fields: oracleProfile | mysqlProfile | postgresqlProfile | sqlServerProfile with username set, OR forwardSshConnectivity.privateKey set, OR secretManagerStoredPassword set"
+    emit:
+      source_type: Compute
+      target_type: Credential
+      source: "<Datastream service compute (Datastream execution context)>"
+      target: "<source database credential (Credential / Secret / AccessKey)>"
+      permissions: ["datastream.connectionProfiles.create", "datastream.connectionProfiles.update"]
+      conditions: [iam_permission, credential_harvesting]
+      state_logic: >-
+        CONDITIONAL(credential_harvesting) by default: the ConnectionProfile stores server-side
+        encrypted credentials that are NOT returned by the GET API. The attack path requires the
+        principal to have one of: (a) ACTIVE(datastream.connectionProfiles.create or .update) to
+        create/update a profile pointing to an attacker-controlled host, triggering a connection
+        test that harvests the credentials; or (b) ACTIVE(datastream.connectionProfiles.get) +
+        ACTIVE(secretmanager.versions.access) if secretManagerStoredPassword is set (reveals SM path).
+        For case (a), emit ACTIVE when the principal has write access and the connection test
+        would complete (network reachability confirmed). For case (b), the credential-chains linchpin
+        (read-secret-yields-identity) handles the chain; this rule surfaces the ExposesCredential
+        structural fact.
+      confidence: 0.65
+      derived_from: ["<CanModifyConfiguration edge on ?connectionProfile>", "<ConnectionProfile credential fields>"]
+      false_positive_note: >-
+        The `password` field is input-only and NOT returned by connectionProfiles.get.
+        Do NOT emit ACTIVE(principal, credential) based on read-only GET access.
+        Credential exposure requires WRITE access (create/update) to bounce the connection
+        test to an attacker host, OR a secretManagerStoredPassword reference combined with
+        Secret Manager read access (handled by credential-chains, not re-derived here).
+        SSH private key fields are also redacted in API responses — only the presence of the
+        key (stored server-side) is confirmed. Connection testing may fail if network
+        reachability to the test host is blocked.
+      narrative: >-
+        An attacker with datastream.connectionProfiles.create or .update can modify the Datastream
+        ConnectionProfile {connectionProfile.name} to test connectivity to an attacker-controlled
+        database host. During the connection test, Datastream sends the stored source database
+        credentials (username + password, or SSH key) to that host, allowing credential harvesting.
+        Alternatively, if the profile references secretManagerStoredPassword, the Secret Manager
+        path is exposed in the connection profile and can be read via secretmanager.versions.access.
+
+  # ---------------------------------------------------------------------------
+  # DATASTREAM — SECTION 9: Private connection → VPC network reach
+  # ---------------------------------------------------------------------------
+  # A Datastream PrivateConnection establishes VPC peering between the Datastream
+  # service network and the customer VPC. Streams using this private connection
+  # can reach databases at private IP addresses in the peered VPC and resources
+  # reachable via Cloud VPN or Dedicated Interconnect.
+
+  - id: gcp-datastream-private-conn-network-reach
+    emits: CanNetworkReach
+    description: "A Datastream PrivateConnection establishes VPC peering between the Datastream service network and a customer VPC, enabling network reach to private resources within that VPC and resources accessible via Cloud VPN or Dedicated Interconnect."
+    match_record:
+      resource_type: "google.datastream.PrivateConnection"
+      field: "vpcPeeringConfig.vpc"
+    where:
+      - "privateConnection.vpcPeeringConfig.vpc is set to a non-empty VPC network resource name"
+      - "privateConnection.state == CREATED (peering is established)"
+    emit:
+      source_type: Network
+      target_type: Network
+      source: "<PrivateConnection node (PrivateEndpoint / Network class)>"
+      target: "<peered VPC network and resources reachable within it>"
+      permissions: []
+      conditions: [network_reachability, service_state]
+      state_logic: >-
+        ACTIVE if privateConnection.state == CREATED (VPC peering is established).
+        CONDITIONAL(service_state) if peering is CREATING or state is unknown.
+        CONDITIONAL(network_reachability) if transitive routing through secondary hops
+        (Cloud SQL proxy, NAT VM, on-prem via VPN) is required and not confirmed.
+        This edge is a structural topology fact; attack value requires a stream using
+        this private connection combined with write access (streams.update) to redirect
+        or create stream destinations.
+      confidence: 0.85
+      derived_from: ["<PrivateConnection.vpcPeeringConfig.vpc field>"]
+      false_positive_note: >-
+        VPC peering does not provide transitive routing — if a resource sits
+        behind a secondary hop, direct reach is not guaranteed. Verify routing tables and
+        firewall rules in the peered VPC. The peering direction gives Datastream access
+        to the customer VPC, not vice versa. Streams must explicitly reference this
+        PrivateConnection in their sourceConfig or destinationConfig connectivity profiles.
+      narrative: >-
+        Datastream PrivateConnection {privateConnection.name} peers the Datastream service
+        network into VPC {vpc.name}; this enables network reachability to databases at
+        private IP addresses within {vpc.name}, including resources reachable via Cloud VPN
+        or Dedicated Interconnect from that VPC. Streams using this private connection can
+        reach these resources as data sources or destinations.
+
+  # ---------------------------------------------------------------------------
+  # DATASTREAM — SECTION 11: Create private connection → network reach attack
+  # ---------------------------------------------------------------------------
+  # datastream.privateConnections.create lets a principal establish VPC peering
+  # from the Datastream service network into an attacker-controlled VPC or a
+  # sensitive customer VPC. This enables network pivoting and lateral movement.
+
+  - id: gcp-datastream-create-private-conn-network-reach
+    emits: CanNetworkReach
+    description: "datastream.privateConnections.create lets a principal establish a VPC peering from the Datastream service network to an attacker-controlled VPC or a sensitive customer network, enabling network reach for probing or bridging boundaries."
+    match_effective_permission:
+      action: "datastream.privateConnections.create"
+      resource_type: "google.datastream.Location"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: "<principal>"
+      target: "<attacker-controlled VPC or sensitive customer network>"
+      permissions: ["datastream.privateConnections.create"]
+      conditions: [iam_permission, api_enabled, peering_acceptance]
+      state_logic: >-
+        ACTIVE if datastream.privateConnections.create is confirmed AND the principal
+        controls or can influence the target VPC (either owns it or the attacker can
+        provision infrastructure in it). CONDITIONAL(peering_acceptance) if the VPC
+        peering request requires acceptance by the target VPC owner — if the attacker
+        does not control the target VPC, the peering remains pending and the attack
+        is CONDITIONAL on the peer accepting the peering request. BLOCKED if a deny
+        policy applies to datastream.privateConnections.create or if an org policy
+        restricts VPC peering.
+      confidence: 0.80
+      derived_from: ["<datastream.privateConnections.create effective permission on principal>"]
+      false_positive_note: >-
+        VPC peering is bidirectional but asymmetric: the initiator (Datastream) can
+        reach the target VPC if the peering is CREATED, but the target VPC does not
+        automatically reach back into the Datastream service network (depends on target
+        VPC routing). The attack requires either (a) attacker-controlled target VPC to
+        accept the peering and bridge into sensitive networks, or (b) compromise of the
+        target VPC owner to accept the peering request. If the peering request is rejected,
+        the network reach is not achieved. VPC peering quotas and org policies may also
+        block peering creation.
+      narrative: >-
+        {principal.name} can create a Datastream PrivateConnection (datastream.privateConnections.create)
+        that peers the Datastream service network into an attacker-controlled VPC or a
+        sensitive customer network. This enables the attacker to probe or bridge network
+        boundaries, reach private databases, or pivot into on-premises systems via VPN/Interconnect.
+
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION RULES — kept here for service self-containment;
+# logically belong in /rules/explicit/gcp-datastream.yaml (explicitPath null).
+# ---------------------------------------------------------------------------
+
+explicit_rules:
+
+  - id: gcp-datafusion-instance-executes-as
+    emits: ExecutesAs
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.datafusion.Instance"
+      field: "dataprocServiceAccount"
+    where:
+      - "if instance.dataprocServiceAccount is set: SA = instance.dataprocServiceAccount"
+      - "else: SA = PROJECT_NUMBER-compute@developer.gserviceaccount.com"
+    emit:
+      source_type: Compute
+      target_type: Identity
+      source: "<Data Fusion instance node>"
+      target: "<dataprocServiceAccount>"
+      api_source: "datafusion.projects.locations.instances.get"
+      evidence_field: "dataprocServiceAccount"
+      narrative: "Data Fusion instance {instance.name} runs pipelines as {sa.name} on ephemeral Dataproc clusters."
+
+  - id: gcp-datastream-connection-profile-credentials-for
+    emits: CredentialsFor
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.datastream.ConnectionProfile"
+      field: "oracleProfile | mysqlProfile | postgresqlProfile | sqlServerProfile | forwardSshConnectivity.privateKey | secretManagerStoredPassword"
+    where:
+      - "profile is a database source type (oracleProfile, mysqlProfile, postgresqlProfile, sqlServerProfile) with a username field present, OR profile has forwardSshConnectivity.privateKey set, OR profile has secretManagerStoredPassword set"
+      - "The ConnectionProfile (class Secret, generic_type ConnectionString) stores credentials that authenticate as the source database identity"
+    emit:
+      source_type: Secret
+      target_type: Identity
+      source: "<ConnectionProfile node (ConnectionString / Secret)>"
+      target: "<source database identity (the database system/user being authenticated to)>"
+      api_source: "datastream.projects.locations.connectionProfiles.get"
+      evidence_field: "oracleProfile.username | mysqlProfile.username | postgresqlProfile.username | sqlServerProfile.username | forwardSshConnectivity | secretManagerStoredPassword"
+      narrative: "{connectionProfile.name} stores credentials (database username + password, or SSH private key) that authenticate to the source database. An attacker with datastream.connectionProfiles.get can learn the username and (if secretManagerStoredPassword is set) the Secret Manager path to the password."
+
+  - id: gcp-datastream-private-connection-peering
+    emits: CanNetworkReach
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.datastream.PrivateConnection"
+      field: "vpcPeeringConfig.vpc"
+    where:
+      - "privateConnection.vpcPeeringConfig.vpc is a non-empty VPC network resource name"
+      - "privateConnection.state == CREATED"
+    emit:
+      source_type: Network
+      target_type: Network
+      source: "<PrivateConnection node (PrivateEndpoint)>"
+      target: "<peered VPC network>"
+      api_source: "datastream.projects.locations.privateConnections.get"
+      evidence_field: "vpcPeeringConfig.vpc"
+      narrative: "Datastream PrivateConnection {privateConnection.name} is VPC-peered into {vpc.name}, enabling streams to reach private database hosts."
+
+  - id: gcp-datastream-stream-cross-project-dest
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.datastream.Stream"
+      field: "destinationConfig.bigqueryDestinationConfig.datasetTemplate.targetDataset | destinationConfig.gcsDestinationConfig.path"
+    where:
+      - "stream destination project differs from stream project (extracted from target dataset or GCS bucket owner)"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<GCP project that owns the stream (AdministrativeBoundary: Project)>"
+      target: "<destination project>"
+      api_source: "datastream.projects.locations.streams.get"
+      evidence_field: "destinationConfig.bigqueryDestinationConfig | destinationConfig.gcsDestinationConfig"
+      narrative: "Datastream stream {stream.name} writes CDC data to a destination in a different project {destProject.name}, creating a cross-project data trust."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - IAM deny policy denying datafusion.instances.update at the effective scope
+#    → emit gcp-datafusion-pipeline-deploy-modifies-code and
+#    gcp-datafusion-swap-pipeline-sa as BLOCKED.
+#  - Deny policy denying iam.serviceAccounts.actAs on the pipeline SA
+#    → gcp-datafusion-create-workload-as and gcp-datafusion-swap-pipeline-sa BLOCKED.
+#  - Deny policy denying datastream.streams.update
+#    → gcp-datastream-stream-update-exfil BLOCKED.
+#  - VPC Service Controls perimeter restricting datastream.googleapis.com or
+#    datafusion.googleapis.com → emit BLOCKED with perimeter as denied_by.
+#  - Org policy constraints/datafusion.restrictPublicIp or similar → adjusts
+#    ExposedToInternet state for Data Fusion management plane.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# DEDUPLICATION NOTES:
+#  - can-execute-as execute-as-via-code-modify fires on any CanModifyCode(instance)
+#    + ExecutesAs(instance, sa) for the AnalyticsService/GenericCompute node;
+#    gcp-datafusion-pipeline-deploy-modifies-code + gcp-datafusion-instance-executes-as
+#    (explicit rule) provide those normalized facts. CanExecuteAs(principal, sa) is
+#    produced by can-execute-as, not re-derived here.
+#  - can-execute-as execute-as-via-config-identity-swap fires on
+#    CanModifyConfiguration(instance) + CanPassIdentity(principal, sa);
+#    gcp-datafusion-swap-pipeline-sa provides the CanModifyConfiguration fact.
+#  - can-control escalate-via-execute-as produces CanEscalateTo for any CanExecuteAs
+#    where privilege(target) > privilege(source). Do NOT emit CanEscalateTo from this
+#    derived file; cite can-control for escalation roll-up instead.
+#  - cicd-chains cicd-modify-buildspec-executes-as also fires on CanModifyCode(runner)
+#    + ExecutesAs for BatchJob / BuildWorker node types; if the Data Fusion instance
+#    is modeled as a GenericCompute/AnalyticsService rather than BatchJob, ensure the
+#    cicd-chains where-clause node_type check includes AnalyticsService, or emit
+#    CanModifyCode targeting a BatchJob sub-node representing the pipeline. Either
+#    approach produces the same CanExecuteAs via can-execute-as; avoid double-deriving.
+# ---------------------------------------------------------------------------

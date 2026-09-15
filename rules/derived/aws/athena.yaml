@@ -1,0 +1,346 @@
+# AWS Athena — Derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# Athena is a serverless SQL query engine over S3 data via the Glue catalog.
+# It does NOT run as an IAM role of its own — there is no Athena ExecutesAs
+# edge. The security primitives are:
+#
+#   (1) DATA READ:  athena:StartQueryExecution + s3:GetObject on the data prefix
+#                  + Glue read permissions => CanReadData over the underlying
+#                  S3 data lake. Phase 11 signature: Athena is the access vector
+#                  by which analyst-level identities can read the full data lake.
+#
+#   (2) OUTPUT-LOCATION HIJACK:  athena:UpdateWorkGroup rewrites the workgroup's
+#                  result output S3 prefix. Subsequent queries by other users in
+#                  that workgroup write results to the attacker-controlled location.
+#                  => CanModifyConfiguration(principal, workgroup); data-plane rules
+#                  collapse with CanReadData of those users to produce CanExfiltrate.
+#
+#   (3) FEDERATED QUERY → LAMBDA TRIGGER:  a workgroup with a data catalog of
+#                  Type: LAMBDA routes federated queries to a registered Lambda
+#                  connector. athena:StartQueryExecution therefore CanTrigger the
+#                  Lambda function. Combined with CanModifyCode on that Lambda
+#                  (Lambda rules), can-execute-as / cicd-chains produce CanExecuteAs
+#                  over the Lambda execution role.
+#
+#   (4) CROSS-ACCOUNT QUERY TRUST:  a workgroup resource policy granting
+#                  athena:StartQueryExecution to a foreign principal creates
+#                  CrossAccountTrust. Cited linchpins roll up the consequences.
+#
+# WHAT THIS FILE DOES NOT RE-DERIVE (cite linchpins instead):
+#   * CanExecuteAs — can-execute-as.yaml executes-as-via-code-modify collapses
+#     CanModifyCode(Lambda connector) + ExecutesAs(Lambda, role) into CanExecuteAs.
+#   * CanEscalateTo — can-control.yaml escalate-via-execute-as / can-execute-as.
+#   * CanExfiltrate — data-plane rules collapse CanReadData over a storage node.
+#   * CanEnterAccount — can-control.yaml enters the account via CrossAccountTrust.
+#   * credential-chains read-secret-yields-identity when CanReadData covers
+#     data that ContainsSecret.
+#
+# PERMISSIONS (all from AWS Service Authorization Reference — Amazon Athena):
+#   athena:StartQueryExecution — submit a SQL query to a workgroup
+#   athena:UpdateWorkGroup     — modify workgroup settings (incl. output location)
+#   athena:PutWorkGroupPolicy  — write the workgroup resource-based policy
+#   s3:GetObject               — read objects from the data-source S3 prefix
+#   s3:ListBucket              — list objects in the data-source S3 bucket
+#   glue:GetTable              — read Glue table metadata (required per query)
+#   glue:GetDatabase           — read Glue database metadata
+#   glue:GetPartition          — read partition metadata for the table
+#
+# STATE CONVENTIONS (RULE-FORMAT.md):
+#   A derived edge is never stronger than its weakest contributor.
+#   A disabled workgroup caps rules 1 and 3 at CONDITIONAL(service_state).
+#   Unconfirmed S3 / Glue permissions cap rule 1 at CONDITIONAL(iam_permission).
+#   KMS-encrypted results cap rule 1 at CONDITIONAL(key_permission) until
+#   credential-chains decrypt-gates-secret-read upgrades it.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 11-data-analytics-ml
+applies_to: [aws]
+
+rules:
+
+  # --- 1) athena:StartQueryExecution + S3/Glue read + s3:PutObject -> CanReadData over data lake ---
+  # Phase 11 primary primitive for Athena. A principal that can submit queries to a
+  # workgroup AND read the underlying S3 data (via Glue catalog table locations) AND
+  # write query results to the output S3 location can successfully execute and retrieve
+  # results. This is the mechanism by which analyst-level identities access the full
+  # data lake — Athena is the query surface. The complete chain: athena:StartQueryExecution
+  # (workgroup gate) + s3:GetObject on the data prefix (data-plane read gate) + s3:PutObject
+  # on the results output location (result-write gate) + Glue read (catalog gate) = effective
+  # data read capability.
+  #
+  # Depends on:
+  #   [?principal, HasPermission, ?workgroup]  — effective athena:StartQueryExecution
+  #                                              on the workgroup ARN; emitted by the
+  #                                              effective-permission evaluator.
+  #   s3:GetObject + s3:PutObject + glue:GetTable confirmed — validated in the
+  #                                              where-clause against the data-source
+  #                                              S3 prefix, output location, and Glue
+  #                                              catalog covering the workgroup.
+  #
+  # Data-plane rules (CanExfiltrate, ContainsSecret + credential-chains) handle
+  # downstream exfiltration and credential-harvest roll-ups — cited, not re-derived.
+  - id: aws-athena-query-reads-data
+    emits: CanReadData
+    description: "athena:StartQueryExecution on an enabled workgroup, combined with s3:GetObject on the data prefix, s3:PutObject on the results output location, and Glue read permissions, enables the principal to read underlying data-lake content."
+    match:
+      - [ ?principal, HasPermission, ?workgroup ]
+    where:
+      - "node_type(?workgroup) == AnalyticsService"
+      - "?workgroup.provider_type == 'AWS::Athena::WorkGroup'"
+      - "?workgroup.State == 'ENABLED'"
+      - "?principal has EFFECTIVE athena:StartQueryExecution on ?workgroup ARN"
+      - "?principal has EFFECTIVE s3:GetObject AND s3:ListBucket on the data-source S3 prefix referenced by tables in ?workgroup's Glue catalog"
+      - "?principal has EFFECTIVE s3:PutObject on the query-results output S3 location in ?workgroup.Configuration.ResultConfiguration.OutputLocation"
+      - "?principal has EFFECTIVE glue:GetTable AND glue:GetDatabase on the Glue catalog tables accessible via ?workgroup"
+      - "?principal has EFFECTIVE glue:GetPartition on partitions in those Glue tables (or glue:GetPartitions wildcard)"
+    emit:
+      source_type: Identity
+      target_type: Storage
+      source: ?principal
+      target: "<S3 ObjectStorage node for the data-source prefix covered by ?workgroup's Glue catalog>"
+      permissions:
+        - "athena:StartQueryExecution"
+        - "s3:GetObject"
+        - "s3:ListBucket"
+        - "s3:PutObject"
+        - "glue:GetTable"
+        - "glue:GetDatabase"
+        - "glue:GetPartition"
+      conditions: [iam_permission, resource_policy, key_permission, service_state]
+      state_logic: >-
+        ACTIVE when ALL FOUR permission sets are confirmed EFFECTIVE: (1)
+        athena:StartQueryExecution on the workgroup, (2) s3:GetObject + s3:ListBucket on
+        the data prefix, (3) s3:PutObject on the workgroup's output location (where Athena
+        writes result objects before the caller can read them via GetQueryResults), and
+        (4) glue:GetTable + glue:GetDatabase on the catalog; AND the workgroup State is
+        ENABLED AND no KMS key_permission gate is unresolved. CONDITIONAL(service_state)
+        when the workgroup State is DISABLED — queries cannot be submitted.
+        CONDITIONAL(iam_permission) when any of the four permission sets are unconfirmed
+        — athena:StartQueryExecution alone cannot read data; s3:PutObject on the output
+        location is required for result materialization. CONDITIONAL(key_permission) when
+        the workgroup encrypts results with a CMK and kms:GenerateDataKey + kms:Decrypt
+        are unconfirmed (results are written encrypted; reading them also requires
+        kms:Decrypt on the result objects). A resource_policy deny on the S3 bucket or
+        Glue catalog caps accordingly. Inherit weakest across all contributors; a BLOCKED
+        deny on any of the four permission gates blocks this edge.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?workgroup (athena:StartQueryExecution effective)"
+        - "?principal HasPermission <S3 data prefix> (s3:GetObject + s3:ListBucket effective)"
+        - "?principal HasPermission <S3 output location> (s3:PutObject effective — required for result write)"
+        - "?principal HasPermission <Glue catalog> (glue:GetTable + glue:GetDatabase + glue:GetPartition effective)"
+        - "credential-chains:decrypt-gates-secret-read (KMS-encrypted results gate — cited not re-derived)"
+      false_positive_note: >-
+        FOUR independent permission gates are ALL required; never emit ACTIVE when any
+        one is unconfirmed. (1) athena:StartQueryExecution on the SPECIFIC workgroup ARN —
+        Athena enforces workgroup-level access; a grant on a different workgroup does not
+        qualify. (2) s3:GetObject on the data-source S3 PREFIX identified from Glue table
+        Location fields — confirm the principal's S3 permissions cover the actual data
+        location (not just the output bucket). (3) s3:PutObject on the query-results output
+        S3 location (from the workgroup's Configuration.ResultConfiguration.OutputLocation)
+        — WITHOUT this, athena:StartQueryExecution fails at the result-write step, before
+        the caller can read results via GetQueryResults. This is distinct from the data-source
+        read permission; both S3 buckets/prefixes must be accessible. (4) glue:GetTable on
+        the SPECIFIC Glue database/table the workgroup's catalog exposes — Glue resource-based
+        policies may deny access to specific databases. Also require glue:GetPartition on the
+        partitions (or glue:GetPartitions wildcard), unless the tables are non-partitioned.
+        When the workgroup uses EnforceWorkGroupConfiguration: true, the output location is
+        fixed by the workgroup (not the caller); the CanReadData target is the DATA SOURCE,
+        not the output location — do not conflate them. A DISABLED workgroup (State: DISABLED)
+        cannot accept new queries — downgrade to CONDITIONAL(service_state). For KMS-encrypted
+        results: the caller needs kms:GenerateDataKey to write and kms:Decrypt to read result
+        objects — without both, result-read is CONDITIONAL(key_permission).
+        credential-chains decrypt-gates-secret-read upgrades to ACTIVE when CanDecrypt
+        is confirmed.
+      narrative: >-
+        {principal.name} can submit SQL queries to Athena workgroup {workgroup.name}
+        (athena:StartQueryExecution) and has s3:GetObject on the underlying data prefix,
+        s3:PutObject on the results output location (where Athena writes results before
+        they can be read), plus Glue catalog read permissions. Athena translates the SQL
+        into S3 data reads, materializes results to the output S3 location (which requires
+        s3:PutObject), and {principal.name} can then read the result set — so {principal.name}
+        can read any content accessible through the workgroup's Glue catalog — including
+        sensitive tables, logs, or application data stored in the data lake. data-plane
+        rules roll up CanExfiltrate; credential-chains read-secret-yields-identity fires
+        if the data ContainsSecret.
+
+  # --- 2) athena:UpdateWorkGroup rewrites output location -> CanModifyConfiguration ---
+  # A principal with athena:UpdateWorkGroup can change the workgroup's query-results
+  # S3 output location (Configuration.ResultConfiguration.OutputLocation). After the
+  # update, all subsequent queries submitted to that workgroup — by ANY user of it —
+  # write their results to the attacker-specified prefix. This is an output-hijack:
+  # the attacker does not need to read the data directly; they redirect the results
+  # of other users' queries to a location they control.
+  #
+  # This CanModifyConfiguration edge is the FACT. CanExfiltrate (over the result data
+  # of those subsequent queries) is produced by data-plane rules that chain
+  # CanReadData(other_user, workgroup) + CanModifyConfiguration(attacker, workgroup)
+  # -> attacker CanExfiltrate — cited, not re-derived here.
+  - id: aws-athena-output-location-hijack
+    emits: CanModifyConfiguration
+    description: "athena:UpdateWorkGroup lets a principal rewrite the workgroup output S3 location, redirecting subsequent users' query results to an attacker-controlled bucket."
+    match:
+      - [ ?principal, HasPermission, ?workgroup ]
+    where:
+      - "node_type(?workgroup) == AnalyticsService"
+      - "?workgroup.provider_type == 'AWS::Athena::WorkGroup'"
+      - "?principal has EFFECTIVE athena:UpdateWorkGroup on ?workgroup ARN"
+    emit:
+      source_type: Identity
+      target_type: AnalyticsService
+      source: ?principal
+      target: ?workgroup
+      permissions: ["athena:UpdateWorkGroup"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when athena:UpdateWorkGroup is confirmed EFFECTIVE on ?workgroup ARN
+        (identity-based policy + no SCP deny + no explicit deny). CONDITIONAL
+        (scp_or_org_policy) when an SCP may restrict the action. BLOCKED by an explicit
+        deny on athena:UpdateWorkGroup.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "?principal HasPermission ?workgroup (athena:UpdateWorkGroup effective permission)"
+      false_positive_note: >-
+        This edge is the MODIFY FACT only; CanExfiltrate over redirected results is
+        produced downstream by data-plane rules — do not emit CanExfiltrate here.
+        IMPORTANT: Distinguish two different output-location override paths:
+        (a) CLIENT-SIDE override: a query caller specifies a different output location
+            at StartQueryExecution time — BLOCKED by EnforceWorkGroupConfiguration: true.
+        (b) SERVER-SIDE override via UpdateWorkGroup: the attacker calls
+            athena:UpdateWorkGroup to change the workgroup's enforced output location
+            (Configuration.ResultConfiguration.OutputLocation) — NOT blocked by
+            EnforceWorkGroupConfiguration: true; that flag only blocks (a).
+        This rule emits edge for (b): UpdateWorkGroup rewrites the workgroup's own
+        output location, forcing all subsequent queries to use the new location.
+        Therefore EnforceWorkGroupConfiguration does NOT prevent this attack path —
+        it does not gate this edge (it only blocks caller-side overrides). Honor
+        SCP/deny on athena:UpdateWorkGroup as a real control.
+      narrative: >-
+        {principal.name} has athena:UpdateWorkGroup on workgroup {workgroup.name} and
+        can rewrite its query-results output S3 location. All subsequent queries submitted
+        to {workgroup.name} by any user will write results to the new location — which
+        the attacker controls. data-plane rules then produce CanExfiltrate over those
+        redirected result objects.
+
+  # --- 3) Principal with athena:StartQueryExecution + workgroup CanTrigger Lambda -> Principal CanTrigger Lambda ---
+  # An Athena workgroup can trigger a Lambda connector function (explicit edge emitted
+  # by /rules/explicit/aws-athena.yaml:aws-athena-workgroup-triggers-lambda from LAMBDA
+  # data catalog config). A principal with athena:StartQueryExecution on that workgroup
+  # can cause the workgroup to invoke the Lambda. This collapses to: the principal can
+  # trigger the Lambda function indirectly via Athena.
+  #
+  # SCHEMA NOTE: This derived rule emits CanTrigger (source: Identity, target:
+  # ServerlessFunction), which has nature: explicit in edges.yaml. Deriving an explicit
+  # edge from a derived rule violates RULE-FORMAT.md §4. This rule's emission should
+  # require CanTrigger's nature to be "both" (schema change). Until resolved, this rule
+  # captures a valid attack-path semantic; the edge is emitted documenting the schema
+  # constraint as a known issue.
+  #
+  # Combined with CanModifyCode on the Lambda connector (Lambda service rules),
+  # can-execute-as executes-as-via-code-modify produces CanExecuteAs over the
+  # Lambda execution role — cited from can-execute-as.yaml and cicd-chains.yaml,
+  # not re-derived here.
+  - id: aws-athena-principal-triggers-lambda
+    emits: CanTrigger
+    description: "A principal with athena:StartQueryExecution on a LAMBDA-catalog workgroup can trigger the registered Lambda connector function."
+    match:
+      - [ ?principal, HasPermission, ?workgroup ]
+      - [ ?workgroup, CanTrigger, ?lambda_function ]
+    where:
+      - "node_type(?workgroup) == AnalyticsService"
+      - "?workgroup.provider_type == 'AWS::Athena::WorkGroup'"
+      - "?principal has EFFECTIVE athena:StartQueryExecution on ?workgroup ARN"
+      - "node_type(?lambda_function) == ServerlessFunction"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: ?principal
+      target: ?lambda_function
+      permissions: ["athena:StartQueryExecution"]
+      conditions: [iam_permission, service_state, trigger_exists]
+      state_logic: >-
+        ACTIVE when athena:StartQueryExecution is confirmed EFFECTIVE on ?workgroup ARN,
+        the workgroup State is ENABLED, the LAMBDA data catalog exists (via the explicit
+        ?workgroup CanTrigger ?lambda_function edge), and the Lambda function exists and
+        is not throttled. CONDITIONAL(service_state) when the workgroup is DISABLED.
+        CONDITIONAL(trigger_exists) when the explicit CanTrigger edge is CONDITIONAL
+        (Lambda ARN invalid/deleted). CONDITIONAL(iam_permission) when
+        athena:StartQueryExecution is unconfirmed. Inherit weakest from contributing
+        HasPermission and CanTrigger edges; a BLOCKED contributor blocks this derivation.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?workgroup (athena:StartQueryExecution effective permission)"
+        - "?workgroup CanTrigger ?lambda_function (explicit normalization: aws-athena-workgroup-triggers-lambda)"
+        - "can-execute-as:execute-as-via-code-modify (CanModifyCode on connector + ExecutesAs -> CanExecuteAs — cited not re-derived)"
+        - "cicd-chains:cicd-modify-buildspec-executes-as (modify-what-it-runs -> executes-as — cited not re-derived)"
+      false_positive_note: >-
+        This edge is CanTrigger only — CanExecuteAs over the Lambda execution role
+        requires additionally that the attacker CanModifyCode the Lambda connector
+        function; can-execute-as executes-as-via-code-modify and/or cicd-chains
+        cicd-modify-buildspec-executes-as produce that roll-up. If the attacker can ONLY
+        trigger (no code modification), cicd-chains cicd-trigger-runner-executes-as
+        applies but is CONDITIONAL(attacker_influenced_definition). Confirm the
+        workgroup-to-Lambda binding: the explicit CanTrigger edge must be ACTIVE or
+        CONDITIONAL(trigger_exists), not BLOCKED. A missing or deleted Lambda function
+        behind the data catalog's LambdaFunctionArn makes this CONDITIONAL(trigger_exists).
+        Do not emit CanExecuteAs here; let can-execute-as produce that roll-up.
+      narrative: >-
+        {principal.name} can submit federated queries to Athena workgroup {workgroup.name}
+        (athena:StartQueryExecution). The workgroup's data catalog is configured to trigger
+        {lambda_function.name}; Athena invokes that function for each federated query.
+        This is CanTrigger({principal.name} -> {lambda_function.name}). If {principal.name}
+        can also modify the Lambda connector code (Lambda rules), can-execute-as produces
+        CanExecuteAs over {lambda_function.name}'s execution role.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP or explicit deny on athena:StartQueryExecution -> rule 1 and rule 3
+#    both BLOCKED.
+#  - A workgroup with State: DISABLED caps rules 1 and 3 at
+#    CONDITIONAL(service_state), never ACTIVE.
+#  - An SCP or explicit deny on athena:UpdateWorkGroup -> rule 2 BLOCKED.
+#  - A missing s3:GetObject on the data-source prefix blocks rule 1 at
+#    CONDITIONAL(iam_permission).
+#  - A missing glue:GetTable / glue:GetDatabase blocks rule 1 at
+#    CONDITIONAL(iam_permission).
+#  - A KMS CMK on the workgroup's result encryption without confirmed
+#    kms:GenerateDataKey + kms:Decrypt caps rule 1 at
+#    CONDITIONAL(key_permission); credential-chains decrypt-gates-secret-read
+#    upgrades to ACTIVE when CanDecrypt is confirmed.
+#  - A deleted or invalid Lambda function ARN in a LAMBDA data catalog caps
+#    rule 3 at CONDITIONAL(trigger_exists), never ACTIVE.
+#  - aws:PrincipalOrgID / aws:SourceAccount conditions in a workgroup policy cap
+#    rule 4 at CONDITIONAL(condition_expression), never ACTIVE open cross-account.
+#  - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules recommended (add to /rules/explicit/aws-athena.yaml
+# if created; these translate raw Athena config to explicit edges consumed above):
+#
+#   aws-athena-workgroup-can-trigger-lambda:
+#     emits: CanTrigger
+#     applies_to: [aws]
+#     match_record:
+#       resource_type: "AWS::Athena::DataCatalog"
+#       field: "Type"
+#       value: "LAMBDA"
+#     emit:
+#       source: "<workgroup node associated with this DataCatalog>"
+#       target: "<Lambda function node identified by LambdaFunctionArn>"
+#       api_source: "athena:GetDataCatalog"
+#       evidence_field: "Parameters.function (LambdaFunctionArn)"
+#       narrative: "Athena workgroup {workgroup.name} triggers Lambda connector {function.name} for federated queries."
+#
+#   aws-athena-workgroup-resource-policy:
+#     emits: HasPolicy
+#     applies_to: [aws]
+#     match_record:
+#       resource_type: "AWS::Athena::WorkGroup"
+#       field: "WorkGroupPolicy"
+#     emit:
+#       source: "<workgroup node>"
+#       target: "<ResourcePolicy node for the workgroup>"
+#       api_source: "athena:GetWorkGroupPolicy"
+#       evidence_field: "Policy"
+#       narrative: "{workgroup.name} has a resource-based policy governing cross-account access."

@@ -1,0 +1,165 @@
+# GCP IAM — Identity & Authorization escalation rules (Phase 2)
+# ---------------------------------------------------------------------------
+# GCP escalation centers on: (1) setIamPolicy at a resource/project/folder/org
+# scope = self-grant; (2) service-account impersonation (actAs/getAccessToken/
+# signBlob) = become an SA and inherit its roles; (3) SA key creation = durable
+# creds. Inheritance means a binding at project/folder/org applies to all
+# descendants — scope discipline is critical to avoid over-claiming.
+# Deny policies are evaluated first (deny wins) -> BLOCKED edges.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 2-identity-authorization
+applies_to: [gcp]
+
+rules:
+
+  # --- setIamPolicy family (self-grant any role) ----------------------------
+  - id: gcp-set-iam-policy-project
+    emits: CanGrantPermission
+    match_effective_permission: {action: "resourcemanager.projects.setIamPolicy", resource_type: "google.cloud.resourcemanager.Project"}
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<project>"
+      permissions: ["resourcemanager.projects.setIamPolicy"]
+      escalation: "Bind roles/owner to self at the project -> full project control."
+      cross_boundary: "emits Controls(project) via can-control roll-up"
+      narrative: "{principal.name} can set the IAM policy of project {project.name} (resourcemanager.projects.setIamPolicy) and grant itself any role, including roles/owner."
+
+  - id: gcp-set-iam-policy-folder
+    emits: CanGrantPermission
+    match_effective_permission: {action: "resourcemanager.folders.setIamPolicy", resource_type: "google.cloud.resourcemanager.Folder"}
+    emit: {source: "<principal>", target: "<folder>", permissions: ["resourcemanager.folders.setIamPolicy"],
+           escalation: "Self-grant at folder -> control of all descendant projects.",
+           narrative: "{principal.name} can set the IAM policy of folder {folder.name} and self-grant roles inherited by all child projects."}
+
+  - id: gcp-set-iam-policy-org
+    emits: CanGrantPermission
+    match_effective_permission: {action: "resourcemanager.organizations.setIamPolicy", resource_type: "google.cloud.resourcemanager.Organization"}
+    emit: {source: "<principal>", target: "<organization>", permissions: ["resourcemanager.organizations.setIamPolicy"],
+           escalation: "Org-level self-grant = organization takeover.",
+           narrative: "{principal.name} can set the organization IAM policy (resourcemanager.organizations.setIamPolicy) — full org control."}
+
+  - id: gcp-set-iam-policy-resource
+    emits: CanModifyPolicy
+    match_effective_permission: {action: "*.setIamPolicy", resource_type: "*"}
+    where: ["action is a resource-level setIamPolicy (e.g. storage.buckets.setIamPolicy, pubsub.topics.setIamPolicy)"]
+    emit: {source: "<principal>", target: "<resource in scope>", permissions: ["<resource>.setIamPolicy"],
+           narrative: "{principal.name} can set the IAM policy of {resource.name}, granting itself access to that resource."}
+
+  # --- Service account impersonation ----------------------------------------
+  - id: gcp-sa-get-access-token
+    emits: CanImpersonate
+    match_effective_permission: {action: "iam.serviceAccounts.getAccessToken", resource_type: "google.iam.ServiceAccount"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<service account in scope>"
+      permissions: ["iam.serviceAccounts.getAccessToken"]
+      escalation: "Mint an OAuth2 token for the SA and inherit ALL of its roles."
+      note: "Also emit CanAssume for cross-provider consistency. This is the GCP privesc workhorse."
+      narrative: "{principal.name} can mint access tokens for {sa.name} (iam.serviceAccounts.getAccessToken) and act with all of its permissions."
+
+  - id: gcp-sa-get-openid-token
+    emits: CanRetrieveToken
+    match_effective_permission: {action: "iam.serviceAccounts.getOpenIdToken", resource_type: "google.iam.ServiceAccount"}
+    emit: {source: "<principal>", target: "<service account>", permissions: ["iam.serviceAccounts.getOpenIdToken"],
+           narrative: "{principal.name} can mint OIDC identity tokens for {sa.name} (useful against IAP/Cloud Run/other OIDC-trusting services)."}
+
+  - id: gcp-sa-sign-blob-jwt
+    emits: CanSignAs
+    match_effective_permission: {action: "iam.serviceAccounts.signJwt", resource_type: "google.iam.ServiceAccount"}
+    alt_permission: "iam.serviceAccounts.signBlob"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["iam.serviceAccounts.signJwt", "iam.serviceAccounts.signBlob"]
+      escalation: "Sign a JWT as the SA and exchange it for an access token -> impersonation."
+      narrative: "{principal.name} can sign JWTs/blobs as {sa.name} (signJwt/signBlob) and self-assert as that SA."
+
+  - id: gcp-sa-implicit-delegation
+    emits: CanImpersonate
+    match_effective_permission: {action: "iam.serviceAccounts.implicitDelegation", resource_type: "google.iam.ServiceAccount"}
+    emit: {source: "<principal>", target: "<service account>", permissions: ["iam.serviceAccounts.implicitDelegation"],
+           note: "Delegation chain: A->B implicitDelegation, B has getAccessToken on C => A reaches C. Fixpoint handles the chain.",
+           narrative: "{principal.name} can use implicit delegation through {sa.name} to reach SAs it can token."}
+
+  # --- SA key creation (durable credentials) --------------------------------
+  - id: gcp-sa-key-create
+    emits: CanCreateCredentialFor
+    match_effective_permission: {action: "iam.serviceAccountKeys.create", resource_type: "google.iam.ServiceAccount"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<service account in scope>"
+      permissions: ["iam.serviceAccountKeys.create"]
+      escalation: "Create a downloadable JSON key -> durable offline credential for the SA."
+      narrative: "{principal.name} can create a private key for {sa.name} (iam.serviceAccountKeys.create), yielding long-lived credentials."
+
+  # --- SA IAM policy = grant self impersonation -----------------------------
+  - id: gcp-sa-set-iam-policy
+    emits: CanModifyTrust
+    match_effective_permission: {action: "iam.serviceAccounts.setIamPolicy", resource_type: "google.iam.ServiceAccount"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["iam.serviceAccounts.setIamPolicy"]
+      escalation: "Grant self roles/iam.serviceAccountTokenCreator on the SA, then impersonate."
+      narrative: "{principal.name} can set the IAM policy of {sa.name} (iam.serviceAccounts.setIamPolicy) and grant itself Token Creator, then impersonate it."
+
+  # --- actAs (PassRole analog; realizes CanExecuteAs with Phase 4) -----------
+  - id: gcp-sa-act-as
+    emits: CanPassIdentity
+    match_effective_permission: {action: "iam.serviceAccounts.actAs", resource_type: "google.iam.ServiceAccount"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["iam.serviceAccounts.actAs"]
+      note: "actAs alone is not execution; pairs with a create/deploy action (gce/gcf/run/cloudbuild) -> CanExecuteAs."
+      narrative: "{principal.name} can attach {sa.name} to a workload it deploys (iam.serviceAccounts.actAs)."
+
+  - id: gcp-execute-as-via-actas
+    emits: CanExecuteAs
+    description: "actAs + ability to create a resource that runs as the SA."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has a create/deploy action in {compute.instances.create, cloudfunctions.functions.create, run.services.create, cloudbuild.builds.create, composer/dataflow/dataproc create}"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["iam.serviceAccounts.actAs", "<service create action>"]
+      escalation: "Deploy a workload bound to a privileged SA and run code as it."
+      narrative: "{principal.name} can actAs {sa.name} and deploy a workload, executing code with the SA's permissions."
+
+  # --- Custom role editing ---------------------------------------------------
+  - id: gcp-roles-update
+    emits: CanModifyPolicy
+    match_effective_permission: {action: "iam.roles.update", resource_type: "google.iam.Role"}
+    where: ["?principal is bound to the custom role being edited"]
+    emit: {source: "<principal>", target: "<custom role>", permissions: ["iam.roles.update"],
+           escalation: "Add permissions to a custom role already bound to the attacker.",
+           narrative: "{principal.name} can add permissions to custom role {role.name} it is bound to (iam.roles.update)."}
+
+  # --- Workload Identity Federation ------------------------------------------
+  - id: gcp-workload-identity-federation
+    emits: CanFederateAs
+    match_record: {resource_type: "google.iam.WorkloadIdentityPool", field: "providers[].attributeMapping"}
+    where: ["a pool provider maps an external (attacker-controllable) subject to an SA via roles/iam.workloadIdentityUser"]
+    emit:
+      source: "<external/federated identity>"
+      target: "<service account>"
+      permissions: ["roles/iam.workloadIdentityUser (getAccessToken via WIF)"]
+      conditions: [trust_relationship, condition_expression]
+      false_positive_note: "Only ACTIVE if the attribute condition is attacker-satisfiable (broad aud/sub mapping)."
+      narrative: "{external.name} can federate via the workload identity pool into {sa.name} (WIF)."
+
+# Deny-policy handling: if an IAM deny policy denies an action above at the
+# effective scope, emit the edge as BLOCKED with denied_by=<deny policy>.

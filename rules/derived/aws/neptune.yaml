@@ -1,0 +1,568 @@
+# AWS Neptune — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Neptune is a managed property-graph and RDF graph database (Gremlin,
+# openCypher, SPARQL). The primary attack surface is DATA ACCESS and DATA
+# EXFILTRATION; Neptune has no customer-configurable execution identity
+# (no ExecutesAs) and no CanModifyCode surface.
+#
+# ATTACK SURFACE SUMMARY:
+#
+# SURFACE 1 — IAM-AUTHENTICATED DATA READ (neptune-db: actions):
+#   A principal with neptune-db:connect AND neptune-db:ReadDataViaQuery on
+#   the cluster resource ARN can issue SigV4-signed HTTP requests to the
+#   Neptune endpoint and run Gremlin/openCypher/SPARQL queries, reading all
+#   graph data (vertices, edges, properties). Combined with network reachability
+#   (in-VPC or public endpoint), this yields:
+#     CanReadData(principal, cluster)                                        [A1]
+#
+# SURFACE 2 — PUBLIC ENDPOINT + NO IAM AUTH (ExposedToInternet):
+#   A Neptune DB instance with PubliclyAccessible: true, a permissive VPC
+#   security group (inbound 0.0.0.0/0 on port 8182), AND
+#   EnableIAMDatabaseAuthentication: false on the cluster is reachable by
+#   any internet host with no credentials:
+#     ExposedToInternet(cluster, AnonymousIdentity)                         [B1]
+#   When IAM auth is enabled on a public cluster, the endpoint is publicly
+#   routed but still requires SigV4; downgrade to CONDITIONAL(condition_expression).
+#
+# SURFACE 3 — CROSS-ACCOUNT SNAPSHOT SHARING (CanExfiltrate):
+#   rds:ModifyDBClusterSnapshotAttribute with AttributeName=restore and
+#   ValuesToAdd=[all] makes the snapshot publicly restorable by any AWS account.
+#   ValuesToAdd=[<accountId>] shares it with a specific account. Either case
+#   allows the recipient to restore a full copy of all graph data:
+#     CanExfiltrate(principal, snapshot)                                    [C1]
+#   For CMK-encrypted snapshots, the restoring account also needs kms:Decrypt /
+#   kms:CreateGrant on the wrapping CMK -> CONDITIONAL(key_permission).
+#
+# WHAT THIS FILE DOES NOT EMIT (cite and defer to linchpins):
+#   * ExecutesAs — Neptune clusters have no customer-configurable execution role
+#     at the DB engine level. No ExecutesAs edge.
+#   * CanExecuteAs — follows from ExecutesAs via can-execute-as.yaml; not
+#     applicable here.
+#   * CanImpersonate / CanEscalateTo — Neptune has no master password or internal
+#     credential store; no ExposesCredential chain fires. credential-chains.yaml
+#     is not the primary linchpin here (no credential grab primitive).
+#   * CanModifyCode — Neptune does not execute customer-defined code.
+#   * CanEnterAccount — can-control.yaml handles CanEnterAccount via
+#     CrossAccountTrust feeds from the snapshot; not re-derived here.
+#   * ContainsSecret — Neptune has no internal user database or master password;
+#     graph data may contain embedded secrets but that is analyst-tagged, not
+#     structurally inferred from Neptune config.
+#
+# LINCHPIN CITATIONS (DO NOT RE-DERIVE):
+#   credential-chains.yaml: Not the primary chain for Neptune (no credential grab
+#     primitive). If an analyst tags a Neptune cluster as ContainsSecret (because
+#     the graph stores API keys / credentials as node properties), the chain
+#     ContainsSecret -> CredentialsFor -> CanImpersonate -> CanEscalateTo is
+#     handled by credential-chains read-secret-yields-identity + impersonate-
+#     is-escalation. Do not re-derive here.
+#   can-control.yaml:
+#     enter-account-via-assume — CrossAccountTrust on a shared snapshot feeds
+#     CanEnterAccount for the account that holds the sharing principal.
+#     control-via-admin — CanAdminister feeds Controls.
+#   can-execute-as.yaml: Not applicable (no ExecutesAs).
+#
+# PERMISSIONS (from AWS Service Authorization Reference for Amazon Neptune):
+#   neptune-db:connect            — authenticate to the Neptune endpoint (IAM DB auth)
+#   neptune-db:ReadDataViaQuery   — execute read queries (Gremlin, openCypher, SPARQL)
+#   neptune-db:WriteDataViaQuery  — execute write/mutation queries
+#   neptune-db:DeleteDataViaQuery — execute delete queries
+#   neptune-db:GetStreamRecords   — read Neptune Streams (change log)
+#   neptune-db:ResetDatabase      — drop all graph data (high destructive impact)
+#   neptune-db:GetEngineStatus    — read cluster status / engine info
+#   rds:ModifyDBClusterSnapshotAttribute — share or make snapshots public
+#   neptune:DescribeDBClusterSnapshotAttributes — read snapshot sharing state
+#   rds:RestoreDBClusterFromSnapshot — restore a snapshot (cross-account exfil)
+#   neptune:CreateDBClusterSnapshot — create a manual snapshot
+#   rds:ModifyDBCluster       — modify cluster config (IAM auth toggle, etc.)
+#   neptune:AddRoleToDBCluster    — attach IAM role for S3 load/export
+#
+# STATE CONVENTIONS (RULE-FORMAT.md):
+#   A derived edge is never stronger than its weakest contributor.
+#   CONDITIONAL(network_reachability): VPC-private clusters require the caller
+#     to be in the same VPC, a peered VPC, or connected via PrivateLink.
+#   CONDITIONAL(condition_expression): public endpoint with IAM auth enabled —
+#     the endpoint is routed to the internet but authentication is required.
+#   CONDITIONAL(key_permission): CMK-encrypted snapshots require kms:Decrypt /
+#     kms:CreateGrant in the restoring account.
+#   BLOCKED: an SCP or IAM boundary denying the relevant action(s).
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 6-storage-databases
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # SECTION A — IAM-AUTHENTICATED DATA READ (neptune-db: actions)
+  # ===========================================================================
+
+  # --- A1) CanReadData via neptune-db:connect + neptune-db:ReadDataViaQuery ---
+  # A principal with both neptune-db:connect (IAM DB authentication) and
+  # neptune-db:ReadDataViaQuery on the cluster resource ARN can connect to the
+  # Neptune HTTP/WebSocket endpoint and run read queries in any supported language
+  # (Gremlin, openCypher, SPARQL). Neptune IAM database authentication requires
+  # SigV4-signed HTTP requests; both actions must be effective for a full read
+  # capability to be confirmed.
+  #
+  # Resource ARN format for neptune-db: actions:
+  #   arn:aws:neptune-db:<region>:<account>:<cluster-resource-id>/*
+  # The cluster-resource-id is the DbClusterResourceId field (e.g. cluster-ABCDEF).
+  #
+  # Engine version note: Neptune engines older than 1.2.0.0 may treat
+  # neptune-db:connect as sufficient for all data operations. Newer engines
+  # enforce neptune-db:ReadDataViaQuery separately. Emit CanReadData when
+  # neptune-db:connect is present, with a note that neptune-db:ReadDataViaQuery
+  # enforcement is engine-version dependent.
+  - id: aws-neptune-iam-auth-read-data
+    emits: CanReadData
+    description: "Principal with neptune-db:connect and neptune-db:ReadDataViaQuery on the cluster resource ARN can read all graph data via IAM-authenticated queries."
+    match_effective_permission:
+      action: ["neptune-db:connect", "neptune-db:ReadDataViaQuery"]
+      resource_type: "AWS::Neptune::DBCluster"
+    where:
+      - "cluster.EnableIAMDatabaseAuthentication == true"
+      - "IAM effective permissions include neptune-db:connect on the cluster's resource ARN (arn:aws:neptune-db:<region>:<account>:<cluster-resource-id>/*)"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: "<principal>"
+      target: "<Neptune cluster (NoSQLDatabase)>"
+      permissions: ["neptune-db:connect", "neptune-db:ReadDataViaQuery"]
+      conditions: [iam_permission, network_reachability]
+      derived_from: ["HasPermission(neptune-db:connect)", "HasPermission(neptune-db:ReadDataViaQuery)"]
+      state_logic: >-
+        ACTIVE when the principal's effective IAM permissions include both
+        neptune-db:connect and neptune-db:ReadDataViaQuery on the cluster's
+        neptune-db resource ARN AND the cluster has EnableIAMDatabaseAuthentication
+        set to true AND network reach to the cluster endpoint is confirmed (trivially
+        true for public endpoints; CONDITIONAL(network_reachability) for VPC-private
+        clusters where the caller is not confirmed in-VPC or via PrivateLink/peering).
+        BLOCKED if an SCP or IAM boundary denies either neptune-db:connect or
+        neptune-db:ReadDataViaQuery on the cluster scope. On Neptune engine versions
+        older than 1.2.0.0 that do not enforce fine-grained neptune-db:* actions,
+        neptune-db:connect alone may be sufficient — emit with a note flagging the
+        engine version dependency. If IAMDatabaseAuthenticationEnabled is false on
+        the cluster, this IAM-auth path does not apply (see Surface 2 for the no-
+        auth exposure).
+      false_positive_note: >-
+        Only emit when EnableIAMDatabaseAuthentication is true on the cluster —
+        the neptune-db:* actions are only evaluated when IAM auth is required.
+        Do not emit ACTIVE for VPC-private clusters when network reachability from
+        the principal to the cluster endpoint has not been confirmed; downgrade to
+        CONDITIONAL(network_reachability). neptune-db:connect alone (without
+        neptune-db:ReadDataViaQuery) is sufficient on engine versions older than
+        1.2.0.0 but not on newer engines; note this engine-version sensitivity in
+        the evidence. The neptune-db: resource ARN uses the DbClusterResourceId
+        (cluster-XXXX), not the cluster ARN — ensure the permission is evaluated
+        against the correct resource ARN format. An IAM policy scoped to a specific
+        cluster resource ID does NOT apply to other clusters.
+      narrative: >-
+        {principal.name} has neptune-db:connect and neptune-db:ReadDataViaQuery on
+        Neptune cluster {cluster.name} (resource ID {cluster.DbClusterResourceId});
+        with IAM database authentication enabled, {principal.name} can issue
+        SigV4-signed Gremlin / openCypher / SPARQL queries and read all graph data
+        (vertices, edges, properties) from the cluster endpoint.
+
+  # ===========================================================================
+  # SECTION B — PUBLIC ENDPOINT EXPOSURE
+  # ===========================================================================
+
+  # --- B0) ExposedToInternet: snapshot public (CrossAccountTrust to external Account) -----
+  # A Neptune cluster snapshot with restore attribute set to 'all' emits an explicit
+  # CrossAccountTrust(snapshot, Account) edge from /rules/explicit/aws-neptune.yaml.
+  # This derived rule transforms that trust into an ExposedToInternet exposure because any
+  # AWS account can immediately call RestoreDBClusterFromSnapshot to obtain a full offline
+  # copy of all graph data. The transformation treats external Account trust as equivalent
+  # to internet exposure (any authenticated AWS principal, which includes AnonymousIdentity
+  # for public restore='all').
+  - id: aws-neptune-snapshot-public-exposed
+    emits: ExposedToInternet
+    description: "Neptune cluster snapshot with public restore attribute (restore=all) is exposed to the internet via CrossAccountTrust to external Account."
+    match:
+      - [ ?snapshot, CrossAccountTrust, ?account ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "node_type(?account) == Account"
+      - "?snapshot.SnapshotType == 'manual' OR ?snapshot source is from aws-neptune-snapshot-public-exposed-explicit rule"
+    emit:
+      source_type: Snapshot
+      target_type: AnonymousIdentity
+      source: ?snapshot
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: []
+      derived_from: ["CrossAccountTrust(?snapshot, ?account)"]
+      state_logic: >-
+        ACTIVE because the snapshot has a public restore permission (CrossAccountTrust
+        to external Account, meaning any AWS account). Any AWS account can call
+        rds:RestoreDBClusterFromSnapshot to create a full copy of the graph data
+        without credentials or further action. External Account trust on a public
+        resource implies internet exposure.
+      narrative: >-
+        Neptune cluster snapshot {snapshot.name} is publicly restorable
+        (AttributeValues contains 'all') — any AWS account can call
+        rds:RestoreDBClusterFromSnapshot to create a full copy of all graph
+        data (vertices, edges, properties) without the owner's involvement.
+
+  # --- B1) ExposedToInternet: public + permissive SG + IAM auth disabled -----
+  # A Neptune DB instance with PubliclyAccessible: true (making its endpoint DNS
+  # resolve to a public IP), a VPC security group that allows inbound TCP on one of
+  # the Neptune ports (8182 for Gremlin/openCypher HTTP, 8183 for SPARQL HTTP, 8184
+  # for Gremlin WebSocket) from 0.0.0.0/0, AND EnableIAMDatabaseAuthentication: false
+  # on the parent cluster is reachable by any host on the internet without any
+  # authentication. An attacker can issue Gremlin, openCypher, or SPARQL queries
+  # to read or write all graph data without needing AWS credentials.
+  #
+  # When IAM auth is enabled (EnableIAMDatabaseAuthentication: true), the endpoint
+  # is publicly routed but SigV4 is required — downgrade to
+  # CONDITIONAL(condition_expression), not ACTIVE.
+  #
+  # Neptune Analytics (NeptuneGraph) has a separate PublicConnectivity flag on
+  # the graph resource; this rule covers Neptune DB clusters/instances only.
+  - id: aws-neptune-public-no-iam-auth
+    emits: ExposedToInternet
+    description: "Neptune DB instance with a public endpoint, permissive security group (port 8182/8183/8184 from 0.0.0.0/0), and IAM database authentication disabled is accessible from the internet without any credential."
+    match_record:
+      resource_type: "AWS::Neptune::DBInstance"
+    where:
+      - "node_type(?instance) == NoSQLDatabase"
+      - "?instance.PubliclyAccessible == true"
+      - "parent cluster of ?instance has EnableIAMDatabaseAuthentication == false"
+      - "VPC security group for ?instance allows inbound TCP on any Neptune port (8182, 8183, or 8184) from 0.0.0.0/0 or ::/0 (or equivalent internet-wide CIDR)"
+    emit:
+      source_type: NoSQLDatabase
+      target_type: AnonymousIdentity
+      source: ?instance
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [resource_policy, condition_expression]
+      derived_from: ["resource_configuration(?instance)"]
+      state_logic: >-
+        ACTIVE when: (a) the Neptune DB instance has PubliclyAccessible: true so
+        its endpoint resolves to a public IP, (b) the VPC security group allows
+        inbound TCP on any Neptune protocol port (8182 for Gremlin/openCypher HTTP,
+        8183 for SPARQL HTTP, or 8184 for Gremlin WebSocket) from 0.0.0.0/0 or ::/0,
+        AND (c) the parent cluster has EnableIAMDatabaseAuthentication: false so
+        requests are accepted without SigV4 authentication. CONDITIONAL(condition_expression)
+        when PubliclyAccessible is true and any Neptune port is open but IAM
+        authentication is enabled on the cluster — the endpoint is publicly routed
+        but SigV4 is required, so it is not anonymously accessible (broadly
+        IAM-accessible). BLOCKED if PubliclyAccessible is false (endpoint only
+        resolves within the VPC) or all Neptune ports are restricted to specific
+        CIDRs (not truly internet-open).
+      false_positive_note: >-
+        PubliclyAccessible: true on the DB instance is a NECESSARY but not sufficient
+        condition — the VPC security group inbound rules must also allow at least one
+        Neptune port (8182, 8183, or 8184) from 0.0.0.0/0 or ::/0 for the cluster to
+        be reachable from the internet. Do not emit ACTIVE if all Neptune ports are
+        restricted to specific CIDRs or VPC IDs; downgrade to CONDITIONAL(network_reachability).
+        Do not emit ACTIVE if EnableIAMDatabaseAuthentication is true on the parent
+        cluster — authentication is still required even with a public endpoint; use
+        CONDITIONAL(condition_expression) instead. Neptune uses port 8182 for Gremlin
+        HTTP and WebSocket (legacy) and openCypher HTTP; port 8183 for SPARQL HTTP;
+        port 8184 for Gremlin WebSocket (modern). Evaluate security group inbound
+        rules for all three ports — a cluster is ExposedToInternet if any of these
+        are open from 0.0.0.0/0. Automated snapshots are not affected by this rule —
+        this applies to live cluster endpoints only.
+      narrative: >-
+        Neptune DB instance {instance.name} (cluster {cluster.name}) is accessible
+        from the public internet without any authentication: its endpoint has a public
+        IP (PubliclyAccessible: true), the VPC security group allows inbound on one or
+        more Neptune ports (8182, 8183, 8184) from 0.0.0.0/0, and IAM database
+        authentication is disabled — any internet host can issue Gremlin / openCypher /
+        SPARQL queries and read or write all graph data without credentials.
+
+  # --- A2) CanWriteData via neptune-db:connect + neptune-db:WriteDataViaQuery ---
+  # A principal with both neptune-db:connect (IAM DB authentication) and
+  # neptune-db:WriteDataViaQuery on the cluster resource ARN can execute write/mutation
+  # queries (Gremlin addV/addE, openCypher CREATE/SET, SPARQL INSERT/DELETE). This
+  # allows poisoning graph data, including modifying relationships and properties
+  # (which may encode trust relationships or credentials).
+  - id: aws-neptune-iam-auth-write-data
+    emits: CanWriteData
+    description: "Principal with neptune-db:connect and neptune-db:WriteDataViaQuery on the cluster resource ARN can execute write/mutation queries and modify graph data."
+    match_effective_permission:
+      action: ["neptune-db:connect", "neptune-db:WriteDataViaQuery"]
+      resource_type: "AWS::Neptune::DBCluster"
+    where:
+      - "cluster.EnableIAMDatabaseAuthentication == true"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: "<principal>"
+      target: "<Neptune cluster (NoSQLDatabase)>"
+      permissions: ["neptune-db:connect", "neptune-db:WriteDataViaQuery"]
+      conditions: [iam_permission, network_reachability]
+      derived_from: ["HasPermission(neptune-db:connect)", "HasPermission(neptune-db:WriteDataViaQuery)"]
+      state_logic: >-
+        ACTIVE when the principal's effective IAM permissions include both
+        neptune-db:connect and neptune-db:WriteDataViaQuery on the cluster's
+        neptune-db resource ARN AND the cluster has EnableIAMDatabaseAuthentication
+        set to true AND network reach to the cluster endpoint is confirmed (trivially
+        true for public endpoints; CONDITIONAL(network_reachability) for VPC-private).
+        BLOCKED if an SCP or IAM boundary denies either action.
+      narrative: >-
+        {principal.name} has neptune-db:connect and neptune-db:WriteDataViaQuery on
+        Neptune cluster {cluster.name}; with IAM database authentication enabled,
+        {principal.name} can issue SigV4-signed write/mutation queries (Gremlin
+        addV/addE, openCypher CREATE/SET, SPARQL INSERT/DELETE) and modify all
+        graph data (vertices, edges, properties), potentially poisoning trust
+        relationships or other critical graph structures.
+
+  # --- A3) CanDeleteData via neptune-db:connect + neptune-db:DeleteDataViaQuery ---
+  # A principal with both neptune-db:connect and neptune-db:DeleteDataViaQuery on
+  # the cluster resource ARN can execute delete queries (Gremlin drop, openCypher
+  # DELETE, SPARQL DELETE). This allows destructive erasure of graph data.
+  - id: aws-neptune-iam-auth-delete-data
+    emits: CanDeleteData
+    description: "Principal with neptune-db:connect and neptune-db:DeleteDataViaQuery on the cluster resource ARN can execute delete queries and erase graph data."
+    match_effective_permission:
+      action: ["neptune-db:connect", "neptune-db:DeleteDataViaQuery"]
+      resource_type: "AWS::Neptune::DBCluster"
+    where:
+      - "cluster.EnableIAMDatabaseAuthentication == true"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: "<principal>"
+      target: "<Neptune cluster (NoSQLDatabase)>"
+      permissions: ["neptune-db:connect", "neptune-db:DeleteDataViaQuery"]
+      conditions: [iam_permission, network_reachability]
+      derived_from: ["HasPermission(neptune-db:connect)", "HasPermission(neptune-db:DeleteDataViaQuery)"]
+      state_logic: >-
+        ACTIVE when the principal's effective IAM permissions include both
+        neptune-db:connect and neptune-db:DeleteDataViaQuery on the cluster's
+        neptune-db resource ARN AND the cluster has EnableIAMDatabaseAuthentication
+        set to true AND network reach to the cluster endpoint is confirmed.
+        BLOCKED if an SCP or IAM boundary denies either action.
+      narrative: >-
+        {principal.name} has neptune-db:connect and neptune-db:DeleteDataViaQuery on
+        Neptune cluster {cluster.name}; with IAM database authentication enabled,
+        {principal.name} can issue SigV4-signed delete queries and erase all graph
+        data (vertices, edges, properties).
+
+  # --- A4) CanReadData via GetStreamRecords (Neptune Streams lateral movement) ---
+  # A principal with neptune-db:connect and neptune-db:GetStreamRecords on the cluster
+  # can read all graph mutations from the Neptune Streams endpoints (/propertygraph/stream
+  # or /sparql/stream), effectively reading all historical graph data changes without
+  # needing direct query access. This is a distinct lateral-movement path.
+  - id: aws-neptune-stream-read-data
+    emits: CanReadData
+    description: "Principal with neptune-db:connect and neptune-db:GetStreamRecords on the cluster resource ARN can read all graph mutations via Neptune Streams."
+    match_effective_permission:
+      action: ["neptune-db:connect", "neptune-db:GetStreamRecords"]
+      resource_type: "AWS::Neptune::DBCluster"
+    where:
+      - "cluster.EnableIAMDatabaseAuthentication == true"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: "<principal>"
+      target: "<Neptune cluster (NoSQLDatabase)>"
+      permissions: ["neptune-db:connect", "neptune-db:GetStreamRecords"]
+      conditions: [iam_permission, network_reachability]
+      derived_from: ["HasPermission(neptune-db:connect)", "HasPermission(neptune-db:GetStreamRecords)"]
+      state_logic: >-
+        ACTIVE when the principal's effective IAM permissions include both
+        neptune-db:connect and neptune-db:GetStreamRecords on the cluster's
+        neptune-db resource ARN AND the cluster has EnableIAMDatabaseAuthentication
+        set to true AND network reach to the cluster endpoint is confirmed.
+        BLOCKED if an SCP or IAM boundary denies either action.
+      false_positive_note: >-
+        Neptune Streams access leaks ALL mutation history, not just the current
+        graph state. A principal with GetStreamRecords can reconstruct the entire
+        evolution of the graph, including vertices/edges since the stream retention
+        window started (default 24 hours).
+      narrative: >-
+        {principal.name} has neptune-db:connect and neptune-db:GetStreamRecords on
+        Neptune cluster {cluster.name}; with IAM database authentication enabled,
+        {principal.name} can read all graph mutations via Neptune Streams
+        (/propertygraph/stream or /sparql/stream), effectively accessing all
+        historical graph data changes without direct query access.
+
+  # ===========================================================================
+  # SECTION C — CROSS-ACCOUNT SNAPSHOT SHARING (CanExfiltrate)
+  # ===========================================================================
+
+  # --- C0) CanExfiltrate: snapshot already public (immediate restore capability) -----
+  # A Neptune cluster snapshot with restore attribute already set to 'all' (via prior
+  # ModifyDBClusterSnapshotAttribute call) establishes a CrossAccountTrust to an external
+  # Account. ANY AWS account can immediately call rds:RestoreDBClusterFromSnapshot
+  # without any permission grant or intermediate action — this is an ALREADY-REALIZED
+  # exfiltration surface, not just a capability for someone to grant. This rule emits
+  # CanExfiltrate(AnonymousIdentity, snapshot) to indicate the immediate realizability
+  # of full data exfiltration by any unauthenticated principal.
+  - id: aws-neptune-snapshot-already-public-exfil
+    emits: CanExfiltrate
+    description: "Neptune cluster snapshot with public restore attribute (restore=all) is immediately exfiltrable by any AWS account via RestoreDBClusterFromSnapshot."
+    match:
+      - [ ?snapshot, CrossAccountTrust, ?account ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "node_type(?account) == Account"
+      - "?snapshot.SnapshotType == 'manual'"
+    emit:
+      source_type: AnonymousIdentity
+      target_type: Snapshot
+      source: "<AnonymousIdentity>"
+      target: ?snapshot
+      permissions: ["rds:RestoreDBClusterFromSnapshot"]
+      conditions: [key_permission]
+      derived_from: ["CrossAccountTrust(?snapshot, ?account)"]
+      state_logic: >-
+        ACTIVE when the snapshot has a public restore permission (AttributeValues='all',
+        emitted as CrossAccountTrust to external Account) and is a manual snapshot.
+        Any AWS account can call rds:RestoreDBClusterFromSnapshot to obtain a full
+        offline copy of all graph data. CONDITIONAL(key_permission) only if the snapshot
+        is encrypted with a customer-managed KMS key (CMK) — the restoring account must
+        also hold kms:Decrypt / kms:CreateGrant on the CMK for the restore to succeed.
+        Without the key grant, the restore call fails.
+      narrative: >-
+        Neptune cluster snapshot {snapshot.name} is immediately restorable by any AWS
+        account (AttributeValues='all'). Any account can call rds:RestoreDBClusterFromSnapshot
+        to create a full copy of all graph data (vertices, edges, properties) — the
+        snapshot itself is a complete offline exfiltration surface requiring no credentials
+        or additional action from the attacker.
+
+  # --- C1) CanExfiltrate: ModifyDBClusterSnapshotAttribute (restore=all / accountId)
+  # rds:ModifyDBClusterSnapshotAttribute with AttributeName=restore and
+  # ValuesToAdd=[all] or ValuesToAdd=[<accountId>] grants the named account(s)
+  # (or any AWS account when "all") the ability to call
+  # rds:RestoreDBClusterFromSnapshot in their own account, yielding a full
+  # copy of all graph data.
+  #
+  # This is the primary data exfiltration primitive for Neptune — analogous to
+  # rds:ModifyDBSnapshotAttribute for RDS. No DB master password is needed; the
+  # snapshot contains a complete offline copy of all graph data at rest.
+  #
+  # For CMK-encrypted snapshots the restoring account must also hold
+  # kms:Decrypt / kms:CreateGrant on the wrapping CMK — downgrade to
+  # CONDITIONAL(key_permission) for CMK-encrypted snapshots.
+  #
+  # Automated snapshots CANNOT be directly shared via ModifyDBClusterSnapshotAttribute;
+  # only manual snapshots support this operation. Do not emit for automated snapshots.
+  - id: aws-neptune-snapshot-exfil
+    emits: CanExfiltrate
+    description: "Principal with rds:ModifyDBClusterSnapshotAttribute permission on a Neptune cluster snapshot can share it cross-account or make it publicly restorable, enabling full graph data exfiltration."
+    match:
+      - [ ?principal, HasPermission, ?perm ]
+    where:
+      - "?perm.action == 'rds:ModifyDBClusterSnapshotAttribute'"
+      - "?perm.resource_type == 'AWS::Neptune::DBClusterSnapshot'"
+      - "target snapshot is of type SnapshotType: manual (automated snapshots cannot be shared)"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: "<Neptune cluster snapshot (Snapshot)>"
+      permissions: ["rds:ModifyDBClusterSnapshotAttribute"]
+      conditions: [iam_permission, key_permission]
+      derived_from: ["HasPermission(?principal, ?perm)"]
+      state_logic: >-
+        ACTIVE when the principal has effective rds:ModifyDBClusterSnapshotAttribute
+        on the snapshot ARN AND the snapshot is a manual snapshot (SnapshotType: manual)
+        AND the snapshot is NOT CMK-encrypted (service-managed encryption does not
+        require a key grant from the restoring account). CONDITIONAL(key_permission)
+        when the snapshot is encrypted with a customer-managed KMS key (CMK) — the
+        exfiltration is only completable if the target account is also granted
+        kms:Decrypt / kms:CreateGrant on the CMK. BLOCKED if an SCP or IAM boundary
+        denies neptune:ModifyDBClusterSnapshotAttribute. The severity is highest when
+        ValuesToAdd=[all] (public — any AWS account can restore); lower but still high
+        when ValuesToAdd=[<specific accountId>] (targeted share).
+      false_positive_note: >-
+        Only manual Neptune cluster snapshots (SnapshotType: manual) can be shared
+        via ModifyDBClusterSnapshotAttribute. Automated snapshots cannot be directly
+        shared — do not emit for automated snapshots. For CMK-encrypted snapshots,
+        the target account must also receive a KMS key grant; without it the
+        RestoreDBClusterFromSnapshot call fails — downgrade to CONDITIONAL(key_permission)
+        and note the CMK ARN from the snapshot's KmsKeyId field. Distinguish
+        ValuesToAdd=[all] (public — highest severity) from ValuesToAdd=[<accountId>]
+        (targeted share — still high severity but scoped to one account). An existing
+        ModifyDBClusterSnapshotAttribute grant with AttributeValues already containing
+        "all" or specific accountIds means the snapshot is ALREADY shared; emit with
+        ACTIVE on the shared state, not just on the sharing capability of the principal.
+      narrative: >-
+        {principal.name} can call rds:ModifyDBClusterSnapshotAttribute on Neptune
+        cluster snapshot {snapshot.name} to set restore access to any AWS account or
+        to a specific attacker-controlled account; the recipient account can then call
+        rds:RestoreDBClusterFromSnapshot to create a full copy of all graph data
+        (vertices, edges, properties) — a complete offline data exfiltration without
+        compromising the live cluster.
+
+  # ===========================================================================
+  # SECTION D — CONFIGURATION MODIFICATION ESCALATION PATHS
+  # ===========================================================================
+
+  # --- D1) CanReadData via CanModifyConfiguration (disable IAM auth escalation) ---
+  # A principal with CanModifyConfiguration on a Neptune cluster can disable IAM
+  # database authentication (EnableIAMDatabaseAuthentication=false). If the cluster
+  # is publicly accessible (or network-reachable), this escalates to CanReadData
+  # because unauthenticated queries then become possible.
+  #
+  # This is a multi-hop escalation: attacker -> CanModifyConfiguration -> modify cluster
+  # -> disable IAM auth -> public cluster (or network-reachable) -> unauthenticated read.
+  #
+  # State is CONDITIONAL(condition_expression) because the escalation requires an
+  # INTERMEDIATE ACTION (calling rds:ModifyDBCluster to disable IAM auth) before
+  # CanReadData becomes possible. Network reachability is already confirmed by the
+  # ExposedToInternet match, so it is not a blocking precondition.
+  - id: aws-neptune-modify-config-yields-read-data
+    emits: CanReadData
+    description: "Principal with CanModifyConfiguration on a Neptune cluster can disable IAM authentication to escalate to CanReadData if the cluster is publicly accessible or network-reachable."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?cluster ]
+      - [ ?cluster, ExposedToInternet, ?anon ]
+    where:
+      - "node_type(?cluster) == NoSQLDatabase"
+      - "?cluster.EnableIAMDatabaseAuthentication == true (must be enableable; rule applies when it CAN be disabled)"
+    emit:
+      source_type: Identity
+      target_type: NoSQLDatabase
+      source: ?principal
+      target: ?cluster
+      permissions: ["rds:ModifyDBCluster"]
+      conditions: [iam_permission, condition_expression]
+      derived_from: ["CanModifyConfiguration(?principal, ?cluster)", "ExposedToInternet(?cluster, ?anon)"]
+      state_logic: >-
+        CONDITIONAL(condition_expression) because the escalation path requires an
+        additional action before CanReadData becomes ACTIVE:
+        (1) principal has CanModifyConfiguration (confirmed by the match),
+        (2) cluster is ExposedToInternet (confirmed by the match, so network
+            reachability is already satisfied), AND
+        (3) principal must execute rds:ModifyDBCluster to disable
+            EnableIAMDatabaseAuthentication, and then issue unauthenticated queries.
+        The blocking precondition is the intermediate two-step action requirement
+        (disable IAM auth, then query), not network reachability. Network reachability
+        is a prerequisite already confirmed by the ExposedToInternet match.
+        If the cluster is not ExposedToInternet or if IAM auth is already false,
+        this rule does not apply.
+      narrative: >-
+        {principal.name} can modify Neptune cluster {cluster.name} configuration
+        and the cluster is exposed to the internet; by executing rds:ModifyDBCluster
+        to disable IAM database authentication (EnableIAMDatabaseAuthentication=false),
+        {principal.name} can then issue unauthenticated queries and read all graph
+        data without credentials — a two-step escalation from configuration control
+        to data access.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP denying neptune-db:connect or neptune-db:ReadDataViaQuery on the
+#    cluster resource ARN -> CanReadData (A1) BLOCKED.
+#  - An SCP denying rds:ModifyDBClusterSnapshotAttribute -> CanExfiltrate
+#    (C1) BLOCKED.
+#  - VPC security group restricting all Neptune ports (8182, 8183, 8184) to
+#    specific CIDRs -> ExposedToInternet (B1) BLOCKED or CONDITIONAL(network_reachability).
+#  - PubliclyAccessible: false on the DB instance -> ExposedToInternet (B1)
+#    BLOCKED regardless of IAM auth or SG configuration.
+#  - EnableIAMDatabaseAuthentication: true on the cluster -> ExposedToInternet
+#    ACTIVE downgraded to CONDITIONAL(condition_expression) — not anonymous.
+#  - CMK-encrypted snapshot + no key grant in restoring account -> CanExfiltrate
+#    CONDITIONAL(key_permission), not ACTIVE.
+# ---------------------------------------------------------------------------
+# NOTE: Explicit normalization rules for aws-neptune (CanAdminister,
+# CanModifyConfiguration, snapshot-cross-account-trust, snapshot-public-exposed)
+# have been moved to /rules/explicit/aws-neptune.yaml per RULE-FORMAT.md.
+# Derived rules must NOT include explicit_rules section — that section is
+# ignored by the evaluation engine.
+# ---------------------------------------------------------------------------

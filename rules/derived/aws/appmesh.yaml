@@ -1,0 +1,257 @@
+# AWS App Mesh — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# App Mesh is a service-mesh control plane that distributes Envoy xDS
+# configuration to sidecar proxies running inside ECS tasks, K8s pods, or EC2
+# instances. It is a LOW-relevance service in this corpus (1 conservative rule).
+#
+# ATTACK SURFACE (Phase 8 scope):
+#
+#   (1) WEAKEN CONTROLS (traffic hijack): a principal with appmesh:UpdateRoute,
+#       appmesh:UpdateVirtualService, appmesh:UpdateGatewayRoute, or
+#       appmesh:UpdateVirtualNode can alter the Envoy xDS configuration delivered
+#       to mesh-enrolled sidecars, redirecting in-mesh or inbound gateway traffic
+#       to an attacker-controlled virtual node -> CanModifyConfiguration on the
+#       mesh routing resource.
+#
+# WHAT THESE RULES DO NOT EMIT:
+#   - CanExecuteAs / CanEscalateTo / CanEnterAccount: App Mesh does not introduce
+#     or assume IAM roles; modifying routing config does not grant AWS credentials.
+#   - ExposedToInternet: App Mesh resources are not directly internet-facing;
+#     internet exposure is captured by ALB/NLB rules for any load balancer fronting
+#     a virtual gateway.
+#   - CanNetworkReach (transitive): end-to-end mesh reachability (which service can
+#     reach which, through which route) is the future network-chains linchpin.
+#     This file emits per-service FACTS only.
+#   - RoutesTo as a derived rule: virtual-router-to-virtual-node route facts are
+#     structural and best emitted directly by the collector from
+#     appmesh:DescribeRoute raw data (see explicit_rules section below).
+#
+# NODE CLASS CONFORMANCE (schema/nodes.yaml + schema/edges.yaml):
+#   Mesh -> VirtualNetwork (Network class)
+#   VirtualRouter, VirtualNode, VirtualService -> GenericNetwork (Network class)
+#   VirtualGateway -> APIGateway (Messaging class)
+#   Route, GatewayRoute -> Route (Network class)
+#
+#   CanModifyConfiguration: source = [Identity] ✓
+#                           target = [Compute, Messaging, Network, "*"] ✓
+#                           (VirtualNetwork, GenericNetwork, APIGateway, Route all
+#                            resolve to Network or Messaging — both admitted by "*")
+#
+# PERMISSIONS — exact action names from:
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsappmesh.html
+#
+# CITED LINCHPINS (not duplicated here):
+#   /rules/derived/can-control.yaml — CanAdminister/CanGrantPermission -> Controls.
+#     App Mesh does not yield Controls over any IAM boundary directly; N/A.
+#   Network-chains file (FUTURE) — composes RoutesTo mesh facts with SG / route-table
+#     / VPC peering facts into end-to-end CanNetworkReach edges.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 8-networking
+service: appmesh
+applies_to: [aws]
+
+# ===========================================================================
+# EXPLICIT normalization rules — raw config -> explicit edges.
+# Co-located for low-relevance services per project convention.
+# ===========================================================================
+explicit_rules:
+
+  # --- Virtual route (non-zero weight) -> RoutesTo (structural fact) ---------
+  # A virtual route rule in an ACTIVE mesh with at least one weighted target
+  # with weight > 0 represents a routing FACT: traffic matching this route is
+  # forwarded to the named virtual node(s). Emitted as RoutesTo so the future
+  # network-chains linchpin can compose mesh routing topology.
+  #
+  # NOTE on edge class conformance: RoutesTo in edges.yaml declares
+  #   source: [Route, Subnet, TransitGateway], target: [Network, Subnet].
+  # A VirtualRouter (generic_type GenericNetwork) is the logical routing entity;
+  # in the App Mesh model, the *Route* resource (generic_type Route) is the
+  # direct source of routing facts. Map: Route (AWS::AppMesh::Route) -> Route
+  # generic type (Network class) -> source set includes Route ✓.
+  # Target: VirtualNode (GenericNetwork, Network class) -> target set includes
+  # Network ✓.
+  - id: aws-appmesh-route-to-virtual-node
+    emits: RoutesTo
+    description: >-
+      An App Mesh Route rule with at least one weighted virtual-node target
+      (weight > 0) routes in-mesh traffic from the virtual router to the named
+      virtual node backend. Structural routing FACT consumed by the future
+      network-chains linchpin.
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::AppMesh::Route"
+      field: "route.spec"
+    where:
+      - "route.status.status == 'ACTIVE'"
+      - "at least one weightedTarget in (spec.httpRoute OR spec.http2Route OR spec.grpcRoute OR spec.tcpRoute).action.weightedTargets has weight > 0"
+    emit:
+      source_type: Route
+      target_type: GenericNetwork
+      source: "<Route node (AWS::AppMesh::Route)>"
+      target: "<VirtualNode node named by weightedTarget.virtualNode>"
+      state: CONDITIONAL
+      permissions: []
+      conditions: [network_reachability, service_state]
+      state_logic: >-
+        CONDITIONAL(network_reachability): the routing FACT exists when the route
+        is in ACTIVE state and the weighted target has weight > 0. Whether a
+        specific workload pod/task registered under this virtual node is actually
+        reachable additionally requires (a) VPC routing, (b) security group rules,
+        and (c) the Envoy sidecar being correctly enrolled — evaluated by the
+        network-chains linchpin. Downgrade to CONDITIONAL(service_state) when
+        route status is not ACTIVE. Do NOT emit for zero-weight targets.
+      api_source: "appmesh:ListRoutes, appmesh:DescribeRoute"
+      evidence_field: >-
+        route.status.status == 'ACTIVE';
+        route.spec.(httpRoute|http2Route|grpcRoute|tcpRoute).action.weightedTargets[].virtualNode;
+        route.spec.(httpRoute|http2Route|grpcRoute|tcpRoute).action.weightedTargets[].weight
+      false_positive_note: >-
+        (1) Zero-weight gate: weighted targets with weight == 0 do not receive
+        traffic. Do not emit RoutesTo for zero-weight entries — they represent
+        inactive canary/drain configurations.
+        (2) Route status: only ACTIVE routes forward traffic. INACTIVE routes
+        must not emit RoutesTo.
+        (3) This edge is a STRUCTURAL FACT consumed by the network-chains linchpin;
+        it is NOT walked by default attack-path queries (RoutesTo is walkable: false
+        in edges.yaml). It exists to enable topology-aware composition.
+        (4) Multiple weighted targets: if a route has N weighted targets, emit N
+        separate RoutesTo edges (one per virtual node). Each edge is independent.
+        (5) mTLS: if the target virtual node enforces strict mTLS, traffic is
+        mutually authenticated and encrypted at the sidecar. A hijacked virtual
+        node that lacks the correct client certificate cannot impersonate a
+        legitimate service or decrypt intercepted traffic. Annotate with lower
+        risk when strict mTLS is observed.
+      narrative: >-
+        The App Mesh Route {source.name} directs in-mesh service traffic to the
+        virtual node {target.name} (weight: {weightedTarget.weight}). An attacker
+        who modifies this route (appmesh:UpdateRoute) can redirect the traffic
+        share to a different or attacker-controlled virtual node backend.
+
+# ===========================================================================
+# DERIVED rules — combine HasPermission + mesh facts -> capability edges
+# ===========================================================================
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1. Modify mesh routing config -> CanModifyConfiguration (traffic hijack)
+  # ---------------------------------------------------------------------------
+  # A principal with any of the listed appmesh write actions can alter the Envoy
+  # xDS configuration for mesh-enrolled sidecars, changing which virtual node
+  # (and therefore which service endpoint) receives in-mesh traffic. This is a
+  # network-control-plane manipulation primitive analogous to modifying a firewall
+  # rule or route table entry.
+  #
+  # HIGH-VALUE ACTIONS:
+  #   appmesh:UpdateRoute        — change route weights or virtual-node targets
+  #                                on a virtual router (directly redirects traffic)
+  #   appmesh:UpdateVirtualService — re-point a virtual service to a different
+  #                                virtual router or virtual node, affecting ALL
+  #                                consumers of that named service in the mesh
+  #   appmesh:UpdateGatewayRoute  — change virtual gateway route target, redirecting
+  #                                inbound external traffic entering the mesh
+  #   appmesh:UpdateVirtualNode   — change service-discovery config (DNS name,
+  #                                Cloud Map namespace/service) for a backend,
+  #                                effectively redirecting upstream traffic to a
+  #                                different process
+  #   appmesh:CreateRoute         — inject a new high-weight route alongside
+  #                                existing routes, capturing a traffic share
+  #
+  # WHAT THIS DOES NOT YIELD:
+  #   IAM credentials, role assumption, or account boundary crossing. The escalation
+  #   chain beyond this edge requires: (a) unencrypted / non-mTLS mesh traffic,
+  #   (b) sensitive data (credentials/tokens) in that traffic, (c) the attacker
+  #   controlling the redirected-to virtual node's backing compute.
+  # ---------------------------------------------------------------------------
+  - id: aws-appmesh-modify-route-config
+    emits: CanModifyConfiguration
+    description: >-
+      A principal with App Mesh route/service write actions can modify the Envoy xDS
+      configuration delivered to mesh sidecars, redirecting in-mesh or inbound gateway
+      traffic to an attacker-controlled virtual node (traffic hijack within the mesh).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?meshresource ]
+    where:
+      - "node_type(?meshresource) in [VirtualNetwork, GenericNetwork, APIGateway, Route]"
+      - "?meshresource.provider_type in ['AWS::AppMesh::Mesh', 'AWS::AppMesh::VirtualRouter', 'AWS::AppMesh::Route', 'AWS::AppMesh::VirtualService', 'AWS::AppMesh::VirtualGateway', 'AWS::AppMesh::GatewayRoute', 'AWS::AppMesh::VirtualNode']"
+      - >-
+        effective_action_on(?principal, ?meshresource) intersects [
+          'appmesh:UpdateRoute',
+          'appmesh:UpdateVirtualService',
+          'appmesh:UpdateGatewayRoute',
+          'appmesh:UpdateVirtualNode',
+          'appmesh:CreateRoute'
+        ]
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: ?principal
+      target: ?meshresource
+      permissions:
+        - "appmesh:UpdateRoute"
+        - "appmesh:UpdateVirtualService"
+        - "appmesh:UpdateGatewayRoute"
+        - "appmesh:UpdateVirtualNode"
+        - "appmesh:CreateRoute"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when effective_action_on(?principal, ?meshresource) includes at least
+        one of the listed appmesh write actions and no SCP or permission boundary
+        explicitly denies them at the effective scope. BLOCKED when an SCP denies
+        the matched action(s) on the mesh or mesh resource ARN. No resource-based
+        policy applies to App Mesh (the service has no resource-based policy support);
+        IAM is the sole authorization layer.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<HasPermission edge_id>" ]
+      false_positive_note: >-
+        (1) NO IAM ESCALATION: App Mesh routing changes do not grant IAM credentials
+        or assume roles. Do NOT chain CanModifyConfiguration (App Mesh) directly to
+        CanExecuteAs or CanEnterAccount without additional evidence that the redirected
+        traffic contains exploitable credentials or that the backing compute node is
+        under attacker control.
+        (2) mTLS gate: if the mesh enforces strict mutual TLS on all virtual nodes
+        (TLSValidationContext.trust with strict mode), a hijacked virtual node cannot
+        impersonate a legitimate service certificate — the sidecar rejects the
+        connection. Annotate this edge with lower confidence (0.6 floor) and note
+        the mTLS control when strict mTLS is confirmed. The edge is still emitted
+        because appmesh:UpdateVirtualNode could change the TLS config itself.
+        (3) Shared-mesh scope: in a RAM-shared mesh, only principals explicitly
+        granted appmesh:Update* in their IAM policies (not just RAM share recipients)
+        can modify routing. RAM sharing alone does not grant write access — honor
+        the effective-permission evaluator output.
+        (4) appmesh:CreateRoute requires the virtual router ARN as the resource
+        scope; a wildcard (*) resource grant includes it, but a narrowly scoped
+        grant to specific route ARNs may not cover route creation. Check resource
+        scope in the effective-permission evaluation.
+        (5) appmesh:UpdateMesh (not listed) changes only the mesh-level egress
+        filter (ALLOW_ALL vs DROP_ALL). This is a configuration change but its
+        direct security impact is egress filtering, not traffic redirection — it is
+        NOT included in this rule's permission set to avoid over-claiming.
+      narrative: >-
+        {principal.name} can modify App Mesh routing configuration on {meshresource.name}
+        (appmesh write actions including UpdateRoute / UpdateVirtualService /
+        UpdateGatewayRoute / UpdateVirtualNode). This allows the principal to redirect
+        in-mesh service-to-service traffic or inbound gateway traffic to an alternate
+        or attacker-controlled virtual node backend. If mutual TLS is not enforced in
+        the mesh, intercepted plaintext traffic may expose credentials, session tokens,
+        or other sensitive data carried in HTTP headers or request bodies.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying appmesh:UpdateRoute, appmesh:UpdateVirtualService, or
+#     appmesh:UpdateGatewayRoute at account/OU scope -> emit
+#     aws-appmesh-modify-route-config with state: BLOCKED and
+#     denied_by=<SCP ARN/statement>.
+#   - A permission boundary capping the principal below the relevant write
+#     actions -> BLOCKED similarly.
+#
+# LINCHPIN CITATIONS (do NOT duplicate):
+#   can-control.yaml — CanAdminister/CanGrantPermission -> Controls.
+#     App Mesh does not yield Controls over any IAM boundary directly; N/A.
+#   Network-chains (FUTURE) — composes RoutesTo mesh facts (from explicit_rules
+#     above) + VPC SG + route-table facts into end-to-end CanNetworkReach chains.
+#     This is the key consumer of aws-appmesh-route-to-virtual-node RoutesTo edges.
+#     Do NOT pre-empt it here.
+# ---------------------------------------------------------------------------

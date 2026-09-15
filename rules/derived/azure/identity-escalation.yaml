@@ -1,0 +1,160 @@
+# Azure — Identity & Authorization escalation rules (Phase 2)
+# ---------------------------------------------------------------------------
+# Azure has TWO linked planes and escalation frequently crosses them:
+#   RESOURCE PLANE (ARM RBAC): roleAssignments/write at MG/sub/RG/resource scope.
+#   IDENTITY PLANE (Entra):   directory roles, app/SP credentials & ownership,
+#                             group membership, MS Graph app permissions.
+# Deny assignments win over role assignments -> BLOCKED edges.
+# There is no sts:AssumeRole analog; "become another principal" is expressed as
+# CanCreateCredentialFor (add SP/app secret) or CanTakeOwnership -> credential.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 2-identity-authorization
+applies_to: [azure]
+
+rules:
+
+  # === RESOURCE PLANE (ARM RBAC) ============================================
+  - id: azure-role-assignment-write
+    emits: CanGrantPermission
+    match_effective_permission: {action: "Microsoft.Authorization/roleAssignments/write", scope_type: "mg|subscription|resourceGroup|resource"}
+    where: ["principal effectively holds Owner or User Access Administrator (or custom role with this action) at the scope"]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<scope (mg/subscription/rg/resource)>"
+      permissions: ["Microsoft.Authorization/roleAssignments/write"]
+      escalation: "Assign Owner to self at the scope -> full control of everything under it."
+      cross_boundary: "at subscription scope -> Controls(subscription) via can-control roll-up"
+      false_positive_note: "Contributor does NOT include roleAssignments/write; only Owner and User Access Administrator (and custom roles explicitly granting it) qualify."
+      narrative: "{principal.name} can create role assignments at {scope.name} (Owner/User Access Administrator) and grant itself Owner."
+
+  - id: azure-role-definition-write
+    emits: CanModifyPolicy
+    match_effective_permission: {action: "Microsoft.Authorization/roleDefinitions/write", scope_type: "mg|subscription"}
+    emit: {source: "<principal>", target: "<scope>", permissions: ["Microsoft.Authorization/roleDefinitions/write"],
+           escalation: "Create/modify a custom role with elevated actions, then (if also can assign) grant it.",
+           narrative: "{principal.name} can create/modify custom role definitions at {scope.name}."}
+
+  # === IDENTITY PLANE (Entra) ===============================================
+  # --- Service principal / app credential addition (the Azure 'assume') -----
+  - id: azure-sp-add-credential
+    emits: CanCreateCredentialFor
+    match_effective_permission: {action: "add password/certificate to servicePrincipal", api: "MS Graph servicePrincipals/{id}/addPassword"}
+    where: ["principal is an OWNER of the SP OR holds Application.ReadWrite.All / directory role (Cloud App Admin, App Admin)"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<service principal>"
+      permissions: ["microsoft.directory/servicePrincipals/credentials/update", "Application.ReadWrite.All"]
+      escalation: "Add a client secret to a privileged SP and authenticate as it (inherit its app roles / RBAC)."
+      narrative: "{principal.name} can add credentials to service principal {sp.name} and authenticate as it."
+
+  - id: azure-app-add-credential
+    emits: CanCreateCredentialFor
+    match_effective_permission: {action: "add password/certificate to application", api: "MS Graph applications/{id}/addPassword"}
+    where: ["principal is an OWNER of the app registration OR holds Application.ReadWrite.All / Application Administrator"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<application registration>"
+      permissions: ["microsoft.directory/applications/credentials/update", "Application.ReadWrite.All"]
+      escalation: "Add a secret to a high-privilege app registration and obtain its tokens."
+      narrative: "{principal.name} can add credentials to app registration {app.name} and authenticate as its service principal."
+
+  - id: azure-app-sp-ownership
+    emits: CanTakeOwnership
+    match_effective_permission: {action: "owner of application/servicePrincipal"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<application/servicePrincipal>"
+      permissions: ["microsoft.directory/applications/owners OR servicePrincipals/owners"]
+      note: "Ownership -> ability to add credentials -> CanCreateCredentialFor (chained)."
+      narrative: "{principal.name} owns {app.name} and can therefore add credentials and act as it."
+
+  # --- Directory (Entra) role assignment ------------------------------------
+  - id: azure-directory-role-assign
+    emits: CanGrantPermission
+    match_effective_permission: {action: "microsoft.directory/roleAssignments/create OR RoleManagement.ReadWrite.Directory"}
+    where: ["principal holds Privileged Role Administrator or Global Administrator"]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<tenant>"
+      permissions: ["Privileged Role Administrator", "RoleManagement.ReadWrite.Directory"]
+      escalation: "Grant self Global Administrator -> tenant takeover."
+      cross_boundary: "emits Controls(tenant) / CanEnterTenant"
+      narrative: "{principal.name} can assign Entra directory roles (Privileged Role Admin) and self-grant Global Administrator."
+
+  # --- Group ownership / membership -----------------------------------------
+  - id: azure-group-owner-add-member
+    emits: CanAddMember
+    match_effective_permission: {action: "owner or member-write on group"}
+    where: ["group grants a privileged role/RBAC assignment", "group is role-assignable or has active assignments"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<group>"
+      permissions: ["microsoft.directory/groups/members/update OR group owner"]
+      escalation: "Add self to a group that carries a privileged role."
+      false_positive_note: "Dynamic-membership groups cannot be joined by adding a member; check membershipRule instead."
+      narrative: "{principal.name} can add members to group {group.name} which carries privileged access."
+
+  # --- Password / auth reset -------------------------------------------------
+  - id: azure-reset-password
+    emits: CanResetCredential
+    match_effective_permission: {action: "microsoft.directory/users/password/update (reset)"}
+    where: ["principal holds Authentication Administrator / Helpdesk Administrator / User Administrator", "target is not a higher-privileged admin (restricted-admin protection)"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<user>"
+      permissions: ["Authentication Administrator | User Administrator"]
+      false_positive_note: "Authentication/Helpdesk/User admins are BLOCKED from resetting credentials of higher-tier admins; honor Entra's restricted-management protections -> BLOCKED edge."
+      narrative: "{principal.name} can reset the password of {user.name} (Authentication/User Administrator)."
+
+  # --- MS Graph app permission consent (privilege via API) ------------------
+  - id: azure-graph-app-role-grant
+    emits: CanGrantPermission
+    match_effective_permission: {action: "appRoleAssignment / admin consent", perm: "AppRoleAssignment.ReadWrite.All + Application.ReadWrite.All"}
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal / service principal>"
+      target: "<service principal>"
+      permissions: ["AppRoleAssignment.ReadWrite.All"]
+      escalation: "Grant a controlled SP the RoleManagement.ReadWrite.Directory app role -> Global-Admin-equivalent."
+      false_positive_note: "This is the classic Graph privesc: AppRoleAssignment.ReadWrite.All lets an SP grant itself any app role. Flag high-impact."
+      narrative: "{principal.name} can assign MS Graph app roles (AppRoleAssignment.ReadWrite.All) and grant itself directory-write, reaching tenant control."
+
+  # --- Managed identity assignment (PassRole analog) ------------------------
+  - id: azure-assign-user-assigned-mi
+    emits: CanPassIdentity
+    match_effective_permission: {action: "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"}
+    where: ["principal also has write on a compute resource that can bind the MI"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "<resource>/write"]
+      note: "Pairs with compute write -> CanExecuteAs(MI) (Phase 4)."
+      narrative: "{principal.name} can assign user-assigned MI {mi.name} to a resource it controls and execute as it."
+
+  - id: azure-federated-credential-write
+    emits: CanModifyTrust
+    match_effective_permission: {action: "add federatedIdentityCredential to app/MI", api: "MS Graph applications/{id}/federatedIdentityCredentials"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<application / managed identity>"
+      permissions: ["microsoft.directory/applications/credentials/update"]
+      escalation: "Add a federated credential trusting an attacker-controlled OIDC issuer -> token as the app without a secret."
+      narrative: "{principal.name} can add a federated identity credential to {app.name}, trusting an external issuer it controls."
+
+# Deny-assignment handling: any action above that is covered by an applicable
+# deny assignment is emitted as BLOCKED with denied_by=<deny assignment>.

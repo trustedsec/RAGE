@@ -1,0 +1,350 @@
+# Azure NetApp Files — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Azure NetApp Files (ANF) is a bare-metal NFS/SMB file service with no public
+# endpoint and no managed-identity execution model. All data-plane access is
+# private (delegated subnet) and governed by NFS export policies / SMB ACLs.
+#
+# ANF resource provider: Microsoft.NetApp
+#   netAppAccounts -> capacityPools -> volumes -> snapshots/backups
+#
+# Verified permissions (Microsoft.NetApp resource-provider operations, 2026):
+#   listCredentials: Microsoft.NetApp/netAppAccounts/listCredentials/action
+#   volume read:     Microsoft.NetApp/netAppAccounts/capacityPools/volumes/read
+#
+# Phase 6 dominant primitives for ANF (low attack surface — 2 conservative rules):
+#   (1) CREDENTIAL GRAB: listCredentials/action returns the AD join password stored
+#       on the ANF account, enabling lateral movement within the Active Directory
+#       domain -> ExposesCredential.
+#   (2) DATA READ: in-VNet NFS/SMB mount of a volume -> CanReadData.
+#       Gated on network_reachability to the delegated subnet AND export policy
+#       compliance. ARM read permission alone does NOT constitute data-plane access.
+#
+# ExposedToInternet does NOT apply: ANF has no public endpoint by platform design.
+#
+# Linchpin citations (CITE, DO NOT DUPLICATE):
+#   credential-chains.yaml — CanReadCredential + CredentialsFor -> [PENDING: new rule]
+#     (the AD join credential CanReadCredential -> CredentialsFor the AD machine
+#      account -> CanImpersonate impersonation chain; see note below on missing
+#      read-credential-yields-identity rule).
+#   can-control.yaml — CanAdminister + CanGrantPermission -> Controls / CanEscalateTo
+#     (derived from the broader ARM RBAC grant, not ANF-specific).
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 6-storage-databases
+applies_to: [azure]
+
+rules:
+
+  # --- listCredentials -> CanReadCredential (AD join password retrieval) ----
+  # Microsoft.NetApp/netAppAccounts/listCredentials/action returns the plaintext
+  # Active Directory join password stored on the ANF account. A principal with
+  # listCredentials/action permission can read this credential; the downstream
+  # CredentialsFor link (AD join password -> AD machine identity) is emitted by
+  # the credential collector or explicit normalization rules, NOT here.
+  # This rule derives CanReadCredential (credential access capability, gated on
+  # AccessKey target type) from HasPermission + the structural fact that the
+  # account ContainsCredential.
+  #
+  # This is a CONTROL-PLANE ARM action — it is NOT gated by volume-level network
+  # access controls (NFS export policy, SMB ACLs, or delegated subnet firewall).
+  # It is callable from any network reaching management.azure.com.
+  #
+  # Guard: only emit when the account ContainsCredential (via the explicit rule
+  # that checks properties.activeDirectories is non-empty).
+  #
+  # DOWNSTREAM CHAIN: CanReadCredential(principal -> AccessKey) + CredentialsFor
+  # (AccessKey -> MachineIdentity) requires a dedicated rule in credential-chains.yaml
+  # (read-credential-yields-identity) to produce CanImpersonate. The generic
+  # read-secret-yields-identity rule expects CanReadSecret, whose target set
+  # [Secret, ConnectionString, Password, APIKey, Certificate] does NOT include
+  # AccessKey. See credential-chains.yaml for the extension.
+  - id: azure-netapp-listcredentials-exposes-ad-cred
+    emits: CanReadCredential
+    description: "listCredentials/action permission on ANF account grants CanReadCredential on the AD join AccessKey."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+      - [ ?account, ContainsCredential, ?cred ]
+    where:
+      - "node_class(?account) == Storage and node_type(?account) == FileStorage"
+      - "?account.provider_type == 'Microsoft.NetApp/netAppAccounts'"
+      - "node_type(?cred) == AccessKey  # The credential is the AD machine account password"
+      - "?principal has EFFECTIVE Microsoft.NetApp/netAppAccounts/listCredentials/action at ?account scope (Owner, Contributor, or custom role with listCredentials)"
+    emit:
+      source_type: Identity
+      target_type: AccessKey
+      source: ?principal
+      target: ?cred
+      permissions: ["Microsoft.NetApp/netAppAccounts/listCredentials/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or Azure Policy deny effect covers listCredentials/action
+        at the effective scope: BLOCKED;
+        elif ?account.properties.activeDirectories is empty (no AD join, no credential):
+        DO NOT EMIT (the ContainsCredential match will not fire);
+        else ACTIVE. This is an ARM control-plane action — NOT gated by volume-level
+        network access controls or delegated subnet firewall rules.
+      confidence: "0.93"
+      derived_from: ["?principal HasPermission ?account", "?account ContainsCredential ?cred"]
+      false_positive_note: >-
+        Only emit when [?account, ContainsCredential, ?cred] matches (i.e., ANF account
+        is AD-joined). If the account is not AD-joined, the explicit rule does not emit
+        ContainsCredential and this derived rule never fires. listCredentials/action is
+        an ARM control-plane call; it succeeds from any network reaching management.azure.com
+        regardless of volume-level network firewall rules. Do NOT apply a network_reachability
+        condition to the CanReadCredential emit itself.
+        Emit BLOCKED only when an Azure deny assignment explicitly covers
+        listCredentials/action. The downstream CredentialsFor link (AD join credential ->
+        AD machine account identity) requires a dedicated linchpin rule in
+        credential-chains.yaml (read-credential-yields-identity, not read-secret-yields-identity,
+        because AccessKey is NOT in CanReadSecret's target set). The identity model
+        confirms that the AD machine account (MachineIdentity node) is a valid
+        CanImpersonate target, so the credential chain fires automatically when both
+        edges are present and the linchpin rule is in place.
+      narrative: >-
+        {principal.name} can invoke listCredentials on ANF account {account.name}
+        (Microsoft.NetApp/netAppAccounts/listCredentials/action), retrieving the
+        Active Directory join AccessKey credential. Combined with the credential-chains
+        rule read-credential-yields-identity (pending linchpin extension), this enables
+        lateral movement to the AD machine account within the joined domain.
+
+  # --- In-VNet NFS/SMB mount -> CanReadData ----------------------------------
+  # A principal with ARM read permission on an ANF volume AND network access to the
+  # volume's delegated subnet can mount the volume over NFS v3/v4.1 or SMB 3.x
+  # and read file data. This is the dominant in-VNet data-plane path for ANF.
+  #
+  # KEY POINT: ARM volumes/read grants METADATA visibility only (mount target IP,
+  # export policy config). Data-plane NFS/SMB mount access is gated by:
+  #   (a) network_reachability: caller's foothold in same VNet or peered/VPN-connected.
+  #   (b) export_policy / SMB ACL: NFS export policy IP allow-list or SMB NTFS ACL
+  #       membership. ARM deny assignments do NOT block data-plane access.
+  #
+  # CRITICAL: NFS/SMB export policy IP matching cannot be evaluated statically at
+  # collection time without runtime foothold IP knowledge. Export policy IP allow-list
+  # compliance is UNKNOWABLE from static configuration alone, so this edge remains
+  # CONDITIONAL(network_reachability, resource_policy) even when export policy is
+  # visible. Do NOT emit ACTIVE branches based on export policy IP matching.
+  #
+  # ExposedToInternet does NOT apply: ANF volumes have no public endpoint.
+  - id: azure-netapp-invnet-volume-read
+    emits: CanReadData
+    description: "In-VNet network access to ANF volume enables NFS/SMB data-plane read (ARM volumes/read is metadata-only prerequisite)."
+    match:
+      - [ ?principal, HasPermission, ?volume ]
+    where:
+      - "node_class(?volume) == Storage and node_type(?volume) == FileStorage"
+      - "?volume.provider_type == 'Microsoft.NetApp/netAppAccounts/capacityPools/volumes'"
+      - "?principal has EFFECTIVE Microsoft.NetApp/netAppAccounts/capacityPools/volumes/read at ?volume scope (Owner, Contributor, Reader, or custom role with volumes/read)"
+      - "?volume.properties.provisioningState == 'Succeeded'  # volume is online"
+    emit:
+      source_type: Identity
+      target_type: FileStorage
+      source: ?principal
+      target: ?volume
+      permissions: ["Microsoft.NetApp/netAppAccounts/capacityPools/volumes/read"]
+      conditions: [iam_permission, network_reachability, resource_policy]
+      state_logic: >-
+        CONDITIONAL(network_reachability, resource_policy) — regardless of export
+        policy visibility. Network reachability to the delegated subnet is required
+        and unknowable statically. NFS export policy IP matching cannot be evaluated
+        at collection time without runtime foothold IP knowledge; SMB NTFS ACL
+        evaluation requires AD group membership resolution. A deny assignment on
+        volumes/read blocks ARM metadata visibility but DOES NOT block data-plane
+        NFS/SMB mount (export policy is the authoritative data-plane control).
+        Maximum state: CONDITIONAL, never ACTIVE.
+      confidence: "0.75"
+      derived_from: ["?principal HasPermission ?volume"]
+      false_positive_note: >-
+        ARM volumes/read grants METADATA only (volume properties, mount target IP,
+        export policy configuration). Data-plane access (file read/write) REQUIRES:
+        (a) network reachability to the volume's delegated subnet (no public endpoint;
+        must be same VNet, peered VNet, or VPN-connected); (b) NFS export policy
+        allowing the caller's source IP (NFS v3/v4.1), or NTFS ACL / AD group membership
+        (SMB). This edge remains CONDITIONAL(network_reachability, resource_policy)
+        because export policy IP matching is NOT evaluable statically — the attacker's
+        foothold IP at mount time is unknown at collection time. Do NOT emit ACTIVE
+        branches; do NOT emit ExposedToInternet — ANF has no public endpoint by platform
+        design. A deny assignment on volumes/read blocks ARM metadata access but DOES
+        NOT block data-plane NFS/SMB mount (export policy is the authoritative
+        data-plane control). Therefore, do NOT emit BLOCKED on this edge when a deny
+        assignment covers volumes/read; instead emit CONDITIONAL(network_reachability)
+        to reflect that data-plane access is still possible via export policy,
+        independent of ARM RBAC.
+      narrative: >-
+        {principal.name} has ARM read permission on ANF volume {volume.name}. To mount
+        and read file data, {principal.name} requires network access to the volume's
+        delegated subnet. The NFS export policy IP allow-list or SMB NTFS ACLs and AD
+        group membership govern the effective read scope (independent of ARM RBAC).
+
+  # --- volumes/write → export policy mutation → CanModifyConfiguration ----
+  # ARM volumes/write permission allows a principal to mutate the volume's export
+  # policy rules (IP ranges, access levels, Kerberos enforcement), including
+  # opening the export to 0.0.0.0/0 or adding the attacker's IP to the allow-list.
+  # This is a control-plane action that mutates configuration; actual data-plane
+  # write access requires subsequent network reachability to the delegated subnet.
+  #
+  # Emit CanModifyConfiguration (control-plane export policy mutation). Downstream,
+  # data-plane CanWriteData is CONDITIONAL(network_reachability) — the export
+  # policy mutation alone does not guarantee data access without network reach.
+  - id: azure-netapp-volume-write-export-policy
+    emits: CanModifyConfiguration
+    description: "volumes/write permission on ANF volume enables export policy mutation."
+    match:
+      - [ ?principal, HasPermission, ?volume ]
+    where:
+      - "node_class(?volume) == Storage and node_type(?volume) == FileStorage"
+      - "?volume.provider_type == 'Microsoft.NetApp/netAppAccounts/capacityPools/volumes'"
+      - "?principal has EFFECTIVE Microsoft.NetApp/netAppAccounts/capacityPools/volumes/write at ?volume scope (Owner, Contributor, or custom role with volumes/write)"
+      - "?volume.properties.provisioningState == 'Succeeded'  # volume is online"
+    emit:
+      source_type: Identity
+      target_type: FileStorage
+      source: ?principal
+      target: ?volume
+      permissions: ["Microsoft.NetApp/netAppAccounts/capacityPools/volumes/write"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment covers volumes/write at effective scope: BLOCKED;
+        elif ?volume.properties.provisioningState != 'Succeeded': CONDITIONAL(service_state);
+        else ACTIVE. volumes/write is a control-plane action that allows export
+        policy mutation (opening NFS export to arbitrary IP ranges or widening
+        SMB ACL scope). This configuration change can enable data-plane access
+        but does NOT itself constitute data-plane write access. Data-plane
+        CanWriteData is gated on network_reachability to the delegated subnet.
+      confidence: "0.90"
+      derived_from: ["?principal HasPermission ?volume"]
+      false_positive_note: >-
+        volumes/write grants control-plane mutation of export policy rules (IP
+        ranges, access levels, Kerberos enforcement) and NFS re-export, or SMB
+        ACL settings. This is a configuration capability, NOT data-plane access.
+        After mutating the export policy, the attacker still requires network
+        reachability to the delegated subnet to mount the volume and write data.
+        CanModifyConfiguration correctly models the control-plane mutation;
+        downstream data-plane CanWriteData should be CONDITIONAL(network_reachability).
+        A deny assignment on volumes/write DOES block this capability.
+      narrative: >-
+        {principal.name} has ARM write permission on ANF volume {volume.name}
+        (Microsoft.NetApp/netAppAccounts/capacityPools/volumes/write) and can mutate
+        the export policy to include their own IP or open it to 0.0.0.0/0. Actual
+        data-plane write access requires network reachability to the delegated subnet.
+
+  # --- snapshots/write → snapshot data exfiltration (within-subscription only) ----
+  # volumes/snapshots/write permission allows a principal to create snapshots
+  # and restore them to new volumes. Azure NetApp Files snapshots are SCOPED to
+  # the same account/subscription — cross-subscription snapshot export/restore is
+  # NOT supported by ANF. Within-subscription, a principal with snapshots/write
+  # can exfiltrate volume data by creating a snapshot and restoring it.
+  #
+  # CRITICAL LIMITATIONS (per ANF product design):
+  #   (a) Snapshots are account-scoped (subscription boundary).
+  #   (b) Snapshot restore requires both snapshots/write (create/restore action)
+  #       AND volumes/write (create destination volume from snapshot).
+  #   (c) Cross-subscription snapshot restore is NOT supported.
+  #
+  # This rule emits CanExfiltrate for snapshots under the current volume,
+  # scoped to within-subscription data movement.
+  - id: azure-netapp-snapshot-exfiltrate
+    emits: CanExfiltrate
+    description: "snapshots/write permission enables snapshot creation/restore, allowing within-subscription data exfiltration."
+    match:
+      - [ ?principal, HasPermission, ?volume ]
+      - [ ?volume, Contains, ?snapshot ]
+    where:
+      - "node_class(?volume) == Storage and node_type(?volume) == FileStorage"
+      - "?volume.provider_type == 'Microsoft.NetApp/netAppAccounts/capacityPools/volumes'"
+      - "node_type(?snapshot) == Snapshot"
+      - "?principal has EFFECTIVE Microsoft.NetApp/netAppAccounts/capacityPools/volumes/snapshots/write at ?volume scope (Owner, Contributor, or custom role with snapshots/write)"
+      - "?volume.properties.provisioningState == 'Succeeded'  # volume is online"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["Microsoft.NetApp/netAppAccounts/capacityPools/volumes/snapshots/write", "Microsoft.NetApp/netAppAccounts/capacityPools/volumes/write"]
+      conditions: [iam_permission, region_or_boundary]
+      state_logic: >-
+        if a deny assignment covers snapshots/write at effective scope: BLOCKED;
+        elif a deny assignment covers volumes/write (required for restore to new volume):
+        BLOCKED;
+        elif ?snapshot exists and snapshots/write permission held: ACTIVE (principal
+        can restore the snapshot to a new volume);
+        elif no snapshots exist but snapshots/write + volumes/write permissions held:
+        POTENTIAL (principal can CREATE a snapshot then restore it to a new volume);
+        else: DO NOT EMIT. The region_or_boundary condition reflects that ANF
+        snapshots are subscription-scoped; cross-subscription restore is NOT supported
+        by Azure ANF. Exfiltration is within-subscription only.
+      confidence: "0.72"
+      derived_from: ["?principal HasPermission ?volume", "?volume Contains ?snapshot"]
+      false_positive_note: >-
+        snapshots/write grants ARM permission to create and restore snapshots on
+        existing snapshots. CRITICAL: Azure ANF does NOT support cross-subscription
+        snapshot restore or export. Snapshots are account/subscription-scoped.
+        Snapshot restore to a new volume REQUIRES both snapshots/write
+        (Microsoft.NetApp/netAppAccounts/capacityPools/volumes/snapshots/write)
+        AND volumes/write (Microsoft.NetApp/netAppAccounts/capacityPools/volumes/write)
+        permissions to create the destination volume. Model as CanExfiltrate
+        (identity -> snapshot) within subscription boundary only. Do NOT emit for
+        cross-subscription restore (not an ANF capability). The subsequent
+        restore-to-attacker-volume path is a separate derived rule (not implemented
+        here), which would depend on volumes/write on the destination volume.
+      narrative: >-
+        {principal.name} has ARM write permission on ANF volume {volume.name}
+        snapshots (Microsoft.NetApp/netAppAccounts/capacityPools/volumes/snapshots/write)
+        and can create and restore snapshots to new volumes within the same subscription.
+        This enables data exfiltration of the volume's contents to a different
+        volume in the same subscription.
+
+# ---------------------------------------------------------------------------
+# Explicit normalization note:
+#   The base HasPermission records (effective listCredentials/action,
+#   effective volumes/read, and the ContainsCredential (account -> AD join AccessKey)
+#   structural fact) must be emitted by an explicit normalization rule or the
+#   general Azure RBAC normalizer if it covers Microsoft.NetApp/* actions.
+#   A dedicated /rules/explicit/azure-netapp.yaml is NOT required if the general
+#   ARM RBAC evaluator already normalizes HasPermission for Microsoft.NetApp actions;
+#   in that case the derived rules above fire directly from the evaluator output.
+#
+# BLOCKED-edge guidance:
+#   - Azure deny assignment covering listCredentials/action
+#     -> azure-netapp-listcredentials-exposes-ad-cred (CanReadCredential) BLOCKED.
+#   - Azure deny assignment covering volumes/read -> ARM metadata access BLOCKED;
+#     but data-plane NFS/SMB mount is NOT blocked (governed by export policy only).
+#     Do NOT emit BLOCKED on azure-netapp-invnet-volume-read; instead emit
+#     CONDITIONAL(network_reachability) to reflect that export policy is the
+#     authoritative data-plane control.
+#   - Azure deny assignment covering volumes/write
+#     -> azure-netapp-volume-write-export-policy (CanModifyConfiguration) BLOCKED.
+#   - Azure deny assignment covering volumes/snapshots/write
+#     -> azure-netapp-snapshot-exfiltrate (CanExfiltrate) BLOCKED.
+#   - No network path to delegated subnet -> azure-netapp-invnet-volume-read
+#     CONDITIONAL(network_reachability).
+#
+# Linchpin cross-references (DO NOT RE-DERIVE here):
+#   credential-chains.yaml [LINCHPIN EXTENSION REQUIRED]:
+#     - read-credential-yields-identity: A NEW provider-agnostic rule that mirrors
+#       read-secret-yields-identity but accepts CanReadCredential (not CanReadSecret)
+#       as input. This rule MUST be added to credential-chains.yaml to complete the
+#       ANF AD-credential chain:
+#       CanReadCredential(?principal -> AccessKey/AD cred)
+#       + CredentialsFor(AccessKey -> MachineIdentity/AD account)
+#       => CanImpersonate(?principal -> MachineIdentity)
+#       (AD machine account is modeled as MachineIdentity, a valid CanImpersonate
+#        target). The new rule allows the graph to automatically emit the impersonation
+#        edge when both edges exist. Until read-credential-yields-identity is added
+#        to credential-chains.yaml, the CanReadCredential -> CanImpersonate chain
+#        remains PENDING and will NOT fire.
+#   can-control.yaml:
+#     - control-via-admin: Owner/Contributor on the netAppAccount -> Controls.
+#     - escalate-via-execute-as: not applicable (ANF has no ExecutesAs surface).
+#
+# Rules added in this fix:
+#   - azure-netapp-account-contains-ad-credential [explicit rule, separate file]
+#       emits ContainsCredential(?account -> AccessKey) when properties.activeDirectories
+#       is non-empty. Prerequisite for azure-netapp-listcredentials-exposes-ad-cred.
+#   - azure-netapp-account-write-ad-hijack [explicit rule, separate file]
+#       netAppAccounts/write permission -> CanModifyConfiguration (AD join hijacking).
+#   - azure-netapp-volume-write-export-policy
+#       volumes/write permission -> CanModifyConfiguration (export policy mutation).
+#   - azure-netapp-snapshot-exfiltrate
+#       snapshots/write permission -> CanExfiltrate (snapshot restore within-subscription).
+# ---------------------------------------------------------------------------

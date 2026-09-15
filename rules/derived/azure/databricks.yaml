@@ -1,0 +1,639 @@
+# Azure Databricks — Derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# DOMINANT PRIMITIVE (Phase 11): analytics/ML compute RUNS AS a managed identity
+# (MI) or service principal (SP) — the Access Connector MI. Whoever can submit a
+# job, modify a notebook, update a job definition, write a DLT pipeline, or set
+# a cluster init script injects attacker code that executes AS that MI.
+# This mirrors can-execute-as (CanModifyCode/CanModifyConfiguration + ExecutesAs
+# → CanExecuteAs) and cicd-chains (modify-what-it-runs → executes-as). CITE those
+# linchpins for roll-ups; emit only the FACTS here.
+#
+# Resource provider: Microsoft.Databricks
+#   Workspace: Microsoft.Databricks/workspaces
+#   Access Connector: Microsoft.Databricks/accessConnectors
+#
+# Databricks data-plane permissions are Databricks-internal (CAN_MANAGE, CAN_RUN,
+# CAN_MANAGE_RUN, READ, WRITE, MANAGE on workspace objects + secret scopes) and
+# Unity Catalog SQL privileges (SELECT, MODIFY, MANAGE). ARM permissions are the
+# control-plane gate. All permission names verified against official docs.
+#
+# CITE (do NOT duplicate):
+#   can-execute-as.yaml    — CanModifyCode/Cmd + ExecutesAs → CanExecuteAs roll-up
+#   cicd-chains.yaml       — modify-what-runner-executes → execute-as; trigger-only path
+#   credential-chains.yaml — CanReadSecret + CredentialsFor → CanImpersonate chain
+#   can-control.yaml       — CanExecuteAs + privilege delta → CanEscalateTo roll-up
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 11-data-analytics-ml
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # ADMINISTRATIVE CONTROL
+  # ===========================================================================
+
+
+  # ===========================================================================
+  # CODE MODIFICATION PRIMITIVES (→ CanModifyCode)
+  # The linchpin: modify what the cluster/job executes, then it runs as its MI.
+  # can-execute-as execute-as-via-code-modify and cicd-chains cicd-modify-buildspec
+  # collapse CanModifyCode + ExecutesAs → CanExecuteAs. CITE them; emit the facts.
+  # ===========================================================================
+
+  - id: azure-dbx-notebook-write
+    emits: CanModifyCode
+    description: "CAN_MANAGE on a notebook path allows overwriting notebook code via import/overwrite; runs as the cluster MI on next execution."
+    match_effective_permission:
+      action: "databricks:notebooks:modify"
+      scope_type: "notebook_path|workspace_path"
+    where:
+      - "principal has Databricks CAN_MANAGE permission on the target notebook path (enables POST /api/2.0/workspace/import with overwrite=true)"
+      - "the notebook is attached to a cluster (all-purpose cluster) or referenced by a job"
+    emit:
+      target_type: Notebook
+      source_type: Identity
+      source: "<principal>"
+      target: "<Databricks Notebook>"
+      permissions: ["databricks:notebooks:modify (CAN_MANAGE on the notebook path — POST /api/2.0/workspace/import with overwrite=true)"]
+      conditions: [service_state, trigger_exists]
+      escalation: >-
+        Overwrite the notebook code with attacker-controlled content (POST /api/2.0/workspace/import
+        with overwrite=true); on the next cluster run (interactive session, scheduled job, or
+        run-now trigger), attacker code executes as the cluster/Access Connector managed identity.
+        Cite can-execute-as.
+      false_positive_note: >-
+        CAN_MANAGE (not CAN_EDIT or WRITE alone) is required to overwrite notebooks via the
+        import API. CAN_EDIT allows editing but not import/overwrite for notebooks owned by
+        others. If no cluster is running and no job trigger exists -> CONDITIONAL(trigger_exists).
+        CAN_RUN on a job is NOT notebook write; the trigger-only path (cicd-chains
+        cicd-trigger-runner-executes-as) applies. Code runs as whatever MI is on the cluster
+        the notebook attaches to.
+      narrative: >-
+        {principal.name} can overwrite notebook {target.name} code (Databricks CAN_MANAGE on
+        the path, /api/2.0/workspace/import with overwrite=true); on next run on the cluster,
+        attacker code executes as the cluster's managed identity.
+
+  - id: azure-dbx-job-update
+    emits: CanModifyCode
+    description: "CAN_MANAGE on a Databricks job allows updating the job task definition (notebook, JAR, wheel, script, DLT pipeline), injecting attacker code."
+    match_effective_permission:
+      action: "databricks:jobs:update"
+      scope_type: "job"
+    where:
+      - "principal has Databricks CAN_MANAGE permission on the target job (POST /api/2.1/jobs/update)"
+      - "job task is a notebook, JAR, wheel, Python script, or DLT pipeline reference"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Databricks Job (BatchJob)>"
+      permissions: ["databricks:jobs:update (CAN_MANAGE on the job — POST /api/2.1/jobs/update)"]
+      conditions: [trigger_exists]
+      escalation: >-
+        Update the job task (notebook path, JAR location, wheel, or Python script) to
+        point at attacker-controlled code; on next scheduled or on-demand run the job
+        executes as the job cluster's Access Connector MI. Mirrors cicd-chains
+        cicd-modify-buildspec-executes-as (job runner = BuildWorker, definition = task spec).
+      false_positive_note: >-
+        CAN_MANAGE_RUN does NOT allow task update — only CAN_MANAGE (job owner/admin)
+        does. CAN_MANAGE_RUN gives trigger-only ability (run-now), not code modification;
+        use cicd-chains cicd-trigger-runner-executes-as for that weaker path.
+        If the job has no schedule and no trigger, CONDITIONAL(trigger_exists).
+      narrative: >-
+        {principal.name} can update the task definition of Databricks job {target.name}
+        (CAN_MANAGE, /api/2.1/jobs/update), injecting attacker code that runs as the job
+        cluster's managed identity on next execution.
+
+  - id: azure-dbx-sql-warehouse-query-execute
+    emits: CanModifyCode
+    description: "Admin role on a SQL Warehouse allows running arbitrary SQL queries that execute as the warehouse MI."
+    match_effective_permission:
+      action: "databricks:sql:warehouse:execute"
+      scope_type: "warehouse"
+    where:
+      - "principal has Databricks Workspace Admin role or CAN_MANAGE on a SQL Warehouse (POST /api/2.0/sql/statements)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Databricks SQL Warehouse (DataWarehouse)>"
+      permissions: ["databricks:sql:warehouse:execute (Admin role or CAN_MANAGE on warehouse)"]
+      conditions: [service_state]
+      escalation: >-
+        Submit a SQL query to the warehouse that executes as the warehouse MI (via the
+        workspace Access Connector MI). Queries can invoke external datasets (ADLS Gen2,
+        Azure SQL, Synapse, etc.) using the MI's ARM RBAC credentials via IMDS.
+      false_positive_note: >-
+        SQL Warehouse code execution is less direct than cluster notebook modification.
+        Requires that the warehouse is running; CONDITIONAL(service_state) if stopped.
+        The query must use SQL-level features (external locations, Azure SQL auth) to
+        escalate. Direct SQL command execution is still attacker-controllable code.
+      narrative: >-
+        {principal.name} can execute SQL queries on Databricks SQL Warehouse {target.name}
+        (Admin or CAN_MANAGE), running arbitrary queries as the warehouse MI that can
+        access Azure resources via IMDS.
+
+  - id: azure-dbx-pipeline-update
+    emits: CanModifyCode
+    description: "CAN_MANAGE on a Delta Live Tables pipeline allows repointing the notebook/library source, injecting attacker code."
+    match_effective_permission:
+      action: "databricks:pipelines:update"
+      scope_type: "pipeline"
+    where:
+      - "principal has Databricks CAN_MANAGE permission on the target DLT pipeline (PUT /api/2.0/pipelines/{id})"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Databricks DLT Pipeline (BatchJob)>"
+      permissions: ["databricks:pipelines:update (CAN_MANAGE on the pipeline — PUT /api/2.0/pipelines/{id})"]
+      conditions: [trigger_exists]
+      escalation: >-
+        Repoint the pipeline notebook source to attacker-controlled code; on next pipeline
+        run (continuous or triggered) executes as the pipeline cluster MI.
+      false_positive_note: >-
+        DLT pipelines run on dedicated clusters; the cluster must have an Access Connector
+        MI or cluster-level MI for escalation. Without an MI, execution yields only data
+        access via explicit credentials. CONDITIONAL(trigger_exists) when the pipeline is
+        not in continuous mode and no trigger exists.
+      narrative: >-
+        {principal.name} can update Delta Live Tables pipeline {target.name} (CAN_MANAGE,
+        /api/2.0/pipelines), injecting attacker code that runs as its cluster MI on the
+        next pipeline execution.
+
+  - id: azure-dbx-cluster-init-script
+    emits: CanModifyCode
+    description: "Cluster init scripts run as root before user code; write access to the init-script URI + cluster edit = code injection on every node."
+    match:
+      - [ ?principal, CanWrite, ?storage ]
+    where:
+      - "node_type(?storage) in [ObjectStorage, FileStorage]  # ADLS Gen2 or Blob"
+      - "the target cluster references ?storage as an init_scripts URI"
+      - "?principal also has Databricks CAN_MANAGE or cluster create permission enabling them to SET the init_scripts URI on the cluster (POST /api/2.0/clusters/edit or /create)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Databricks Cluster (BatchJob/GenericCompute)>"
+      permissions: ["CanWrite on init-script storage URI", "databricks:clusters:edit (CAN_MANAGE on cluster or cluster create policy)"]
+      conditions: [service_state, trigger_exists]
+      state_logic: >-
+        ACTIVE if the cluster is running (or can be started) and the principal controls
+        both the init-script URI in storage AND has cluster edit capability;
+        CONDITIONAL(service_state) if the cluster is stopped;
+        CONDITIONAL(trigger_exists) if no cluster restart/start has been established.
+      false_positive_note: >-
+        Requires BOTH write to the init-script blob URI AND cluster-edit permission to
+        set that URI on the cluster. Either alone is insufficient. The init script runs on
+        cluster restart (not on an already-running cluster). Without a cluster restart
+        -> CONDITIONAL(trigger_exists + service_state). Init scripts run as root, not as
+        the cluster user, but they execute in the same IMDS context as the cluster MI.
+      derived_from: [ "<CanWrite edge_id on ?storage>", "<cluster edit permission>" ]
+      narrative: >-
+        {principal.name} can write the init-script blob for cluster {target.name} and
+        set that init_scripts URI (cluster edit), injecting root-level code that runs
+        as the cluster managed identity on next restart.
+
+  # ===========================================================================
+  # CONFIGURATION MODIFICATION (→ CanModifyConfiguration)
+  # ===========================================================================
+
+  - id: azure-dbx-cluster-create-edit
+    emits: CanModifyConfiguration
+    description: "Cluster create/edit permission allows modifying Spark configuration (MI binding, credential passthrough, init scripts)."
+    match_effective_permission:
+      any_of:
+        - {action: "databricks:clusters:create", scope_type: "workspace"}
+        - {action: "databricks:clusters:edit", scope_type: "cluster"}
+    where:
+      - "principal has Databricks cluster create permission (governed by cluster policy) OR CAN_MANAGE on an existing cluster"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Databricks Cluster (BatchJob/GenericCompute)>"
+      permissions: ["databricks:clusters:create (cluster policy allows) OR databricks:clusters:edit (CAN_MANAGE on cluster — POST /api/2.0/clusters/edit)"]
+      conditions: [role_compatibility, service_state]
+      escalation: >-
+        Modify Spark configuration (spark.databricks.azure.msi.enabled, msi_resource_id,
+        init_scripts, spark.hadoop.fs.azure.account.key.*) or change the attached Access
+        Connector to one with a more privileged MI. Realized at cluster restart.
+      false_positive_note: >-
+        Cluster create is gated by cluster policy; a restrictive policy may block init
+        scripts or unconstrained Spark conf -> CONDITIONAL(role_compatibility). Config
+        change realized only after cluster restart -> CONDITIONAL(service_state) on a
+        running cluster. The cluster create/edit does NOT by itself bypass cluster policy
+        on managed clusters.
+      narrative: >-
+        {principal.name} can create or edit cluster {target.name} configuration (cluster
+        create policy / CAN_MANAGE), modifying its MI binding, Spark conf, or init scripts.
+
+  - id: azure-dbx-access-connector-mi-attach
+    emits: CanAttachIdentity
+    description: "Attach/swap a user-assigned MI on a Databricks Access Connector, giving all workspace clusters access to that MI via IMDS."
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.Databricks/accessConnectors/write on the target Access Connector"
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?userMI"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Databricks Access Connector (GenericCompute — identity broker)>"
+      permissions: ["Microsoft.Databricks/accessConnectors/write", "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"]
+      conditions: [role_compatibility, service_state]
+      false_positive_note: >-
+        BOTH ARM permissions are required: assign/action on the MI AND accessConnectors/write.
+        Neither alone attaches the MI. The new MI becomes accessible to cluster code only
+        after clusters are restarted (the Access Connector change propagates, but running
+        clusters hold a cached token until expiry or restart). Escalation only if the
+        attached MI out-privileges the caller. Honor the assign/action resource scope.
+      derived_from: [ "<CanPassIdentity edge_id>" ]
+      narrative: >-
+        {principal.name} can attach/swap user-assigned MI {userMI.name} on Access Connector
+        {target.name} (accessConnectors/write + assign/action on {userMI.name}), so cluster
+        code will execute as {userMI.name} via IMDS after cluster restart.
+
+  - id: azure-dbx-cluster-policy-write
+    emits: CanModifyConfiguration
+    description: "Cluster policy write/admin allows loosening security constraints on cluster creation (init scripts, credential passthrough, unconstrained Spark conf)."
+    match_effective_permission:
+      action: "databricks:cluster-policies:write"
+      scope_type: "workspace"
+    where:
+      - "principal has Databricks workspace Admin role OR can call POST /api/2.0/policies/clusters/create and PATCH /api/2.0/policies/clusters/edit"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Databricks Workspace (AnalyticsService)>"
+      permissions: ["databricks:cluster-policies:write (workspace Admin or cluster policy admin entitlement)"]
+      conditions: [service_state]
+      escalation: >-
+        Modify or create a cluster policy that permits init scripts, relaxes Spark conf
+        constraints, or enables credential passthrough, then create a cluster with the
+        loosened policy. Effective escalation path: policy write → cluster create → init
+        script or MI binding → CanExecuteAs.
+      false_positive_note: >-
+        Policy write alone does not yield code execution; it enables downstream cluster
+        create actions that were previously blocked. Emit CONDITIONAL unless the caller
+        can also create/edit a cluster under the new policy. Cluster policies are a
+        Databricks data-plane (REST API) concept; they are not exposed as ARM sub-resources.
+      narrative: >-
+        {principal.name} can write cluster policies for workspace {target.name}
+        (Databricks workspace Admin or cluster policy admin), potentially loosening init-script
+        or Spark-conf constraints to enable otherwise-blocked code injection paths.
+
+  # ===========================================================================
+  # IDENTITY ATTACHMENT (→ CanPassIdentity / CanAttachIdentity)
+  # ===========================================================================
+
+
+  # ===========================================================================
+  # CREDENTIAL ACCESS (→ CanReadSecret / ExposesCredential / CanRetrieveToken)
+  # ===========================================================================
+
+  - id: azure-dbx-secret-scope-read
+    emits: CanReadSecret
+    description: "READ ACL on a Databricks secret scope allows reading its secrets via dbutils.secrets.get()."
+    match_effective_permission:
+      action: "databricks:secrets:read"
+      scope_type: "secret_scope"
+    where:
+      - "principal has READ ACL on the target secret scope (GET /api/2.0/secrets/get?scope=<scope>&key=<key>)"
+      - "if secret_scope.backend_type == AZURE_KEYVAULT then principal (or the cluster MI) must have Key Vault secret/get permission"
+    emit:
+      source_type: Identity
+      target: "<Databricks Secret Scope (Secret)>"
+      permissions: ["databricks:secrets:read (READ ACL on scope — GET /api/2.0/secrets/get)"]
+      conditions: []
+      state_logic: >-
+        ACTIVE for Databricks-managed secret scopes. CONDITIONAL(key_permission) for
+        Key Vault-backed scopes unless the Access Connector MI's Key Vault permissions
+        are confirmed (the MI must have secrets/get on the vault).
+      false_positive_note: >-
+        The Databricks API obfuscates secret values in notebook output (replaces with
+        [REDACTED]) but dbutils.secrets.get() returns the plaintext string to in-memory
+        code. The READ ACL IS a credential-access primitive — code on the cluster can
+        exfiltrate the value. KV-backed scopes proxy to Key Vault via the Access Connector
+        MI; the MI must have Key Vault secret get permission — without it, the read
+        returns an error. Honor that gate: emit CONDITIONAL(key_permission) for KV-backed
+        scopes unless the MI's Key Vault access is confirmed.
+      narrative: >-
+        {principal.name} has READ ACL on Databricks secret scope {target.name}; any code
+        it runs on the cluster can read secret values via dbutils.secrets.get(), accessing
+        stored credentials (storage keys, connection strings, API keys).
+
+  # NOTE: azure-dbx-cluster-spark-conf-read has been removed.
+  # The capability is now modeled via credential-chains linchpin:
+  # CanRead(principal, cluster) + ContainsSecret(cluster, credential) → CanReadSecret derivation.
+  # This separates the structural fact (cluster contains embedded credentials; emitted by
+  # explicit rule azure-dbx-cluster-spark-conf-contains-key) from the principal's read
+  # permission (CanRead / clusters/get). The credential-chains linchpin combines them.
+
+  - id: azure-dbx-cluster-imds-exposescred
+    emits: ExposesCredential
+    description: "A cluster with a bound Access Connector MI leaks that MI's credential to any code running on it via IMDS."
+    match:
+      - [ ?cluster, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?cluster) in [BatchJob, GenericCompute]"
+      - "node_type(?mi) in [ManagedIdentity, ServiceIdentity]"
+    emit:
+      source: "<Databricks Cluster>"
+      target: "<managed identity (ManagedIdentity)>"
+      permissions: []
+      note: >-
+        Cluster code calls IMDS at 169.254.169.254/metadata/identity/oauth2/token with
+        Metadata: true header to obtain an ARM bearer token for the bound MI. This is the
+        leak fact; CanRetrieveToken (azure-dbx-cluster-imds-token) is the capability.
+      false_positive_note: >-
+        Only fires when the cluster actually has a bound MI (Access Connector MI or
+        cluster-level user-assigned MI). No MI -> do NOT emit. The system-assigned MI of
+        the workspace's managed resource group is NOT automatically available to cluster
+        code; only the configured Access Connector MI is.
+      derived_from: [ "<ExecutesAs edge_id>" ]
+      narrative: >-
+        Databricks cluster {source.name} exposes the credential of its managed identity
+        {target.name} to any code running on the cluster via IMDS (169.254.169.254).
+
+  - id: azure-dbx-cluster-imds-token
+    emits: CanRetrieveToken
+    description: "Any code on a cluster with a bound MI can mint a bearer token for that MI via IMDS."
+    match:
+      - [ ?cluster, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?cluster) in [BatchJob, GenericCompute]"
+      - "node_type(?mi) in [ManagedIdentity, ServiceIdentity]"
+    emit:
+      source: "<Databricks Cluster>"
+      target: "<managed identity (ManagedIdentity)>"
+      permissions: []
+      note: >-
+        GET http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01
+        &resource=https://management.azure.com/ with header 'Metadata: true'. Works for
+        any Azure resource audience. The companion ExposesCredential fact is emitted by
+        azure-dbx-cluster-imds-exposescred.
+      false_positive_note: >-
+        Only fires when the cluster actually has a bound MI via Access Connector or
+        cluster-level MI configuration. No bound MI -> do NOT emit.
+      derived_from: [ "<ExecutesAs edge_id>" ]
+      narrative: >-
+        Any task running on cluster {source.name} can request a bearer token for MI
+        {target.name} from IMDS (169.254.169.254), obtaining ARM credentials with no
+        additional authentication.
+
+  # ===========================================================================
+  # PAT / CREDENTIAL MANAGEMENT (→ CanCreateCredentialFor)
+  # ===========================================================================
+
+
+  # ===========================================================================
+  # DATA-PLANE GRANTS (→ CanGrantPermission / CanReadData)
+  # ===========================================================================
+
+  - id: azure-dbx-unity-catalog-manage
+    emits: CanGrantPermission
+    description: "MANAGE privilege on a Unity Catalog object (catalog/schema/table/storage credential) allows granting access to other principals, including self."
+    match_effective_permission:
+      action: "databricks:unitycatalog:manage"
+      scope_type: "catalog|schema|table|storage_credential|external_location"
+    where:
+      - "principal holds Unity Catalog MANAGE privilege on the target object (GRANT ... ON <object> TO <principal>)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<any Identity>"
+      permissions: ["databricks:unitycatalog:manage (MANAGE privilege on UC object)"]
+      false_positive_note: >-
+        MANAGE allows granting to others but does NOT by itself grant SELECT to the holder.
+        Emit CanGrantPermission; a downstream GRANT SELECT to self would yield CanReadData
+        (from credential-chains execute-then-read-secret or direct grant). Unity Catalog
+        also supports storage credentials and external locations — MANAGE on a storage
+        credential allows granting USAGE to others (data access escalation). Only emit
+        ACTIVE when the MANAGE privilege is confirmed (SELECT from information_schema
+        or grants API).
+      narrative: >-
+        {principal.name} holds Unity Catalog MANAGE on {target.name}; it can GRANT SELECT
+        (or other privileges) on that object to itself or any other principal, bypassing
+        intended data access controls.
+
+  - id: azure-dbx-unity-catalog-select
+    emits: CanReadData
+    description: "SELECT privilege on a Unity Catalog table/schema/catalog grants data-plane read access to the underlying data."
+    match_effective_permission:
+      action: "databricks:unitycatalog:select"
+      scope_type: "table|schema|catalog"
+    where:
+      - "principal holds Unity Catalog SELECT privilege on the target table, schema, or catalog"
+      - "the underlying data is in ADLS Gen2, Delta Lake, or an external location"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Unity Catalog table/schema/catalog (Data)>"
+      permissions: ["databricks:unitycatalog:select (SELECT privilege on UC object)"]
+      conditions: [iam_permission, network_reachability]
+      false_positive_note: >-
+        SELECT is a data-plane read via the Databricks SQL warehouse or cluster; it does
+        NOT require direct ADLS RBAC on the underlying storage (the Access Connector MI
+        provides that). The principal still needs access to a SQL warehouse or cluster to
+        execute the query. Metastore-admin or catalog-owner SELECT is implicitly included
+        with those roles. Do not emit for tables the principal has no SELECT on.
+      narrative: >-
+        {principal.name} has SELECT on Unity Catalog object {target.name} and can read its
+        data via a Databricks SQL warehouse or cluster query.
+
+  - id: azure-dbx-secret-scope-manage
+    emits: CanGrantPermission
+    description: "MANAGE ACL on a Databricks secret scope allows granting READ/WRITE/MANAGE access to other principals and managing ACLs."
+    match_effective_permission:
+      action: "databricks:secrets:manage"
+      scope_type: "secret_scope"
+    where:
+      - "principal has MANAGE ACL on the target secret scope (PUT /api/2.0/secrets/acls)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<any Identity>"
+      permissions: ["databricks:secrets:manage (MANAGE ACL on secret scope — PUT /api/2.0/secrets/acls)"]
+      false_positive_note: >-
+        MANAGE on a scope allows granting READ/WRITE/MANAGE to any user (ACL modification).
+        MANAGE also allows the holder to DELETE secrets, but it does NOT automatically grant
+        WRITE (PUT new secrets); the holder must have READ and WRITE ACLs separately to read
+        and write secrets. Databricks secret scope ACL model has distinct READ, WRITE, and MANAGE
+        levels where MANAGE does NOT imply WRITE. A Databricks workspace admin can manage ACLs
+        on all scopes regardless of scope-level ACLs. Emit CanGrantPermission targeting any
+        Identity (the scope of the grant is bounded to the secret scope's contents).
+        Do NOT conflate with CanReadSecret — MANAGE alone does not read secrets; that requires
+        READ ACL.
+      narrative: >-
+        {principal.name} has MANAGE ACL on secret scope {target.name} (PUT /api/2.0/secrets/acls)
+        and can grant READ/WRITE/MANAGE access to any workspace user, including itself.
+
+  # ===========================================================================
+  # DATA EXFILTRATION (→ CanExfiltrate)
+  # ===========================================================================
+
+  - id: azure-dbx-delta-sharing-open
+    emits: CanExfiltrate
+    description: "Creating a Delta Sharing share with OPEN recipients produces publicly downloadable signed URLs for the shared data, enabling unauthenticated data exfiltration."
+    match_effective_permission:
+      action: "databricks:unitycatalog:create_share"
+      scope_type: "metastore|workspace"
+    where:
+      - "principal has Unity Catalog CREATE_SHARE privilege (metastore Admin or CREATE_SHARE on the metastore)"
+      - "principal can configure the recipient with sharing_type OPEN (no authentication required)"
+      - "principal has SELECT privilege on the tables being shared"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal>"
+      target: "<Unity Catalog shared tables (Data)>"
+      permissions: ["databricks:unitycatalog:create_share (CREATE_SHARE privilege on metastore; metastore Admin role)"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the recipient sharing_type is OPEN (public download URL, no authentication
+        required). CONDITIONAL(trust_relationship) when sharing_type is DATABRICKS
+        (requires recipient to hold a Databricks token — not truly public).
+      false_positive_note: >-
+        OPEN sharing produces a sharing profile JSON with a bearerToken that enables
+        reading signed URLs — effectively public data export. DATABRICKS sharing requires
+        the recipient to have a Databricks account token; that path is not unauthenticated
+        exfil. Only emit ACTIVE for OPEN sharing. The principal must have SELECT on the
+        shared tables AND CREATE_SHARE privilege on the metastore (or be metastore admin).
+      narrative: >-
+        {principal.name} can create an OPEN Delta Sharing share from Unity Catalog tables
+        {target.name} (CREATE_SHARE privilege), generating publicly accessible signed download
+        URLs and exfiltrating the data without authentication controls.
+
+  # ===========================================================================
+  # NETWORK EXPOSURE
+  # ===========================================================================
+
+  - id: azure-dbx-public-rest-endpoint
+    emits: ExposedToInternet
+    description: "Databricks workspace REST API endpoint is publicly reachable; any token/PAT holder can authenticate from the internet."
+    match_effective_permission:
+      config_property: "publicNetworkAccess"
+      value: "enabled|null"  # default is enabled unless explicitly Disabled
+    where:
+      - "workspace publicNetworkAccess != Disabled"
+      - "workspace does not enforce Private Link for both front-end and back-end (privateEndpoint count < 2 OR requiredNsgRules != AllRules)"
+    emit:
+      source_type: AnalyticsService
+      target_type: AnonymousIdentity
+      source: "<Databricks workspace (AnalyticsService)>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      false_positive_note: >-
+        The workspace REST API endpoint (adb-<id>.azuredatabricks.net) is public by default.
+        With Private Link enforced (publicNetworkAccess = Disabled + private endpoints for
+        both front-end browser and back-end cluster-to-control-plane), the endpoint is no
+        longer internet-accessible -> do NOT emit ExposedToInternet; emit PrivateReachability
+        instead. Note: even with No-Public-IP (NPIP/secure cluster connectivity), the
+        CONTROL PLANE endpoint remains public — NPIP only removes public IPs from cluster
+        nodes; the workspace URL stays public.
+      narrative: >-
+        Databricks workspace {source.name} REST API (adb-<id>.azuredatabricks.net) is
+        reachable from the internet; any PAT or Azure AD token holder can authenticate to
+        the API without being on a private network.
+
+  # ===========================================================================
+  # JOB TRIGGERING (→ CanTrigger)
+  # ===========================================================================
+
+
+  # ===========================================================================
+  # DERIVED: EXECUTE AS MANAGED IDENTITY
+  # Cite can-execute-as.yaml linchpin rule 'execute-as-via-code-modify' for the
+  # CanModifyCode + ExecutesAs → CanExecuteAs roll-up. When CanModifyCode edges
+  # (notebook-write, job-update, pipeline-update) and ExecutesAs facts (cluster→MI)
+  # are in the graph, can-execute-as.yaml automatically emits the CanExecuteAs edge
+  # with the provider-agnostic narrative. This ensures consistent derivation across
+  # all providers and prevents duplicate edges.
+  #
+  # Similarly, the CanExecuteAs + privilege escalation → CanEscalateTo roll-up is
+  # handled by can-control.yaml rule 'escalate-via-execute-as'. No Databricks-specific
+  # re-derivation is needed; the linchpin rules are canonical.
+  # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A Deny Assignment (Blueprint / Managed App) over any ARM action (workspaces/write,
+#    accessConnectors/write, assign/action) -> emit with state: BLOCKED.
+#  - Private Link enforced (publicNetworkAccess=Disabled) -> azure-dbx-public-rest-endpoint
+#    BLOCKED; emit PrivateReachability instead.
+#  - Cluster policy blocks init_scripts or unconstrained spark.conf -> azure-dbx-cluster-init-
+#    script and azure-dbx-cluster-create-edit BLOCKED at the policy scope.
+#  - KV-backed secret scope where connector MI lacks Key Vault secret/get ->
+#    azure-dbx-secret-scope-read CONDITIONAL(key_permission) until resolved by
+#    credential-chains decrypt-gates-secret-read.
+#  - No bound MI on cluster -> azure-dbx-cluster-imds-exposescred and
+#    azure-dbx-cluster-imds-token BLOCKED/not emitted.
+#  - CAN_MANAGE_RUN (trigger only) on a job -> CanTrigger (azure-dbx-job-run-now),
+#    NOT CanModifyCode; trigger-only CanExecuteAs is cicd-chains CONDITIONAL.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization (raw config -> explicit edges). These belong in
+# /rules/explicit/azure-databricks.yaml; noted here for completeness.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: azure-dbx-cluster-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Databricks::Cluster", field: "azure_attributes.msi_resource_id / access_connector_id"}
+    where:
+      - "cluster has azure_attributes.msi_resource_id (cluster-level MI) OR"
+      - "workspace has a linked Access Connector (Microsoft.Databricks/accessConnectors) with an MI"
+    emit:
+      source: "<Databricks cluster (BatchJob/GenericCompute)>"
+      target: "<user-assigned MI (ManagedIdentity)>"
+      note: >-
+        The Access Connector's MI is the canonical execution identity for most clusters.
+        Cluster-level user-assigned MI (azure_attributes.msi_resource_id with
+        spark.databricks.azure.msi.enabled=true) is an alternative; emit ExecutesAs for
+        both patterns.
+      narrative: "Databricks cluster {cluster.name} runs as managed identity {mi.name}."
+
+  - id: azure-dbx-job-cluster-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Databricks::Job", field: "settings.job_clusters[].new_cluster OR settings.tasks[].existing_cluster_id"}
+    where:
+      - "job has a new_cluster or uses an existing cluster; resolve the cluster's MI binding"
+    emit:
+      source: "<Databricks Job (BatchJob)>"
+      target: "<MI of the job cluster (ManagedIdentity)>"
+      note: "Job cluster inherits the Access Connector MI of its workspace, or a cluster-level MI."
+      narrative: "Databricks job {job.name} runs as MI {mi.name} via its cluster."
+
+  - id: azure-dbx-access-connector-mi-attached
+    emits: AttachedTo
+    source_config: {resource_type: "Microsoft.Databricks/accessConnectors", field: "identity.userAssignedIdentities"}
+    emit:
+      source: "<user-assigned MI (ManagedIdentity)>"
+      target: "<Access Connector>"
+      narrative: "User-assigned MI {mi.name} is attached to Access Connector {connector.name}."
+
+  - id: azure-dbx-cluster-contains-spark-cred
+    emits: ContainsSecret
+    source_config: {resource_type: "Databricks::Cluster", field: "spark_conf"}
+    where:
+      - "spark_conf has a key matching spark.hadoop.fs.azure.account.key.*, fs.azure.sas.*, or similar credential pattern with a non-empty value"
+    emit:
+      source: "<Databricks Cluster>"
+      target: "<embedded storage key/SAS (Credential/AccessKey)>"
+      note: "Inline storage keys in Spark config are readable via GET /api/2.0/clusters/get."
+      narrative: "Cluster {cluster.name} contains a storage credential in its Spark configuration."
+
+  - id: azure-dbx-workspace-contains-pat
+    emits: ContainsCredential
+    source_config: {resource_type: "Databricks::Workspace", api: "GET /api/2.0/token-management/tokens"}
+    where: ["response includes active PAT records (admin listing)"]
+    emit:
+      source: "<Databricks Workspace>"
+      target: "<PAT (Token)>"
+      note: "PATs authenticate to the Databricks REST API as the issuing user; long-lived by default."
+      narrative: "Databricks workspace {workspace.name} has active PAT tokens that authenticate to its REST API."

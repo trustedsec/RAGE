@@ -1,0 +1,163 @@
+# GCP Access Context Manager / VPC Service Controls — Derived attack-path rules (Phase 13 — cross-boundary guardrails)
+# ===========================================================================
+# THE GCP VPC-SC GUARDRAIL LAYER. A VPC Service Controls perimeter is a
+# ConditionalPolicy node that SUPPRESSES cross-perimeter data-plane API calls
+# from outside the perimeter to protected services inside it. The security model
+# is exactly dual to AWS SCPs and GCP Org Policy (rules/derived/hierarchy-chains.yaml
+# rule 3 guardrail-removal-upgrades-blocked handles the state-upgrade from
+# BLOCKED -> CONDITIONAL(guardrail_removed) for all three).
+#
+# HEADLINE: perimeter edit/delete = guardrail removal enabling cross-boundary exfil.
+#
+# WHAT THIS FILE EMITS (service FACTS only — linchpins do the roll-ups):
+#   1. CanModifyPolicy(Identity -> ServicePerimeter)
+#      — for servicePerimeters.update / servicePerimeters.delete permission
+#      — CITES hierarchy-chains guardrail-removal-upgrades-blocked for the
+#        BLOCKED -> CONDITIONAL(guardrail_removed) upgrade of CanReadData / CanExfiltrate
+#   2. CanModifyPolicy(Identity -> AccessLevel)
+#      — for accessLevels.update / accessLevels.delete permission
+#      — Access levels gate ingress rules; weakening/deleting one opens the ingress path
+#   3. CanGrantPermission(Identity -> Identity)
+#      — for policies.setIamPolicy on the AccessPolicy
+#      — IAM self-grant to policyAdmin = full perimeter control
+#      — CITES gcp/identity-escalation.yaml gcp-set-iam-policy-resource for the
+#        setIamPolicy -> CanGrantPermission -> CanEscalateTo chain
+#
+# WHAT THIS FILE DOES NOT EMIT (linchpins handle it — cite, do not duplicate):
+#   * The BLOCKED state on CanReadData / CanExfiltrate is set by the explicit
+#     normalization rules (gcp-accesscontextmanager.yaml) during collection.
+#   * The BLOCKED -> CONDITIONAL(guardrail_removed) upgrade is emitted ONCE by
+#     hierarchy-chains.yaml guardrail-removal-upgrades-blocked (rule 3). Do NOT
+#     re-emit the unblocked data edges here.
+#   * CanGrantPermission -> CanEscalateTo chain lives in can-control.yaml and
+#     credential-chains.yaml. Do NOT re-derive the escalation roll-up here.
+#
+# EDGE CONFORMANCE (schema/edges.yaml), honored by every rule:
+#   CanModifyPolicy: source [Identity]  target [Policy, Identity, *]
+#   CanGrantPermission: source [Identity]  target [Identity]
+#
+# CORRECTNESS NUANCES (from providers/gcp/accesscontextmanager.md §22):
+#   * DRY_RUN perimeters (useExplicitDryRunSpec + status absent) do NOT enforce —
+#     do not model them as guardrails; emit BLOCKED edges only for enforced perimeters.
+#   * Only emit BLOCKED on services actually listed in status.restrictedServices[].
+#   * Ingress rules that already whitelist the source project+identity+operation
+#     mean the path is NOT blocked — do not mark it BLOCKED.
+#   * Bridge perimeters (PERIMETER_TYPE_BRIDGE) are explicitly permitted cross-
+#     perimeter paths, not guardrails — do not emit them as ConditionalPolicy
+#     suppressors.
+#   * Access-level DELETION may break a referencing ingress rule rather than open
+#     it — prefer .update (broadening) as the cleaner path; for .delete emit as
+#     CONDITIONAL pending collector verification.
+#
+# Permission names verbatim from
+#   https://cloud.google.com/access-context-manager/docs/access-control
+# ===========================================================================
+
+provider: gcp
+phase: 13-cross-boundary
+applies_to: [gcp]
+
+rules:
+
+  # --- Derived: IAM grant to perimeter control chain ---------------------------
+  # DERIVATION RATIONALE: The explicit rule gcp-acm-can-set-iam-policy emits
+  # CanGrantPermission(Identity -> Identity @AccessPolicy), enabling a principal
+  # to grant itself or others roles/accesscontextmanager.policyAdmin.
+  # The policyAdmin role carries both accesscontextmanager.servicePerimeters.update
+  # and accesscontextmanager.accessLevels.update, which are CanModifyPolicy over
+  # the perimeter and access-level nodes. This derived rule connects the grant
+  # chain: once a principal can grant policyAdmin to itself, it gains full
+  # CanModifyPolicy over every ServicePerimeter under that AccessPolicy.
+  #
+  # This is a two-hop escalation:
+  #   1. CanGrantPermission(principal -> principal @AccessPolicy)
+  #   2. Grant roles/policyAdmin to self
+  #   3. policyAdmin includes .servicePerimeters.update, .accessLevels.update
+  #   4. CanModifyPolicy(principal -> ServicePerimeter) for each perimeter
+  #
+  # Without this rule, the setIamPolicy -> policyAdmin -> perimeter-update path
+  # is not traversable in the graph (only the explicit CanGrantPermission is emitted).
+  # With this rule, the full escalation chain from setIamPolicy to perimeter control
+  # is explicit.
+  #
+  # NOTE: identity-escalation.yaml gcp-set-iam-policy-resource also handles the
+  # CanGrantPermission -> CanEscalateTo roll-up; this rule is orthogonal—it focuses
+  # on the specific ACM perimeter-control path. Both are correct and non-overlapping.
+  - id: gcp-acm-iam-grant-to-perimeter-control
+    emits: CanModifyPolicy
+    description: "Identity that can grant policyAdmin at access policy scope gains full perimeter control."
+    applies_to: [gcp]
+    match:
+      # Match: a principal with CanGrantPermission at the AccessPolicy can grant policyAdmin to itself
+      - [ ?principal, CanGrantPermission, ?target ]
+      # The AccessPolicy is the parent boundary; the ServicePerimeter is the child
+      - [ ?accesspolicy, Contains, ?perimeter ]
+    where:
+      - "scope_of(?principal, CanGrantPermission) == ?accesspolicy (organization or access policy)"
+      - "node_class(?perimeter) == ConditionalPolicy"
+      - "provider_type(?perimeter) == 'google.identity.accesscontextmanager.v1.ServicePerimeter'"
+      - "?principal == ?target (self-grant path; principal can grant policyAdmin to itself)"
+    emit:
+      source_type: Identity
+      target_type: ConditionalPolicy
+      source: ?principal
+      target: ?perimeter
+      state_logic: "CONDITIONAL(role_grant_exercised) — the principal must actually grant itself or another principal policyAdmin and then assume/federate as that identity. ACTIVE when the grant has been exercised and the principal holds policyAdmin."
+      conditions: [trust_relationship, iam_permission]
+      confidence: 0.85
+      derived_from:
+        - "gcp-acm-can-set-iam-policy (CanGrantPermission at AccessPolicy)"
+        - "identity-escalation.yaml gcp-set-iam-policy-resource (policyAdmin role definition)"
+        - "hierarchy-chains.yaml admin-inherits-down-contains (perimeter under access policy)"
+      false_positive_note: "This rule is only traversable if the principal actually exercises the grant to assign itself/others policyAdmin. If a deny policy prevents the grant or the role assignment, this edge is BLOCKED."
+      narrative: "{principal.name} can grant itself or others roles/accesscontextmanager.policyAdmin by setting the IAM policy on the access policy. policyAdmin includes servicePerimeters.update and accessLevels.update, enabling full modification of every perimeter {perimeter.name} under that policy. Cite can-control.yaml and hierarchy-chains.yaml guardrail-removal-upgrades-blocked for downstream BLOCKED -> CONDITIONAL(guardrail_removed) upgrades."
+
+  # ANTI-DUPLICATION NOTE (Verifier findings):
+  # Removed rules gcp-acm-modify-perimeter-guardrail, gcp-acm-modify-access-level-guardrail,
+  # and (the malformed) gcp-acm-policy-iam-self-grant. All three were self-referential derived rules
+  # (matching an edge type and emitting the identical edge type with no graph transformation),
+  # producing zero net-new edges under monotonic deduplication. The explicit rules
+  # gcp-acm-can-modify-perimeter, gcp-acm-can-modify-access-level, and gcp-acm-can-set-iam-policy
+  # in /rules/explicit/gcp-accesscontextmanager.yaml already emit these edges correctly.
+  # The guardrail-removal state upgrade (BLOCKED -> CONDITIONAL(guardrail_removed)) is handled
+  # by hierarchy-chains.yaml guardrail-removal-upgrades-blocked (rule 3); the CanGrantPermission
+  # escalation roll-up is handled by can-control.yaml and gcp/identity-escalation.yaml.
+  # The iam-grant-to-perimeter-control rule above connects the setIamPolicy -> policyAdmin ->
+  # perimeter-update chain; it is the ONLY derived rule needed in this file.
+
+# ===========================================================================
+# EXPLICIT NORMALIZATION dependency (see /rules/explicit/gcp-accesscontextmanager.yaml):
+#   * HasPolicy(Project -> ServicePerimeter)         — project is inside perimeter
+#       evidence: status.resources[] includes projects/<number>
+#       api: accesscontextmanager.servicePerimeters.get
+#   * HasPolicy(ServicePerimeter -> AccessLevel)     — ingress rule references level
+#       evidence: ingressPolicies[].ingressFrom.sources[].accessLevel
+#       api: accesscontextmanager.servicePerimeters.get
+#   * CanModifyPolicy(Identity -> ConditionalPolicy) — effective update/delete perms
+#       evidence: effective IAM via IAM Policy Analyzer
+#   * CanGrantPermission(Identity -> Identity)       — effective setIamPolicy
+#       evidence: effective IAM via IAM Policy Analyzer
+#   * BLOCKED state on CanReadData / CanExfiltrate edges crossing the perimeter:
+#       set by the collector when the source project is outside the perimeter,
+#       the target resource is inside the perimeter, the service is in
+#       status.restrictedServices[], and NO whitelisting ingress/egress rule permits
+#       that specific source+identity+operation combination.
+#       blocked_by must point to the ServicePerimeter node.
+#
+# ANTI-DUPLICATION:
+#   * The BLOCKED -> CONDITIONAL(guardrail_removed) upgrade of every gated edge is
+#     emitted ONCE by hierarchy-chains.yaml guardrail-removal-upgrades-blocked.
+#     This file NEVER re-emits the unblocked downstream edge.
+#   * CanEscalateTo / Controls roll-ups are produced by can-control.yaml and
+#     hierarchy-chains.yaml off the CanGrantPermission we emit. Not re-derived here.
+#   * Org Policy guardrail removal for non-ACM constraints lives in
+#     rules/derived/gcp/orgpolicy.yaml — this file covers only ACM/VPC-SC resources.
+#
+# BLOCKED-edge guidance:
+#   * DRY_RUN perimeters (only spec, no status, or status.resources == []) do NOT
+#     suppress any edges — do not emit BLOCKED edges for them.
+#   * A perimeter of PERIMETER_TYPE_BRIDGE is a permitted cross-perimeter path, not a
+#     guardrail — do not emit CanModifyPolicy over it (no guardrail to remove).
+#   * An IAM deny policy denying accesscontextmanager.servicePerimeters.update keeps
+#     CanModifyPolicy BLOCKED — no guardrail-removal fires until the deny is lifted.
+# ===========================================================================

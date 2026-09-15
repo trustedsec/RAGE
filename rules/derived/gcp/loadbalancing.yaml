@@ -1,0 +1,600 @@
+# GCP Cloud Load Balancing — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# Phase 8 networking theme. Covers external Application Load Balancers (global
+# and regional), internal Application Load Balancers, and the IAP (Identity-Aware
+# Proxy) control plane that gates access to backends.
+#
+# ATTACK-PATH PRIMITIVES EMITTED HERE (Phase 8 categories):
+#   (1) EXPOSURE:
+#       A global/regional external forwarding rule with a public IP ->
+#       ExposedToInternet(LoadBalancer -> AnonymousIdentity).
+#   (2) WEAKEN CONTROLS — four distinct primitives:
+#       (a) globalForwardingRules.setTarget / forwardingRules.setTarget -> redirect
+#           the public IP to an attacker-controlled proxy (traffic hijack).
+#       (b) urlMaps.update -> rewrite routing rules; redirect paths to attacker
+#           backend or bypass IAP on specific paths.
+#       (c) backendServices.update (iap.enabled=false) -> disable IAP gate;
+#           expose authenticated application to unauthenticated internet access.
+#       (d) backendServices.setIamPolicy -> broaden IAP resource policy to allUsers;
+#           bypass authentication without disabling the IAP feature flag.
+#   (3) ADMIN: compute.loadBalancerAdmin-equivalent -> CanAdminister.
+#   (4) PRIVATE CONNECTIVITY: internal LB reachable from in-VPC compute ->
+#       PrivateReachability.
+#   (5) WEAKEN CONTROLS (Cloud Armor): remove WAF/DDoS security policy ->
+#       CanModifyConfiguration on the backend service (Firewall node).
+#
+# WHAT IS NOT IN THIS FILE:
+#   - Transitive network reachability (internet -> LB -> backend VM -> SA token) is
+#     NOT derived here. Emit FACTS (ExposedToInternet + structural RoutesTo from
+#     explicit_rules); the future network-chains linchpin composes end-to-end paths.
+#   - Backend workload execution (GCE MIG, Cloud Run, GCF, GKE): those edges live
+#     in gce.yaml, cloudrun.yaml, gcf.yaml, gke.yaml respectively.
+#   - VPC firewall rules and network-level reachability: vpc.yaml.
+#
+# LINCHPINS CITED (not re-derived here):
+#   can-control  control-via-admin: CanAdminister -> Controls.
+#   can-control-gcp  enter-project-via-impersonation: CanExecuteAs cross-project -> CanEnterProject.
+#   (future) network-chains: ExposedToInternet + RoutesTo + ExecutesAs -> internet-to-backend path.
+#
+# CONDITION SEMANTICS:
+#   ACTIVE: public IP allocated AND forwarding rule references a target proxy with at
+#           least one functional backend service — exposure fact confirmed from config.
+#   CONDITIONAL(network_reachability): internal LBs — reachable only from within the
+#           VPC or peered networks.
+#   CONDITIONAL(iam_permission): write permission confirmed only for that specific scope.
+#   BLOCKED: IAM deny policy or org policy constraint negates the write action at
+#            effective scope.
+#
+# All permission strings verified against the GCP Compute Engine IAM permissions
+# reference and roles/compute.loadBalancerAdmin definition (2026-09 snapshot).
+# No permissions are hallucinated.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 8-networking
+applies_to: [gcp]
+
+rules:
+
+  # ===========================================================================
+  # (1) EXPOSURE
+  # ===========================================================================
+
+  # --- Public external forwarding rule -> ExposedToInternet ------------------
+  - id: gcp-lb-external-exposed
+    emits: ExposedToInternet
+    description: >-
+      A global or regional external forwarding rule with a public IP (loadBalancingScheme
+      EXTERNAL or EXTERNAL_MANAGED) is reachable from the public internet on its configured
+      port. IAP on backend services is an authentication layer but does not remove the
+      internet-exposure fact.
+    where:
+      - "forwardingRule.loadBalancingScheme in [EXTERNAL, EXTERNAL_MANAGED]"
+      - "forwardingRule.IPAddress is non-null (public IP allocated)"
+      - "forwardingRule references a target proxy that references at least one URL map with a backend service (non-empty routing chain)"
+    emit:
+      source_type: LoadBalancer
+      target_type: AnonymousIdentity
+      source: "<global or regional external ForwardingRule>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      state_logic: >-
+        ACTIVE when the forwarding rule has a public IP AND references a target proxy
+        whose URL map has at least one path rule mapping to a backend service (or default
+        service). CONDITIONAL(service_state) if the backend service has no configured
+        backends (empty MIG/NEG list) — the IP is public but returns 502/503 only.
+        Do NOT emit for forwardingRules with loadBalancingScheme INTERNAL or
+        INTERNAL_MANAGED — those are VPC-internal.
+      conditions: []
+      false_positive_note: >-
+        (a) INTERNAL / INTERNAL_MANAGED forwarding rules are NOT internet-exposed — do not emit.
+        (b) If all backend services behind the URL map have iap.enabled=true, the LB frontend
+        is internet-reachable but requires a valid Google identity to pass IAP. Emit
+        ExposedToInternet (the IP is public and the LB accepts connections), but note IAP
+        presence in the narrative and reduce confidence (0.7 vs 0.95 for unprotected).
+        (c) An empty backend service (no backends) returns 502/503; emit with
+        CONDITIONAL(service_state) and lower confidence.
+        (d) Backend-level firewall rules (Cloud Armor) do not change the ExposedToInternet
+        fact — they filter L7 attacks but the frontend remains internet-reachable.
+      narrative: >-
+        Forwarding rule {source.name} has a public external IP; any internet host can send
+        HTTP/HTTPS traffic to it on port {source.portRange}. If backend services lack IAP
+        or IAP is disabled, traffic reaches backends unauthenticated. If IAP is enabled on
+        all backends, a valid Google identity is required to pass through, but the frontend
+        IP itself accepts connections from the open internet.
+
+  # ===========================================================================
+  # (2) WEAKEN CONTROLS
+  # ===========================================================================
+
+  # --- Admin: full LB control ------------------------------------------------
+  - id: gcp-lb-admin
+    emits: CanAdminister
+    description: >-
+      Holding compute.loadBalancerAdmin-equivalent permissions (roles/compute.loadBalancerAdmin
+      or roles/compute.networkAdmin / roles/compute.admin) grants full create/update/delete
+      control over all Cloud Load Balancing resources: forwarding rules, target proxies,
+      URL maps, backend services, NEGs, health checks, SSL certificates.
+    match_effective_permission:
+      action: "compute.globalForwardingRules.create"
+      resource_type: "compute.googleapis.com/GlobalForwardingRule"
+    where:
+      - >-
+        principal effectively holds compute.globalForwardingRules.* AND
+        compute.urlMaps.* AND compute.backendServices.* (i.e. roles/compute.loadBalancerAdmin
+        or superset — not merely compute.*.get/list)
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<Cloud Load Balancing resources in scope>"
+      permissions:
+        - "compute.globalForwardingRules.create"
+        - "compute.globalForwardingRules.delete"
+        - "compute.urlMaps.update"
+        - "compute.backendServices.update"
+        - "compute.networkEndpointGroups.create"
+        - "compute.targetHttpsProxies.create"
+        - "compute.sslCertificates.create"
+      conditions: [iam_permission]
+      false_positive_note: >-
+        CanAdminister requires the full write wildcard (roles/compute.loadBalancerAdmin or
+        equivalent). A principal with only compute.*.get / compute.*.list (roles/compute.viewer)
+        does NOT qualify. roles/compute.loadBalancerAdmin does NOT include
+        compute.backendServices.setIamPolicy; IAP policy changes require separate permissions
+        (roles/compute.securityAdmin, roles/compute.admin, or a custom role containing that
+        specific permission). Verify the full effective permission set is present and not
+        blocked by an IAM deny policy. roles/compute.loadBalancerAdmin does NOT include
+        compute.instances.* or iam.serviceAccounts.actAs; escalation to backend SA requires
+        additional permissions (handled in gce.yaml / cloudrun.yaml via backend execution paths).
+      narrative: >-
+        {principal.name} holds roles/compute.loadBalancerAdmin or equivalent and can
+        fully control all Cloud Load Balancing resources in scope, including adding public
+        frontend IPs, rewriting URL maps, and disabling IAP on backend services via
+        compute.backendServices.update. IAP resource-policy mutation requires separate
+        compute.backendServices.setIamPolicy permission.
+
+  # --- Forwarding rule setTarget -> redirect public IP to attacker proxy ------
+  - id: gcp-lb-set-target
+    emits: CanModifyConfiguration
+    description: >-
+      compute.globalForwardingRules.setTarget (or compute.forwardingRules.setTarget for
+      regional) changes the target proxy of an existing forwarding rule. An attacker can
+      re-point a public IP at an attacker-controlled target proxy/backend service,
+      intercepting all traffic for the forwarding rule's hostname without touching the
+      original backend or changing DNS.
+    match_effective_permission:
+      action: "compute.globalForwardingRules.setTarget"
+      resource_type: "compute.googleapis.com/GlobalForwardingRule"
+    alt_permission: "compute.forwardingRules.setTarget"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<GlobalForwardingRule or ForwardingRule in scope>"
+      permissions:
+        - "compute.globalForwardingRules.setTarget"
+        - "compute.forwardingRules.setTarget"
+      conditions: [iam_permission]
+      escalation: >-
+        setTarget on a public global forwarding rule preserves the anycast IP and port
+        while redirecting all matching traffic to a new target proxy. Attacker creates a
+        target HTTPS proxy referencing an attacker-controlled URL map and backend service,
+        then calls setTarget on the existing forwarding rule. All client traffic (including
+        session cookies, authorization headers, and POST bodies) is now forwarded to the
+        attacker's backend AFTER TLS termination at the GFE.
+      false_positive_note: >-
+        compute.globalForwardingRules.setTarget requires the target to be a valid Compute
+        resource (TargetHttpProxy / TargetHttpsProxy / TargetTcpProxy) that exists in the
+        same project. The attacker must also hold permissions to create the target proxy
+        and its URL map / backend service. For regional forwarding rules use
+        compute.forwardingRules.setTarget. This mutation affects INTERNAL forwarding rules
+        only within the VPC — scope impact accordingly for INTERNAL LBs. Also see
+        gcp-lb-target-proxy-url-map for the distinct attack of rewriting the URL map bound
+        to an existing target proxy (compute.targetHttpsProxies.setUrlMap /
+        compute.targetHttpProxies.setUrlMap).
+      narrative: >-
+        {principal.name} can call setTarget on forwarding rule {target.name}
+        (compute.globalForwardingRules.setTarget / compute.forwardingRules.setTarget),
+        redirecting its public IP to an attacker-controlled target proxy. All traffic to
+        {target.name}'s IP (including POST bodies and session tokens) flows to the attacker's
+        backend after TLS termination at Google's Front End.
+
+  # --- Target proxy setUrlMap -> replace URL map binding --------------------
+  - id: gcp-lb-target-proxy-url-map
+    emits: CanModifyConfiguration
+    description: >-
+      compute.targetHttpsProxies.setUrlMap (or compute.targetHttpProxies.setUrlMap)
+      changes the URL map bound to an existing target proxy. An attacker can swap the
+      URL map without touching the forwarding rule, redirecting all traffic through the
+      target proxy to an attacker-controlled URL map and backend service. This achieves
+      traffic hijack and IAP bypass without requiring setTarget on the forwarding rule.
+    match_effective_permission:
+      action: "compute.targetHttpsProxies.setUrlMap"
+      resource_type: "compute.googleapis.com/TargetHttpsProxy"
+    alt_permission: "compute.targetHttpProxies.setUrlMap"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<TargetHttpsProxy or TargetHttpProxy in scope>"
+      permissions:
+        - "compute.targetHttpsProxies.setUrlMap"
+        - "compute.targetHttpProxies.setUrlMap"
+      conditions: [iam_permission]
+      escalation: >-
+        setUrlMap on a target proxy changes the URL map that proxy evaluates for all
+        incoming traffic. Attacker creates an attacker-controlled URL map and backend
+        service, then calls setUrlMap on an existing target proxy bound to a public
+        forwarding rule. All client traffic through that proxy (including session cookies,
+        authorization headers, and POST bodies) is now forwarded to the attacker's backend
+        AFTER TLS termination at the GFE.
+      false_positive_note: >-
+        compute.targetHttpsProxies.setUrlMap requires the new URL map to already exist
+        and the principal to hold compute.urlMaps.use on it. Creating a net-new URL map
+        additionally requires compute.urlMaps.create. For target HTTP proxies (non-HTTPS),
+        use compute.targetHttpProxies.setUrlMap. This mutation is a distinct attack from
+        compute.globalForwardingRules.setTarget; both achieve traffic hijack but via
+        different resource mutation points. The impact is identical when the target proxy
+        is bound to a public forwarding rule.
+      narrative: >-
+        {principal.name} can call setUrlMap on target proxy {target.name}
+        (compute.targetHttpsProxies.setUrlMap / compute.targetHttpProxies.setUrlMap),
+        replacing the URL map the proxy evaluates. All traffic flowing through this target
+        proxy (from its bound public forwarding rule) is now routed to an attacker-controlled
+        URL map and backend. TLS terminates at the GFE; the attacker's backend receives
+        decrypted HTTP traffic including session cookies and authorization headers.
+
+  # --- URL map update -> traffic hijack / IAP bypass on specific paths --------
+  - id: gcp-lb-urlmap-update
+    emits: CanModifyConfiguration
+    description: >-
+      compute.urlMaps.update (global URL maps) and compute.regionUrlMaps.update (regional
+      URL maps) rewrite host rules, path matchers, and default service. An attacker can
+      redirect specific paths or entire hostnames to attacker-controlled backend services,
+      intercept decrypted application traffic, or route paths to a backend service NOT
+      protected by IAP (bypassing authentication on those paths while leaving IAP visually
+      enabled on the URL map).
+    match_effective_permission:
+      action: "compute.urlMaps.update"
+      resource_type: "compute.googleapis.com/UrlMap"
+    alt_permission: "compute.regionUrlMaps.update"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<UrlMap or RegionUrlMap in scope>"
+      permissions:
+        - "compute.urlMaps.update"
+        - "compute.regionUrlMaps.update"
+      conditions: [iam_permission]
+      escalation: >-
+        (a) Selective path hijack: modify pathMatchers[].pathRules[] to route /api/* or
+        /login to an internet NEG pointing to an external attacker host. The LB terminates
+        TLS and forwards decrypted HTTP to the attacker. All POST bodies, cookies, and
+        authorization headers in matched requests are captured.
+        (b) IAP bypass per-path: route specific paths (e.g. /admin/*, /metrics) to a
+        backend service with iap.enabled=false; those paths are now unauthenticated even
+        though the URL map is associated with IAP-protected backend services for other paths.
+        (c) Full hostname redirect: override hostRules[] to send an entire virtual host to
+        an attacker backend; requires compute.urlMaps.update or compute.regionUrlMaps.update
+        plus compute.backendServices.use on the target backend service.
+      false_positive_note: >-
+        compute.urlMaps.update and compute.regionUrlMaps.update are distinct permissions;
+        global LBs use compute.urlMaps.update, regional Application Load Balancers use
+        compute.regionUrlMaps.update. Verify the scope (global vs regional) against the
+        LB resource type. The new backend service target must already exist and the principal
+        must hold compute.backendServices.use on it. Creating a net-new backend service
+        additionally requires compute.backendServices.create. For IAP-bypass impact, the URL
+        map must be associated with an LB that serves IAP-protected traffic; impact is lower
+        if no IAP is present. Changes take effect immediately (typically within seconds to
+        minutes via GFE propagation).
+      narrative: >-
+        {principal.name} can rewrite URL map {target.name} (compute.urlMaps.update or
+        compute.regionUrlMaps.update for regional LBs), redirecting specific paths or hostnames
+        to attacker-controlled backend services. TLS terminates at the GFE, so the attacker's
+        backend receives decrypted HTTP traffic including session cookies and authorization
+        headers. If IAP-protected paths are present, the attacker can route unprotected paths
+        around IAP, selectively bypassing authentication.
+
+  # --- Backend service update -> swap/add backends or change config -----------
+  - id: gcp-lb-backend-service-update
+    emits: CanModifyConfiguration
+    description: >-
+      compute.backendServices.update allows modifying backend service configuration,
+      including adding/removing Network Endpoint Groups (NEGs) from the backend pool
+      and changing load-balancing configuration. An attacker can add a serverless NEG
+      pointing to an attacker-controlled Cloud Run service to intercept a fraction of
+      traffic. NOTE: disabling IAP (iap.enabled=false) is the canonical case covered
+      by gcp-iap-disable-on-backend-service in iap.yaml — this rule focuses on the
+      backend-pool mutation sub-case.
+    match_effective_permission:
+      action: "compute.backendServices.update"
+      resource_type: "compute.googleapis.com/BackendService"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<BackendService in scope>"
+      permissions:
+        - "compute.backendServices.update"
+      conditions: [iam_permission]
+      escalation: >-
+        (a) Backend swapping: adding a new NEG (including a serverless NEG pointing to an
+        attacker-controlled Cloud Run service) to the backend service routes a fraction of
+        traffic to the attacker. Requires compute.networkEndpointGroups.use on the NEG.
+        (b) Load balancing scheme change: modifying the balancing mode or capacity scaler
+        can affect which backends receive traffic (low impact; included for completeness).
+        (c) IAP disable is covered by gcp-iap-disable-on-backend-service in iap.yaml.
+      false_positive_note: >-
+        compute.backendServices.update is a broad permission. Impact tiers:
+        (high) Adding an attacker-controlled serverless NEG to the backend pool — attacker
+          receives a fraction of sessions (probabilistic, not all); the NEG must already exist
+          and the principal must hold compute.networkEndpointGroups.use on it.
+        (low) Modifying health check thresholds, timeout, or balancing mode — operational only,
+          not security. For the IAP-disable case and its narrative, see
+          gcp-iap-disable-on-backend-service in iap.yaml. Regional backend services use
+          compute.regionBackendServices.update; confirm scope. Requires confirmation that
+          backendServices.update is not blocked by an IAM deny policy or org policy constraint.
+      narrative: >-
+        {principal.name} can update backend service {target.name}
+        (compute.backendServices.update), including adding network endpoint groups to the
+        backend pool. The attacker can create or substitute a serverless NEG pointing to an
+        attacker-controlled Cloud Run service to intercept a fraction of traffic. For the
+        IAP-disable case, see the companion rule gcp-iap-disable-on-backend-service in iap.yaml.
+
+  # --- Backend service setIamPolicy -> broaden IAP access --------------------
+  - id: gcp-lb-iap-policy-write
+    emits: CanModifyConfiguration
+    description: >-
+      compute.backendServices.setIamPolicy rewrites the IAP resource-level allow policy on
+      a backend service. Granting roles/iap.httpsResourceAccessor to allUsers bypasses IAP
+      authentication — all requests pass through without a Google identity — without setting
+      iap.enabled=false, so monitoring / logs show IAP still "enabled" while access is open.
+    match_effective_permission:
+      action: "compute.backendServices.setIamPolicy"
+      resource_type: "compute.googleapis.com/BackendService"
+    where:
+      - "backend service has iap.enabled=true (IAP is active — policy write is relevant)"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: "<principal>"
+      target: "<IAP-protected BackendService in scope>"
+      permissions:
+        - "compute.backendServices.setIamPolicy"
+      conditions: [iam_permission]
+      escalation: >-
+        Grant roles/iap.httpsResourceAccessor to allUsers (or allAuthenticatedUsers for
+        any Google-authenticated user) on the backend service's IAM policy. IAP passes
+        all requests regardless of the caller's specific identity. The IAP feature flag
+        remains enabled, making the open access harder to detect in configuration audits
+        that only check iap.enabled rather than the IAP resource policy membership.
+      false_positive_note: >-
+        Only impactful if the backend service has iap.enabled=true. If IAP is not enabled,
+        setIamPolicy is a no-op for authentication purposes (IAP resource policy is unused).
+        Distinguish broadening (granting allUsers — attack) from narrowing (revoking access —
+        hardening) in the narrative. compute.backendServices.setIamPolicy is NOT included in
+        roles/compute.viewer; it requires roles/compute.loadBalancerAdmin or a custom role.
+      narrative: >-
+        {principal.name} can rewrite the IAP resource policy on backend service {target.name}
+        (compute.backendServices.setIamPolicy). Granting roles/iap.httpsResourceAccessor
+        to allUsers opens the IAP-protected application to any internet user while the IAP
+        feature flag remains visually enabled, bypassing the authentication gate without
+        triggering iap.enabled=false alerts.
+
+  # --- Cloud Armor remove -> weaken L7 WAF/DDoS protection -------------------
+  - id: gcp-lb-cloud-armor-disable
+    emits: CanModifyConfiguration
+    description: >-
+      compute.backendServices.setSecurityPolicy removes or replaces the Cloud Armor
+      security policy attached to a backend service, stripping L7 DDoS mitigation and
+      WAF rule enforcement from all traffic reaching that backend. setSecurityPolicy
+      is a distinct IAM permission (not subsumed by compute.backendServices.update).
+    match_effective_permission:
+      action: "compute.backendServices.setSecurityPolicy"
+      resource_type: "compute.googleapis.com/BackendService"
+    where:
+      - "backend service has a Cloud Armor security policy attached (securityPolicy field non-null)"
+    emit:
+      source_type: Identity
+      target_type: GenericNetwork
+      source: "<principal>"
+      target: "<Cloud Armor SecurityPolicy protecting BackendService>"
+      permissions:
+        - "compute.backendServices.setSecurityPolicy"
+      conditions: [iam_permission]
+      escalation: >-
+        Call setSecurityPolicy with an empty or permissive policy to remove Cloud Armor
+        from the backend service. All traffic that was previously blocked by Cloud Armor
+        rules (SQLi, XSS, SSRF, rate limits, geo-block, IP-allowlist enforcement) now
+        reaches the backend unfiltered. For backends with custom IP allowlist rules this
+        can additionally allow access from blocked IP ranges.
+      false_positive_note: >-
+        Only impactful if the backend service has a non-null securityPolicy (Cloud Armor
+        attached). A backend service without Cloud Armor is already unprotected at the WAF
+        layer — removing a null policy is a no-op. compute.backendServices.setSecurityPolicy
+        is a distinct IAM permission from compute.backendServices.update; confirm it is
+        present in the effective permission set (it is included in roles/compute.loadBalancerAdmin
+        and roles/compute.securityAdmin). Cloud Armor presence does not affect the
+        ExposedToInternet fact; it only reduces L7 exploitability. The target is a
+        Cloud Armor SecurityPolicy (generic_type GenericNetwork), not a VPC firewall rule.
+      narrative: >-
+        {principal.name} can remove the Cloud Armor security policy from backend service
+        {target.name} (compute.backendServices.setSecurityPolicy). Removing Cloud Armor
+        strips all L7 WAF rules (SQLi, XSS, SSRF), rate limiting, and IP allowlist
+        enforcement, allowing previously blocked attack traffic to reach the backend.
+
+  # --- Internal LB -> PrivateReachability from in-VPC compute ----------------
+  - id: gcp-lb-internal-reachable
+    emits: PrivateReachability
+    description: >-
+      An internal Application Load Balancer or internal passthrough NLB (loadBalancingScheme
+      INTERNAL or INTERNAL_MANAGED) is reachable only from within the VPC, peered VPCs,
+      or connected on-premises networks. A compute resource with a foothold in the same VPC
+      can reach the internal LB frontend and, through it, the backends.
+    where:
+      - "forwardingRule.loadBalancingScheme in [INTERNAL, INTERNAL_MANAGED]"
+      - "forwardingRule.IPAddress is a private RFC-1918 address"
+      - "source compute resource is in the same VPC (or a peered VPC / VPN-connected network)"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<Compute resource in the same VPC>"
+      target: "<internal ForwardingRule (frontend IP)>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability): confirmed only when the source compute resource
+        is in the same VPC subnet or a peered/VPN-connected network AND no GFW/VPC
+        firewall rule blocks the connection to the internal LB's frontend IP.
+        Do NOT emit for EXTERNAL / EXTERNAL_MANAGED forwarding rules.
+      false_positive_note: >-
+        Internal LBs have their own GFW firewall requirements (health-check probes must
+        be allowed from 130.211.0.0/22 and 35.191.0.0/16). Firewall rules on the backend
+        VMs/subnet may still block connections even if the LB frontend is reachable.
+        Shared VPC: an internal LB in the host project's VPC is reachable from service
+        project VMs that use that subnet (if permitted). Emit PrivateReachability for the
+        most specific source node confirmed in-network.
+      narrative: >-
+        Internal LB {target.name} is reachable from compute resource {source.name} over
+        the VPC network on its private frontend IP. A foothold in {source.name} provides
+        access to the internal LB's backends (via private routing), which may include
+        sensitive internal services not intended for external reach.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An IAM deny policy blocking compute.backendServices.update,
+#     compute.backendServices.setIamPolicy, compute.urlMaps.update,
+#     compute.globalForwardingRules.setTarget, or compute.forwardingRules.setTarget
+#     at the resource / project / folder / org scope -> emit the edge with
+#     state: BLOCKED and denied_by=<deny policy / binding>.
+#   - An org policy constraint (e.g. constraints/compute.restrictLoadBalancerCreationForTypes
+#     restricting EXTERNAL LBs) prevents creating new external forwarding rules but does
+#     NOT retroactively block existing public forwarding rules. Do not emit BLOCKED for
+#     existing resources; emit a note for new-resource creation only.
+#   - An org policy constraints/iam.disableServiceAccountKeyCreation does not apply here.
+#   - Cloud Armor rules in enforcement mode are a hardening control; they do not block
+#     ExposedToInternet — emit that fact regardless, noting Cloud Armor presence.
+# ---------------------------------------------------------------------------
+
+# LINCHPINS CITED (do not re-derive):
+#   /rules/derived/can-control.yaml: control-via-admin (CanAdminister -> Controls)
+#   /rules/derived/gcp/can-control-gcp.yaml: enter-project-via-impersonation
+#   /rules/derived/gcp/iap.yaml: gcp-iap-disable-on-backend-service (IAP-disabling sub-case of CanModifyConfiguration)
+#   (future) network-chains: ExposedToInternet + RoutesTo + backend ExecutesAs -> full internet-to-SA path
+
+# Explicit normalization rules (raw API config -> explicit structural edges).
+# These emit LocatedIn and AttachedTo structural facts required for path context.
+# Backend execution edges (ExecutesAs, ExposedToInternet on backends) live in gce.yaml,
+# cloudrun.yaml, gcf.yaml, and appengine.yaml.
+explicit_rules:
+
+  - id: gcp-lb-forwarding-rule-located-in-network
+    emits: LocatedIn
+    applies_to: [gcp]
+    source_config:
+      resource_type: "compute.googleapis.com/ForwardingRule"
+      field: "network"
+    emit:
+      source: "<ForwardingRule>"
+      target: "<VirtualNetwork referenced by ForwardingRule.network>"
+      api_source: "compute.forwardingRules.list / compute.globalForwardingRules.list"
+      evidence_field: "network"
+      narrative: >-
+        Forwarding rule {source.name} is placed in VPC network {target.name}
+        (for internal LBs; global external LBs are not subnet-bound).
+
+  - id: gcp-lb-target-proxy-to-forwarding-rule
+    emits: AttachedTo
+    applies_to: [gcp]
+    source_config:
+      resource_type: "compute.googleapis.com/TargetHttpsProxy"
+      field: "urlMap"
+    emit:
+      source: "<TargetHttpsProxy>"
+      target: "<ForwardingRule that references this TargetHttpsProxy>"
+      api_source: "compute.targetHttpsProxies.list + compute.globalForwardingRules.list"
+      evidence_field: "target (on the ForwardingRule)"
+      narrative: >-
+        Target HTTPS proxy {source.name} is referenced by forwarding rule {target.name};
+        together they form the L7 frontend entry point.
+
+  - id: gcp-lb-urlmap-to-target-proxy
+    emits: AttachedTo
+    applies_to: [gcp]
+    source_config:
+      resource_type: "compute.googleapis.com/UrlMap"
+      field: "selfLink"
+    emit:
+      source: "<UrlMap>"
+      target: "<TargetHttpProxy or TargetHttpsProxy that references this UrlMap>"
+      api_source: "compute.targetHttpProxies.list / compute.targetHttpsProxies.list"
+      evidence_field: "urlMap"
+      narrative: >-
+        URL map {source.name} is bound to target proxy {target.name}; it defines the
+        L7 routing rules (host rules and path matchers) for all traffic through that proxy.
+
+  - id: gcp-lb-backend-service-to-urlmap
+    emits: AttachedTo
+    applies_to: [gcp]
+    source_config:
+      resource_type: "compute.googleapis.com/BackendService"
+      field: "selfLink"
+    emit:
+      source: "<BackendService>"
+      target: "<UrlMap that references this BackendService in pathRules or defaultService>"
+      api_source: "compute.urlMaps.get / list"
+      evidence_field: "pathMatchers[].pathRules[].service OR defaultService"
+      narrative: >-
+        Backend service {source.name} is targeted by URL map {target.name} (as a path rule
+        target or default service); traffic matching the URL map rules is forwarded to this
+        backend service.
+
+  - id: gcp-lb-neg-to-backend-service
+    emits: AttachedTo
+    applies_to: [gcp]
+    source_config:
+      resource_type: "compute.googleapis.com/NetworkEndpointGroup"
+      field: "selfLink"
+    emit:
+      source: "<NetworkEndpointGroup>"
+      target: "<BackendService that lists this NEG in backends[]>"
+      api_source: "compute.backendServices.get"
+      evidence_field: "backends[].group"
+      narrative: >-
+        Network endpoint group {source.name} is a backend member of backend service
+        {target.name}; traffic from the LB is distributed to the NEG's endpoints.
+
+  - id: gcp-lb-serverless-neg-cloud-run
+    emits: AttachedTo
+    applies_to: [gcp]
+    source_config:
+      resource_type: "compute.googleapis.com/NetworkEndpointGroup"
+      field: "cloudRun.service"
+    where:
+      - "networkEndpointGroups[].networkEndpointType == SERVERLESS"
+      - "networkEndpointGroups[].cloudRun.service is non-null"
+    emit:
+      source: "<NetworkEndpointGroup (serverless)>"
+      target: "<Cloud Run Service referenced by cloudRun.service>"
+      api_source: "compute.networkEndpointGroups.get"
+      evidence_field: "cloudRun.service"
+      narrative: >-
+        Serverless NEG {source.name} routes LB traffic to Cloud Run service {target.name};
+        requests forwarded through this NEG are handled by Cloud Run (and run as its runtime SA).
+
+  - id: gcp-lb-ssl-cert-to-target-proxy
+    emits: AttachedTo
+    applies_to: [gcp]
+    source_config:
+      resource_type: "compute.googleapis.com/SslCertificate"
+      field: "selfLink"
+    emit:
+      source: "<SslCertificate>"
+      target: "<TargetHttpsProxy that references this certificate>"
+      api_source: "compute.targetHttpsProxies.get"
+      evidence_field: "sslCertificates[]"
+      narrative: >-
+        SSL certificate {source.name} is bound to target HTTPS proxy {target.name};
+        it provides the TLS identity for traffic to the LB's public frontend.

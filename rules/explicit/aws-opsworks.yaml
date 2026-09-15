@@ -1,0 +1,323 @@
+# Explicit normalization rules for AWS OpsWorks Stacks
+# ---------------------------------------------------------------------------
+# These rules normalize raw AWS config (opsworks:Describe* + ec2:DescribeInstances
+# API responses) into EXPLICIT edges. They run BEFORE derived rules.
+#
+# OpsWorks Stacks reached EOL on May 26, 2024. Existing stacks are still
+# valid collection targets.
+#
+# IAM permission source:
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsopsworks.html
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-pipelines
+applies_to: [aws]
+
+rules:
+
+  # --- ExecutesAs: EC2 instance -> instance profile role ---------------------
+  # OpsWorks manages EC2 instances. The instance profile (IAM role attached to
+  # the EC2 instance) is the identity under which Chef recipes and all
+  # opsworks:CreateDeployment commands run. Evidence: join
+  # opsworks:DescribeInstances (for Ec2InstanceId) with ec2:DescribeInstances
+  # (for IamInstanceProfile.Arn).
+  - id: aws-opsworks-executes-as-instance-profile
+    emits: ExecutesAs
+    description: "OpsWorks-managed EC2 instance runs as its IAM instance profile role."
+    match_effective_permission: {}
+    match_record:
+      resource_type: "AWS::OpsWorks::Instance"
+      api: "opsworks:DescribeInstances + ec2:DescribeInstances"
+      join_key: "Ec2InstanceId == InstanceId"
+      field: "IamInstanceProfile.Arn"
+      condition: "IamInstanceProfile.Arn != null AND Status in [online, setup, configure]"
+    emit:
+      source_type: VirtualMachine
+      target_type: MachineIdentity
+      source: "<OpsWorks EC2 instance node (VirtualMachine)>"
+      target: "<IAM instance profile role (MachineIdentity / Role)>"
+      permissions: []
+      state_logic: >-
+        ACTIVE when the instance is in ONLINE/running state. CONDITIONAL(service_state)
+        when the instance is starting (setup/configure lifecycle state). Do not emit for
+        stopped or terminated instances.
+      confidence: 1.0
+      evidence_field: "ec2:DescribeInstances[].Instances[].IamInstanceProfile.Arn"
+      narrative: >-
+        {instance.name} (EC2 instance {ec2_id}) runs as the IAM instance profile role
+        {role.name}; all Chef recipe code and deployment commands execute with this
+        identity's credentials (readable from IMDS).
+
+  # --- ExecutesAs: OpsWorks Stack -> service role ----------------------------
+  # The OpsWorks service role is used by the OpsWorks control plane to call AWS
+  # APIs (EC2 RunInstances/TerminateInstances, ELB, CloudWatch, etc.) on behalf
+  # of the stack. Evidence: opsworks:DescribeStacks[ServiceRoleArn].
+  - id: aws-opsworks-executes-as-service-role
+    emits: ExecutesAs
+    description: "OpsWorks Stack's control plane operates as the stack's service role."
+    match_record:
+      resource_type: "AWS::OpsWorks::Stack"
+      api: "opsworks:DescribeStacks"
+      field: "ServiceRoleArn"
+      condition: "ServiceRoleArn != null"
+    emit:
+      source_type: ApplicationPlatform
+      target_type: MachineIdentity
+      source: "<OpsWorks Stack node (ApplicationPlatform)>"
+      target: "<OpsWorks service role (MachineIdentity)>"
+      permissions: []
+      state_logic: "ACTIVE when stack exists and ServiceRoleArn is set."
+      confidence: 1.0
+      evidence_field: "opsworks:DescribeStacks[].Stacks[].ServiceRoleArn"
+      narrative: >-
+        {stack.name} operates as service role {service_role.name}; OpsWorks calls AWS
+        APIs (EC2, ELB, CloudWatch, ECS) using this role on the stack's behalf.
+
+  # --- CanModifyCode: effective opsworks:CreateDeployment ---------------------
+  # Any principal with effective opsworks:CreateDeployment can run execute_recipes
+  # or run_command on stack instances. Normalized here as an explicit CanModifyCode
+  # edge pointing to the OpsWorks instance(s). The derived rules in opsworks.yaml
+  # then combine this with ExecutesAs to produce CanExecuteAs via cicd-chains.
+  - id: aws-opsworks-can-modify-code-create-deployment
+    emits: CanModifyCode
+    description: "opsworks:CreateDeployment grants ability to run arbitrary Chef recipes or commands on stack instances (execute_recipes / run_command)."
+    match_effective_permission:
+      action: "opsworks:CreateDeployment"
+      resource_type: "AWS::OpsWorks::Stack"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: "<principal>"
+      target: "<OpsWorks-managed EC2 instances in the stack scope>"
+      permissions: ["opsworks:CreateDeployment"]
+      narrative: >-
+        {principal.name} can run a deployment on {stack.name}'s instances
+        (opsworks:CreateDeployment), executing Chef recipes or shell commands as the
+        instance profile role (execute_recipes / run_command subtypes).
+
+  # --- CanModifyCode: effective opsworks:UpdateStack (cookbook source) --------
+  # opsworks:UpdateStack can change the CustomCookbooksSource URL, redirecting
+  # cookbook downloads to an attacker-controlled repo. Normalized as CanModifyCode
+  # on the stack (ApplicationPlatform) — the supply-chain surface.
+  - id: aws-opsworks-can-modify-code-update-stack
+    emits: CanModifyCode
+    description: "opsworks:UpdateStack lets a principal change the custom cookbook source URL, enabling cookbook supply-chain injection."
+    match_effective_permission:
+      action: "opsworks:UpdateStack"
+      resource_type: "AWS::OpsWorks::Stack"
+    emit:
+      source_type: Identity
+      target_type: ApplicationPlatform
+      source: "<principal>"
+      target: "<OpsWorks Stack (ApplicationPlatform)>"
+      permissions: ["opsworks:UpdateStack"]
+      narrative: >-
+        {principal.name} can change {stack.name}'s custom cookbook source
+        (opsworks:UpdateStack), redirecting cookbook downloads to an attacker-controlled
+        repository for supply-chain injection.
+
+  # --- CanTrigger: effective opsworks:CreateDeployment (non-modify subtypes) --
+  # Separate from CanModifyCode — captures the trigger-only capability where the
+  # current definition is used. Feeds cicd-chains rule 2.
+  - id: aws-opsworks-can-trigger-create-deployment
+    emits: CanTrigger
+    description: "opsworks:CreateDeployment can trigger a deployment run using the stack's current cookbook/app definition."
+    match_effective_permission:
+      action: "opsworks:CreateDeployment"
+      resource_type: "AWS::OpsWorks::Stack"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: "<principal>"
+      target: "<OpsWorks-managed EC2 instances in the stack scope>"
+      permissions: ["opsworks:CreateDeployment"]
+      narrative: >-
+        {principal.name} can trigger a deployment on {stack.name}'s instances
+        (opsworks:CreateDeployment); the current cookbook/app definition runs as the
+        instance profile role.
+
+  # --- CanGrantPermission: effective opsworks:SetPermission -------------------
+  # opsworks:SetPermission (Permissions management, Write) lets a caller grant
+  # any OpsWorks user admin, IAM, deploy, or SSH rights on a stack.
+  - id: aws-opsworks-can-grant-permission-set-permission
+    emits: CanGrantPermission
+    description: "opsworks:SetPermission grants a principal the ability to assign deploy/admin/SSH rights to any OpsWorks user on a stack."
+    match_effective_permission:
+      action: "opsworks:SetPermission"
+      resource_type: "AWS::OpsWorks::Stack"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<any OpsWorks user with a UserProfile in the account>"
+      permissions: ["opsworks:SetPermission"]
+      narrative: >-
+        {principal.name} can call opsworks:SetPermission to grant any OpsWorks user
+        (including itself) admin or deploy rights on {stack.name}.
+
+  # --- CanModifyTrust: opsworks:UpdateStack + iam:PassRole (service role swap) --
+  # UpdateStack with a new ServiceRoleArn effectively changes what identity
+  # OpsWorks operates as at the control-plane level. Requires iam:PassRole.
+  - id: aws-opsworks-can-modify-trust-update-stack-service-role
+    emits: CanModifyTrust
+    description: "opsworks:UpdateStack + iam:PassRole on the new service role swaps the identity OpsWorks operates as."
+    match_effective_permission:
+      action: "opsworks:UpdateStack"
+      resource_type: "AWS::OpsWorks::Stack"
+    where:
+      - "principal also has effective iam:PassRole on a role trusted by opsworks.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: "<principal>"
+      target: "<OpsWorks service role passable to opsworks.amazonaws.com>"
+      permissions: ["opsworks:UpdateStack", "iam:PassRole"]
+      narrative: >-
+        {principal.name} can change {stack.name}'s service role
+        (opsworks:UpdateStack + iam:PassRole) to a chosen IAM role trusted by
+        opsworks.amazonaws.com, redirecting OpsWorks control-plane operations to
+        that identity.
+
+  # --- ContainsSecret: OpsWorks App secure environment variables -------------
+  # opsworks:DescribeApps returns App.Environment[] key/value pairs. Values with
+  # Secure=true are sensitive credentials. These are passed to Chef as data bag
+  # entries and readable by any deployment code.
+  - id: aws-opsworks-contains-app-env-secret
+    emits: ContainsSecret
+    description: "OpsWorks App secure environment variables are credentials accessible to all deployment code on the stack."
+    match_record:
+      resource_type: "AWS::OpsWorks::App"
+      api: "opsworks:DescribeApps"
+      field: "Environment[].Secure == true"
+    emit:
+      source_type: ApplicationPlatform
+      target_type: Secret
+      source: "<OpsWorks Stack (ApplicationPlatform) owning the app>"
+      target: "<Secret (app environment variable key/value)>"
+      permissions: []
+      evidence_field: "opsworks:DescribeApps[].Apps[].Environment[]{Secure=true}"
+      narrative: >-
+        {stack.name} app {app.name} stores a secure environment variable that is
+        accessible as a Chef data bag entry to any deployment recipe; any code
+        executed via opsworks:CreateDeployment can exfiltrate it.
+
+  # --- CanModifyCode: opsworks:UpdateApp (app source supply chain) -----------
+  # opsworks:UpdateApp can change an app's source repository (GitHub, SVN, S3, HTTP).
+  # The next deployment (e.g., 'deploy' command) checks out and runs the attacker's
+  # code from the new source repository on all stack instances as the instance
+  # profile role. This is a supply-chain CanModifyCode into the instances.
+  - id: aws-opsworks-can-modify-code-update-app
+    emits: CanModifyCode
+    description: "opsworks:UpdateApp lets a principal change an app's source repository, enabling application supply-chain injection."
+    match_effective_permission:
+      action: "opsworks:UpdateApp"
+      resource_type: "AWS::OpsWorks::App"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: "<principal>"
+      target: "<OpsWorks-managed EC2 instances in the app's owning stack>"
+      permissions: ["opsworks:UpdateApp"]
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) — a deploy deployment must be issued after the
+        app source is changed to pull and run the attacker's code. ACTIVE when the
+        attacker also has opsworks:CreateDeployment on the stack (can trigger the
+        deploy). CONDITIONAL(service_state) if all instances are stopped.
+      confidence: 0.75
+      narrative: >-
+        {principal.name} can change {app.name}'s source repository
+        (opsworks:UpdateApp), redirecting the next application deployment to pull
+        attacker-controlled code onto {stack.name}'s instances.
+
+  # --- CanReadSecret: opsworks:DescribeStackProvisioningParameters -----------
+  # opsworks:DescribeStackProvisioningParameters returns provisioning parameters
+  # including agent registration keys — credential material allowing an attacker to
+  # register external instances to the stack or impersonate the stack's provisioning
+  # agent. This is a credential-read primitive.
+  - id: aws-opsworks-read-provisioning-parameters
+    emits: CanReadSecret
+    description: "opsworks:DescribeStackProvisioningParameters exposes agent registration keys and other provisioning secrets."
+    match_effective_permission:
+      action: "opsworks:DescribeStackProvisioningParameters"
+      resource_type: "AWS::OpsWorks::Stack"
+    emit:
+      source_type: Identity
+      target_type: Secret
+      source: "<principal>"
+      target: "<Secret (agent registration key / provisioning parameter)>"
+      permissions: ["opsworks:DescribeStackProvisioningParameters"]
+      state_logic: "ACTIVE."
+      confidence: 0.8
+      narrative: >-
+        {principal.name} can read {stack.name}'s provisioning parameters
+        (opsworks:DescribeStackProvisioningParameters), obtaining agent registration
+        keys that can be used to register external instances to the stack.
+
+  # --- CanPassIdentity: opsworks:CloneStack + iam:PassRole ------------------
+  # opsworks:CloneStack creates a copy of an existing stack, optionally binding new
+  # roles (service role and instance profile). Combined with iam:PassRole for a
+  # chosen privileged role, this lets an attacker create a cloned stack running as
+  # that role. The cloned stack's instances inherit the new role's privileges.
+  - id: aws-opsworks-clone-stack-pass-role
+    emits: CanPassIdentity
+    description: "opsworks:CloneStack + iam:PassRole on a privileged role lets a principal create a cloned stack running as that role."
+    match_effective_permission:
+      actions: ["opsworks:CloneStack", "iam:PassRole"]
+      resource_type: "AWS::OpsWorks::Stack"
+    where:
+      - "principal has effective iam:PassRole on a role trusted by ec2.amazonaws.com or opsworks.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: "<principal>"
+      target: "<Role passable to ec2.amazonaws.com or opsworks.amazonaws.com>"
+      permissions: ["opsworks:CloneStack", "iam:PassRole"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has both opsworks:CloneStack (account-level) and
+        iam:PassRole on a role trusted by ec2.amazonaws.com (instance profile) or
+        opsworks.amazonaws.com (service role). POTENTIAL(role_compatibility) when
+        the role trust policy is unknown.
+      confidence: 0.85
+      narrative: >-
+        {principal.name} can call opsworks:CloneStack to create a copy of an
+        OpsWorks stack and bind a chosen role to it (opsworks:CloneStack +
+        iam:PassRole), making the cloned stack's instances run as that role.
+
+  # --- CanPassIdentity: opsworks:CreateStack/UpdateStack + iam:PassRole -----
+  # iam:PassRole to OpsWorks (service role) or EC2 (instance profile) plus the
+  # ability to create or update a stack lets a principal bind a chosen privileged
+  # role to instances. Combined with CanModifyCode (explicit rule 1 or derived rule 1),
+  # this yields CanExecuteAs for the passed role. The CanPassIdentity fact is a
+  # primitive used by cicd-chains/can-execute-as for the escalation roll-up.
+  - id: aws-opsworks-pass-role-to-stack
+    emits: CanPassIdentity
+    description: "iam:PassRole for opsworks.amazonaws.com (service role) or ec2.amazonaws.com (instance profile) plus opsworks:CreateStack or opsworks:UpdateStack lets a principal bind a chosen role to a stack."
+    match_effective_permission:
+      actions: ["iam:PassRole", "opsworks:CreateStack"]
+      resource_type: "AWS::OpsWorks::Stack"
+    where:
+      - "iam:PassRole scoped to a role trusted by opsworks.amazonaws.com or ec2.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Role
+      source: "<principal>"
+      target: "<Role trusted by opsworks.amazonaws.com or ec2.amazonaws.com>"
+      permissions: ["iam:PassRole", "opsworks:CreateStack"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when role trust allows opsworks.amazonaws.com (service role) or
+        ec2.amazonaws.com (instance profile) AND the principal has the stack-level
+        write action (opsworks:CreateStack or opsworks:UpdateStack).
+        POTENTIAL(role_compatibility) when the trust policy is unknown or does not
+        clearly admit the OpsWorks/EC2 principal. The downstream CanExecuteAs (via
+        CanModifyCode + ExecutesAs after binding) is derived by cicd-chains rule 1;
+        this edge is a primitive fact for path-finding.
+      confidence: 0.9
+      narrative: >-
+        {principal.name} can pass {role.name} to OpsWorks (iam:PassRole) and create
+        or update a stack (opsworks:CreateStack / opsworks:UpdateStack) to bind
+        {role.name} as the instance profile; subsequent deployments execute code as
+        {role.name}.

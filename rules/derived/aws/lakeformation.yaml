@@ -1,0 +1,628 @@
+# AWS Lake Formation — Derived attack-path rules (Phase 11 — data / analytics / ML)
+# ---------------------------------------------------------------------------
+# Lake Formation is the PERMISSION PLANE layered on top of the Glue Data Catalog
+# and S3. It does NOT store data itself; it controls which IAM principals can query
+# governed tables via Athena, Glue ETL, EMR, Redshift Spectrum, and SageMaker.
+#
+# SECURITY SIGNATURE:
+#   Lake Formation implements its own data-plane grant model LAYERED ON IAM.
+#   A principal needs BOTH (a) an IAM permission to call the analytics service
+#   AND (b) a Lake Formation data-lake permission (SELECT / INSERT / etc.) on
+#   the catalog resource. The LF service vends temporary S3 credentials via the
+#   internal action lakeformation:GetDataAccess when both conditions are met.
+#
+# PHASE 11 DOMINANT PRIMITIVE — NOT execution/compute:
+#   Lake Formation's dominant attack primitive is the DATA-PLANE GRANT MODEL:
+#     lakeformation:GrantPermissions -> grant self SELECT on any table
+#       -> CanReadData (read underlying S3 data via Athena/Glue/EMR)
+#       -> CanExfiltrate (copy data to external location)
+#     lakeformation:PutDataLakeSettings -> self-add as LF admin
+#       -> CanAdminister (bypass ALL LF permission checks account-wide)
+#       -> CanGrantPermission on any resource to any principal
+#     lakeformation:GrantPermissions to foreign account -> CrossAccountTrust
+#       -> cross-account CanReadData (data exfil across account boundary)
+#
+#   The execution-as-identity primitive (Phase 11 dominant theme) does NOT apply
+#   to Lake Formation itself — it is a control plane, not a compute service.
+#   The analytics services (Glue, EMR, SageMaker) that consume LF-governed data
+#   ARE compute services with ExecutesAs; their rules live in their own adapters.
+#   This file emits the LF-specific data-access and permission-plane facts that
+#   feed downstream path-finding.
+#
+# WHAT THIS FILE EMITS:
+#   Rule 1 (aws-lf-grant-permissions-self):
+#     Principal holds effective lakeformation:GrantPermissions AND is an LF admin
+#     OR holds the target permission with GRANT OPTION
+#     => CanGrantPermission(principal, target_principal)
+#     — the LF-specific data-plane grant primitive; enables self-grant of SELECT.
+#
+#   Rule 2 (aws-lf-put-datalake-settings-admin):
+#     Principal has effective lakeformation:PutDataLakeSettings
+#     => CanAdminister(principal, data_lake)
+#     — self-add to LF admin list bypasses ALL LF permission checks; highest-impact
+#       single action in Lake Formation.
+#
+#   Rule 3 (aws-lf-get-data-access-read):
+#     Principal has effective LF SELECT grant on a table (via CanGrantPermission
+#     or pre-existing LF grant) AND the analytics service IAM path exists
+#     => CanReadData(principal, table)
+#     — the data-plane read enabled by LF SELECT + IAM analytics service perms.
+#
+#   Rule 4 (aws-lf-get-data-access-exfil):
+#     CanReadData(principal, table) AND principal can direct output to external storage
+#     (Athena UNLOAD to S3, Glue job writes to external bucket, EMR writes to external path)
+#     => CanExfiltrate(principal, table)
+#     — data exfiltration from the governed data lake.
+#
+#   Rule 5 (aws-lf-cross-account-grant):
+#     Principal has effective lakeformation:GrantPermissions AND grants to a principal
+#     in a foreign account
+#     => CrossAccountTrust(lf_permission, foreign_account)
+#     — cross-account data sharing trust enabling foreign principals to query
+#       this account's governed data lake.
+#
+#   Rule 6 (aws-lf-update-resource-config):
+#     Principal has effective lakeformation:UpdateResource on a registered location
+#     => CanModifyConfiguration(principal, data_lake)
+#     — swaps the IAM role LF uses to vend S3 credentials for the location; a
+#       high-privilege role swap is a privilege escalation path.
+#
+#   Rule 7 (aws-lf-register-resource-passrole):
+#     Principal has effective lakeformation:RegisterResource AND iam:PassRole
+#     to lakeformation.amazonaws.com for the chosen role
+#     => CanPassIdentity(principal, role)
+#     — the principal chooses which role LF vends credentials for when data
+#       consumers access the newly registered location.
+#
+# WHAT THIS FILE DOES NOT EMIT (cite and defer):
+#   * CanExecuteAs — the analytics service adapters (Glue/EMR/SageMaker) own the
+#     execute-as primitive. can-execute-as.yaml collapses CanModifyCode + ExecutesAs.
+#   * CanEscalateTo — can-control.yaml owns the escalation roll-up off CanAdminister
+#     and CanGrantPermission.
+#   * ExposesCredential — credential-chains owns the CanReadData -> ContainsSecret
+#     -> credential-harvest chain. This file asserts CanReadData; credential-chains
+#     fires if the data contains secrets (ContainsSecret).
+#   * CanImpersonate — credential-chains read-secret-yields-identity fires when
+#     CanReadData(table) + ContainsSecret(table) + CredentialsFor(secret, identity).
+#   * CanModifyPolicy via LF grants — the IAM CanModifyPolicy covers IAM policy
+#     mutation; LF permission grants are modeled as CanGrantPermission (data plane).
+#
+# PERMISSIONS (from AWS Service Authorization Reference — Lake Formation):
+#   lakeformation:GrantPermissions       — grant LF data permissions to principals
+#   lakeformation:BatchGrantPermissions  — batch version of GrantPermissions
+#   lakeformation:RevokePermissions      — revoke LF permissions
+#   lakeformation:ListPermissions        — read all LF grants (recon)
+#   lakeformation:GetDataLakeSettings    — read LF admin list (recon)
+#   lakeformation:PutDataLakeSettings    — modify LF admin list + settings (HIGH VALUE)
+#   lakeformation:GetDataAccess          — internal action; vends S3 creds to analytics services
+#   lakeformation:RegisterResource       — register S3 location; optionally pass a role
+#   lakeformation:DeregisterResource     — remove a registered location
+#   lakeformation:UpdateResource         — change the IAM role for a registered location
+#   lakeformation:ListResources          — read registered locations + roles (recon)
+#   lakeformation:CreateLakeFormationOptIn  — accept/enable cross-account catalog share
+#   lakeformation:DeleteLakeFormationOptIn  — remove cross-account opt-in
+#   lakeformation:ListLakeFormationOptIns   — enumerate accepted cross-account shares
+#   iam:PassRole (to lakeformation.amazonaws.com) — attach a role to a registered location
+#
+# DUAL GATE (IAM + LF): accessing LF-governed data requires BOTH:
+#   (a) IAM permission to call the analytics service (e.g., athena:StartQueryExecution,
+#       glue:StartJobRun, elasticmapreduce:AddJobFlowSteps) — enforced by IAM
+#   (b) LF data-lake permission (SELECT on the table) — enforced by Lake Formation
+#   Do NOT emit CanReadData when only one side of the gate is confirmed.
+#
+# STATE CONVENTIONS (RULE-FORMAT.md):
+#   A derived edge is never stronger than its weakest contributor.
+#   GRANT OPTION gate: regular grantors can only re-grant what they hold + GRANT OPTION;
+#   LF admins are unrestricted. Reflect this in state_logic.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 11-data-analytics-ml
+applies_to: [aws]
+
+rules:
+
+  # --- 1) GrantPermissions capability -> data-lake permission grants ----------
+  # Lake Formation's central privilege-escalation action. A principal with
+  # effective lakeformation:GrantPermissions can grant LF data-lake permissions
+  # (SELECT, INSERT, CREATE_TABLE, DATA_LOCATION_ACCESS, etc.) to any principal,
+  # including themselves. Two modes:
+  #   (a) LF admin: unrestricted — can grant ANY permission on ANY resource.
+  #   (b) Non-admin with GRANT OPTION: can re-grant only permissions they hold
+  #       WITH the GRANT OPTION flag on the specific resource.
+  # Self-granting SELECT on a governed table enables CanReadData via the analytics
+  # service. Granting to another principal (incl. self) is CanGrantPermission.
+  #
+  # This rule emits TWO sub-patterns:
+  #   Rule 1a: Self-grant (principal -> principal): CanGrantPermission(principal, principal)
+  #   Rule 1b: General grant to arbitrary principal: emitted only as pattern, not concrete
+  #            (CanGrantPermission(principal -> ANY) is enforced at consumption time by
+  #             downstream rules that bind the specific target principal)
+  - id: aws-lf-grant-permissions-self-grant
+    emits: CanGrantPermission
+    description: >-
+      lakeformation:GrantPermissions lets a principal grant LF data-lake permissions
+      (SELECT / INSERT / DATA_LOCATION_ACCESS / etc.) to ANY principal, including
+      themselves. This sub-rule captures the self-grant case (principal -> principal),
+      the privilege escalation primitive in Lake Formation.
+    match:
+      - [ ?principal, HasPermission, ?data_lake ]
+    where:
+      - "node_type(?data_lake) == DataLake"
+      - "?data_lake.provider_type == 'AWS::LakeFormation::DataLake'"
+      - >-
+        ?principal has EFFECTIVE lakeformation:GrantPermissions (or
+        lakeformation:BatchGrantPermissions) on the target catalog resource scope
+        (explicit rule aws-lf-can-grant-permission confirms this)
+        AND (?principal is an LF admin (GetDataLakeSettings confirms principal in
+        DataLakeAdmins list) OR ?principal holds the target LF permission WITH
+        GRANT OPTION on the specific resource)
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?principal
+      permissions:
+        - "lakeformation:GrantPermissions"
+        - "lakeformation:BatchGrantPermissions"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when ?principal is an LF admin (GetDataLakeSettings lists principal in
+        DataLakeAdmins) — unrestricted GrantPermissions on any resource.
+        ACTIVE when ?principal holds the specific target LF permission WITH GRANT OPTION
+        confirmed on the resource (ListPermissions confirms GrantOption: true for the
+        principal's grant record on the target resource). CONDITIONAL(iam_permission)
+        when lakeformation:GrantPermissions effective permission is unconfirmed (boundary /
+        SCP may cap it). BLOCKED by an SCP or permission boundary that explicitly denies
+        lakeformation:GrantPermissions. Inherit weakest from CanGrantPermission contributor.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?data_lake (lakeformation:GrantPermissions via explicit rule aws-lf-can-grant-permission)"
+        - "?principal in DataLakeAdmins (explicit rule aws-lf-admin-list) OR holds target permission WITH GRANT OPTION (ListPermissions via explicit rule aws-lf-existing-grants)"
+      false_positive_note: >-
+        CRITICAL: honor the GRANT OPTION gate. A non-admin principal can only re-grant
+        what they THEMSELVES hold with GRANT OPTION. If the principal's ListPermissions
+        grant record shows GrantOption: false, they cannot re-grant even if they hold
+        lakeformation:GrantPermissions in IAM — IAM allows the API call but LF will
+        reject the grant attempt. LF admins bypass this entirely. Do NOT emit ACTIVE
+        for a non-admin principal without GRANT OPTION on the target resource. Scope to
+        the specific resources the principal can grant (LF admin = all; GRANT OPTION
+        holder = only their granted resources). An SCP denying lakeformation:GrantPermissions
+        at the org level blocks even LF admins at the IAM layer.
+      narrative: >-
+        {principal.name} has effective lakeformation:GrantPermissions and (as an LF admin
+        or GRANT OPTION holder) can grant any LF data-lake permission — including SELECT
+        on governed tables — to itself. Self-granting SELECT enables reading the underlying
+        S3 data via Athena, Glue, or EMR (CanReadData via rule 3).
+
+  # --- 2) PutDataLakeSettings -> Lake Formation admin (bypass all checks) -----
+  # The single highest-impact IAM action in Lake Formation. A principal with
+  # effective lakeformation:PutDataLakeSettings can add any principal ARN (including
+  # themselves) to the DataLakeAdmins list. LF admins bypass ALL Lake Formation
+  # permission checks — they can grant any permission on any resource to any
+  # principal, read any governed table, and manage registered S3 locations without
+  # restriction. This is equivalent to a database superuser / DBA escalation.
+  #
+  # Note: lakeformation:PutDataLakeSettings also controls cross-account settings
+  # and the data lake's default permission mode (Lake Formation mode vs. IAM+S3 mode).
+  # Changing to IAM+S3 mode can disable LF permission enforcement entirely for newly
+  # created resources by clearing default permission templates. This is a high-impact
+  # configuration bypass that disables LF as a mandatory permission gate account-wide.
+  - id: aws-lf-put-datalake-settings-admin
+    emits: CanGrantPermission
+    description: >-
+      lakeformation:PutDataLakeSettings lets a principal add themselves to the Lake
+      Formation DataLakeAdmins list, after which ALL LF permission checks are bypassed
+      for that principal — they can grant any data permission to any principal, read any
+      governed table, and modify any registered location. Emits CanGrantPermission
+      (nature:both) to feed into can-control linchpin for escalation roll-up.
+    match:
+      - [ ?principal, HasPermission, ?data_lake ]
+    where:
+      - "node_type(?data_lake) == DataLake"
+      - "?data_lake.provider_type == 'AWS::LakeFormation::DataLake'"
+      - "?principal has EFFECTIVE lakeformation:PutDataLakeSettings on resource '*'"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?principal
+      permissions:
+        - "lakeformation:PutDataLakeSettings"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when lakeformation:PutDataLakeSettings is confirmed EFFECTIVE for
+        ?principal on resource '*' (this action requires resource '*' — it cannot be
+        scoped to individual tables or databases). CONDITIONAL(scp_or_org_policy) when
+        an SCP is present but its effective deny on lakeformation:PutDataLakeSettings
+        is unconfirmed. BLOCKED by an explicit SCP or permission boundary deny on
+        lakeformation:PutDataLakeSettings. Inherit weakest from HasPermission contributor.
+      confidence: "min(contributing_confidences) * 0.98"
+      derived_from:
+        - "?principal HasPermission ?data_lake (lakeformation:PutDataLakeSettings effective)"
+        - "can-control:control-via-admin (downstream CanEscalateTo — cited not re-derived)"
+      false_positive_note: >-
+        lakeformation:PutDataLakeSettings acts on the data lake resource, which can only
+        be scoped to '*' in IAM (it is not resource-level-restricted). Confirm the
+        effective permission accounts for permission boundaries and SCPs; an org SCP
+        denying lakeformation:PutDataLakeSettings is the primary defensive control. The
+        CanEscalateTo consequence (admin > normal privilege) is produced by can-control's
+        escalate-via-execute-as / control-via-admin — cite, do not re-derive here.
+        Additionally, PutDataLakeSettings can modify the data lake's default permission
+        mode to disable LF enforcement for new resources; setting CreateDatabaseDefaultPermissions
+        and CreateTableDefaultPermissions to empty [] removes LF as a mandatory gate
+        for new catalog objects.
+      narrative: >-
+        {principal.name} has effective lakeformation:PutDataLakeSettings and can add
+        itself to the Lake Formation DataLakeAdmins list. As an LF admin, ALL LF
+        permission checks are bypassed account-wide: the principal can grant any data
+        permission to any principal, read any governed table, and modify any registered
+        S3 location. This is the highest-privilege escalation action in Lake Formation.
+
+  # --- 3) LF SELECT grant + analytics service IAM -> read governed table data -
+  # Lake Formation's data-plane read capability. A principal with:
+  #   (a) an effective LF SELECT (or ALL / ALL_TABLES) grant on a Glue table — from
+  #       ListPermissions (explicit rule aws-lf-existing-grants emits HasPermission)
+  #   (b) IAM permission to call an analytics service that queries the table
+  #       (e.g., athena:StartQueryExecution, glue:StartJobRun, EMR, Redshift Spectrum via
+  #       their execution role that the principal CanExecuteAs)
+  # can read the raw underlying data in the registered S3 location. The analytics
+  # service calls lakeformation:GetDataAccess internally, which vends temporary S3
+  # credentials. The caller never calls GetDataAccess directly.
+  #
+  # DUAL-PATH RULE SPLIT:
+  # This rule captures two distinct attack paths:
+  #   PATH A (DIRECT): principal holds LF SELECT AND calls athena:StartQueryExecution
+  #   PATH B (INDIRECT): principal can trigger Glue/EMR/SageMaker jobs whose execution
+  #     role holds LF SELECT (via can-execute-as linchpin CanExecuteAs + job role's
+  #     HasPermission on the table)
+  # Both satisfy the dual gate: principal must have effective access to an analytics
+  # service AND that service (or its execution role) must have LF SELECT.
+  - id: aws-lf-get-data-access-read
+    emits: CanReadData
+    description: >-
+      An effective Lake Formation SELECT grant on a governed table, combined with IAM
+      permission to call an analytics service (Athena, Glue, EMR, Redshift Spectrum,
+      SageMaker), enables reading the underlying S3 data via LF-vended credentials
+      (lakeformation:GetDataAccess called internally by the service).
+    match:
+      - [ ?principal, HasPermission, ?table ]
+    where:
+      - "node_type(?table) == DataWarehouse"
+      - "?table.provider_type in ['AWS::Glue::Table', 'AWS::Glue::Database']"
+      - "?table.lf_permissions contains at least one of: [SELECT, ALL, ALL_TABLES]"
+      - >-
+        ?principal holds IAM permission to call AT LEAST ONE analytics service that
+        can execute a SELECT query against the table:
+        athena:StartQueryExecution (direct query execution)
+        OR glue:StartJobRun (Glue ETL job; principal CanExecuteAs the job's service role,
+          which itself must hold HasPermission(SELECT) on the table)
+        OR elasticmapreduce:AddJobFlowSteps (EMR cluster steps; similar execution-role path)
+        OR redshift-data:ExecuteStatement (Redshift Serverless / Data API path;
+          cluster's service role holds LF SELECT)
+        OR sagemaker:CreateProcessingJob (SageMaker processing job; job's execution role
+          must hold LF SELECT)
+        Confirmed effective at their respective resource scope.
+    emit:
+      source_type: Identity
+      target_type: DataWarehouse
+      source: ?principal
+      target: ?table
+      permissions:
+        - "lakeformation:GetDataAccess"
+        - "athena:StartQueryExecution | glue:StartJobRun | elasticmapreduce:AddJobFlowSteps | redshift-data:ExecuteStatement | sagemaker:CreateProcessingJob"
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when BOTH gates are confirmed: (1) the principal has an effective LF
+        SELECT grant on the target table (HasPermission confirmed by explicit rule
+        aws-lf-existing-grants), AND (2) the principal has effective IAM permission
+        to call at least one analytics service that can query the table (Athena/Glue/EMR/
+        Redshift/SageMaker). For indirect paths (job execution roles), the principal must
+        have CanExecuteAs on the job role AND the job role must have HasPermission(SELECT)
+        on the table. CONDITIONAL(iam_permission) when the analytics-service IAM permission
+        is unconfirmed or gated by a permission boundary. CONDITIONAL(resource_policy)
+        when the LF grant is unconfirmed or gated by column-level / row-level filters
+        (cell-level security narrows actual data access). BLOCKED by an SCP or explicit
+        deny on the analytics service call or on lakeformation:GetDataAccess at the
+        service-execution level. Inherit weakest from HasPermission and analytics-service
+        HasPermission contributors.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?table (LF SELECT grant, explicit rule aws-lf-existing-grants)"
+        - "?principal HasPermission analytics_service (Athena/Glue/EMR/Redshift/SageMaker IAM permission)"
+        - "can-execute-as linchpin (for indirect job execution paths)"
+      false_positive_note: >-
+        TWO GATES REQUIRED: both the LF data-lake permission (SELECT on the table) AND
+        the IAM permission to call the analytics service must be confirmed effective.
+        A principal with only the IAM permission but no LF SELECT grant will receive
+        an LF AccessDeniedException when the analytics service calls GetDataAccess.
+        A principal with the LF SELECT grant but no IAM permission to call the analytics
+        service cannot execute a query. Emit ACTIVE only when both are confirmed.
+        For indirect paths (Glue jobs, EMR steps), the principal does NOT need LF SELECT
+        themselves — only the job role does. The path is: principal CanTrigger/CanExecuteAs
+        the job role + job role HasPermission(SELECT). Additionally: (a) column-level
+        security (LF column filters on the grant) limits which columns are readable —
+        scope CanReadData to the columns actually granted; (b) row-level (cell-level)
+        security further limits accessible rows; (c) if the S3 location is NOT registered
+        as an LF location, LF permissions do not apply — do not emit this rule for
+        unregistered S3 buckets; (d) the LF permission must be on the TABLE node, not
+        just on a parent database (unless ALL_TABLES in the database is granted);
+        (e) TBAC (tag-based access control) grants via LF-tag expressions may not be
+        captured if the explicit rule aws-lf-existing-grants only records direct grants —
+        cross-check ListPermissions for TBAC grants on matching tagged resources.
+        An LF admin bypasses the LF-grant gate (gate (a)) but still needs the analytics-service
+        IAM permission.
+      narrative: >-
+        {principal.name} holds an effective Lake Formation SELECT grant on {table.name}
+        and has IAM permission to query it via an analytics service (Athena / Glue ETL /
+        EMR / Redshift Spectrum / SageMaker). Lake Formation internally vends temporary
+        S3 credentials (lakeformation:GetDataAccess) to the analytics service, enabling
+        {principal.name} to read the raw underlying data in the registered S3 location.
+
+  # --- 4) CanReadData on governed table + external write path -> CanExfiltrate -
+  # A principal who can read a governed table (rule 3) can exfiltrate the data if
+  # they can also direct query output to an external destination:
+  #   - Athena: UNLOAD to an S3 bucket outside the account / in the attacker's account
+  #   - Glue ETL: write DynamicFrame to an external S3 path or JDBC target
+  #   - EMR: write Spark DataFrame to an external S3 bucket or HDFS export
+  #   - Redshift Spectrum: UNLOAD to external S3
+  # The IAM gate: the principal (or the analytics service's execution role) must have
+  # s3:PutObject on the destination S3 bucket. This is the data exfiltration path
+  # from a governed data lake.
+  - id: aws-lf-get-data-access-exfil
+    emits: CanExfiltrate
+    description: >-
+      A principal who can read LF-governed table data (via Athena/Glue/EMR/Redshift
+      Spectrum) and can write query output to an external S3 destination
+      (UNLOAD / Glue job target / EMR write) can exfiltrate the governed data out of
+      the account's LF-controlled boundary.
+    match:
+      - [ ?principal, CanReadData, ?table ]
+    where:
+      - "node_type(?table) == DataWarehouse"
+      - "?table.provider_type in ['AWS::Glue::Table', 'AWS::Glue::Database']"
+      - >-
+        ?principal can direct query output to an external S3 destination:
+        (a) Athena UNLOAD to s3://<external-bucket>: principal has s3:PutObject on
+            the external bucket AND athena:StartQueryExecution is ACTIVE (from rule 3)
+        OR (b) Glue ETL job writes to external S3: the Glue job's service role has
+            s3:PutObject on the external bucket AND ?principal CanModifyCode or CanTrigger
+            the Glue job (Glue adapter handles this; here the external-write path is confirmed)
+        OR (c) EMR step writes to external S3: similar to Glue
+    emit:
+      source_type: Identity
+      target_type: DataWarehouse
+      source: ?principal
+      target: ?table
+      permissions:
+        - "athena:StartQueryExecution"
+        - "s3:PutObject (on destination bucket)"
+        - "lakeformation:GetDataAccess"
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when CanReadData on ?table is ACTIVE (rule 3) AND the principal can
+        direct output to an external S3 destination (s3:PutObject confirmed on the
+        external bucket or the analytics job's execution role is confirmed to write
+        externally). CONDITIONAL(iam_permission) when the s3:PutObject on the external
+        destination is unconfirmed. CONDITIONAL(resource_policy) when the external
+        bucket's policy may block writes from the analytics service's role. Inherit
+        weakest from the contributing CanReadData edge; a CONDITIONAL CanReadData
+        (e.g., analytics-service IAM unconfirmed) yields at best CONDITIONAL here.
+        BLOCKED if the analytics service blocks UNLOAD to external buckets (Athena
+        workgroup EnforceWorkgroupConfiguration with OutputLocation constraint) or
+        an SCP restricts cross-account s3:PutObject.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal CanReadData ?table (LF-governed table read, rule aws-lf-get-data-access-read)"
+        - "?principal HasPermission external_s3 (s3:PutObject on external destination)"
+      false_positive_note: >-
+        Exfiltration requires a write path to an external destination, not just the
+        ability to read. Confirm the external S3 bucket is actually external (different
+        account or attacker-controlled). Athena workgroup settings with
+        EnforceWorkgroupConfiguration=true and a restricted OutputLocation override
+        the query-level UNLOAD destination — if the workgroup enforces a specific S3
+        path within the same account, this path is CONDITIONAL or BLOCKED. Glue and
+        EMR job targets are controlled by the job/step definition — if the job definition
+        is immutable (CanModifyCode is BLOCKED), the external write path may not be
+        available to the attacker without modifying the job first.
+      narrative: >-
+        {principal.name} can read LF-governed table {table.name} (via Athena / Glue /
+        EMR) and can direct query output to an external S3 destination (UNLOAD to
+        s3://<attacker-bucket> or Glue/EMR job writing externally). This enables
+        exfiltrating the governed table's data out of the account's LF-controlled
+        boundary.
+
+  # --- 5) GrantPermissions to foreign-account principal -> CrossAccountTrust ---
+  # A Lake Formation administrator or GRANT OPTION holder can grant LF data-lake
+  # permissions (SELECT, INSERT, DATA_LOCATION_ACCESS) to a principal ARN in a
+  # foreign AWS account. This enables that external account's principal to access
+  # the governed data through their own analytics services. The mechanism:
+  #   (1) Granting account: GrantPermissions to arn:aws:iam::<foreign>:role/X
+  #   (2) Granting account: optionally creates a RAM share of the Glue catalog resource
+  #       via ram:CreateResourceShare (lakeformation + glue resources) to foreign account
+  #   (3) Receiving account: CreateLakeFormationOptIn or accepts the RAM share
+  #   (4) Receiving account: X now holds LF SELECT on the table in the granting account
+  #   (5) X can run Athena/Glue/EMR in THEIR account querying the granting account's data
+  #
+  # Cross-account Glue catalog sharing via AWS RAM is documented as a Lake Formation
+  # feature (ram:CreateResourceShare + lakeformation catalog resources). A principal
+  # with lakeformation:GrantPermissions + ram:CreateResourceShare can create a RAM
+  # resource share of Glue database/table resources and share to a foreign account,
+  # enabling cross-account catalog access without knowing the foreign principal's ARN
+  # in advance (share to account ID).
+  #
+  # This rule emits the TRUST FACT; CanReadData cross-boundary is derived downstream
+  # when the foreign principal's HasPermission (LF SELECT + analytics IAM) is confirmed.
+  - id: aws-lf-cross-account-grant
+    emits: CrossAccountTrust
+    description: >-
+      An LF admin (or GRANT OPTION holder) granting Lake Formation SELECT / INSERT /
+      DATA_LOCATION_ACCESS to a principal ARN in a foreign AWS account creates cross-
+      account data-lake trust: the external principal can query this account's governed
+      data via their own analytics services.
+    match:
+      - [ ?principal, CanGrantPermission, ?data_lake ]
+    where:
+      - "node_type(?data_lake) == DataLake"
+      - "?data_lake.provider_type == 'AWS::LakeFormation::DataLake'"
+      - >-
+        ?principal grants (or can grant) LF permissions (SELECT, INSERT, ALL,
+        DATA_LOCATION_ACCESS) to a Principal whose account != account(?data_lake);
+        confirmed by ListPermissions showing a grant to an ARN in a different account
+        (explicit rule aws-lf-existing-grants) OR by lakeformation:GrantPermissions
+        being ACTIVE for ?principal (rule 1) AND evidence of cross-account recipient
+        in the data lake's permission records or RAM resource shares.
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<LF permission grant record for the foreign principal>"
+      target: "<the foreign AWS account named in the LF grant>"
+      permissions:
+        - "lakeformation:GrantPermissions"
+        - "lakeformation:BatchGrantPermissions"
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when ListPermissions confirms an existing grant to a Principal ARN in a
+        foreign account AND (?principal is an LF admin OR holds GRANT OPTION on the
+        specific resource). CONDITIONAL(resource_policy) when CanGrantPermission (rule 1)
+        is the source (the cross-account grant has not yet been executed but the
+        principal can execute it). CONDITIONAL(condition_expression) when the cross-
+        account grant is scoped by an aws:PrincipalOrgID or aws:PrincipalAccount
+        condition that restricts which foreign accounts qualify. BLOCKED by an SCP
+        that denies lakeformation:GrantPermissions to external accounts
+        (aws:PrincipalOrgID condition on SCP). This edge asserts the TRUST; the
+        foreign principal's CanReadData cross-boundary requires the receiving account
+        to accept the RAM share and hold the analytics service IAM permissions.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal CanGrantPermission ?data_lake (rule aws-lf-grant-permissions-self)"
+        - "ListPermissions evidence of grant to foreign-account principal"
+      false_positive_note: >-
+        Cross-account LF data access has THREE required conditions — all must hold:
+        (1) the granting account's LF GrantPermissions to the foreign principal is in
+        place (ListPermissions confirms the grant record, or RAM resource share of Glue
+        catalog resources to foreign account is confirmed); (2) the receiving account
+        must accept the cross-account catalog access (via RAM share acceptance /
+        CreateLakeFormationOptIn in the receiving account — lakeformation:ListLakeFormationOptIns
+        in the receiving account confirms this); (3) the foreign principal must hold
+        IAM permissions to call the analytics service IN THEIR OWN ACCOUNT. Without
+        all three, the foreign principal cannot read data. Emit CrossAccountTrust ACTIVE
+        only when (1) is confirmed; (2) and (3) yield CONDITIONAL(resource_policy) on
+        the downstream CanReadData that can-control then evaluates. An SCP in the
+        GRANTING account blocking lakeformation:GrantPermissions to external accounts
+        (using aws:PrincipalOrgID conditions) prevents this pattern entirely -> BLOCKED.
+        ADDITIONAL: Cross-account grants via AWS RAM require the granting account to
+        call ram:CreateResourceShare with Glue database/table resources in the
+        ResourceArns array. A principal with both lakeformation:GrantPermissions +
+        ram:CreateResourceShare can establish cross-account catalog access without
+        explicit LF grant records (the RAM share implicitly grants access). Check
+        ram:ListResources and ram:GetResourceShareAssociations in both accounts for
+        evidence of shares.
+      narrative: >-
+        {principal.name} (or an existing grant) grants Lake Formation SELECT permissions
+        to a principal in foreign account {foreign_account}. That external principal can
+        now query the governed data lake's tables from their own AWS account using their
+        own analytics services (Athena / Glue / EMR), provided they have accepted the
+        cross-account catalog share and hold the analytics service IAM permissions. This
+        is cross-account data exfiltration trust.
+
+  # --- 6) UpdateResource -> swap the vended-credential role for a location -----
+  # lakeformation:UpdateResource lets a principal change the IAM role associated
+  # with a registered S3 data lake location. Lake Formation uses this role to vend
+  # temporary credentials (lakeformation:GetDataAccess) when analytics services
+  # access the location's underlying S3 data. Swapping the role to a high-privilege
+  # alternative means all subsequent data access under that location uses the new
+  # role's credentials — a configuration-change privilege escalation path.
+  #
+  # The attacker must also hold iam:PassRole for the new role to lakeformation.amazonaws.com.
+  # This is modeled as CanModifyConfiguration on the DataLake node; the downstream
+  # CanPassIdentity edge (rule 7) covers the PassRole aspect separately.
+  - id: aws-lf-update-resource-config
+    emits: CanModifyConfiguration
+    description: >-
+      lakeformation:UpdateResource + iam:PassRole to lakeformation.amazonaws.com lets
+      a principal swap the IAM role Lake Formation uses to vend temporary S3 credentials
+      for a registered location, redirecting all subsequent data access through a role
+      of the attacker's choosing.
+    match:
+      - [ ?principal, HasPermission, ?data_lake ]
+    where:
+      - "node_type(?data_lake) == DataLake"
+      - "?data_lake.provider_type == 'AWS::LakeFormation::DataLake'"
+      - "?principal has EFFECTIVE lakeformation:UpdateResource on resource '*'"
+      - "?principal has EFFECTIVE iam:PassRole for a role trusted by lakeformation.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: DataLake
+      source: ?principal
+      target: ?data_lake
+      permissions:
+        - "lakeformation:UpdateResource"
+        - "iam:PassRole (to lakeformation.amazonaws.com)"
+      conditions: [iam_permission, role_compatibility, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when BOTH lakeformation:UpdateResource (resource '*') AND iam:PassRole
+        for a role whose trust policy allows lakeformation.amazonaws.com are confirmed
+        EFFECTIVE for ?principal. CONDITIONAL(role_compatibility) when the role trust
+        for lakeformation.amazonaws.com is unconfirmed (role may not admit LF as a
+        trusted service — check trust policy before emitting ACTIVE).
+        CONDITIONAL(iam_permission) when UpdateResource effective permission is
+        unconfirmed. BLOCKED by an SCP denying lakeformation:UpdateResource or
+        iam:PassRole for the target role. Inherit weakest from HasPermission contributor.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?data_lake (lakeformation:UpdateResource effective)"
+        - "?principal HasPermission role (iam:PassRole to lakeformation.amazonaws.com effective)"
+        - "can-execute-as:execute-as-via-config-identity-swap (downstream CanExecuteAs — cited not re-derived)"
+      false_positive_note: >-
+        Two permissions required: lakeformation:UpdateResource AND iam:PassRole scoped
+        to lakeformation.amazonaws.com. If iam:PassRole has an iam:PassedToService
+        condition that excludes lakeformation.amazonaws.com, the role swap will fail.
+        The privilege escalation consequence is that subsequent analytics service calls
+        to that location use the new role's credentials — this is a DATA ACCESS change,
+        not a control-plane role assumption. The attacker's code does not run as the new
+        role; the ANALYTICS SERVICE executes as the new role when vending credentials.
+        can-execute-as execute-as-via-config-identity-swap collapses this into CanExecuteAs
+        if the attacker can also trigger a Glue/EMR job against the location — cite, do
+        not re-derive.
+      narrative: >-
+        {principal.name} has effective lakeformation:UpdateResource and can pass an IAM
+        role to lakeformation.amazonaws.com (iam:PassRole). By updating a registered S3
+        location's associated role, {principal.name} causes Lake Formation to vend
+        temporary credentials for the new role when analytics services access that
+        location's data. Subsequent Glue/EMR/Athena queries against the location run
+        with the new role's S3 and other IAM permissions.
+
+  # --- 7) RegisterResource + iam:PassRole -> choose the vended credential role -
+  # MOVED TO EXPLICIT RULES: This rule pattern emits CanPassIdentity(nature:explicit)
+  # which is declared nature:explicit in edges.yaml and thus must be emitted by
+  # /rules/explicit/aws-lakeformation.yaml only, per RULE-FORMAT.md conformance.
+  # The explicit rule aws-lf-pass-role-to-lakeformation handles CanPassIdentity
+  # emission. This derived rule instead consumes that edge and emits CanCreateWorkloadAs
+  # or passes through to cicd-chains linchpin via CanExecuteAs derivation.
+  # This rule documents the path for reference only; all CanPassIdentity emission
+  # occurs in the explicit file.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying lakeformation:GrantPermissions or lakeformation:BatchGrantPermissions
+#     to external accounts (aws:PrincipalOrgID SCP) blocks rule 5 -> emit BLOCKED.
+#   - An SCP denying lakeformation:PutDataLakeSettings blocks rule 2 -> BLOCKED.
+#   - An SCP denying lakeformation:RegisterResource blocks rule 6 -> BLOCKED.
+#   - iam:PassRole with iam:PassedToService NOT including lakeformation.amazonaws.com
+#     blocks rules 6 and 7 (UpdateResource / RegisterResource) -> CONDITIONAL(role_compatibility) or BLOCKED.
+#   - A role trust policy that does not include lakeformation.amazonaws.com as a
+#     trusted service blocks rules 6 and 7 -> CONDITIONAL(role_compatibility).
+#   - Column-level or cell-level security (LF data filters) on an LF SELECT grant
+#     limits the scope of CanReadData in rule 3 — not BLOCKED but scope-narrowed.
+#   - An Athena workgroup with EnforceWorkgroupConfiguration=true and a restricted
+#     OutputLocation limits CanExfiltrate in rule 4 -> CONDITIONAL/BLOCKED.
+#   - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------
+
+# NOTE: Explicit normalization rules are in /rules/explicit/aws-lakeformation.yaml
+# This derived file consumes the edges emitted by explicit rules and produces
+# derived CanReadData, CanExfiltrate, and CrossAccountTrust chains.
+# Per RULE-FORMAT.md, derived rules may only emit edges with nature:derived or
+# nature:both. Explicit-natured edges (CanAdminister, CanPassIdentity) are emitted
+# by the explicit file only.

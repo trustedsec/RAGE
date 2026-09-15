@@ -1,0 +1,867 @@
+# Azure — Event Grid (Microsoft.EventGrid) derived attack-path rules (Phase 10)
+# ---------------------------------------------------------------------------
+# PHASE-10 SERVICE ADAPTER: Azure Event Grid is the Azure messaging & event system
+# service. Topics (custom, system, partner, domain) receive events and route them
+# via EVENT SUBSCRIPTIONS to compute consumers (Azure Functions, Logic Apps,
+# webhooks, Service Bus, Storage queues, Event Hubs). This file emits the
+# NORMALIZED MESSAGING FACTS that messaging-chains.yaml, can-execute-as.yaml,
+# credential-chains.yaml, and can-control.yaml consume to produce the full
+# escalation and cross-boundary roll-ups. Do NOT re-derive those roll-ups here —
+# CITE the linchpins.
+#
+# KEY ATTACK SURFACE (verified against Microsoft.EventGrid ops ref, 2026-09):
+#   (a) TOPIC KEY RETRIEVAL + PUBLISH (the headline path):
+#       Microsoft.EventGrid/topics/listKeys/action  — retrieve topic access key
+#       + publish event via HTTPS with aeg-sas-key header => CanWriteData on topic
+#       + event subscription binding (CanTrigger topic->consumer) already present
+#       => messaging-chains rule 1 collapses: CanTrigger(principal->consumer)
+#       => messaging-chains rule 2 + ExecutesAs(consumer,MI): CanExecuteAs(MI).
+#
+#   (b) SUBSCRIPTION ENDPOINT REDIRECTION (the exfil primitive):
+#       Microsoft.EventGrid/eventSubscriptions/write  — change subscription endpoint
+#       to attacker-controlled webhook => all future events exfiltrated.
+#       If events carry credentials: ContainsSecret + CanReadData => CanExfiltrate.
+#       credential-chains read-secret-yields-identity fires if events hold identity creds.
+#
+#   (c) TOPIC KEY CREDENTIAL EXPOSURE:
+#       listKeys/action reveals a shared secret (aeg-sas-key) for the topic.
+#       Modeled as ExposesCredential(topic -> AccessKey) + CanReadSecret.
+#       The key provides indefinite, un-revocable (until regenerated) publish rights.
+#
+#   (d) DOMAIN KEY (broader blast radius):
+#       Microsoft.EventGrid/domains/listKeys/action  — key valid for ALL topics in
+#       the domain => CanReadSecret(domain key) with broader scope than per-topic key.
+#
+#   (e) PARTNER CONFIGURATION (cross-tenant publish trust):
+#       Microsoft.EventGrid/partnerConfigurations/write  — authorize an external
+#       partner (potentially attacker-controlled SaaS) to publish into the subscription.
+#       => CrossTenantTrust. Can-control rolls up to CanEnterSubscription if a
+#       consumer in this subscription then fires.
+#
+#   (f) NEW SUBSCRIPTION CREATION (CanTrigger binding creation):
+#       eventSubscriptions/write on a resource scope creates a NEW binding from a
+#       system topic to an attacker-controlled webhook. The attacker-chosen endpoint
+#       receives all resource events => CanReadData / CanExfiltrate on event stream.
+#
+# LINCHPINS CITED (not re-derived here):
+#   messaging-chains  messaging-publish-triggers-consumer (rule 1):
+#                     CanWriteData(?p, ?topic) + CanTrigger(?topic, ?consumer)
+#                     => CanTrigger(?p, ?consumer).
+#   messaging-chains  messaging-trigger-executes-as (rule 2):
+#                     CanTrigger(?p, ?consumer) + ExecutesAs(?consumer, ?identity)
+#                     => CanExecuteAs(?p, ?identity) CONDITIONAL(trigger_exists).
+#   messaging-chains  messaging-resource-policy-cross-boundary-trust (rule 4):
+#                     cross-boundary messaging trust => CrossAccountTrust /
+#                     CrossProjectTrust; can-control rolls to CanEnter*.
+#   can-execute-as    execute-as-via-code-modify: CanModifyCode + ExecutesAs =>
+#                     CanExecuteAs (dedupes with cicd/messaging-chains).
+#   can-control       escalate-via-execute-as: CanExecuteAs => CanEscalateTo.
+#   credential-chains read-secret-yields-identity: CanReadSecret + CredentialsFor
+#                     => CanImpersonate.
+#   credential-chains execute-then-read-secret: CanExecuteAs + CanReadSecret =>
+#                     CanReadSecret (for credential-centric reverse queries).
+#
+# STATE DEFAULTS:
+#   ACTIVE when the required operations are confirmed at effective scope with no
+#     deny assignment covering them.
+#   CONDITIONAL(trigger_exists) when a publish right exists but no confirmed live
+#     event subscription binding routes the topic to a consumer.
+#   CONDITIONAL(condition_expression) when an event filter may block the attacker's
+#     event type from reaching the consumer.
+#   CONDITIONAL(service_state) when the consumer is not running or the topic is
+#     disabled.
+#   BLOCKED when a deny assignment covers the critical operation at effective scope,
+#     or when publicNetworkAccess=Disabled prevents internet-based publish access.
+#   POTENTIAL when only ARM read permissions are confirmed; key access or event
+#     subscription write not yet demonstrated.
+#
+# All operation strings from the official Microsoft.EventGrid resource-provider
+# operations reference. No hallucinated permissions.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 10-messaging
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # 1. Administrative control (→ CanAdminister)
+  # ===========================================================================
+
+  - id: azure-evg-topic-admin
+    emits: CanAdminister
+    description: "Full control of an Event Grid topic (EventGrid Contributor / Contributor / Owner)."
+    match_effective_permission:
+      action: "Microsoft.EventGrid/topics/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds EventGrid Contributor, Contributor, Owner, or a custom role granting Microsoft.EventGrid/topics/* at the scope"
+    emit:
+      source_type: Identity
+      target_type: EventBus
+      source: "<principal>"
+      target: "<Event Grid topic (EventBus) in scope>"
+      permissions:
+        - "Microsoft.EventGrid/topics/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed. BLOCKED if a deny assignment
+        covers topics/write at the scope. CanAdminister(topic) does NOT imply
+        Microsoft.Authorization/*/write; escalation is via the topic key (CanReadSecret)
+        or subscription endpoint redirect (CanModifyConfiguration), not role self-assignment.
+      confidence: 0.98
+      derived_from: ["effective permission: Microsoft.EventGrid/topics/write"]
+      false_positive_note: >-
+        EventGrid Contributor grants full control of topics, domains, subscriptions, and
+        partner resources but NOT Microsoft.Authorization/*/write. An attacker holding this
+        role can retrieve topic keys (listKeys/action) and redirect subscriptions but cannot
+        directly grant themselves roles elsewhere. EventGrid EventSubscription Contributor
+        does NOT include topics/write; it grants only eventSubscriptions/* scoped operations.
+      narrative: >-
+        {principal.name} has full administrative control of Event Grid topic {target.name}
+        (Microsoft.EventGrid/topics/*), including key retrieval and subscription management.
+
+  # ===========================================================================
+  # 2. Topic key retrieval — the primary credential exposure (→ CanReadSecret)
+  # ===========================================================================
+
+  - id: azure-evg-list-keys
+    emits: CanReadSecret
+    description: "Retrieve the topic access key (aeg-sas-key) from an Event Grid custom topic; the key enables unlimited event publishing to the topic, triggering all subscribers."
+    match_effective_permission:
+      action: "Microsoft.EventGrid/topics/listKeys/action"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: AccessKey
+      source: "<principal>"
+      target: "<topic access key (AccessKey) for the Event Grid topic>"
+      permissions:
+        - "Microsoft.EventGrid/topics/listKeys/action"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed. The key is a long-lived shared
+        secret retrievable on demand; it does not expire unless manually regenerated. BLOCKED
+        if a deny assignment covers listKeys/action at the effective scope. A topic with
+        publicNetworkAccess=Disabled does NOT neutralize the key itself — the key can still
+        be used from within the VNet or from a private endpoint. Key retrieval does not
+        require physical network access to the topic endpoint.
+      confidence: 0.97
+      derived_from:
+        - "effective permission: Microsoft.EventGrid/topics/listKeys/action"
+        - "credential-chains.yaml: CanReadSecret + CredentialsFor(key -> publish right) feeds ExposesCredential"
+      false_positive_note: >-
+        The key permits publishing to the topic, not subscribing or reading events from
+        consumer endpoints. Two keys exist (key1, key2) for rotation; both are returned
+        by listKeys. This edge is ACTIVE on confirmation of listKeys/action in effective
+        permissions — no additional state gate needed, since retrieving a key is an
+        instantaneous ARM API call with no further prerequisite. Do not confuse with
+        Microsoft.EventGrid/topics/regenerateKey/action (which rotates/destroys the key).
+        A topic key for a domain topic is distinct from the domain-level key (see
+        azure-evg-domain-list-keys); scope accordingly.
+      narrative: >-
+        {principal.name} can retrieve the access key for Event Grid topic {target.name}
+        (topics/listKeys/action); the key permits publishing arbitrary events to the topic
+        via HTTPS (aeg-sas-key header) without Entra authentication, triggering all
+        bound event subscriptions.
+
+  # ===========================================================================
+  # 3. Domain key retrieval — broader blast radius (→ CanReadSecret)
+  # ===========================================================================
+
+  - id: azure-evg-domain-list-keys
+    emits: CanReadSecret
+    description: "Retrieve the domain access key from an Event Grid domain; the key enables publishing to ALL topics within the domain, triggering all their subscribers."
+    match_effective_permission:
+      action: "Microsoft.EventGrid/domains/listKeys/action"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: AccessKey
+      source: "<principal>"
+      target: "<domain access key (AccessKey) for the Event Grid domain>"
+      permissions:
+        - "Microsoft.EventGrid/domains/listKeys/action"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed. Higher blast radius than a
+        per-topic key: a single domain key grants publish access to ALL topics under the
+        domain. BLOCKED if a deny assignment covers domains/listKeys/action.
+      confidence: 0.97
+      derived_from:
+        - "effective permission: Microsoft.EventGrid/domains/listKeys/action"
+        - "messaging-chains.yaml: CanWriteData (via domain key publish) + CanTrigger(domain topic->consumer) => CanTrigger(principal->consumer)"
+      false_positive_note: >-
+        The domain key provides publish rights to all topics in the domain — more powerful
+        than a per-topic key. Confirm the scope: listKeys/action at domain resource level
+        returns domain-level keys; a principal with only topic-level listKeys cannot use it
+        to derive domain-level keys. Scope the ExposesCredential and downstream CanWriteData
+        edges to the entire domain's topic set, not just a single topic.
+      narrative: >-
+        {principal.name} can retrieve the access key for Event Grid domain {target.name}
+        (domains/listKeys/action); the domain key permits publishing events to ALL topics
+        in the domain, triggering every subscriber bound to any domain topic.
+
+  # ===========================================================================
+  # 4. Topic key → ExposesCredential (→ ExposesCredential)
+  # ===========================================================================
+
+  - id: azure-evg-key-exposes-credential
+    emits: ExposesCredential
+    description: "An Event Grid topic exposes its access key to any principal who can call listKeys/action; the key is a long-lived publish credential for the topic."
+    match:
+      - [ ?topic, HasPolicy, ?accesspolicy ]
+    where:
+      - "node_type(?topic) == EventBus"
+      - "node_type(?accesspolicy) in [ResourcePolicy, GenericPolicy]"
+      - "?topic has access keys (key1 and key2) that are enabled and non-empty"
+    emit:
+      source_type: Messaging
+      target_type: Credential
+      source: ?topic
+      target: "<topic access key (AccessKey) — key1 and key2>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the topic exists and has keys (always true for custom topics and domains;
+        keys cannot be disabled without disabling key-based auth entirely). Not applicable to
+        system topics (system topics do not expose user-facing access keys for event publishing).
+      confidence: 1.0
+      derived_from:
+        - "Event Grid topic always has two access keys (key1, key2) for publishing"
+        - "azure-evg-list-keys: CanReadSecret to retrieve the key"
+        - "credential-chains.yaml: ExposesCredential feeds downstream publish-as-key CanWriteData"
+      false_positive_note: >-
+        This edge expresses the structural fact that the topic has access keys, not that
+        they have been retrieved. The attack step requires a principal to hold
+        listKeys/action (azure-evg-list-keys CanReadSecret) AND then use the key for
+        publishing (azure-evg-publish-via-key CanWriteData). Do not model this as an
+        escalation edge on its own. System topics do not expose user-publishable access keys;
+        do not emit for Microsoft.EventGrid/systemTopics nodes.
+      narrative: >-
+        Event Grid topic {source.name} holds access keys (key1, key2) that any principal
+        with listKeys/action can retrieve; the retrieved key is a durable publish credential
+        for the topic, usable for triggering all bound event subscription consumers.
+
+  # ===========================================================================
+  # 5. Publish via key or Entra → CanWriteData on the topic (the publish primitive)
+  # ===========================================================================
+
+  - id: azure-evg-publish-via-key
+    emits: CanWriteData
+    description: "A principal that holds the topic access key (retrieved via listKeys/action) can publish arbitrary events to the topic over HTTPS, triggering all bound consumers."
+    match:
+      - [ ?principal, CanReadSecret, ?key ]
+    where:
+      - "node_type(?key) == AccessKey"
+      - "?key is a topic access key (key1 or key2) for an Event Grid custom topic or domain topic"
+      - "?topic is the Event Grid topic or domain that ?key authenticates to"
+      - "?topic.properties.publicNetworkAccess == Enabled OR principal has network path to topic private endpoint"
+    emit:
+      source_type: Identity
+      target_type: GenericData
+      source: ?principal
+      target: ?topic
+      permissions: []
+      conditions: [trigger_exists, network_reachability]
+      state_logic: >-
+        ACTIVE when the key has been retrieved (CanReadSecret ACTIVE) AND the topic is
+        network-reachable (publicNetworkAccess=Enabled, or principal has private endpoint
+        access). CONDITIONAL(network_reachability) when the topic has publicNetworkAccess=
+        Disabled and no confirmed private endpoint reach. CONDITIONAL(trigger_exists) when
+        the topic has no confirmed live event subscription binding to a consumer (publishing
+        succeeds but no consumer is triggered — still emitted at CONDITIONAL because a
+        subscription may exist or be creatable). Inherit weakest from CanReadSecret.
+        BLOCKED if the key has been rotated after retrieval (key is no longer valid) or
+        if deny assignment blocks listKeys/action (which blocks the prerequisite CanReadSecret).
+      confidence: "min(contributing_confidences) * 0.97"
+      derived_from:
+        - "azure-evg-list-keys OR azure-evg-domain-list-keys: ?principal CanReadSecret ?key"
+        - "messaging-chains.yaml: messaging-publish-triggers-consumer: CanWriteData + CanTrigger(topic->consumer) => CanTrigger(principal->consumer)"
+      false_positive_note: >-
+        Publishing via key does NOT require any ARM RBAC permission at publish time — it is
+        HTTP authenticated using the key (aeg-sas-key header). The prerequisite is CanReadSecret
+        (listKeys/action), which retrieves the key. Once the key is in hand, the attacker can
+        publish from any network endpoint that can reach the topic's public endpoint or private
+        endpoint. Do not list Microsoft.EventGrid/events/send/action in permissions (that is
+        Entra token-based publish, a different path). A topic with publicNetworkAccess=Disabled
+        cannot be published to from the internet regardless of key possession; downgrade to
+        CONDITIONAL(network_reachability) if no confirmed private endpoint access. The key
+        enables unlimited publishing — no per-event rate limit that would prevent triggering
+        consumers. Publishing does NOT grant read access to consumer endpoints (Service Bus
+        queues, Storage queues). The consumer must have a live, enabled event subscription
+        binding for messaging-chains rule 1 to fire — verify the binding before marking the
+        full CanTrigger chain ACTIVE. System topics do not accept publish via key (only
+        first-party services publish); do not emit for system topics.
+      narrative: >-
+        {principal.name} holds the access key for Event Grid topic {target.name}
+        (retrieved via topics/listKeys/action); it can publish arbitrary events over HTTPS
+        (aeg-sas-key header), triggering all bound event subscription consumers with an
+        attacker-controlled payload. messaging-chains derives CanTrigger(principal->consumer)
+        from this CanWriteData + the existing subscription CanTrigger binding.
+
+  - id: azure-evg-publish-entra
+    emits: CanWriteData
+    description: "A principal with the EventGrid Data Sender role (events/send/action) on a custom topic can publish events via Entra token, triggering all bound consumers."
+    match_effective_permission:
+      action: "Microsoft.EventGrid/events/send/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "?topic is a custom topic or domain topic (NOT a system topic)"
+      - "?topic.properties.publicNetworkAccess == Enabled OR principal has network path to private endpoint"
+    emit:
+      source_type: Identity
+      target_type: GenericData
+      source: "<principal>"
+      target: "<Event Grid custom topic or domain topic (EventBus)>"
+      permissions:
+        - "Microsoft.EventGrid/events/send/action"
+      conditions: [trigger_exists, network_reachability]
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed AND the topic is network-reachable.
+        CONDITIONAL(network_reachability) when publicNetworkAccess=Disabled and no private
+        endpoint reach confirmed. CONDITIONAL(trigger_exists) when no confirmed live subscription
+        binding routes the topic to a consumer (but publishing still succeeds). BLOCKED if a
+        deny assignment covers events/send/action at the effective scope.
+      confidence: 0.96
+      derived_from:
+        - "effective permission: Microsoft.EventGrid/events/send/action"
+        - "messaging-chains.yaml: messaging-publish-triggers-consumer: CanWriteData + CanTrigger(topic->consumer) => CanTrigger(principal->consumer)"
+      false_positive_note: >-
+        events/send/action is the Entra data-plane RBAC permission for publishing, included
+        in EventGrid Data Sender and EventGrid Contributor. It does NOT grant control-plane
+        access (cannot modify subscriptions or retrieve keys). It applies to CUSTOM topics
+        and domain topics only — system topics are published to exclusively by the originating
+        Azure resource; events/send/action on a system topic returns 403. Confirm the topic
+        type before emitting. Standard Reader and Contributor roles at resource-group scope
+        DO include wildcard data-plane actions including events/send/action; a resource-scoped
+        Contributor does NOT inherit it without explicit assignment.
+      narrative: >-
+        {principal.name} holds Microsoft.EventGrid/events/send/action on Event Grid topic
+        {target.name} (EventGrid Data Sender role or equivalent); it can publish arbitrary
+        events via Entra token, triggering all bound event subscription consumers with an
+        attacker-controlled payload.
+
+  # ===========================================================================
+  # 6. Event subscription write — endpoint redirection and new bindings
+  #    (→ CanModifyConfiguration, CanReadData)
+  # ===========================================================================
+
+  - id: azure-evg-subscription-write
+    emits: CanModifyConfiguration
+    description: "Modify an existing event subscription's endpoint, redirecting all future events to an attacker-controlled webhook; enables event exfiltration and payload inspection."
+    match_effective_permission:
+      any_of:
+        - action: "Microsoft.EventGrid/eventSubscriptions/write"
+          scope_type: "resource|resourceGroup|subscription"
+        - action: "Microsoft.EventGrid/topics/eventSubscriptions/write"
+          scope_type: "resource|resourceGroup|subscription"
+        - action: "Microsoft.EventGrid/systemTopics/eventSubscriptions/write"
+          scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "an existing event subscription is present on the topic or system topic"
+      - "the subscription has a modifiable endpoint (webhook / Function / Logic App / Service Bus / Storage queue)"
+    emit:
+      source_type: Identity
+      target_type: EventBus
+      source: "<principal>"
+      target: "<Event Grid topic or system topic (EventBus) whose subscription is modified>"
+      permissions:
+        - "Microsoft.EventGrid/eventSubscriptions/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed and the subscription endpoint can be
+        changed via ARM PATCH. Azure does NOT require the endpoint to confirm the redirect before
+        the subscription update takes effect (endpoint validation is sent to the new URL; if the
+        new endpoint is attacker-controlled and returns the validation code, the update succeeds).
+        BLOCKED if a deny assignment covers eventSubscriptions/write at the scope. Note: changing
+        the endpoint immediately stops event delivery to the original endpoint and starts delivery
+        to the new one — this is a destructive reconfiguration that may be detected.
+      confidence: 0.95
+      derived_from:
+        - "effective permission: Microsoft.EventGrid/eventSubscriptions/write (or topic/systemTopic variant)"
+        - "can-execute-as.yaml: execute-as-via-config-identity-swap pattern (configuration change redirects execution flow)"
+      false_positive_note: >-
+        Modifying a subscription endpoint REDIRECTS events — it does NOT inject code into the
+        consumer. The escalation is CanReadData (event exfiltration) and potentially CanReadSecret
+        if events carry credential material (ContainsSecret path). It is NOT a CanModifyCode on
+        the consumer compute. Do not emit CanModifyCode; this is purely configuration-level access
+        to the routing layer. The endpoint validation handshake (Event Grid sends a validation
+        event to the new endpoint) means the attacker must control the endpoint and be able to
+        respond with the validation code — this is a real condition but trivially satisfied by an
+        attacker-hosted HTTP endpoint. Honor filter conditions: if the subscription has a strict
+        event type filter, the attacker only receives events of that type.
+      narrative: >-
+        {principal.name} holds Microsoft.EventGrid/eventSubscriptions/write on topic {target.name};
+        it can change the subscription delivery endpoint to an attacker-controlled webhook, routing
+        all future events from that topic to the attacker. If events carry credential material,
+        credential-chains derives CanImpersonate via ContainsSecret + CredentialsFor.
+
+  - id: azure-evg-create-subscription
+    emits: CanModifyConfiguration
+    description: "Create a new event subscription on a topic or system topic, binding an event source to an attacker-controlled webhook endpoint."
+    match_effective_permission:
+      any_of:
+        - action: "Microsoft.EventGrid/eventSubscriptions/write"
+          scope_type: "resource|resourceGroup|subscription"
+        - action: "Microsoft.EventGrid/topics/eventSubscriptions/write"
+          scope_type: "resource|resourceGroup|subscription"
+        - action: "Microsoft.EventGrid/systemTopics/eventSubscriptions/write"
+          scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "no existing subscription is present, OR the attacker creates a NEW subscription (not modifying an existing one)"
+    emit:
+      source_type: Identity
+      target_type: EventBus
+      source: "<principal>"
+      target: "<Event Grid topic or system topic (EventBus) whose subscription is created>"
+      permissions:
+        - "Microsoft.EventGrid/eventSubscriptions/write"
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed and the topic or system topic
+        exists and is active. Creating a NEW subscription establishes a new CanTrigger
+        binding from the topic to the attacker's endpoint — events from the source start
+        flowing to the attacker immediately after validation. BLOCKED if a deny assignment
+        covers eventSubscriptions/write.
+      confidence: 0.93
+      derived_from:
+        - "effective permission: Microsoft.EventGrid/eventSubscriptions/write"
+        - "messaging-chains.yaml: messaging-publish-triggers-consumer: new subscription = new CanTrigger binding (matches optional[0] of rule 1)"
+      false_positive_note: >-
+        Creating a new subscription on a system topic is particularly impactful because it
+        exposes all resource events (blob operations, key vault events, resource group changes)
+        without requiring publish access to the topic — the source (Azure service) publishes
+        automatically. The attacker only needs eventSubscriptions/write at the resource scope
+        to tap the event stream. For custom topics, a new subscription only receives events
+        published AFTER subscription creation; historical events are not replayed.
+        A subscription at subscription scope (global) covers ALL resources' system topics —
+        broader than resource-group or resource scope.
+      narrative: >-
+        {principal.name} holds Microsoft.EventGrid/eventSubscriptions/write at the scope of
+        {target.name}; it can create a new event subscription routing all topic events to an
+        attacker-controlled endpoint. For system topics, this taps the Azure resource event
+        stream without requiring publish access (the source resource publishes automatically).
+
+  # ===========================================================================
+  # 7. Event subscription as CanTrigger binding (the Phase-10 primitive)
+  # ===========================================================================
+
+  - id: azure-evg-subscription-triggers-compute
+    emits: CanTrigger
+    description: "An active Event Grid event subscription binds a topic to a Compute consumer (Azure Function, Logic App, webhook); this is the CanTrigger fact consumed by messaging-chains rule 1."
+    match:
+      - [ ?subscription, HasPolicy, ?topic ]
+    where:
+      - "node_type(?subscription) == EventRule"
+      - "node_type(?topic) == EventBus"
+      - "?subscription.properties.provisioningState == Succeeded"
+      - "?subscription.properties.destination.endpointType in [AzureFunction, WebHook] (Compute consumers only)"
+      - "?consumer is the Compute node at the destination endpoint (ServerlessFunction for AzureFunction, Webhook for WebHook)"
+    emit:
+      source_type: EventBus
+      target_type: Compute
+      source: ?topic
+      target: ?consumer
+      permissions: []
+      conditions: [service_state, condition_expression]
+      state_logic: >-
+        CONDITIONAL(service_state, condition_expression) when the subscription
+        provisioningState=Succeeded. The edge is base-CONDITIONAL because real-world traversal
+        depends on: (1) the consumer being running/reachable (service_state), and (2) the
+        event type filter on the subscription not blocking attacker-controlled event types
+        (condition_expression). Downgrade to BLOCKED if provisioningState != Succeeded or
+        the subscription is explicitly disabled. BLOCKED if delivery is suspended
+        (e.g., dead-letter-only after max retry exhaustion).
+        This is the structural CanTrigger binding fact — consumed by messaging-chains
+        messaging-publish-triggers-consumer to derive CanTrigger(publisher->consumer).
+      confidence: 0.97
+      derived_from:
+        - "Event subscription provisioningState=Succeeded with a Compute consumer endpoint"
+        - "messaging-chains.yaml: messaging-publish-triggers-consumer (rule 1): CanWriteData(?p,?topic) + CanTrigger(?topic,?consumer) => CanTrigger(?p,?consumer)"
+        - "messaging-chains.yaml: messaging-trigger-executes-as (rule 2): CanTrigger(?p,?consumer) + ExecutesAs(?consumer,?id) => CanExecuteAs(?p,?id)"
+      false_positive_note: >-
+        This edge is the raw event-source binding fact for COMPUTE CONSUMERS only
+        (the subscription routes topic events to the consumer). It does NOT by itself grant
+        escalation — escalation requires a publisher (CanWriteData) on the topic AND a
+        consumer that ExecutesAs an identity (messaging-chains rules 1-2 provide the roll-up).
+        Honor the event type filter: if the filter restricts which events reach the consumer
+        and the attacker cannot produce a matching event, the edge remains CONDITIONAL
+        (condition_expression) — messaging-chains will not derive CanTrigger(publisher->consumer)
+        unless the publisher can craft events matching the filter. For Messaging consumers
+        (Service Bus, Storage queue, Event Hub), emit CanWriteData instead, as the message
+        lands in a further consumer's event source. A consumer target of type Webhook is
+        modeled as Webhook (Compute subtype); a consumer target of type Azure Function is
+        modeled as ServerlessFunction.
+      narrative: >-
+        Event Grid topic {source.name} has an active event subscription routing events to
+        Compute consumer {target.name}; publishing an event to {source.name} (with a matching
+        event type and filter) triggers {target.name} with an attacker-controlled payload.
+        messaging-chains messaging-publish-triggers-consumer consumes this CanTrigger fact
+        together with CanWriteData on the topic to derive CanTrigger(publisher->consumer),
+        then messaging-trigger-executes-as derives CanExecuteAs(consumer's identity).
+
+  # NOTE: Messaging consumer destinations (Service Bus, Storage queue, Event Hub) are handled
+  # by the explicit normalization rule azure-evg-subscription-binding in azure-eventgrid.yaml,
+  # which emits CanWriteData(topic, queue) as an explicit structural fact. The downstream
+  # consumer's own CanTrigger binding on that queue/topic, combined with the topic's
+  # CanWriteData, feeds messaging-chains to complete the path. We do not re-derive this
+  # here; it is explicit infrastructure.
+
+  # ===========================================================================
+  # 8. Event exfiltration via subscription redirect (→ CanReadData)
+  # ===========================================================================
+
+  - id: azure-evg-read-events-via-redirect
+    emits: CanReadData
+    description: "Redirecting an event subscription's endpoint to an attacker-controlled webhook enables reading all event payloads from that topic (event exfiltration)."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?topic ]
+    where:
+      - "node_type(?topic) == EventBus"
+      - "?principal reached CanModifyConfiguration via azure-evg-subscription-write or azure-evg-create-subscription (eventSubscriptions/write on the topic)"
+    emit:
+      source_type: Identity
+      target_type: EventBus
+      source: ?principal
+      target: ?topic
+      permissions:
+        - "Microsoft.EventGrid/eventSubscriptions/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the CanModifyConfiguration edge (azure-evg-subscription-write or
+        azure-evg-create-subscription) is ACTIVE — the attacker can redirect or create a
+        subscription endpoint and receive all matching events. Inherit state from the
+        contributing CanModifyConfiguration edge. BLOCKED if the subscription write is
+        covered by a deny assignment.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "azure-evg-subscription-write OR azure-evg-create-subscription: ?principal CanModifyConfiguration ?topic"
+        - "messaging-chains.yaml: messaging-resource-policy-cross-boundary-trust cites this pattern for data exfil (CanReadData over event stream)"
+      false_positive_note: >-
+        CanReadData here is over the EVENT STREAM (event payloads), not a traditional
+        storage resource. The value depends on what the events contain: for system topics
+        (Storage, Key Vault, Service Bus), the events contain metadata about resource
+        operations (object names, timestamps, operation types) rather than full data
+        payloads — intelligence value, not direct data access. For custom topics, events
+        may contain full application data (orders, transactions, user actions). Confirm
+        the topic source type and expected payload schema before scoring this edge high.
+        If events contain credential material (access keys, connection strings),
+        credential-chains read-secret-yields-identity fires via ContainsSecret path.
+      narrative: >-
+        {principal.name} can redirect the event subscription endpoint for {target.name}
+        (eventSubscriptions/write); all future events from this topic are delivered to the
+        attacker-controlled endpoint, exposing event payload data. If events carry
+        credential material, credential-chains derives CanImpersonate.
+
+  # ===========================================================================
+  # 9. Partner configuration write → CanModifyConfiguration (cross-tenant binding)
+  #    (→ CanModifyConfiguration)
+  # ===========================================================================
+  # REPLACED: azure-evg-partner-config-cross-tenant (FIX finding [high]).
+  # The old rule emitted CrossTenantTrust with source_type: Identity, but
+  # CrossTenantTrust.source must be [Tenant, ApplicationIdentity] per schema.
+  # The principal holding partnerConfigurations/write is an Identity, not a Tenant.
+  # Additionally, CrossTenantTrust nature is 'explicit' in schema — a derived rule
+  # cannot emit it unless nature is 'both'. The correct flow:
+  #   (a) Principal holds partnerConfigurations/write =>
+  #       CanModifyConfiguration(principal -> subscription boundary)
+  #   (b) When partnerConfiguration is activated (explicit edge), emit CrossTenantTrust
+  #       with source: Tenant (customer), target: Tenant (partner) in the explicit file.
+  # This rule emits the CanModifyConfiguration fact; the cross-boundary trust
+  # structure is modeled explicitly in azure-eventgrid.yaml.
+
+  - id: azure-evg-partner-config-modify
+    emits: CanModifyConfiguration
+    description: "Modifying Event Grid partner configurations authorizes an external partner to publish events into this subscription; a capability to alter subscription-level messaging trust."
+    match_effective_permission:
+      action: "Microsoft.EventGrid/partnerConfigurations/write"
+      scope_type: "subscription"
+    where:
+      - "the subscription scope includes the subscription being configured"
+    emit:
+      source_type: Identity
+      target_type: AdministrativeBoundary
+      source: "<principal holding partnerConfigurations/write>"
+      target: "<subscription (AdministrativeBoundary)>"
+      permissions:
+        - "Microsoft.EventGrid/partnerConfigurations/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when partnerConfigurations/write is confirmed at subscription scope. The
+        capability allows the principal to authorize external partner namespaces to publish
+        into this subscription's partner topics. BLOCKED if a deny assignment covers
+        partnerConfigurations/write.
+      confidence: 0.90
+      derived_from:
+        - "effective permission: Microsoft.EventGrid/partnerConfigurations/write at subscription scope"
+        - "messaging-chains.yaml: messaging-resource-policy-cross-boundary-trust (rule 4) cites cross-boundary messaging trust patterns"
+      false_positive_note: >-
+        partnerConfigurations/write grants control over which external partners are
+        authorized to publish into this subscription via partner topics. Event Grid
+        partner namespaces require Microsoft verification; preview/self-registered
+        namespaces also exist. The cross-tenant TRUST structure itself
+        (source: customer Tenant, target: partner Tenant) is modeled as an explicit
+        edge in azure-eventgrid.yaml when the partner topic is Activated. This rule
+        captures the configuration capability; can-control rolls up to CanEnterSubscription
+        if a live consumer fires. Cite, do not re-derive the CanEnter* roll-up.
+      narrative: >-
+        {principal.name} holds Microsoft.EventGrid/partnerConfigurations/write at
+        subscription scope; it can authorize external partner registrations to publish
+        events into partner topics in this subscription.
+
+  # ===========================================================================
+  # 10. Public topic exposure (→ ExposedToInternet)
+  # ===========================================================================
+
+  - id: azure-evg-topic-public
+    emits: ExposedToInternet
+    description: "An Event Grid custom topic with publicNetworkAccess=Enabled is internet-accessible for event publishing (any holder of the topic key can publish from the internet)."
+    match:
+      - [ ?topic, HasPolicy, ?accesspolicy ]
+    where:
+      - "node_type(?topic) == EventBus"
+      - "?topic.provider_type == 'Microsoft.EventGrid/topics'"
+      - "?topic.properties.publicNetworkAccess == Enabled"
+      - "?topic has access keys (keys not disabled via local auth disabled setting)"
+    emit:
+      source_type: EventBus
+      target_type: AnonymousIdentity
+      source: ?topic
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the topic has publicNetworkAccess=Enabled AND access keys are not
+        disabled (disableLocalAuth property is false or unset). The topic is internet-reachable
+        for any entity holding the key. CONDITIONAL(service_state) if the topic is in a
+        degraded state. BLOCKED if publicNetworkAccess=Disabled — topic is not reachable from
+        the internet regardless of key possession. BLOCKED if disableLocalAuth=true — key-based
+        publish from internet is not possible (Entra-only auth would still be possible for
+        authorized principals).
+      confidence: 0.90
+      derived_from:
+        - "topic.properties.publicNetworkAccess=Enabled"
+        - "topic access keys are enabled (disableLocalAuth is not true)"
+      false_positive_note: >-
+        This edge models that the topic PUBLISH SURFACE is internet-accessible, not that
+        arbitrary anonymous users can publish — a topic key is still required. The ExposedToInternet
+        edge expresses the attack entry point (internet reachability) for a key-holding attacker.
+        If disableLocalAuth=true, Entra-based publish (events/send/action) is still possible
+        from authorized principals — but anonymous/key-based internet publish is blocked; in
+        that case do not emit this edge. System topics are published to by Azure services only
+        (not user-publishable) — do not emit for systemTopics. Domain topics inherit internet
+        exposure from their domain's publicNetworkAccess setting.
+      narrative: >-
+        Event Grid topic {source.name} has publicNetworkAccess=Enabled and key-based
+        authentication; any internet-based party holding the topic access key can publish
+        events and trigger all bound event subscription consumers.
+
+  # ===========================================================================
+  # 11. Delivery MI attachment — replaced ExecutesAs with AttachedTo (FIX finding [high])
+  # ===========================================================================
+  # REMOVED: azure-evg-delivery-mi-executes-as. The delivery MI is used for outbound
+  # DELIVERY authentication only, not code execution. Modeling it as ExecutesAs(EventBus,MI)
+  # is a schema violation — ExecutesAs.source must be [Compute], but EventBus is Messaging,
+  # not Compute. The correct edge is AttachedTo(MI -> EventBus), which is emitted explicitly
+  # in azure-eventgrid.yaml (azure-evg-topic-mi-attached, azure-evg-systemtopic-mi-attached).
+  # The delivery MI's role in CanModifyConfiguration (subscription redirect to a resource
+  # the delivery MI can reach) is expressed by CanModifyConfiguration itself, not by an
+  # ExecutesAs on the topic. If the delivery MI should appear in escalation paths, it is
+  # via the explicit AttachedTo + the resource's own ExecutesAs/HasPermission edges.
+
+  # ===========================================================================
+  # 11. Dead-letter queue read (→ CanReadData) — missing rule implementation
+  # ===========================================================================
+
+  - id: azure-evg-read-dlq
+    emits: CanReadData
+    description: "A principal with read access to an Event Grid subscription's dead-letter destination (Storage blob container) can read all failed/expired event payloads, including any credential material they contain."
+    match:
+      - [ ?principal, CanReadData, ?storage_container ]
+      - [ ?subscription, HasPolicy, ?dlq_policy ]
+    where:
+      - "node_type(?principal) in [Identity, Compute]"
+      - "node_type(?storage_container) in [ObjectStorage]"
+      - "node_type(?subscription) == EventRule"
+      - "?subscription.properties.deadLetterDestination.properties.resourceId == ?storage_container.id"
+      - "?dlq_policy is the dead-letter destination configuration on the subscription"
+    emit:
+      source_type: Identity
+      target_type: GenericStorage
+      source: ?principal
+      target: ?storage_container
+      permissions:
+        - "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read (or Storage Blob Data Reader role)"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal has effective read permission on the storage container
+        AND the subscription is configured with a dead-letter destination pointing to that
+        container. The principal can read all event blobs in the dead-letter container,
+        including events that failed delivery or expired. BLOCKED if a deny assignment
+        covers blob read on the container or if no dead-letter destination is configured.
+      confidence: 0.92
+      derived_from:
+        - "?principal CanReadData ?storage_container: effective Storage blob read permission"
+        - "subscription.properties.deadLetterDestination.properties.resourceId: configuration link to DLQ container"
+        - "messaging-chains.yaml: messaging-read-data-exfiltration (if DLQ contains credentials, credential-chains fires)"
+      false_positive_note: >-
+        The dead-letter queue is populated with events that failed delivery after max retries
+        or that expired before delivery. These failures are often transient (endpoint down,
+        slow network), so the DLQ may be infrequently populated. However, if a custom topic
+        receives events with sensitive data and event delivery fails systematically (e.g.,
+        webhook endpoint unreachable), the DLQ accumulates those events. Confirm that the
+        subscription actually uses a dead-letter destination (not all subscriptions do);
+        check deadLetterDestination.properties.resourceId on the subscription object.
+        If the container is in a different subscription and the principal crosses that
+        boundary to read it, check the cross-subscription path separately.
+      narrative: >-
+        {principal.name} has read access to the Storage container {target.name} that serves
+        as the dead-letter destination for Event Grid subscription on topic {subscription.topic};
+        it can read all failed/expired event payloads in the container, including any
+        credential material embedded in those events.
+
+  # ===========================================================================
+  # 12. Domain topic → expose all topics' CanWriteData via domain key
+  # ===========================================================================
+
+  - id: azure-evg-domain-key-publish-domain
+    emits: CanWriteData
+    description: "A principal holding the domain access key can publish events to ALL topics within the Event Grid domain, triggering all subscribers across the domain."
+    match:
+      - [ ?principal, CanReadSecret, ?domainkey ]
+    where:
+      - "node_type(?domainkey) == AccessKey"
+      - "?domainkey is a domain-level access key (from azure-evg-domain-list-keys)"
+      - "?domain is the Event Grid domain whose key was retrieved"
+      - "?domain.properties.publicNetworkAccess == Enabled OR principal has VNet access to private endpoint"
+    emit:
+      source_type: Identity
+      target_type: GenericData
+      source: ?principal
+      target: ?domain
+      permissions: []
+      conditions: [trigger_exists, network_reachability]
+      state_logic: >-
+        ACTIVE when the domain key has been retrieved (CanReadSecret ACTIVE on domain key)
+        AND the domain is network-reachable. CONDITIONAL(trigger_exists) when no confirmed
+        live subscription on any domain topic routes to a consumer. CONDITIONAL(network_reachability)
+        when publicNetworkAccess=Disabled and no private endpoint access confirmed. The domain key
+        permits publishing to all topics in the domain via the domain endpoint.
+      confidence: "min(contributing_confidences) * 0.96"
+      derived_from:
+        - "azure-evg-domain-list-keys: ?principal CanReadSecret ?domainkey"
+        - "messaging-chains.yaml: messaging-publish-triggers-consumer: CanWriteData(?p,?domain-topic) + CanTrigger(?domain-topic,?consumer) => CanTrigger(?p,?consumer)"
+      false_positive_note: >-
+        Publishing via domain key does NOT require any ARM RBAC permission at publish time — it is
+        HTTP authenticated using the key (aeg-sas-key header). The prerequisite is CanReadSecret
+        (domains/listKeys/action), which retrieves the key. The domain key has broader blast radius
+        than per-topic keys: it grants publish access to ALL topics in the domain. The domain key is
+        submitted to the domain endpoint with a 'topic' field specifying the target domain topic;
+        publishing to all domain topics requires knowledge of topic names, but these are enumerable
+        via ARM read (domains/topics/read). Scope: this edge targets the domain node; downstream
+        CanTrigger edges target each topic's consumers. A principal who can list domain topics
+        and holds the domain key can target any topic in the domain without per-topic keys.
+      narrative: >-
+        {principal.name} holds the domain access key for Event Grid domain {target.name}
+        (retrieved via domains/listKeys/action); publishing to any topic in the domain
+        triggers that topic's bound event subscription consumers with an attacker-controlled
+        payload.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A deny assignment covering topics/listKeys/action -> azure-evg-list-keys
+#    BLOCKED; downstream CanWriteData via key is not achievable.
+#  - A deny assignment covering eventSubscriptions/write -> azure-evg-subscription-write
+#    and azure-evg-create-subscription BLOCKED.
+#  - publicNetworkAccess=Disabled on the topic -> azure-evg-topic-public BLOCKED;
+#    azure-evg-publish-via-key CONDITIONAL(network_reachability) unless VNet access confirmed.
+#  - disableLocalAuth=true on the topic -> key-based publish is not possible;
+#    azure-evg-publish-via-key BLOCKED (key is retrieved but cannot be used for publish);
+#    azure-evg-publish-entra remains as the only publish path for Entra-authorized callers.
+#  - System topics (Microsoft.EventGrid/systemTopics) do NOT accept user-initiated publish
+#    (events/send/action returns 403) — do not emit azure-evg-publish-via-key or
+#    azure-evg-publish-entra for system topics. Only azure-evg-subscription-write and
+#    azure-evg-create-subscription apply to system topics.
+#  - A subscription in provisioningState != Succeeded or delivery suspended (dead-letter-only)
+#    -> azure-evg-subscription-triggers-consumer CONDITIONAL(service_state) not ACTIVE.
+#  - A strict event type filter on a subscription may prevent attacker-published events
+#    from matching -> azure-evg-subscription-triggers-consumer CONDITIONAL(condition_expression).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/azure-eventgrid.yaml (CanTrigger subscription binding,
+# ExecutesAs delivery MI, ContainsSecret for events with credential payloads,
+# ExposesCredential topic key, AttachedTo delivery MI on topic).
+explicit_rules:
+
+  - id: azure-evg-subscription-binding
+    emits: CanTrigger
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.EventGrid/eventSubscriptions"
+      field: "properties.destination.endpointType"
+    where:
+      - "properties.provisioningState == Succeeded"
+      - "properties.destination.endpointType in [WebHook, AzureFunction, ServiceBusQueue, ServiceBusTopic, StorageQueue, EventHub, HybridConnection]"
+    emit:
+      source_type: EventBus
+      target_type: Compute
+      source: "<topic or system topic that the subscription is on>"
+      target: "<consumer at destination endpoint (ServerlessFunction for AzureFunction, Webhook for WebHook, Queue for ServiceBusQueue/StorageQueue, etc.)>"
+      api_source: "GET <resource>/providers/Microsoft.EventGrid/eventSubscriptions"
+      evidence_field: "properties.destination.properties.resourceId OR properties.destination.endpointUrl"
+      narrative: "Event Grid subscription {source.name} routes events from {topic.name} to {target.name} (endpointType: {value}) on each event."
+
+  - id: azure-evg-topic-key-secret
+    emits: ExposesCredential
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.EventGrid/topics"
+      field: "properties.endpoint"
+    where:
+      - "properties.endpoint is non-empty"
+      - "topic is of kind Custom (not system topic)"
+    emit:
+      source_type: EventBus
+      target_type: AccessKey
+      source: "<Event Grid topic>"
+      target: "<topic access key (AccessKey) — key1 and key2 (not collected; modeled as existence)>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.EventGrid/topics/{topic}"
+      evidence_field: "properties.endpoint (existence of topic implies keys exist)"
+      narrative: "Event Grid topic {source.name} has access keys (key1, key2) that can be retrieved via topics/listKeys/action and used for key-based event publishing."
+
+  - id: azure-evg-topic-delivery-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.EventGrid/topics"
+      field: "identity"
+    where:
+      - "identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned']"
+    emit:
+      source_type: EventBus
+      target_type: ManagedIdentity
+      source: "<Event Grid topic (EventBus)>"
+      target: "<managed identity (identity.principalId or userAssignedIdentities key)>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.EventGrid/topics/{topic}"
+      evidence_field: "identity.principalId OR identity.userAssignedIdentities"
+      narrative: "Event Grid topic {source.name} uses managed identity {target.name} for outbound event delivery to private endpoints."
+
+  - id: azure-evg-systemtopic-delivery-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.EventGrid/systemTopics"
+      field: "identity"
+    where:
+      - "identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned']"
+    emit:
+      source_type: EventBus
+      target_type: ManagedIdentity
+      source: "<Event Grid system topic (EventBus)>"
+      target: "<managed identity (identity.principalId or userAssignedIdentities key)>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.EventGrid/systemTopics/{systemTopic}"
+      evidence_field: "identity.principalId OR identity.userAssignedIdentities"
+      narrative: "Event Grid system topic {source.name} uses managed identity {target.name} for outbound event delivery."

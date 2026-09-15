@@ -1,0 +1,625 @@
+# Azure Machine Learning (Microsoft.MachineLearningServices) — Derived rules (Phase 11)
+# ---------------------------------------------------------------------------
+# Core AML escalation invariant (Phase-11 theme):
+#   AML compute clusters, compute instances, and training jobs run AS the
+#   workspace managed identity (system-assigned) or a user-assigned MI bound
+#   to the compute. Any code that runs on the compute — a training job command,
+#   a pipeline step, a notebook cell, an online endpoint scoring script — can
+#   mint MI tokens from IMDS (169.254.169.254/metadata/identity/oauth2/token,
+#   header "Metadata: true") and act as that identity.
+#
+#   Whoever can SUBMIT A JOB, MODIFY A NOTEBOOK, REGISTER A MALICIOUS
+#   ENVIRONMENT, or WRITE TO AN ONLINE DEPLOYMENT injects attacker code that
+#   executes AS the compute MI → CanExecuteAs (cite can-execute-as.yaml,
+#   cicd-chains.yaml).
+#
+#   The Azure PassRole analog: `Microsoft.ManagedIdentity/userAssignedIdentities/
+#   assign/action` + `Microsoft.MachineLearningServices/workspaces/computes/write`
+#   → attach/swap the MI on a cluster → CanPassIdentity / CanAttachIdentity.
+#   Per-job identity override (`identity.client_id` in job spec) =
+#   CanPassIdentity directly in the job submission.
+#
+#   Secondary vectors:
+#     (a) DATASTORE listsecrets: datastores store storage-account keys, SAS
+#         tokens, and SP client secrets → ExposesCredential / CanReadSecret.
+#     (b) WORKSPACE CONNECTIONS listsecrets: OpenAI / Cognitive Services /
+#         custom endpoint API keys → CanReadSecret.
+#     (c) ONLINE ENDPOINT scoring: public HTTPS URL + key → ExposedToInternet.
+#
+# All operation strings verified against the Microsoft.MachineLearningServices
+# resource-provider operations reference (learn.microsoft.com, 2026-08).
+# Deny assignments override → BLOCKED. Escalation edges require the target MI
+# to out-privilege the caller.
+#
+# LINCHPIN CITATIONS (CITE, DO NOT DUPLICATE):
+#   can-execute-as.yaml   — CanModifyCode/CanModifyConfiguration/CanExecuteCommand
+#                           + ExecutesAs → CanExecuteAs (provider-agnostic roll-up).
+#   cicd-chains.yaml      — modify-what-it-runs → execute-as (framing for job/pipeline
+#                           submit as CI/CD-style injection).
+#   credential-chains.yaml — CanReadSecret + CredentialsFor → CanImpersonate.
+#   can-control.yaml      — CanExecuteAs + privilege > caller → CanEscalateTo (roll-up).
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 11-data-analytics-ml
+applies_to: [azure]
+
+rules:
+
+
+  # =========================================================================
+  # CODE MODIFICATION PRIMITIVES
+  # =========================================================================
+
+  - id: azure-aml-job-submit
+    emits: CanModifyCode
+    description: "Submit a training/pipeline/AutoML job whose command or script runs on the cluster as the compute MI."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/jobs/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<AML compute cluster or compute instance (BatchJob / VirtualMachine)>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/jobs/write"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the target compute has available nodes and the job spec carries
+        an attacker-controlled command / script / notebook reference.
+        CONDITIONAL(service_state) when the cluster is at zero nodes (auto-scale to
+        zero) — the job will run when scale-up occurs. Built-in role AzureML Data
+        Scientist grants this action.
+      false_positive_note: >-
+        The job must carry an attacker-controlled command, script, or notebook
+        reference. Submitting a job with a trusted, pinned script to a zero-node
+        cluster is CONDITIONAL(service_state). Does NOT require compute/write; the
+        job submission alone triggers code execution on the existing compute.
+      narrative: "{principal.name} can submit a training or pipeline job (workspaces/jobs/write) to cluster {target.name}; the job command or script runs as the cluster's managed identity."
+
+  - id: azure-aml-notebook-write
+    emits: CanModifyCode
+    description: "Overwrite a notebook on the workspace file share (via storage write); the notebook runs on a compute instance as the compute MI."
+    match_effective_permission:
+      any_of:
+        - action: "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"
+          note: "Storage Blob Data Contributor / Owner on the linked ADLS Gen2 / Blob storage account"
+        - action: "Microsoft.MachineLearningServices/workspaces/notebooks/write"
+          note: "Direct notebook write via AML workspace API"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "the write target is the workspace's linked storage account or the AML notebook file share"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<AML compute instance (Notebook / VirtualMachine)>"
+      permissions:
+        - "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"
+        - "Microsoft.MachineLearningServices/workspaces/notebooks/write"
+      conditions: [trigger_exists]
+      state_logic: >-
+        ACTIVE when a user is actively running the notebook interactively on a
+        compute instance OR a job schedule already references the notebook.
+        CONDITIONAL(trigger_exists) when no scheduled job or active session is
+        established — the code is planted but needs a run path.
+      false_positive_note: >-
+        Only emit when the write target is the workspace's linked storage or
+        notebook file share, not arbitrary blob storage. The attacker must also have
+        knowledge of the notebook path the compute instance or job will run; a
+        write to an unmonitored path is not code execution.
+      narrative: "{principal.name} can overwrite a notebook on the AML workspace file share ({target.name}); the notebook executes as the compute instance's managed identity on the next interactive session or scheduled run."
+
+  - id: azure-aml-environment-write
+    emits: CanModifyCode
+    description: "Register a malicious custom Docker environment image; when a job references it, the attacker container runs as the cluster MI."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/environments/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<AML compute cluster (BatchJob)>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/environments/write"]
+      conditions: [trigger_exists]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) by default — the malicious environment is
+        registered but runs only when a job is submitted referencing it. Upgrade to
+        ACTIVE when the attacker can also submit a job (workspaces/jobs/write) that
+        explicitly uses the registered environment.
+      false_positive_note: >-
+        The environment write alone does not cause execution; a job submission that
+        references the malicious environment is required. Emit ACTIVE only when the
+        attacker ALSO holds workspaces/jobs/write (job-submit path). Do not emit for
+        curated (Microsoft-managed) environments — those cannot be overwritten.
+        Custom environments must point to an attacker-controlled image in ACR or
+        Docker Hub to materialize code execution.
+      narrative: "{principal.name} can register a malicious Docker environment (workspaces/environments/write); when a job is submitted using this environment, the attacker container runs on cluster {target.name} as its managed identity."
+
+  - id: azure-aml-component-write
+    emits: CanModifyCode
+    description: "Overwrite a shared pipeline component definition; future pipeline jobs using that component run attacker code as the cluster MI."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/components/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<AML compute cluster (BatchJob)>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/components/write"]
+      conditions: [trigger_exists]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) — the component is overwritten but only
+        reaches execution when a pipeline job referencing that component runs.
+        ACTIVE when a pipeline schedule already references the component.
+      false_positive_note: >-
+        Only affects FUTURE pipeline runs that reference the specific component by
+        name/version. An already-running job is not affected. Do not emit if the
+        component is a private/pinned version that no active pipeline references.
+        Emit CONDITIONAL(trigger_exists) unless a pipeline schedule explicitly
+        references the component version.
+      narrative: "{principal.name} can overwrite pipeline component {component.name} (workspaces/components/write); future pipeline jobs referencing it will execute the attacker's code on cluster {target.name} as its managed identity."
+
+  - id: azure-aml-aks-attached-compute-job-submit
+    emits: CanModifyCode
+    description: "Submit a job to an AKS cluster attached as an AML compute target; the job runs inside the AKS cluster as a Kubernetes workload, enabling lateral movement to non-AML K8s resources."
+    match:
+      - [ ?principal, CanModifyCode, ?compute ]
+      - [ ?compute, Contains, ?k8sCluster ]
+    where:
+      - "node_type(?compute) in [Compute]"
+      - "?compute.kind == AKS (AML attached AKS compute target)"
+      - "node_type(?k8sCluster) in [ContainerCluster, KubernetesCluster]"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<AKS cluster (ContainerCluster)"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/jobs/write"]
+      conditions: [service_state, role_compatibility]
+      state_logic: >-
+        ACTIVE when the attached AKS cluster is accessible and a job can be
+        submitted. The job runs as a K8s workload within the AKS cluster,
+        subject to the K8s RBAC and network policies of the AKS cluster
+        (not AML RBAC). Cite cicd-chains for the injection pattern.
+      false_positive_note: >-
+        This path exists only for AKS-attached computes (compute.kind == AKS).
+        Standard AML managed computes (AmlCompute, ComputeInstance) run in
+        AML-managed environments and do not enable lateral K8s movement.
+        The attacker code runs inside the AKS cluster; escalation from there
+        depends on AKS RBAC and K8s network policies, not AML identity.
+      note: >-
+        AKS-attached AML compute is a container-chains attack path: AML job
+        submission → Kubernetes workload → K8s node access / service account
+        escalation. Link to container-chains.yaml for the K8s traversal rules.
+      narrative: "{principal.name} can submit a job to AML compute {compute.name} (workspaces/jobs/write), which is backed by AKS cluster {k8sCluster.name}; the job runs as a Kubernetes workload inside AKS, enabling lateral movement within the AKS cluster beyond AML isolation."
+
+  - id: azure-aml-online-deployment-write
+    emits: CanModifyCode
+    description: "Replace an online endpoint deployment's scoring script / model / environment; code executes as the endpoint MI on each inference request."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/write"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<online endpoint deployment (ContainerService)>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/onlineEndpoints/deployments/write"]
+      conditions: [trigger_exists]
+      state_logic: >-
+        ACTIVE once the deployment is updated and receives an inference request
+        (endpoint has active traffic allocation to the deployment).
+        CONDITIONAL(trigger_exists) if no traffic is routed to this deployment.
+      false_positive_note: >-
+        Traffic must be routed to the deployment (non-zero traffic allocation).
+        A deployment with 0% traffic does not execute on inference requests.
+        The endpoint MI may be system-assigned (auto-created per endpoint) with
+        limited privileges — verify the endpoint MI's RBAC before asserting
+        a high-value escalation.
+      narrative: "{principal.name} can update online deployment {target.name} (onlineEndpoints/deployments/write), replacing the scoring script or container; attacker code runs as the endpoint's managed identity on each inference request."
+
+  # =========================================================================
+  # CONFIGURATION MODIFICATION PRIMITIVES
+  # =========================================================================
+
+  - id: azure-aml-compute-write-config
+    emits: CanModifyConfiguration
+    description: "Write to a compute cluster — changes the compute identity block, SSH keys, subnet, or init scripts."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/computes/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "target is a compute cluster (BatchJob / AmlCompute), not a compute instance"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<AML compute cluster>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/computes/write"]
+      note: >-
+        Can change the identity block (attach user-assigned MI), SSH key, subnet
+        placement, custom data / init scripts. Identity block changes do NOT
+        propagate to already-running compute nodes — recreate / scale-to-zero
+        is required for the new MI to take effect on nodes.
+      false_positive_note: >-
+        In-place identity block updates on a running cluster do not reach
+        currently-active nodes; new nodes will use the updated MI. Scale-to-zero
+        then scale-up is required for full propagation, so emit
+        CONDITIONAL(service_state) for the MI-swap path.
+      narrative: "{principal.name} can modify the configuration of compute {target.name} (computes/write), including its managed identity block and initialization scripts."
+
+
+  # =========================================================================
+  # IDENTITY ATTACHMENT (Azure PassRole analog)
+  # =========================================================================
+
+  - id: azure-aml-attach-mi-to-compute
+    emits: CanAttachIdentity
+    description: "Attach a user-assigned MI to an AML compute cluster/instance — future jobs run as the new MI."
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?userMI"
+      - "?principal has EFFECTIVE Microsoft.MachineLearningServices/workspaces/computes/write on the target compute"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<AML compute cluster or compute instance>"
+      permissions:
+        - "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
+        - "Microsoft.MachineLearningServices/workspaces/computes/write"
+      conditions: [role_compatibility, service_state]
+      state_logic: >-
+        ACTIVE for the attach capability itself; downstream CanExecuteAs via
+        can-execute-as linchpin requires a run path (job submit or existing node
+        startup) and that the new MI out-privileges the caller. Emit
+        CONDITIONAL(service_state) when the cluster has active nodes that will
+        not pick up the new MI without a scale cycle.
+      false_positive_note: >-
+        BOTH permissions are required: assign/action on the specific MI AND
+        computes/write on the specific compute. Neither alone attaches the MI.
+        Honor the assign/action resource scope — a narrow scope to a specific MI
+        resource prevents free choice. Running nodes do not pick up the new MI
+        without a restart/scale cycle.
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to compute {target.name} (assign/action + computes/write); future training jobs on this compute will execute as {userMI.name}."
+
+
+  - id: azure-aml-create-compute-with-mi
+    emits: CanCreateWorkloadAs
+    description: "Create a new AML compute bound to a chosen user-assigned MI, then submit a job to it — execute as that MI."
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.MachineLearningServices/workspaces/computes/write (create new compute)"
+      - "?principal has EFFECTIVE Microsoft.MachineLearningServices/workspaces/jobs/write (job submit)"
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?userMI"
+    emit:
+      source_type: Identity
+      target_type: ManagedIdentity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions:
+        - "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
+        - "Microsoft.MachineLearningServices/workspaces/computes/write"
+        - "Microsoft.MachineLearningServices/workspaces/jobs/write"
+      conditions: [role_compatibility, service_state]
+      state_logic: >-
+        POTENTIAL until the compute is created (computes/write) and a job is
+        submitted (jobs/write); ACTIVE once both steps are executed and the
+        compute has a running node. Emit POTENTIAL when the create steps are
+        not yet materialized.
+      derived_from: [ "<CanPassIdentity edge_id>" ]
+      false_positive_note: >-
+        All three permissions are required: assign/action on the MI, computes/write
+        to create the compute, and jobs/write to submit a job. Without jobs/write
+        the compute exists but no code runs. Escalation only if the attached MI
+        out-privileges the caller. The new compute node must provision before the
+        job can run; emit CONDITIONAL(service_state) during provisioning.
+      narrative: "{principal.name} can create a new AML compute cluster (computes/write) bound to user-assigned MI {target.name} (assign/action), then submit a job (jobs/write) to execute attacker code as {target.name}."
+
+  # =========================================================================
+  # CREDENTIAL ACCESS — DATASTORES
+  # =========================================================================
+
+  - id: azure-aml-datastore-listsecrets
+    emits: CanReadSecret
+    description: "Retrieve stored datastore credentials (storage account key, SAS token, or SP client secret) via listsecrets."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/datastores/listsecrets/action"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<datastore credential (ConnectionString / AccessKey / Secret)>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/datastores/listsecrets/action"]
+      note: >-
+        Retrieves: storage account key (AccountKey datastores), SAS token
+        (SAS datastores), service principal client secret (ServicePrincipal
+        datastores), or certificate. AzureML Data Scientist does NOT include
+        this action — requires Contributor/Owner or an explicit custom grant.
+      false_positive_note: >-
+        The built-in AzureML Data Scientist role does NOT include
+        listsecrets/action. Do not emit CanReadSecret for datastore credentials
+        unless the principal explicitly holds this action or Contributor/Owner at
+        the workspace or resource-group scope. The action returns the credential
+        value; modeling this as CanReadSecret (not merely CanRead) is intentional.
+        Credentials for identity-credential datastores (MI-backed) contain no
+        secret to retrieve — only emit for credential_type in [accountKey, sas,
+        servicePrincipal, certificate].
+      narrative: "{principal.name} can retrieve the stored credentials of AML datastore {target.name} (datastores/listsecrets/action), including storage account keys, SAS tokens, or service principal client secrets."
+
+  - id: azure-aml-connection-listsecrets
+    emits: CanReadSecret
+    description: "Retrieve workspace connection secrets (API keys for OpenAI, Cognitive Services, or custom REST endpoints) via connections/listsecrets."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/connections/listsecrets/action"
+      scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<workspace connection secret (APIKey / ConnectionString)>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/connections/listsecrets/action"]
+      note: >-
+        Workspace connections store API keys and connection strings for external
+        services (AzureOpenAI, CognitiveService, CustomKeys, etc.). Retrieving
+        them via listsecrets yields usable credentials for downstream services.
+      false_positive_note: >-
+        Only emit when the workspace connection category implies a stored secret
+        (AzureOpenAI, CognitiveService, CustomKeys, AzureBlob with accountKey,
+        etc.). Identity-credential connections (MI-backed) contain no secret
+        to retrieve.
+      narrative: "{principal.name} can retrieve the API keys or connection strings of workspace connection {target.name} (connections/listsecrets/action), enabling access to the external service it connects to."
+
+  - id: azure-aml-online-endpoint-listkeys
+    emits: CanReadSecret
+    description: "Retrieve the API key for a key-authenticated online endpoint via listkeys/action; required to invoke public endpoints."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/onlineEndpoints/listkeys/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "onlineEndpoint authMode == Key"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<online endpoint scoring API key>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/onlineEndpoints/listkeys/action"]
+      note: >-
+        The scoring key is a shared secret allowing unauthenticated invocation
+        of the online endpoint. Retrieving it via listkeys/action yields a
+        credential for the endpoint API. Pair with ExposedToInternet on the
+        endpoint to complete the attack path.
+      false_positive_note: >-
+        Only emit for endpoints with authMode=Key. Token-authenticated (AAD)
+        endpoints do not have a listkeys secret; they require Azure AD
+        authentication instead. The endpoint URL alone is not exploitable
+        without the scoring key.
+      narrative: "{principal.name} can retrieve the scoring API key for online endpoint {target.name} (onlineEndpoints/listkeys/action), enabling unauthenticated invocations if the endpoint is ExposedToInternet."
+
+  # =========================================================================
+  # CREDENTIAL EXPOSURE — IMDS ON COMPUTE
+  # =========================================================================
+
+  - id: azure-aml-compute-imds-exposescred
+    emits: ExposesCredential
+    description: "Any code running on an AML compute node can mint the compute MI's token from IMDS — the MI credential is exposed to all job code."
+    match:
+      - [ ?compute, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?compute) in [BatchJob, VirtualMachine, Notebook]"
+      - "node_type(?mi) in [ManagedIdentity]"
+    emit:
+      source_type: Compute
+      target_type: ManagedIdentity
+      source: "<AML compute cluster, compute instance, or online endpoint deployment>"
+      target: "<managed identity (system-assigned or user-assigned)>"
+      permissions: []
+      derived_from: [ "<ExecutesAs edge_id>" ]
+      false_positive_note: >-
+        Only fires when the compute has a managed identity (identity.type !=
+        None). If the compute has no MI, IMDS returns an error and there is no
+        credential to expose. System-assigned MI for online endpoints has
+        limited scope by default; verify the MI's RBAC grants before asserting
+        high-value escalation.
+      narrative: "{compute.name} exposes the credential of its managed identity {mi.name} to any code running on its nodes via IMDS (169.254.169.254), including all training job commands and notebook cells."
+
+  - id: azure-aml-compute-imds-token
+    emits: CanRetrieveToken
+    description: "Any code on an AML compute node can mint a bearer token for the compute MI via IMDS."
+    match:
+      - [ ?compute, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?compute) in [BatchJob, VirtualMachine, Notebook]"
+      - "node_type(?mi) in [ManagedIdentity]"
+    emit:
+      source_type: Compute
+      target_type: ManagedIdentity
+      source: "<AML compute cluster, compute instance, or online endpoint deployment>"
+      target: "<managed identity>"
+      permissions: []
+      derived_from: [ "<ExecutesAs edge_id>" ]
+      note: >-
+        IMDS: GET http://169.254.169.254/metadata/identity/oauth2/token?
+        api-version=2018-02-01&resource=https://management.azure.com/
+        with header 'Metadata: true'. Companion to azure-aml-compute-imds-exposescred.
+      false_positive_note: >-
+        Only fires when the compute has a managed identity. No MI → no token.
+        Do not emit for the workspace system-assigned MI unless the compute
+        explicitly inherits it (identity.type == SystemAssigned on the compute
+        ARM resource).
+      narrative: "Any job or notebook cell on {compute.name} can request a bearer token for {mi.name} from IMDS (169.254.169.254) with no additional credential."
+
+  - id: azure-aml-datastore-exposes-cred
+    emits: ExposesCredential
+    description: "An AML datastore configured with accountKey/SAS/servicePrincipal credential exposes that credential to principals with listsecrets."
+    match:
+      - [ ?datastore, ContainsSecret, ?credential ]
+    where:
+      - "node_type(?datastore) in [Data, GenericData]"
+      - "node_type(?credential) in [Secret, ConnectionString, AccessKey, Credential]"
+      - "datastore.credential_type in [accountKey, sas, servicePrincipal, certificate]"
+    emit:
+      source_type: Data
+      target_type: Credential
+      source: "<AML datastore>"
+      target: "<stored credential (storage key / SAS / SP client secret / cert)>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/datastores/listsecrets/action"]
+      derived_from: [ "<ContainsSecret edge_id>" ]
+      false_positive_note: >-
+        Only emit when the datastore credential_type is a static credential
+        (accountKey, sas, servicePrincipal, certificate). Identity/MI-backed
+        datastores have no stored credential to expose. This edge is consumed
+        by credential-chains read-secret-yields-identity when the credential is
+        CredentialsFor an identity.
+      narrative: "{datastore.name} is configured with a static credential ({credential.type}) retrievable via listsecrets/action; this credential authenticates to the backing data store."
+
+  # =========================================================================
+  # EXECUTION EDGES (CanExecuteAs — derived by linchpins, not re-derived here)
+  # =========================================================================
+  # The following CanExecuteAs paths are derived by linchpin rules in
+  # can-execute-as.yaml from the primitive edges CanModifyCode, CanExecuteCommand,
+  # CanModifyConfiguration, and CanAttachIdentity combined with ExecutesAs.
+  # Do NOT re-derive them here to avoid dual-emission.
+  #
+  # Specific linchpin rules that collapse to CanExecuteAs:
+  #  - execute-as-via-code-modify       (CanModifyCode + ExecutesAs)
+  #  - execute-as-via-config-identity-swap (CanModifyConfiguration + CanPassIdentity)
+  #  - execute-as-via-command           (CanExecuteCommand + ExecutesAs)
+  #
+  # These primitive edges are all emitted below (azure-aml-job-submit,
+  # azure-aml-notebook-write, azure-aml-environment-write, azure-aml-component-write,
+  # azure-aml-online-deployment-write, azure-aml-compute-write-config,
+  # azure-aml-attach-mi-to-compute, azure-aml-computeinstance-ssh).
+  # =========================================================================
+
+  # =========================================================================
+  # COMMAND EXECUTION — COMPUTE INSTANCE SSH
+  # =========================================================================
+
+  - id: azure-aml-computeinstance-ssh
+    emits: CanModifyConfiguration
+    description: "Write access to a compute instance can modify SSH public key configuration and other network settings."
+    match_effective_permission:
+      action: "Microsoft.MachineLearningServices/workspaces/computes/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "target is a compute instance (not a managed compute cluster)"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: "<principal>"
+      target: "<compute instance>"
+      permissions: ["Microsoft.MachineLearningServices/workspaces/computes/write"]
+      conditions: [network_reachability, role_compatibility]
+      state_logic: >-
+        ACTIVE for the CanModifyConfiguration capability itself. CanExecuteCommand
+        can be derived only when the attacker ALSO holds or can obtain the SSH
+        private key corresponding to a public key they set, or when SSH is
+        already enabled and a trusted public key is configured that the attacker
+        holds the private key for. Emit CONDITIONAL(role_compatibility) when SSH
+        key possession cannot be verified.
+      false_positive_note: >-
+        Having computes/write does NOT imply CanExecuteCommand without evidence
+        that: (a) SSH is enabled on the instance (enableNodePublicIp=true), (b)
+        a public SSH key is configured, and (c) the attacker holds the corresponding
+        private key OR can set their own. A principal with computes/write but
+        no private key and who cannot update the SSH configuration cannot SSH in.
+        Do not emit CanExecuteCommand; emit CanModifyConfiguration. The downstream
+        execute-as-via-command linchpin can derive CanExecuteAs only when SSH
+        access is independently confirmed.
+      narrative: "{principal.name} can modify the configuration of compute instance {target.name} (computes/write), including SSH public key settings."
+
+  # =========================================================================
+  # SCHEDULING / TRIGGERING
+  # =========================================================================
+  # CanSchedule and CanTrigger are explicit facts; see explicit rules file.
+  # =========================================================================
+
+  # =========================================================================
+  # NETWORK EXPOSURE
+  # =========================================================================
+
+  - id: azure-aml-public-endpoint
+    emits: ExposedToInternet
+    description: "AML workspace with publicNetworkAccess=Enabled exposes its management REST API to the internet — any token holder can reach it."
+    where:
+      - "workspace publicNetworkAccess == Enabled (no private-endpoint-only restriction)"
+    emit:
+      source_type: Data
+      target_type: AnonymousIdentity
+      source: "<AML workspace (AnalyticsService / GenericData)>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      false_positive_note: >-
+        Do not emit if publicNetworkAccess is Disabled or the workspace is
+        restricted to private endpoints only (no public-IP workspace). In that
+        case emit PrivateReachability for access from within the VNet.
+        Authentication (Azure AD token) is always required; this edge models
+        internet reachability, not anonymous access. Anonymous access is not
+        possible to the AML workspace REST API.
+      narrative: "AML workspace {workspace.name} exposes its management REST API to the public internet (publicNetworkAccess=Enabled); any valid Azure AD token can be used to authenticate and submit jobs or retrieve datastore secrets."
+
+  - id: azure-aml-online-endpoint-public
+    emits: ExposedToInternet
+    description: "AML online endpoint with a public HTTPS URL and key-based auth is reachable from the internet; the scoring key is retrievable via listkeys."
+    where:
+      - "onlineEndpoint publicNetworkAccess == Enabled (or not restricted to private endpoint)"
+      - "onlineEndpoint authMode == Key"
+    emit:
+      source_type: Compute
+      target_type: AnonymousIdentity
+      source: "<AML online endpoint (API / PublicEndpoint)>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      false_positive_note: >-
+        Key-based authentication still requires the scoring key, which is
+        retrievable via onlineEndpoints/listkeys/action (Contributor/Owner or
+        custom grant). Without the key, the endpoint URL is public but not
+        exploitable without the credential. Emit ACTIVE for the network
+        reachability fact; pair with a CanReadSecret for the key to build the
+        full attack path. Do not emit for Token-authenticated (AAD-only) or
+        private-endpoint-only endpoints.
+      narrative: "AML online endpoint {endpoint.name} is reachable from the public internet (publicNetworkAccess=Enabled, authMode=Key); an attacker with the scoring key can invoke it, running the scoring script as the endpoint's managed identity."
+
+  # =========================================================================
+  # ROLE ASSIGNMENT — GRANT PERMISSION
+  # =========================================================================
+
+  - id: azure-aml-role-assignment-write
+    emits: CanGrantPermission
+    description: "Owner / User Access Administrator on the AML workspace or compute scope can grant AML roles to any principal, including itself."
+    match_effective_permission:
+      action: "Microsoft.Authorization/roleAssignments/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "scope covers the AML workspace or its parent resource group / subscription"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<any principal>"
+      permissions: ["Microsoft.Authorization/roleAssignments/write"]
+      conditions: [iam_permission]
+      false_positive_note: >-
+        Only Owner and User Access Administrator (or custom roles with
+        Microsoft.Authorization/roleAssignments/write) can grant roles. Contributor
+        does NOT include this action. Scoping conditions may restrict which roles
+        can be assigned (e.g. conditions on roleDefinitionId). Honor deny
+        assignments that block role-assignment write.
+      narrative: "{principal.name} can grant AML roles (e.g. AzureML Data Scientist, Contributor) to any principal at workspace {target.name}'s scope (Microsoft.Authorization/roleAssignments/write), including itself."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A deny assignment (Azure Blueprint / Managed Application) over any action
+#    listed above → emit the edge with state: BLOCKED and denied_by=<deny>.
+#  - publicNetworkAccess == Disabled → azure-aml-public-endpoint is BLOCKED;
+#    emit PrivateReachability for VNet-accessible scenarios.
+#  - A workspace with managed vnet + private endpoints only → compute nodes
+#    cannot reach external public endpoints by default; PrivateReachability.
+#  - Zero-node cluster at the time of assessment → azure-aml-execute-as-via-job
+#    is CONDITIONAL(service_state), not BLOCKED (cluster can auto-scale).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization for this service belongs in
+# /rules/explicit/azure-machinelearning.yaml (ExecutesAs, AttachedTo,
+# ContainsSecret, ContainsCredential facts). All rules are defined there and
+# must not be duplicated here to avoid dual-emission.
+# ---------------------------------------------------------------------------

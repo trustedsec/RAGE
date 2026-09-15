@@ -1,0 +1,732 @@
+# Azure DevOps — derived attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# THE PHASE-9 AZURE DEVOPS ADAPTER. Emits the normalized FACTS consumed by the
+# provider-agnostic CI/CD linchpin (cicd-chains.yaml) and the federation linchpin
+# (federation-chains.yaml). Does NOT re-derive what the linchpins roll up:
+#
+#   cicd-chains cicd-modify-buildspec-executes-as
+#     CONSUMES: CanModifyCode(?principal, ?pipeline) + ExecutesAs(?pipeline, ?sc_identity)
+#     PRODUCES: CanExecuteAs(?principal, ?sc_identity)  [ACTIVE when run path exists]
+#
+#   cicd-chains cicd-trigger-runner-executes-as
+#     CONSUMES: CanTrigger(?principal, ?pipeline) + ExecutesAs(?pipeline, ?sc_identity)
+#     PRODUCES: CanExecuteAs(?principal, ?sc_identity)  [CONDITIONAL(attacker_influenced_def)]
+#
+#   federation-chains federation-maps-to-identity
+#     CONSUMES: ExternalIdentityMapsTo(?devops_oidc, ?arm_role)
+#              + TrustsExternalIdentity(?anchor, ?devops_oidc)
+#     PRODUCES: CanFederateAs(?devops_oidc, ?arm_role)
+#
+#   cicd-chains cicd-external-ci-federates-as  [bridges the external-CI OIDC case]
+#
+# SERVICE-SPECIFIC FACTS THIS FILE EMITS:
+#   ExecutesAs            — pipeline (BuildWorker) runs as its service-connection identity
+#   CanModifyCode         — who can alter the pipeline definition the runner executes
+#   CanTrigger            — who can queue / start a pipeline run
+#   TrustsExternalIdentity — WIF service connection: ARM federated credential trusts DevOps OIDC
+#   ExternalIdentityMapsTo — WIF: DevOps OIDC issuer subject maps to Entra SP/MI
+#   ExposesCredential     — ARM secret-based service connection: client secret is in job env
+#   CanRetrieveToken      — WIF service connection: pipeline can mint OIDC JWT for ARM role
+#   CanReadSecret         — pipeline reads variable-group secrets / Key Vault linked group
+#   CanAttachIdentity     — swap/bind a service connection to a pipeline
+#   CanEnterSubscription  — pipeline with broad ARM SC gains foothold in the subscription
+#
+# ESCALATION ROLL-UPS (CITED, NOT RE-DERIVED HERE):
+#   can-execute-as.yaml          — CanModifyCode + ExecutesAs => CanExecuteAs
+#   cicd-chains.yaml             — CI/CD-framed CanExecuteAs + trigger propagation
+#   federation-chains.yaml       — CanFederateAs => CanEnterSubscription / CanImpersonate
+#   hierarchy-chains.yaml        — CanEnterSubscription => Controls(subscription) when SC is admin
+#   credential-chains.yaml       — ExposesCredential => CanImpersonate escalation
+#
+# PERMISSION STRINGS:
+#   DevOps-plane permissions (project-level security namespace bit-flags):
+#     "Edit pipeline definition" — DevOps build namespace: administer, edit queue, manage queues
+#     "Queue builds"             — DevOps build namespace: queue a new run
+#     "Manage service endpoints" — DevOps service endpoint namespace: create/update/delete SC
+#   ARM RBAC (for the pipeline's ARM objects, not the pipeline definition itself):
+#     "Microsoft.DevOps/pipelines/write"        — ARM-plane pipeline object write
+#   MS Graph (for Entra SP/app backing the service connection):
+#     "microsoft.directory/applications/federatedIdentityCredentials/create" — add WIF credential
+#   Azure DevOps REST API calls that evidence each edge are listed in the evidence_field fields.
+#
+# BLOCKED-edge guidance:
+#   - Branch protection (required reviewer on trigger branch) -> CanModifyCode CONDITIONAL/BLOCKED
+#   - Protected environment (required approval on pipeline stage) -> CanTrigger CONDITIONAL
+#   - Fork PR isolation (Limit job authorization scope, no SC access) -> PR trigger CONDITIONAL
+#   - WIF service connection: ExposesCredential NOT emitted (no stored secret); only CanRetrieveToken
+#   - Azure deny assignment covering DevOps operations -> BLOCKED with denied_by ref
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 9-cicd-pipelines
+applies_to: [azure]
+
+rules:
+
+  # =========================================================================
+  # EXECUTION IDENTITY FACTS
+  # =========================================================================
+  # NOTE: Explicit normalization of ExecutesAs already lives in explicit_rules:
+  # (azure-devops-executes-as-normalize). Derived rules consume the normalized
+  # ExecutesAs edge; do not re-derive it here.
+
+  # =========================================================================
+  # CODE MODIFICATION FACTS (→ cicd-chains consumes these)
+  # =========================================================================
+
+  # --- Edit pipeline definition permission => CanModifyCode -------------------
+  # Explicit normalization already lives in explicit_rules: (azure-devops-can-modify-code-normalize).
+  # Derived rules consume the normalized CanModifyCode edge; do not re-derive it here.
+
+  # --- Push to CI trigger branch => CanModifyCode ----------------------------
+  # If a principal can push commits to the branch that a pipeline's CI trigger watches,
+  # the pushed commit runs on the next build — attacker-supplied code executes as the
+  # service-connection identity. This is the "supply via repo" CanModifyCode path.
+  - id: azure-devops-push-trigger-branch
+    emits: CanModifyCode
+    description: "Write access to the CI-trigger branch of the pipeline's source repo lets a principal inject code that the pipeline will execute on the next triggered run."
+    applies_to: [azure]
+    match:
+      - [ ?principal, CanWrite, ?repo_branch ]
+      - [ ?repo_branch, CanTrigger, ?pipeline ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "?repo_branch is the branch / ref filter the pipeline's CI trigger watches"
+      - "node_type(?repo_branch) in [ObjectStorage, GenericStorage]  # Azure Repos branch modeled as concrete ObjectStorage or GenericStorage node"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: ?pipeline
+      permissions: ["Contribute (Azure Repos source namespace, vso.code_write)", "git push to trigger ref"]
+      conditions: [branch_protection]
+      state_logic: >-
+        ACTIVE when the principal can push directly to the trigger branch AND no branch
+        policy requires pull-request review before merge (or requires minimum approver count
+        that the attacker cannot satisfy alone). CONDITIONAL(branch_protection) when a branch
+        policy (required-reviewer, minimum approvers, work-item linking, etc.) gates direct
+        pushes — the attacker must craft a PR that passes review, which is not guaranteed.
+        Inherit weakest from the CanWrite contributor: a CONDITIONAL CanWrite (branch policy)
+        yields a CONDITIONAL CanModifyCode.
+      confidence: 0.9
+      derived_from: [ "?principal CanWrite ?repo_branch", "?repo_branch CanTrigger ?pipeline" ]
+      false_positive_note: >-
+        Check branch policies on the trigger branch (GET git/repositories/{id}/refs/policies).
+        A policy requiring at least one reviewer or pull-request review before merge prevents
+        a direct push from yielding ACTIVE code control — downgrade to CONDITIONAL(branch_protection).
+        GitHub-hosted repos also require checking the GitHub branch protection rules separately.
+        For pull-request triggers (pr: config in YAML), also check fork isolation settings
+        (azure-devops-pr-trigger-executes-as) — a PR from a fork may not have service-connection
+        access if fork isolation is enabled.
+      narrative: >-
+        {principal.name} has write access to the CI-trigger branch of the repository that
+        pipeline {pipeline.name} builds; a push to that branch triggers a run executing the
+        committed pipeline YAML as the service-connection identity.
+
+  # --- YAML template repo write => CanModifyCode (fan-out) --------------------
+  # Many pipelines use `extends: template` to inherit shared steps from a central
+  # repo. Write access to the template repo/branch lets an attacker inject code
+  # into ALL downstream pipelines that import that template.
+  - id: azure-devops-template-repo-write
+    emits: CanModifyCode
+    description: "Write to a shared YAML template repo/branch that a pipeline imports via 'extends: template', injecting code into all downstream pipelines that use it."
+    applies_to: [azure]
+    match:
+      - [ ?principal, CanWrite, ?template_repo_branch ]
+      - [ ?template_repo_branch, ContainsResourceReference, ?pipeline ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "?pipeline imports ?template_repo_branch via 'extends: template' in its YAML definition"
+      - "?template_repo_branch is NOT pinned to a specific commit SHA or tag in the extends: block (or its parent YAML)"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: ?pipeline
+      permissions: ["Contribute (Azure Repos source namespace, vso.code_write)", "git push"]
+      conditions: [branch_protection]
+      state_logic: >-
+        ACTIVE when the principal can push directly to the template branch AND the pipeline
+        enforces no required-template-from-trusted-repo control (or the attacker's push is
+        to the very branch the control trusts) AND the template is NOT pinned to a specific
+        commit. CONDITIONAL(branch_protection) when a branch policy requires-reviewer or when
+        the template import is pinned to a commit SHA/tag the attacker cannot modify. Inherit
+        weakest from CanWrite on the template repo.
+      confidence: 0.85
+      derived_from: [ "?principal CanWrite ?template_repo_branch", "?template_repo_branch ContainsResourceReference ?pipeline" ]
+      false_positive_note: >-
+        Fan-out impact can be large (one template repo write reaches many pipelines). Verify
+        the template import path is actually reachable (the pipeline's extends: block
+        references the exact branch the principal can write). A 'Require template from
+        trusted repo' enforcement control on the PIPELINE (not the template repo) can block
+        using an untrusted template — but cannot block modifications to the TRUSTED template
+        itself. Honor branch policies on the template repo. If the template import pins to
+        a commit SHA or tag (rather than a branch), the CanModifyCode is CONDITIONAL(branch_protection)
+        because updates to that commit require the attacker to modify the extends: block itself
+        (which requires Edit pipeline definition, not just template-repo write).
+      narrative: >-
+        {principal.name} can modify the shared YAML template in {template_repo_branch.name}
+        that pipeline {pipeline.name} imports; any code injected into the template executes
+        as the pipeline's service-connection identity on the next run.
+
+  # =========================================================================
+  # TRIGGER FACTS (→ cicd-chains consumes these)
+  # =========================================================================
+
+  # --- Queue builds permission => CanTrigger ---------------------------------
+  # Explicit normalization already lives in explicit_rules: (azure-devops-queue-builds-normalize).
+  # Derived rules consume the normalized CanTrigger edge; do not re-derive it here.
+
+  # =========================================================================
+  # WORKLOAD IDENTITY FEDERATION — WIF SERVICE CONNECTIONS
+  # =========================================================================
+
+  # --- WIF service connection: ARM federated credential trusts DevOps OIDC ---
+  # Explicit normalization already lives in explicit_rules: (azure-devops-wif-fedcred-normalize).
+  # That rule emits both TrustsExternalIdentity and ExternalIdentityMapsTo for WIF SCs.
+  # Derived rules consume these normalized edges; do not re-derive them here.
+
+  # NOTE: ExternalIdentityMapsTo is also normalized by explicit_rules:
+  # (azure-devops-wif-fedcred-normalize), which is the primary emit source.
+  # Derived rules consume this; do not re-derive it here.
+
+  # =========================================================================
+  # CREDENTIAL EXPOSURE
+  # =========================================================================
+
+  # --- ARM secret-based SC injects client secret into job env ----------------
+  # When a pipeline task uses an ARM (non-WIF) service connection, the Azure DevOps
+  # agent injects AZURE_CLIENT_ID / AZURE_CLIENT_SECRET (or a certificate file) as
+  # environment variables or temp files in the job workspace. Any code running in the
+  # job can read these — including bash/PowerShell scripts, dotnet programs, or
+  # attacker-injected steps.
+  - id: azure-devops-sc-exposes-client-secret
+    emits: ExposesCredential
+    description: "An ARM service connection (secret-based) injects the backing SP's client secret / certificate into the job environment; pipeline code can read and exfiltrate it."
+    applies_to: [azure]
+    match:
+      - [ ?pipeline, ExecutesAs, ?sc_identity ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "node_type(?sc_identity) == MachineIdentity"
+      - "?sc_identity is backed by a secret-based ARM service connection (not WIF)"
+    emit:
+      source_type: BuildWorker
+      target_type: Credential
+      source: ?pipeline
+      target: "client secret / certificate for {sc_identity.name}"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE for every secret-based ARM service connection used by the pipeline; the
+        secret is injected by the agent before each task that references the SC. The
+        credential is LONG-LIVED (client secret) — not a short-lived token. Inherits
+        CONDITIONAL(service_state) if the SC itself is CONDITIONAL.
+      confidence: 0.9
+      derived_from: [ "azure-devops-pipeline-executes-as-sc" ]
+      false_positive_note: >-
+        Do NOT emit ExposesCredential for WIF (federated credential) service connections
+        — there is no stored secret to expose. Only emit for service connections where
+        clientSecret or certificate is present in the SC configuration
+        (GET serviceendpoint/endpoints/{id} shows type and auth scheme).
+        Secret rotation or expiry: if the SP's secret is expired, downgrade to
+        CONDITIONAL(service_state). The exposed secret is reusable outside the pipeline
+        (long-lived) — this is a significant difference from a short-lived OIDC token.
+      narrative: >-
+        {pipeline.name} runs as service connection {sc_identity.name} using a stored
+        client secret; that secret is injected into the job environment and is readable by
+        any code running in the pipeline, including attacker-injected steps. The credential
+        is long-lived and usable outside the pipeline context.
+
+  # --- WIF SC: pipeline can retrieve short-lived OIDC token ------------------
+  - id: azure-devops-wif-retrieve-oidc-token
+    emits: CanRetrieveToken
+    description: "A WIF service connection lets a pipeline job request a short-lived Azure DevOps OIDC token that is then exchanged for an ARM access token; any code in the job can call the OIDC endpoint."
+    applies_to: [azure]
+    match:
+      - [ ?devops_oidc, ExternalIdentityMapsTo, ?arm_identity ]
+    where:
+      - "node_type(?devops_oidc) in [ExternalIdentity, FederatedIdentity]"
+      - "node_type(?arm_identity) in [MachineIdentity, ApplicationIdentity]"
+      - "?devops_oidc.issuer matches 'https://vstoken.dev.azure.com/'"
+    emit:
+      source_type: FederatedIdentity
+      target_type: MachineIdentity
+      source: ?devops_oidc
+      target: ?arm_identity
+      permissions: ["POST https://vstoken.dev.azure.com/{org_id}/_apis/distributedtask/hubs/build/plans/{plan_id}/jobs/{job_id}/oidctoken"]
+      conditions: [trust_condition]
+      state_logic: >-
+        ACTIVE when the WIF trust is ACTIVE (ExternalIdentityMapsTo trust condition is
+        correctly pinned). CONDITIONAL(trust_condition) when the trust is CONDITIONAL
+        (subject/issuer unpinned or wildcard). The resulting token is short-lived (typically
+        10 minutes) and NOT a stored secret — it cannot be exfiltrated for long-term use,
+        but it IS usable immediately to make ARM API calls as ?arm_identity during the job run.
+      confidence: 0.9
+      derived_from: [ "?devops_oidc ExternalIdentityMapsTo ?arm_identity" ]
+      false_positive_note: >-
+        The OIDC token is short-lived and audience-restricted (aud=api://AzureADTokenExchange).
+        It is NOT a client secret — it cannot be used directly without the token exchange
+        and is scoped to the ARM trust. However, within a pipeline run, it DOES yield full
+        ARM access as the service principal for the duration of the job. A pipeline step can
+        also call the OIDC endpoint manually (idToken task output) and pass the JWT to other
+        azure-cli / custom tooling that performs the ARM token exchange.
+      narrative: >-
+        Pipeline jobs using WIF service connection {arm_identity.name} call the DevOps OIDC
+        endpoint to obtain a short-lived JWT that ARM exchanges for an access token; any code
+        in the job can trigger this exchange and act as {arm_identity.name} for the duration
+        of the run.
+
+  # =========================================================================
+  # SECRET ACCESS
+  # =========================================================================
+
+  # --- Variable group secrets exposed to pipeline runs -----------------------
+  # A pipeline stage that references a variable group (linkType: Vsts, non-Key Vault)
+  # has all group secrets injected as env-vars into every job step. Secret variables
+  # are masked in logs but are fully accessible to pipeline code. Key Vault-linked
+  # VGs are handled by a separate rule (azure-devops-kv-variable-group-can-read-secret).
+  - id: azure-devops-variable-group-can-read-secret
+    emits: CanReadSecret
+    description: "A pipeline that references a non-Key Vault variable group has the group's secret variables injected into every job's environment; pipeline code can read and log them."
+    applies_to: [azure]
+    match:
+      - [ ?pipeline, HasPolicy, ?variable_group ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "node_type(?variable_group) == Secret"
+      - "?variable_group.provider_type == Microsoft.DevOps/variablegroups"
+      - "NOT (?variable_group.linkType == AzureKeyVault)"
+      - "?variable_group is referenced in ?pipeline's YAML variables: block or classic-pipeline variable group"
+    emit:
+      source_type: BuildWorker
+      target_type: Secret
+      source: ?pipeline
+      target: ?variable_group
+      permissions: ["Use permission on variable group (DevOps Library namespace)"]
+      conditions: []
+      state_logic: >-
+        ACTIVE when the variable group is accessible to the pipeline (pipeline granted
+        'Use' permission on the VG in DevOps Library) and the variable group contains
+        at least one secret variable. Exclude Key Vault-linked VGs; those are handled by
+        azure-devops-kv-variable-group-can-read-secret.
+      confidence: 0.9
+      derived_from: []
+      false_positive_note: >-
+        DevOps secret variable masking does NOT constitute a security boundary — the mask
+        only prevents the value from appearing in UI logs. Code can still print the value
+        to a file, send it over the network, or read it via $env:VAR_NAME. Do NOT treat
+        masking as access control. This rule applies only to non-Key Vault VGs; Key Vault-
+        linked VGs have resource_policy gates (RBAC on the Key Vault) — do not emit ACTIVE
+        for them here.
+      narrative: >-
+        {pipeline.name} references variable group {variable_group.name}; all secret
+        variables in the group are injected as environment variables into pipeline job steps
+        and are fully readable by pipeline code (DevOps log masking is not a security boundary).
+
+  # --- Key Vault-linked variable group exposes KV secrets --------------------
+  - id: azure-devops-kv-variable-group-can-read-secret
+    emits: CanReadSecret
+    description: "A Key Vault-linked variable group exposes Azure Key Vault secrets to pipeline runs; the pipeline's service-connection identity must hold Key Vault Secrets User RBAC."
+    applies_to: [azure]
+    match:
+      - [ ?pipeline, HasPolicy, ?variable_group ]
+      - [ ?variable_group, ContainsSecret, ?kv_secret ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "node_type(?variable_group) == Secret"
+      - "?variable_group.linkType == AzureKeyVault"
+      - "node_type(?kv_secret) == Secret  # Key Vault secret node"
+    emit:
+      source_type: BuildWorker
+      target_type: Secret
+      source: ?pipeline
+      target: ?kv_secret
+      permissions: ["Key Vault Secrets User RBAC on the Key Vault (for the service connection's identity)", "Use (variable group) in DevOps Library namespace"]
+      conditions: [resource_policy, iam_permission]
+      state_logic: >-
+        ACTIVE when the pipeline's service-connection identity has Key Vault Secrets User
+        (or legacy Get on the KV access policy) on the vault and the variable group is
+        referenced by the pipeline. CONDITIONAL(resource_policy) when the RBAC or access
+        policy grant is absent or uncertain — the pipeline will fail to load the group at
+        queue time.
+      confidence: 0.85
+      derived_from: [ "azure-devops-variable-group-can-read-secret" ]
+      false_positive_note: >-
+        The Key Vault secret read happens at pipeline queue time (before the run starts),
+        not at job step execution time. If the SC identity lacks RBAC, the pipeline fails to
+        start with an error — not a silent miss. Verify the service-connection SP has
+        Key Vault Secrets User at the vault or secret scope. A Key Vault access policy
+        model (not RBAC) requires an explicit 'Get' policy grant for the SP.
+      narrative: >-
+        {pipeline.name}'s Key Vault-linked variable group {variable_group.name} fetches
+        secrets from Azure Key Vault at queue time; the pipeline service-connection identity
+        reads {kv_secret.name} and injects it into the job environment.
+
+  # --- Secure file exposed to pipeline job ------------------------------------
+  - id: azure-devops-secure-file-can-read
+    emits: CanReadSecret
+    description: "A pipeline stage that uses DownloadSecureFile@1 (or equivalent) materializes the secure file on the agent disk; pipeline code can read the certificate, SSH key, or credential file."
+    applies_to: [azure]
+    match:
+      - [ ?pipeline, HasPolicy, ?secure_file ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "node_type(?secure_file) == Secret"
+      - "?secure_file.provider_type == Microsoft.DevOps/securefile"
+      - "?pipeline YAML references ?secure_file via DownloadSecureFile@1 task or secureFile input"
+    emit:
+      source_type: BuildWorker
+      target_type: Secret
+      source: ?pipeline
+      target: ?secure_file
+      permissions: ["Use permission on secure file (DevOps Library namespace)"]
+      conditions: []
+      state_logic: >-
+        ACTIVE when the pipeline has Use permission on the secure file and the task is
+        present in the pipeline YAML. CONDITIONAL(service_state) if the secure file is
+        locked (authorized for specific pipelines only and this one is not on the list).
+      confidence: 0.9
+      derived_from: []
+      false_positive_note: >-
+        The secure file is materialized as a temporary file on the agent disk at the path
+        returned by the task's secureFilePath output variable. On Microsoft-hosted agents
+        the file is deleted after the job; on self-hosted agents, poor cleanup may persist
+        it. The file content (certificate, SSH key) is fully accessible to job code.
+      narrative: >-
+        {pipeline.name} downloads secure file {secure_file.name} to the agent disk during
+        the job; pipeline code can read the file at the path provided by DownloadSecureFile@1.
+
+  # =========================================================================
+  # SERVICE CONNECTION ATTACHMENT (IDENTITY SWAP)
+  # =========================================================================
+
+  # --- Manage service endpoints => attach identity to pipeline, and CanPassIdentity pass ---
+  # A principal with 'Manage service endpoints' in the DevOps project (or
+  # Administrator role on the service connection) can bind a different — or more
+  # privileged — service connection to a pipeline, changing the Azure identity it
+  # executes as. Additionally, this permission combined with Edit pipeline definition
+  # also enables creating a NEW service connection embedding a chosen SP's credentials,
+  # which is a CanPassIdentity fact.
+  - id: azure-devops-sc-attach-to-pipeline
+    emits: CanAttachIdentity
+    description: "DevOps 'Manage service endpoints' permission lets a principal bind a different — potentially more privileged — service connection to a pipeline, changing its execution identity."
+    applies_to: [azure]
+    match:
+      - [ ?principal, HasPermission, ?pipeline ]
+    where:
+      - "node_type(?pipeline) == BuildWorker"
+      - "?principal holds 'Manage service endpoints' in DevOps service-endpoint security namespace"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: ?principal
+      target: ?pipeline
+      permissions: ["Manage service endpoints (DevOps service endpoint namespace)"]
+      conditions: [role_compatibility]
+      state_logic: >-
+        ACTIVE when the permission is held and the principal can reference a target
+        service connection (has 'Use' or 'Administrator' on it). CONDITIONAL(role_compatibility)
+        when the target SC requires additional authorization.
+      confidence: 0.85
+      derived_from: []
+      false_positive_note: >-
+        This edge models the ability to CHANGE the identity binding. Escalation only occurs
+        if the new SC is MORE privileged than the old. The edge target is the Pipeline
+        (Compute), not the identity — CanAttachIdentity(principal -> pipeline). The downstream
+        escalation (CanExecuteAs the more-privileged SC identity) is derived by can-execute-as
+        execute-as-via-config-identity-swap off the resulting CanModifyConfiguration +
+        CanPassIdentity combination. Also see azure-devops-sc-pass-identity for the
+        CanPassIdentity fact.
+      narrative: >-
+        {principal.name} can bind a different service connection to pipeline {pipeline.name}
+        (DevOps 'Manage service endpoints'), changing which Azure identity the pipeline
+        executes as. If the new service connection is more privileged, this is a privilege
+        escalation.
+
+  # --- Manage service endpoints => can create SC with chosen SP credentials ----
+  - id: azure-devops-sc-pass-identity
+    emits: CanPassIdentity
+    description: "DevOps 'Manage service endpoints' permission lets a principal create a new service connection embedding a chosen Entra SP's credentials, enabling identity-swap escalation paths."
+    applies_to: [azure]
+    match:
+      - [ ?principal, HasPermission, ?service_endpoint_namespace ]
+      - [ ?principal, CanCreateCredentialFor, ?target_sp ]
+    where:
+      - "?principal holds 'Manage service endpoints' in DevOps service-endpoint security namespace"
+      - "node_type(?target_sp) in [ApplicationIdentity, ServiceAccount]"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?target_sp
+      permissions: ["Manage service endpoints (DevOps service endpoint namespace)", "CanCreateCredentialFor (?target_sp)"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when the principal holds Manage service endpoints AND can create/add credentials
+        for the target SP (MS Graph Application.ReadWrite or Owner on the SP). The principal
+        can then create an ARM service connection wrapping ?target_sp's credentials and bind
+        it to a pipeline, enabling CanExecuteAs the target SP via execute-as-via-config-identity-swap.
+      confidence: 0.85
+      derived_from: []
+      false_positive_note: >-
+        The CanCreateCredentialFor precondition is critical — Manage service endpoints alone
+        does NOT yield CanPassIdentity unless the principal also holds MS Graph permissions
+        to add credentials to the target SP. This is a conjunction, not an unconditional path.
+      narrative: >-
+        {principal.name} can create a new ARM service connection embedding credentials for
+        {target_sp.name} (Manage service endpoints + CanCreateCredentialFor), enabling
+        identity-swap escalation when combined with Edit pipeline definition.
+
+  # =========================================================================
+  # SUBSCRIPTION ENTRY (first-class — bridge to hierarchy-chains)
+  # =========================================================================
+
+  # --- Principal CanExecuteAs SC with sub-level ARM role => CanEnterSubscription
+  # A principal who can execute code in the pipeline as the SC identity thereby
+  # obtains a foothold in any Azure subscription that SC identity can access
+  # at Contributor/Owner scope. Source must be Identity (not BuildWorker/Compute),
+  # as CanEnterSubscription.source is restricted to [Identity] in edges.yaml.
+  - id: azure-devops-sc-identity-enters-subscription
+    emits: CanEnterSubscription
+    description: "A principal that can CanExecuteAs the pipeline's service-connection identity, where that identity holds ARM Contributor/Owner at subscription scope, gains a foothold in that Azure subscription."
+    applies_to: [azure]
+    match:
+      - [ ?principal, CanExecuteAs, ?sc_identity ]
+      - [ ?sc_identity, HasRole, ?arm_role ]
+    where:
+      - "node_type(?principal) in [Identity, HumanIdentity, MachineIdentity, ServiceAccount, ManagedIdentity, ApplicationIdentity]"
+      - "node_type(?sc_identity) in [MachineIdentity, ApplicationIdentity, FederatedIdentity]"
+      - "?arm_role.scope_type == subscription"
+      - "?arm_role.name in ['Contributor', 'Owner', 'User Access Administrator'] OR ?arm_role.actions covers Microsoft.Resources/*"
+      - "?sc_identity is a DevOps pipeline service-connection identity (provider_type == Microsoft.DevOps/serviceconnections)"
+    emit:
+      source_type: Identity
+      target_type: Subscription
+      source: ?principal
+      target: "Azure subscription where ?arm_role is assigned to ?sc_identity"
+      permissions: ["ARM Contributor/Owner at subscription scope (on the service-connection identity)"]
+      conditions: []
+      state_logic: >-
+        Inherit from the CanExecuteAs contributor: ACTIVE when the principal can actively
+        execute code as the SC identity (CanExecuteAs is ACTIVE) AND the SC identity holds
+        the ARM role at subscription scope. CONDITIONAL when CanExecuteAs is CONDITIONAL
+        (e.g. trigger-only, no direct code modification). BLOCKED if the SC identity is
+        disabled or the ARM role assignment is revoked. The foothold is exactly as strong
+        as the code-execution capability that grants it.
+      confidence: 0.9
+      derived_from: [ "?principal CanExecuteAs ?sc_identity", "?sc_identity HasRole ?arm_role" ]
+      false_positive_note: >-
+        Only emit when the SC's ARM RBAC is genuinely at subscription scope (or management
+        group). A resource-group-scoped SC yields CanWrite(resource_group) not
+        CanEnterSubscription — honor the actual scope. User Access Administrator without
+        Contributor is still sufficient (can self-assign Contributor) so include it.
+        Multiple subscriptions may be covered by the same SC if its SP has MG-level RBAC
+        — emit once per subscription boundary the SC's role covers. FederatedIdentity
+        (WIF service connections) are included in the source check because WIF SC identities
+        are FederatedIdentity nodes per devops.md. This edge complements federation-chains
+        federate-then-enter-account (which handles the WIF path via CanFederateAs) — this
+        covers both secret-based ARM SC and the CanExecuteAs antecedent for WIF. Do not
+        double-emit for the same (principal, subscription).
+      narrative: >-
+        {principal.name} can execute code as service-connection identity {sc_identity.name}
+        (via pipeline code injection — cicd-chains), which holds ARM {arm_role.name} at
+        subscription scope; this gives {principal.name} a foothold in that Azure subscription.
+
+  # =========================================================================
+  # SELF-HOSTED AGENT EXECUTION IDENTITY
+  # =========================================================================
+
+  # --- Self-hosted agent VM executes as its OS user / managed identity --------
+  # A self-hosted agent runs on a customer-provided VirtualMachine. The agent process
+  # runs as the OS user (e.g. NT AUTHORITY\NETWORK SERVICE on Windows, a local Linux
+  # user) or a system-assigned managed identity if the VM is Azure-hosted. Any code
+  # running in a pipeline job on that agent can access the VM's OS user identity or
+  # managed identity (via instance metadata endpoint / /var/run/secrets/tokens), making
+  # the agent's host identity a second execution identity for all pipelines it runs.
+  - id: azure-devops-self-hosted-agent-executes-as
+    emits: ExecutesAs
+    description: "A self-hosted pipeline agent (VirtualMachine) runs as its OS user / managed identity, providing a second execution identity for all pipelines on that agent."
+    applies_to: [azure]
+    match:
+      - [ ?agent_pool, LocatedIn, ?agent_vm ]
+    where:
+      - "node_type(?agent_pool) == ContainerTask  # Agent pool node"
+      - "node_type(?agent_vm) == VirtualMachine"
+      - "?agent_pool.provider_type matches 'Microsoft.DevOps/agentpools'"
+      - "?agent_pool.pool_type == 'self-hosted'  # Distinguishes from Microsoft-hosted pools"
+    emit:
+      source_type: ContainerTask
+      target_type: MachineIdentity
+      source: ?agent_pool
+      target: "OS user / managed identity of ?agent_vm"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the agent pool is registered and enabled AND the agent VM's OS user /
+        managed identity is available to the agent process (system-assigned MI accessible
+        via IMDS, local OS user context active). CONDITIONAL(service_state) when the agent
+        is offline or the VM is stopped. BLOCKED if the agent is deregistered or the VM is
+        deleted.
+      confidence: 0.9
+      derived_from: []
+      false_positive_note: >-
+        Only emit for self-hosted agent pools; Microsoft-hosted agents execute in Microsoft-
+        managed infrastructure and do not expose a customer-controllable OS user identity.
+        On Azure-hosted self-hosted VMs, the system-assigned managed identity is available
+        via the IMDS endpoint; on on-premises self-hosted agents, the OS user context is
+        the available identity. Do not emit if the agent VM is external (non-Azure) and has
+        no managed identity.
+      narrative: >-
+        {agent_pool.name} (self-hosted agent) runs on {agent_vm.name}; all pipeline jobs on
+        this agent execute also as the VM's OS user or managed identity, providing a secondary
+        execution context and access to the VM's credentials.
+
+  # =========================================================================
+  # CONTAINER REGISTRY SUPPLY-CHAIN (ACR PUSH)
+  # =========================================================================
+
+  # --- Service connection CanExecuteAs + AcrPush RBAC => CanModifyCode to ACR
+  # A pipeline's service-connection identity with AcrPush RBAC on an Azure Container
+  # Registry can inject malicious images. Any workload that pulls from that registry
+  # will execute the poisoned image — a supply-chain escalation that container-chains
+  # propagates into all downstream workloads.
+  #
+  # NOTE: This rule emits CanModifyCode(sc_identity -> acr_registry), not from the
+  # principal directly. The principal's escalation to the ACR comes via CanExecuteAs
+  # the SC identity. cicd-chains cicd-modify-buildspec-executes-as produces
+  # CanExecuteAs(principal -> sc_identity), and this rule (within a derived rule or
+  # a separate container-supply-chain linchpin) rolls that up to
+  # CanModifyCode(sc_identity -> acr). For now, this is a deferred rule commented
+  # for future implementation; it requires container-chains integration.
+  #
+  # DEFERRED: azure-devops-pipeline-acr-push-modifies-code
+  #   match: [ ?sc_identity, CanExecuteAs, ... ] + [ ?sc_identity, HasRole, ?acr_role ]
+  #   emits: CanModifyCode(?sc_identity -> ?acr_registry)
+  #   state: ACTIVE when AcrPush is held; inherits from CanExecuteAs.
+  # This will be implemented in a separate container-supply-chain linchpin or
+  # deferred rule once the canonical container propagation is finalized.
+
+  # =========================================================================
+  # MISSING: PR-TRIGGERED PIPELINE (PWN-REQUEST PATH)
+  # =========================================================================
+  # The devops.md resource model (section 5, 14, 22) documents the pwn-request path:
+  # a PR-triggered pipeline where fork isolation is absent lets a PR contributor's
+  # code run as the service-connection identity. This is a high-value escalation path
+  # (contributor -> pipeline service-connection identity). The exact rule structure
+  # depends on how the graph models Azure Repos PR triggers and fork isolation flags;
+  # for now, this is a documentation note. A future rule should emit:
+  #   CanModifyCode(?pr_contributor, ?pipeline)
+  # with state:
+  #   ACTIVE when PR fork isolation is disabled AND PR code runs in the pipeline
+  #   CONDITIONAL(fork_isolation) when fork isolation is enabled or unclear
+  # This would feed cicd-chains for CONDITIONAL CanExecuteAs(pr_contributor, sc_identity).
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION HOOKS
+# These are the explicit normalization records the collector populates; they
+# feed the derived rules above. Listed here for completeness; implement in
+# /rules/explicit/azure-devops.yaml if explicit normalization is needed beyond
+# what the DevOps REST API collector produces natively.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: azure-devops-executes-as-normalize
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.DevOps/pipelines"
+      field: "configuration.repository + stage[*].jobs[*].pool + tasks[*].inputs.azureSubscription"
+    emit:
+      source: "<pipeline node>"
+      target: "<service connection MachineIdentity / FederatedIdentity node>"
+      api_source: "GET https://dev.azure.com/{org}/{project}/_apis/pipelines/{id}"
+      evidence_field: "serviceEndpointId referenced in stage/task"
+      narrative: "{pipeline.name} executes as the Azure identity backing service connection {sc.name}."
+
+  - id: azure-devops-can-modify-code-normalize
+    emits: CanModifyCode
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.DevOps/pipelines"
+      field: "security_namespace.BuildNamespace.Edit"
+    emit:
+      source: "<principal>"
+      target: "<pipeline node>"
+      api_source: "GET https://dev.azure.com/{org}/_apis/accesscontrollists/{BuildNamespaceId}"
+      evidence_field: "allow_bits & Edit"
+      state_logic: >-
+        ACTIVE when the principal holds Edit permission for the pipeline and no YAML template
+        enforcement controls block direct edits (see false_positive_note in derived rule).
+        CONDITIONAL(branch_protection) when template enforcement or required-reviewer policy
+        gates edits. Classic pipelines: always ACTIVE when Edit is held.
+      confidence: 0.95
+      false_positive_note: >-
+        For YAML pipelines, check DevOps project settings for 'Require template from trusted repo'
+        and 'Require reviewer on pipeline changes' — these can make CanModifyCode CONDITIONAL.
+        Classic pipelines: Edit permission is always ACTIVE.
+      narrative: "{principal.name} has 'Edit pipeline definition' on {pipeline.name}."
+
+  - id: azure-devops-wif-fedcred-normalize
+    emits: [TrustsExternalIdentity, ExternalIdentityMapsTo]
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.DevOps/serviceconnections"
+      field: "authorization.scheme == WorkloadIdentityFederation"
+    emit:
+      - source: "<Entra application / MI backing the service connection>"
+        target: "<Azure DevOps OIDC principal node>"
+        edge_type: TrustsExternalIdentity
+        source_type: "ApplicationIdentity | ManagedIdentity (conditional on actual node type)"
+        target_type: FederatedIdentity
+        api_source: "MS Graph GET /applications/{id}/federatedIdentityCredentials + GET serviceendpoint/endpoints/{id}"
+        evidence_field: "federatedIdentityCredentials[*].issuer + subject"
+        state_logic: >-
+          ACTIVE when the subject pin exactly matches the service connection name (per-SC,
+          narrow trust). CONDITIONAL(trust_condition) when the subject is absent or a wildcard.
+        narrative: "{entra_app.name} trusts Azure DevOps OIDC issuer for service connection {sc.name}."
+      - source: "<Azure DevOps OIDC principal node>"
+        target: "<Entra application / MI backing the service connection>"
+        edge_type: ExternalIdentityMapsTo
+        source_type: FederatedIdentity
+        target_type: "ApplicationIdentity | ManagedIdentity (conditional on actual node type)"
+        api_source: "MS Graph GET /applications/{id}/federatedIdentityCredentials + GET serviceendpoint/endpoints/{id}"
+        evidence_field: "federatedIdentityCredentials[*].issuer + subject matching sc://"
+        state_logic: "Inherit from TrustsExternalIdentity: ACTIVE when pinned, CONDITIONAL when unpinned."
+        narrative: "The DevOps OIDC principal for {sc.name} maps to Entra identity {entra_app.name}."
+
+  - id: azure-devops-variable-group-normalize
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.DevOps/variablegroups"
+      field: "variables[*].isSecret == true"
+    emit:
+      source: "<variable group node>"
+      target: "<Credential / Secret node>"
+      api_source: "GET https://dev.azure.com/{org}/{project}/_apis/distributedtask/variablegroups"
+      evidence_field: "variables[*].isSecret"
+      narrative: "Variable group {vg.name} contains secret variable {var_name}."
+
+  - id: azure-devops-queue-builds-normalize
+    emits: CanTrigger
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.DevOps/pipelines"
+      field: "security_namespace.BuildNamespace.QueueBuilds"
+    emit:
+      source: "<principal>"
+      target: "<pipeline node>"
+      api_source: "GET https://dev.azure.com/{org}/_apis/accesscontrollists/{BuildNamespaceId}"
+      evidence_field: "allow_bits & QueueBuilds"
+      state_logic: >-
+        ACTIVE when the principal holds Queue builds permission and the pipeline is not
+        gated by a required approval/check blocking manual runs. CONDITIONAL(service_state)
+        when the pipeline is disabled.
+      false_positive_note: >-
+        Queue builds is held by all project Contributor members by default. Do NOT emit
+        CanExecuteAs directly — let cicd-chains cicd-trigger-runner-executes-as produce
+        CONDITIONAL(attacker_influenced_definition) CanExecuteAs. Trigger-only is weaker
+        escalation than code modification.
+      confidence: 0.9
+      narrative: "{principal.name} can queue runs of pipeline {pipeline.name}."

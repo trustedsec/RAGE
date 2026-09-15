@@ -1,0 +1,502 @@
+# GCP VPC Networks — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# Covers: VPC Networks, Subnets, Firewall Rules, Routes, VPC Network Peering,
+#         Shared VPC (XPN), Private Service Connect (PSC), and external LB
+#         exposure via forwarding rules.
+#
+# PHASE 8 THEME: Emit network FACTS (exposure, peering, PSC, shared-VPC
+# cross-project trust). Transitive end-to-end reachability (firewall + route +
+# peering composing into a full path) is a FUTURE provider-agnostic linchpin —
+# DO NOT invent it here. Emit per-primitive facts and let a later network-chains
+# file compose them.
+#
+# COMPOSITION:
+#   * can-control.yaml     — terminal Controls / CanEscalateTo rollups (cited,
+#                            not duplicated here).
+#   * can-control-gcp.yaml — GCP-scoped CanEnterProject rollup (cited, not
+#                            duplicated here).
+#
+# Official permission reference:
+#   https://cloud.google.com/compute/docs/access/iam
+#   https://cloud.google.com/vpc/docs/shared-vpc
+#   https://cloud.google.com/vpc/docs/vpc-peering
+#   https://cloud.google.com/vpc/docs/private-service-connect
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 8-networking
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # EXPOSURE: Firewall rule open to the internet → CanReachPort
+  # ---------------------------------------------------------------------------
+  - id: gcp-vpc-firewall-internet-exposure
+    emits: CanReachPort
+    description: >-
+      An ingress firewall rule allowing 0.0.0.0/0 (or ::/0) on a specific port
+      permits any internet host to initiate a connection to matching VMs on that
+      port.
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/Firewall"
+      field: "sourceRanges"
+    where:
+      - "firewall.direction == INGRESS"
+      - "firewall.sourceRanges contains '0.0.0.0/0' or '::/0'"
+      - "firewall.action == allow (i.e. no 'denied' array; rule is in the 'allowed' list)"
+      - "firewall.disabled != true"
+      - "port determined from firewall.allowed[].ports (specific port(s) or all)"
+    emit:
+      source_type: Firewall
+      target_type: Compute
+      source: "<Firewall node for this rule (represents the network-level allow condition)>"
+      target: "<VMs in firewall.network matching firewall.targetTags or firewall.targetServiceAccounts; ALL VMs in the network when neither is set>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: "CONDITIONAL(network_reachability) — the firewall rule is a necessary but not sufficient condition; a route to the internet gateway must also exist (default for auto-mode VPCs). ACTIVE when the network has a default route via default-internet-gateway and the VM has an external IP or sits behind an external LB."
+      confidence: "0.85"
+      derived_from: ["<Firewall record: direction=INGRESS, sourceRanges include 0.0.0.0/0>"]
+      false_positive_note: >-
+        (1) targetTags / targetServiceAccounts narrow applicability — a rule is
+        NOT open to all VMs unless both fields are empty. Evaluate the target
+        filter strictly; do NOT emit against VMs whose tags/SA do not match.
+        (2) A higher-priority hierarchical firewall policy DENY at org/folder
+        scope overrides this VPC-level allow — emit as BLOCKED if a hierarchical
+        deny is present on the same port/direction at a higher priority.
+        (3) GCP firewall rules are stateful; inbound allow implies return traffic
+        allowed. Do NOT model egress separately from this fact.
+        (4) A VM with only an internal IP and no external IP or external LB
+        cannot be reached from 0.0.0.0/0 even if this firewall rule exists —
+        downgrade to CONDITIONAL(network_reachability) in that case.
+        (5) MISSING: IAP bypass escalation path — when IAP TCP forwarding is the
+        only authorized ingress and an attacker with compute.firewalls.create
+        adds a direct allow on the same port from 0.0.0.0/0, they bypass IAP
+        entirely. This distinct high-value path should be covered by a separate
+        rule or escalation derivation (needs additional rule in explicit/gcp-vpc.yaml).
+      narrative: >-
+        Firewall rule {firewall.name} in VPC {network.name} allows inbound
+        connections from the entire internet (0.0.0.0/0) on port {port} to
+        {target_description}. An internet adversary can initiate a TCP/UDP
+        session to any matching VM on this port.
+
+  # ---------------------------------------------------------------------------
+  # EXPOSURE: External forwarding rule → ExposedToInternet
+  # ---------------------------------------------------------------------------
+  # NOTE: ExposedToInternet has nature: derived in edges.yaml, so emission from
+  # derived file is correct. However, gcp-vpc-external-lb-exposed (derived section)
+  # and gcp-vpc-external-forwarding-rule (explicit_rules section) both match the
+  # same condition (loadBalancingScheme in [EXTERNAL, EXTERNAL_MANAGED] with
+  # IPAddress set) and both emit ExposedToInternet, creating direct duplication
+  # that will produce two edges per qualifying forwarding rule at runtime.
+  #
+  # FIX: Retained this derived rule (correct nature); removed the duplicate
+  # gcp-vpc-external-forwarding-rule from explicit_rules section.
+  #
+  - id: gcp-vpc-external-lb-exposed
+    emits: ExposedToInternet
+    description: >-
+      A forwarding rule with loadBalancingScheme EXTERNAL and an assigned
+      external IP exposes the backend service to the public internet.
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/ForwardingRule"
+      field: "loadBalancingScheme"
+    where:
+      - "forwardingRule.loadBalancingScheme in [EXTERNAL, EXTERNAL_MANAGED]"
+      - "forwardingRule.IPAddress is set (non-empty external IP)"
+      - "forwardingRule.target or forwardingRule.backendService is set"
+    emit:
+      source_type: LoadBalancer
+      target_type: AnonymousIdentity
+      source: "<ForwardingRule node>"
+      target: "<AnonymousIdentity — internet>"
+      permissions: []
+      conditions: []
+      state_logic: "ACTIVE — an external forwarding rule with an assigned external IP is publicly reachable by definition."
+      confidence: "0.95"
+      derived_from: ["<ForwardingRule record: loadBalancingScheme=EXTERNAL, IPAddress set>"]
+      false_positive_note: >-
+        (1) Cloud Armor security policies attached to the backend service may
+        block most internet traffic. The exposure FACT is still ACTIVE; analysts
+        may lower the exploitability score when a WAF policy is present, but the
+        edge itself is correct.
+        (2) An internal forwarding rule (loadBalancingScheme=INTERNAL or
+        INTERNAL_MANAGED) is NOT internet-facing — do not emit ExposedToInternet.
+        (3) Protocol-forwarding rules (target=TargetInstance) with an EXTERNAL
+        scheme do count — the instance is directly reachable.
+      narrative: >-
+        Forwarding rule {forwardingRule.name} (external IP {ip}) exposes the
+        backend to the public internet. Any unauthenticated internet user can
+        send traffic to this IP, which is forwarded to the backend workload.
+
+  # ---------------------------------------------------------------------------
+  # EXPOSURE: External LB routes traffic to backend → RoutesTo
+  # ---------------------------------------------------------------------------
+  # NOTE: This rule uses match_record (raw API output), making it structurally
+  # identical to an explicit normalization rule. It reads raw ForwardingRule
+  # records rather than composing existing edges via graph-pattern. This is a
+  # structural mismatch — moved to explicit normalization.
+  #
+  # MOVED TO: /rules/explicit/gcp-vpc.yaml as gcp-vpc-lb-routes-to-backend
+  # (using RoutesTo emits with source_type: LoadBalancer, target_type: Compute)
+  #
+  # Commenting out to prevent duplicate emission:
+  # - id: gcp-vpc-lb-routes-to-backend
+  #   emits: RoutesTo  # changed from CanNetworkReach
+  #   ...
+
+  # ---------------------------------------------------------------------------
+  # REACHABILITY PIVOT: VPC Network Peering → PeeredWith
+  # ---------------------------------------------------------------------------
+  # NOTE: This rule uses match_record (raw API output) and PeeredWith has
+  # nature: explicit in edges.yaml. A derived file cannot emit nature:explicit
+  # edges. Additionally, gcp-vpc-peering-fact (derived section) and gcp-vpc-peering-node
+  # (explicit_rules section) both emit PeeredWith from the same evidence
+  # (network.peerings[].state == ACTIVE), creating direct rule duplication.
+  #
+  # FIX: Removed this derived rule. Retained gcp-vpc-peering-node in the
+  # explicit_rules section (sole source for PeeredWith emission).
+  #
+  # Commenting out to prevent duplicate emission:
+  # - id: gcp-vpc-peering-fact
+  #   emits: PeeredWith
+  #   ...
+
+  # ---------------------------------------------------------------------------
+  # PRIVATE CONNECTIVITY: PSC consumer endpoint → PrivateReachability
+  # ---------------------------------------------------------------------------
+  # NOTE: This rule uses match_record (raw API output) with source_type: Compute
+  # (entire VPC workload set) but PrivateReachability in edges.yaml only allows
+  # source: [Compute, Messaging]. The source ambiguity (entire VPC vs. specific
+  # workload) is noted in false_positive_note (4) but unresolved.
+  #
+  # Additionally, gcp-vpc-psc-private-reach (derived) and gcp-vpc-psc-forwarding-rule
+  # (explicit_rules) both match target matching 'serviceAttachments' pattern and
+  # both emit PrivateReachability, creating duplication that will produce two
+  # edges per PSC forwarding rule at runtime.
+  #
+  # FIX: Retained this derived rule (PrivateReachability has nature:derived,
+  # correct in derived file). Removed the duplicate gcp-vpc-psc-forwarding-rule
+  # from explicit_rules section.
+  #
+  # TODO: Resolve source ambiguity in a future derivation phase:
+  #   - Option (a): Iterate per-Compute workload in the consumer VPC
+  #   - Option (b): Accept VirtualNetwork as allowed source for PrivateReachability
+  #   - Option (c): Use a PrivateEndpoint/ForwardingRule node as source instead
+  #
+  - id: gcp-vpc-psc-private-reach
+    emits: PrivateReachability
+    description: >-
+      A Private Service Connect consumer endpoint (forwarding rule targeting a
+      serviceAttachment) provides a private internal-IP path from the consumer
+      VPC to the producer service, without internet traversal.
+    applies_to: [gcp]
+    match_record:
+      resource_type: "compute.googleapis.com/ForwardingRule"
+      field: "target"
+    where:
+      - "forwardingRule.target matches the pattern 'projects/.*/regions/.*/serviceAttachments/.*'"
+      - "forwardingRule.loadBalancingScheme is empty (PSC consumer endpoints have no scheme)"
+      - "forwardingRule.IPAddress is set (the consumer's internal VIP)"
+    emit:
+      source_type: Compute
+      target_type: PrivateEndpoint
+      source: "<Compute workloads co-located in the consumer VPC (VirtualNetwork containing the PSC ForwardingRule)>"
+      target: "<PrivateEndpoint node (consumer PSC ForwardingRule)>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: "CONDITIONAL(network_reachability) — any Compute workload in the consumer VPC with a route to the PSC endpoint's internal IP can reach the producer service. Firewall rules in the consumer VPC may restrict which VMs can initiate the connection."
+      confidence: "0.90"
+      derived_from: ["<ForwardingRule.target = serviceAttachment self-link>"]
+      false_positive_note: >-
+        (1) PSC is unidirectional: the consumer can reach the producer; the
+        producer network does NOT gain access to the consumer VPC. Do not emit
+        a reverse PrivateReachability edge.
+        (2) The serviceAttachment may have an accept/reject list (consumerAcceptLists).
+        If the consumer project is not in the accept list, the PSC connection is
+        PENDING or REJECTED — downgrade to POTENTIAL(service_state).
+        (3) DNS auto-configuration for the PSC endpoint is separate. Workloads
+        may need a private DNS record pointing to the endpoint IP; without it
+        the path exists but resolution requires manual DNS setup.
+        (4) The source of this edge is the set of Compute workloads in the
+        consumer VPC — emit a PrivateReachability edge per co-located workload
+        (or express as the VPC as the implied foothold scope) when instantiated.
+      narrative: >-
+        Private Service Connect consumer endpoint {endpoint.name} (internal IP
+        {ip}) in VPC {consumer_vpc.name} provides a private path to producer
+        service {producer.name}. Any Compute workload in {consumer_vpc.name}
+        that can route to {ip} can access the producer service without traversing
+        the public internet.
+
+  # ---------------------------------------------------------------------------
+  # CROSS-PROJECT: Shared VPC service project attachment → CrossProjectTrust
+  # ---------------------------------------------------------------------------
+  # NOTE: This rule uses match_record (raw API output), making it structurally
+  # identical to an explicit normalization rule. It reads raw Project records
+  # rather than composing existing edges via graph-pattern, which violates
+  # the derived-rule contract per RULE-FORMAT.md. Additionally, gcp-vpc-shared-vpc-cross-project
+  # (derived) and gcp-vpc-xpn-cross-project-trust (explicit_rules) both match
+  # xpnProjectStatus=SERVICE and both emit CrossProjectTrust, creating direct
+  # duplication that will produce two edges per qualifying project at runtime.
+  #
+  # FIX: Removed this derived rule. Retained gcp-vpc-xpn-cross-project-trust
+  # in the explicit_rules section (sole source for CrossProjectTrust emission).
+  # CrossProjectTrust from xpnProjectStatus is a structural normalization fact —
+  # it belongs in explicit normalization only.
+  #
+  # Commenting out to prevent duplicate emission:
+  # - id: gcp-vpc-shared-vpc-cross-project
+  #   emits: CrossProjectTrust
+  #   ...
+
+  # ---------------------------------------------------------------------------
+  # CROSS-PROJECT: Shared VPC + networkUser grant → CanNetworkReach
+  # ---------------------------------------------------------------------------
+  - id: gcp-vpc-shared-vpc-network-reach
+    emits: CanNetworkReach
+    description: >-
+      A service-project service account holding compute.networkUser on a
+      host-project subnet can create workloads whose NICs land in that subnet,
+      giving those workloads internal-IP reachability to all other resources in
+      the subnet (including those from other service projects).
+    applies_to: [gcp]
+    match:
+      - [ ?sa, HasPermission, ?host_subnet ]
+    where:
+      - "permission == compute.subnetworks.use (granted via roles/compute.networkUser on the subnet or host project)"
+      - "?sa is a ServiceAccount or Identity in a service project"
+      - "?host_subnet is a Subnet in the host project (Shared VPC host)"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: ?sa
+      target: "<VMs / resources co-located in ?host_subnet>"
+      permissions: ["compute.subnetworks.use", "compute.instances.create", "iam.serviceAccounts.actAs"]
+      conditions: [network_reachability, iam_permission]
+      state_logic: "CONDITIONAL(iam_permission) — requires compute.subnetworks.use on the host subnet AND compute.instances.create + iam.serviceAccounts.actAs to materialize a workload in the subnet. CONDITIONAL(network_reachability) applies to the resulting VM's lateral reach within the subnet after the workload is created."
+      confidence: "0.80"
+      derived_from: ["<CrossProjectTrust: service_project → host_project>", "<HasPermission: ?sa compute.subnetworks.use on ?host_subnet>"]
+      false_positive_note: >-
+        (1) compute.subnetworks.use alone does not create network reachability;
+        the SA must also be able to create (or already have) a compute instance
+        in the subnet (compute.instances.create + iam.serviceAccounts.actAs). If
+        only subnetworks.use is held, downgrade to POTENTIAL(iam_permission).
+        (2) Firewall rules in the host project apply to all tenant workloads in
+        the subnet. A deny-all-intra-subnet rule would block lateral movement
+        even within the same subnet.
+        (3) Shared VPC subnets from different regions are NOT in the same L2
+        domain; region matters for direct L3 adjacency.
+      narrative: >-
+        Service account {sa.name} holds compute.subnetworks.use on Shared VPC
+        subnet {subnet.name} in host project {host_project.name}. Creating a
+        workload in this subnet places it in the same network segment as all
+        other service-project workloads sharing that subnet, enabling
+        internal-IP reachability to those resources.
+
+  # ---------------------------------------------------------------------------
+  # WEAKEN CONTROLS: firewall write permission → CanModifyConfiguration
+  # ---------------------------------------------------------------------------
+  # NOTE: This rule uses match_effective_permission (non-standard derived key)
+  # which is not defined in RULE-FORMAT.md. The defined match key is a
+  # graph-pattern list. Using match_effective_permission means the rule cannot
+  # be evaluated by the derivation engine as specified. Additionally, the rule
+  # reads raw permissions rather than composing edges, making it identical to
+  # an explicit normalization rule.
+  #
+  # FIX: Moved to /rules/explicit/gcp-vpc.yaml as a normalization rule with
+  # match_effective_permission (if supported in explicit rules) or rewritten
+  # as a derived rule with proper graph-pattern matching.
+  #
+  # Additionally, MISSING ESCALATION PATH: compute.routes.create (documented
+  # in vpc.md as enabling route injection / MitM via nextHopIlb redirection)
+  # should emit CanModifyConfiguration for Network resources. Similarly,
+  # compute.subnetworks.setIamPolicy (enabling self-grant of roles/compute.networkUser
+  # on host subnets) is a privilege escalation path with no corresponding rule.
+  #
+  # Commenting out to move to explicit rules:
+  # - id: gcp-vpc-modify-firewall-open
+  #   emits: CanModifyConfiguration
+  #   ...
+
+  # ---------------------------------------------------------------------------
+  # WEAKEN CONTROLS: network peering write → CanModifyConfiguration
+  # ---------------------------------------------------------------------------
+  # NOTE: This rule uses match_effective_permission (non-standard derived key)
+  # which is not defined in RULE-FORMAT.md. Additionally, the state_logic
+  # contains a semantic error: it marks the capability as ACTIVE but the
+  # state_logic narrative correctly notes that peer-side acceptance is required
+  # before the peering is effective. ACTIVE implies 'all preconditions satisfied
+  # now' per edges.yaml edge_state_model, but peer acceptance is a required
+  # precondition not yet satisfied. The CanModifyConfiguration edge should be
+  # ACTIVE (capability to initiate exists), but the resulting network change
+  # (PeeredWith fact) is only CONDITIONAL(service_state) (peer must accept).
+  #
+  # FIX: Moved to /rules/explicit/gcp-vpc.yaml. Corrected state_logic to:
+  # "ACTIVE — the capability to initiate peering is ACTIVE if EFFECTIVE permission
+  # confirmed. However, the resulting peering fact only becomes ACTIVE after mutual
+  # acceptance (peer side must also call compute.networks.addPeering)."
+  #
+  # Commenting out to move to explicit rules:
+  # - id: gcp-vpc-modify-network-peering
+  #   emits: CanModifyConfiguration
+  #   ...
+
+  # ---------------------------------------------------------------------------
+  # ROUTING FACT: Route with internet gateway next-hop → RoutesTo
+  # ---------------------------------------------------------------------------
+  # NOTE: SEMANTIC MISMATCH — this rule models 'Route → VirtualNetwork
+  # containing the route' which is a containment/placement fact, not a routing
+  # fact. RoutesTo is intended to model traffic routing (Route → destination
+  # Network/Subnet), not the Route's home network. The source and target are
+  # inverted: the source should be the Route, and the target should be the
+  # destination network/prefix (the internet/external network), not the VPC
+  # that contains the route.
+  #
+  # Additionally, this rule uses match_record (raw API output) instead of
+  # graph-pattern matching on existing edges, making it structurally identical
+  # to an explicit normalization rule.
+  #
+  # FIX: Moved to /rules/explicit/gcp-vpc.yaml as normalization rule.
+  # Corrected semantics: source = Route, target = destination network/prefix
+  # (external gateway or a representation of the internet), not the containing VPC.
+  #
+  # Commenting out to move to explicit rules:
+  # - id: gcp-vpc-route-internet-gateway
+  #   emits: RoutesTo
+  #   ...
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   * An org policy constraint/compute.restrictVpcPeering that denies all
+#     cross-org peering -> gcp-vpc-peering-fact or gcp-vpc-modify-network-peering
+#     should be emitted with state: BLOCKED and denied_by=<orgPolicy>.
+#   * An org policy constraint/compute.vmExternalIpAccess that denies external
+#     IPs on instances -> ExposedToInternet edges for instances with external IPs
+#     are BLOCKED (though forwarding rule / LB edges remain ACTIVE for LBs not
+#     covered by the instance constraint).
+#   * A Hierarchical Firewall Policy DENY rule at org/folder with higher priority
+#     than the VPC ALLOW -> gcp-vpc-firewall-internet-exposure should be BLOCKED.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service belong in
+# /rules/explicit/gcp-vpc.yaml. Key explicit normalizations needed:
+#   - VPC / Subnet / Firewall / Route / Peering nodes from compute.googleapis.com
+#   - crossProjectTrust from xpnProjectStatus=SERVICE + xpnHostProject field
+#   - Subnet IAM bindings (compute.subnetworks.getIamPolicy) -> HasPermission
+#   - ForwardingRule (PSC) -> PrivateEndpoint node + PrivateReachability
+#   - ForwardingRule (EXTERNAL) -> LoadBalancer node + ExposedToInternet
+explicit_rules:
+
+  - id: gcp-vpc-network-node
+    emits: LocatedIn
+    applies_to: [gcp]
+    match_record:
+      api: "compute.networks.list"
+      resource_type: "compute.googleapis.com/Network"
+    emit:
+      source_type: VirtualNetwork
+      target_type: Project
+      source: "<VirtualNetwork node>"
+      target: "<Project containing the network>"
+      api_source: "compute.networks.list"
+      evidence_field: "network.selfLink"
+      narrative: "{network.name} is a VPC network located in project {project.name}."
+
+  - id: gcp-vpc-subnet-node
+    emits: LocatedIn
+    applies_to: [gcp]
+    match_record:
+      api: "compute.subnetworks.list"
+      resource_type: "compute.googleapis.com/Subnetwork"
+    emit:
+      source_type: Subnet
+      target_type: VirtualNetwork
+      source: "<Subnet node>"
+      target: "<VirtualNetwork containing the subnet>"
+      api_source: "compute.subnetworks.list"
+      evidence_field: "subnetwork.network"
+      narrative: "{subnet.name} is a subnet in VPC {network.name} (region {region})."
+
+  - id: gcp-vpc-firewall-node
+    emits: AttachedTo
+    applies_to: [gcp]
+    match_record:
+      api: "compute.firewalls.list"
+      resource_type: "compute.googleapis.com/Firewall"
+    emit:
+      source_type: Firewall
+      target_type: VirtualNetwork
+      source: "<Firewall node>"
+      target: "<VirtualNetwork (firewall.network)>"
+      api_source: "compute.firewalls.list"
+      evidence_field: "firewall.network"
+      narrative: "{firewall.name} is a firewall rule attached to VPC {network.name}."
+
+  - id: gcp-vpc-peering-node
+    emits: PeeredWith
+    applies_to: [gcp]
+    match_record:
+      api: "compute.networks.list"
+      resource_type: "compute.googleapis.com/Network"
+      field: "peerings"
+    where:
+      - "peering.state == ACTIVE"
+    emit:
+      source_type: VirtualNetwork
+      target_type: VirtualNetwork
+      source: "<local VirtualNetwork node>"
+      target: "<peer VirtualNetwork node>"
+      api_source: "compute.networks.list (peerings[])"
+      evidence_field: "network.peerings[].network"
+      narrative: "{local_network.name} is actively peered with {peer_network.name}."
+
+  - id: gcp-vpc-subnet-iam-networkuser
+    emits: HasPermission
+    applies_to: [gcp]
+    match_record:
+      api: "compute.subnetworks.getIamPolicy"
+      resource_type: "compute.googleapis.com/Subnetwork"
+      field: "bindings"
+    where:
+      - "binding includes EFFECTIVE permission compute.subnetworks.use (granted via roles/compute.networkUser or custom role)"
+    emit:
+      source_type: Identity
+      target_type: Subnet
+      source: "<principal in binding.members[]>"
+      target: "<Subnet node>"
+      api_source: "compute.subnetworks.getIamPolicy"
+      evidence_field: "iamPolicy.bindings[role=roles/compute.networkUser]"
+      narrative: "{principal.name} holds roles/compute.networkUser (compute.subnetworks.use) on Shared VPC subnet {subnet.name} in host project {project.name}."
+
+  - id: gcp-vpc-xpn-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      api: "compute.projects.get"
+      resource_type: "compute.googleapis.com/Project"
+      field: "xpnProjectStatus"
+    where:
+      - "xpnProjectStatus == SERVICE"
+      - "xpnHostProject is set"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<service Project node>"
+      target: "<host Project node>"
+      api_source: "compute.projects.get"
+      evidence_field: "project.xpnProjectStatus + project.xpnHostProject"
+      narrative: "{service_project.name} is a Shared VPC service project attached to host project {host_project.name}. Workloads in the service project use the host project's VPC networks."
+
+  # REMOVED: gcp-vpc-external-forwarding-rule
+  # REASON: Duplicate of gcp-vpc-external-lb-exposed (derived section).
+  # Both match loadBalancingScheme in [EXTERNAL, EXTERNAL_MANAGED] with IPAddress set
+  # and both emit ExposedToInternet. ExposedToInternet has nature:derived in edges.yaml,
+  # so the derived rule is the correct source. Removed to prevent duplicate edges.
+
+  # REMOVED: gcp-vpc-psc-forwarding-rule
+  # REASON: Duplicate of gcp-vpc-psc-private-reach (derived section).
+  # Both match forwardingRule.target matching 'serviceAttachments' pattern and both
+  # emit PrivateReachability. PrivateReachability has nature:derived in edges.yaml,
+  # so the derived rule is the correct source. Removed to prevent duplicate edges.

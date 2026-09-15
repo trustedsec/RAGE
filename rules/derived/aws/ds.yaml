@@ -1,0 +1,179 @@
+# AWS Directory Service — Derived attack-path rules (Phase 2 — Identity)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Explicit normalization
+# (CanResetCredential, CanModifyTrust, TrustsExternalIdentity, MemberOf,
+# CanAdminister) already lives in /rules/explicit/aws-ds.yaml; these rules
+# combine those explicit edges into privilege-escalation and cross-domain
+# capabilities.
+#
+# WHAT DS IS (docs: docs.aws.amazon.com/directoryservice/latest/admin-guide/):
+# AWS Managed Microsoft AD and AD Connector are managed directory products.
+# Their attack surface is credential-level: ds:ResetUserPassword resets AD user
+# passwords; AD trusts bridge managed directories to on-prem domains.
+# No compute, no execution role, no code surface — purely Phase 2 (identity).
+#
+# THE PRIMARY ESCALATION INVARIANT:
+#   IAMPrincipal holds effective ds:ResetUserPassword on DirectoryARN
+#     => CanResetCredential(IAMPrincipal -> DirectoryUser)   [explicit]
+#   + DirectoryUser MemberOf Domain Admins                   [explicit]
+#     => CanEscalateTo(IAMPrincipal -> DomainAdminUser)     [rule 1, direct]
+#   + DomainAdminUser is more-privileged than IAMPrincipal
+#     => result is privilege escalation (captured by rule 1 emit)
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE:
+#   * credential-chains.yaml —
+#       - impersonate-is-escalation: NOT USED here (rule 1 emits CanEscalateTo
+#         directly because CanImpersonate target set excludes HumanIdentity; this
+#         is a single-step direct escalation, not an impersonation->escalation chain)
+#       - execute-then-read-secret: not applicable to DS (no execution surface)
+#   * federation-chains.yaml —
+#       - federation-maps-to-identity: consumes TrustsExternalIdentity emitted
+#         by explicit aws-ds-trust-record to derive CanFederateAs when external
+#         domain identity is attacker-controllable. DS rules only emit the
+#         TrustsExternalIdentity structural facts; the full federation collapse
+#         is DEFERRED to federation-chains.yaml.
+#   * ../identity-escalation.yaml (Phase 2, AWS) —
+#       - aws-update-assume-role-policy (CanModifyTrust on IAM roles) —
+#         CITED: if the directory is a SAML IdP for an IAM role, modifying the
+#         role trust is the IAM rule, not a DS rule. DS contributes only the
+#         CanResetCredential / CanModifyTrust on the AD trust itself.
+#       - aws-assume-role-web-identity: if an AD FS server on a domain-joined EC2
+#         is configured as a SAML IdP, CanResetCredential -> domain admin access
+#         -> AD FS token manipulation -> sts:AssumeRoleWithSAML. That chain depends
+#         on the Phase-2 SAML rule + an EC2 execution path. CITED, not duplicated.
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml), honored by every emit;
+# typed source_type/target_type per RULE-FORMAT.md, within these sets:
+#   CanResetCredential: source [Identity]  target [Identity, HumanIdentity]
+#   CanImpersonate:     source [Identity]  target [ServiceAccount, MachineIdentity,
+#                                                   ManagedIdentity, WorkloadIdentity,
+#                                                   ApplicationIdentity]
+#   CanModifyTrust:     source [Identity]  target [Role, TrustPolicy, ServiceAccount,
+#                                                   MachineIdentity]
+#   CanEscalateTo:      source [Identity]  target [Identity]
+#   MemberOf:           source [Identity]  target [Group, Role]
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 2-identity-authorization
+applies_to: [aws]
+
+rules:
+
+  # --- 1) Reset password of a domain-admin user -> escalate to domain admin ----
+  # THE primary DS escalation. ds:ResetUserPassword on a directory is a
+  # blanket capability over all users in that directory. When a reachable
+  # directory user is a member of Domain Admins (or Enterprise Admins, Schema
+  # Admins), resetting their password yields Windows-authenticated access to the
+  # managed domain as a domain admin — a privilege escalation within the directory
+  # scope. We emit CanEscalateTo directly (Identity -> Identity; both in the
+  # allowed source/target set) rather than CanImpersonate (whose target set
+  # excludes HumanIdentity per schema/edges.yaml). This is a direct single-step
+  # escalation edge, not an impersonation->escalation chain. The CanResetCredential
+  # primitive is already in the explicit rules; this derived rule combines it with
+  # MemberOf on a privileged group to produce the escalation summary edge.
+  - id: aws-ds-escalate-via-domain-admin-reset
+    emits: CanEscalateTo
+    description: "Resetting the password of a domain-admin directory user yields privilege escalation to domain-admin access over all domain-joined resources."
+    match:
+      - [ ?principal, CanResetCredential, ?user ]
+      - [ ?user, MemberOf, ?group ]
+    where:
+      - "node_type(?user) == HumanIdentity"
+      - "node_type(?group) == Group"
+      - "?group.name in ['Domain Admins', 'Enterprise Admins', 'Schema Admins', 'BUILTIN\\Administrators']"
+      - "?user.directory_id == ?group.directory_id  # same directory scope"
+      - "privilege(?user) > privilege(?principal)  # genuine escalation"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?user
+      permissions: ["ds:ResetUserPassword"]
+      conditions: [iam_permission, permission_boundary, scp_or_org_policy, service_state]
+      state_logic: >-
+        ACTIVE when the principal has effective ds:ResetUserPassword on the
+        directory ARN and the user's MemberOf(Domain Admins | Enterprise Admins |
+        Schema Admins | BUILTIN\Administrators) is confirmed AND the target user is
+        more privileged than the calling principal. CONDITIONAL(service_state) if
+        the directory is in a non-Active state (e.g. 'Impaired', 'RestoreFailed') —
+        password reset may fail transiently. BLOCKED if an SCP denies
+        ds:ResetUserPassword at the account scope, or if a permission boundary
+        caps the ds:ResetUserPassword action for the principal.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanResetCredential edge_id: ?principal -> ?user>", "<MemberOf edge_id: ?user -> ?group>" ]
+      false_positive_note: >-
+        Only emit when the target user is a member of a privileged AD group
+        (Domain Admins, Enterprise Admins, Schema Admins, BUILTIN\Administrators)
+        confirmed by collected MemberOf data — do NOT guess membership. Requires
+        privilege(?user) > privilege(?principal); a lateral same-privilege reset
+        is CanResetCredential but not CanEscalateTo. The resulting access is
+        Windows-domain escalation (domain-joined EC2 / RDP / Windows services),
+        NOT direct AWS IAM escalation. AWS API access from this path requires an
+        additional SAML federation step via an AD FS instance configured as a SAML
+        IdP (see aws-assume-role-web-identity in identity-escalation.yaml, cited
+        but not duplicated here). Do NOT emit for Simple AD or AD Connector
+        directories where the directory type does not support domain admin groups.
+      narrative: >-
+        {principal.name} can reset the password of {user.name}
+        (ds:ResetUserPassword on directory {user.directory_id}); {user.name} is a
+        member of {group.name}, granting {principal.name} domain-level
+        administrative access to all domain-joined resources in the managed Active
+        Directory domain.
+
+  # --- 2) ds:CreateTrust / ds:UpdateTrust -> modify the directory trust boundary
+  # An IAM principal that can add or alter an AD trust relationship can bridge an
+  # attacker-controlled on-prem (or third-party) domain into the managed forest —
+  # granting Kerberos authentication from that external domain against the managed
+  # directory's domain-joined resources. The explicit rule aws-ds-can-create-trust
+  # already emits CanModifyTrust on the TrustPolicy node; this rule is REMOVED
+  # (duplicate — explicit rule is canonical). The cross-boundary Kerberos
+  # capability (if the attacker already controls an external domain) is DEFERRED
+  # to federation-chains via the explicit TrustsExternalIdentity edge emitted by
+  # aws-ds-trust-record.
+
+  # --- 3) AD trust records are already emitted by explicit aws-ds-trust-record
+  # REMOVED: the derived rule aws-ds-external-trust-exists attempted to match
+  # TrustPolicy nodes via a [ ?directory, CanAdminister, ?trust ] pattern, but
+  # CanAdminister's target set is ["*"] (any node), so the binding would resolve
+  # to the directory's CanAdminister targets (the directory itself, GenericManagement),
+  # not TrustPolicy nodes. The actual TrustPolicy nodes are never materialized
+  # by CanAdminister edges. The duplicate structural fact (TrustsExternalIdentity
+  # on verified trusts) is already emitted by the explicit normalization rule
+  # aws-ds-trust-record in /rules/explicit/aws-ds.yaml, which reads the
+  # ds:DescribeTrusts API records directly. That explicit rule is the canonical
+  # source; this derived rule was redundant and unfixable at the pattern level.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP/permission boundary denying ds:ResetUserPassword at the account scope
+#    -> emit CanResetCredential with state: BLOCKED and denied_by=<SCP arn>.
+#    Rule 1 (CanEscalateTo) also becomes BLOCKED if either CanResetCredential or
+#    MemberOf contributors are BLOCKED.
+#  - An SCP denying ds:CreateTrust/ds:UpdateTrust -> emit CanModifyTrust BLOCKED
+#    (explicit rule aws-ds-can-create-trust).
+#  - A directory in 'Deleted' or 'Deleting' state -> adapter should not emit
+#    directory nodes -> rules do not fire.
+#  - Simple AD does not support trusts at all — do not emit TrustsExternalIdentity
+#    for AWS::DirectoryService::SimpleAD.
+#  - AD Connector does not independently hold trust relationships; trusts live in
+#    the on-prem AD. Do not emit TrustsExternalIdentity for AD Connector-backed
+#    directories from this rule (explicit aws-ds-trust-record already filters
+#    correctly).
+#
+# CITATION SUMMARY (linchpins consumed but not duplicated):
+#   - credential-chains.yaml impersonate-is-escalation:
+#       NOT USED: rule 1 emits CanEscalateTo directly (not via CanImpersonate,
+#       whose target set excludes HumanIdentity).
+#   - federation-chains.yaml federation-maps-to-identity:
+#       consumes TrustsExternalIdentity emitted by explicit aws-ds-trust-record
+#       to derive CanFederateAs (when external domain is attacker-controllable).
+#   - ../identity-escalation.yaml aws-assume-role-web-identity:
+#       if a SAML IdP on domain-joined EC2 bridges the directory to IAM roles,
+#       the SAML trust is that rule's domain; DS contributes only the credential
+#       reset fact. CITED, not duplicated.
+#
+# EXPLICIT RULES: all explicit normalization (CanResetCredential,
+# CanAdminister, CanModifyTrust, TrustsExternalIdentity, MemberOf) lives
+# exclusively in /rules/explicit/aws-ds.yaml. Do not duplicate them here.
+# ---------------------------------------------------------------------------

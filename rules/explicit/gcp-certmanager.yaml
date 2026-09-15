@@ -1,0 +1,206 @@
+# Normalizing GCP Certificate Authority Service (CAS / privateca.*) into explicit edges.
+# The adapter emits raw CA Service records (caPools.get / getIamPolicy,
+# certificateAuthorities.get, certificateTemplates.get / getIamPolicy,
+# certificates.get) and effective-permission decisions; these rules translate them
+# into common explicit edges conforming to schema/edges.yaml. They do not combine edges.
+# Permissions/actions are verbatim from
+# cloud.google.com/certificate-authority-service/docs/reference/permissions-and-roles.
+#
+# A CA pool is modeled as a SigningKey (Secret-class) node — an issuer whose private
+# key signs caller-supplied certificate requests. There is NO execution role and NO
+# ExecutesAs. Issuing a usable cert requires BOTH privateca.certificates.create AND
+# privateca.caPools.use on the pool; we normalize the issuance capability as CanSignAs
+# and let the derived rules apply the issuance-policy / trust gates.
+#
+# NOTE: the Certificate Manager service (certificatemanager.*) is DISTINCT — it stores/
+# serves TLS certs and cert maps for load balancers and does NOT sign arbitrary
+# identities. Its writes are config-tamper on the referencing LB, not CanSignAs; not
+# normalized here.
+
+rules:
+
+  # --- CA pool allow policy -> ResourcePolicy attachment --------------------
+  - id: gcp-certmanager-ca-pool-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record: {resource_type: "google.privateca.CaPool", field: "iamPolicy.bindings"}
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<CA pool node (SigningKey)>"
+      target: "<CA pool ResourcePolicy node>"
+      api_source: "privateca.projects.locations.caPools.getIamPolicy"
+      evidence_field: "iamPolicy.bindings"
+      narrative: "{capool.name} has an IAM allow policy governing who may issue certificates and manage the pool."
+
+  # --- Certificate template allow policy -> ResourcePolicy ------------------
+  - id: gcp-certmanager-template-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record: {resource_type: "google.privateca.CertificateTemplate", field: "iamPolicy.bindings"}
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<certificate template node (Policy)>"
+      target: "<template ResourcePolicy node>"
+      api_source: "privateca.projects.locations.certificateTemplates.getIamPolicy"
+      evidence_field: "iamPolicy.bindings"
+      narrative: "{template.name} has an IAM allow policy governing who may use it for issuance."
+
+  # --- Issue certificate = sign as the CA (effective permission) ------------
+  # Requires BOTH certificates.create AND caPools.use on the pool; the evaluator
+  # confirms both before emitting. This is the credential-minting primitive -> CanSignAs.
+  # Subject/SAN forgeability and trust consumption are applied by the derived rules.
+  - id: gcp-certmanager-can-sign-as-explicit
+    emits: CanSignAs
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "privateca.certificates.create"
+      resource_type: "google.privateca.CaPool"
+    where:
+      - "principal ALSO has EFFECTIVE privateca.caPools.use on the same pool (both required)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<CA pool node (SigningKey)>"
+      api_source: "policy evaluation (Policy Analyzer) — NOT certificates.create itself"
+      permissions: ["privateca.certificates.create", "privateca.caPools.use"]
+      evidence_field: "issuancePolicy (allowed subject/SAN constraints) — gates forgery"
+      narrative: "{principal.name} can issue certificates signed by CA pool {capool.name} (privateca.certificates.create + privateca.caPools.use)."
+
+  # --- Retrieve issued certificate PEM (recon of others' certs) -------------
+  - id: gcp-certmanager-can-read-certificate
+    emits: CanRead
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "privateca.certificates.get"
+      resource_type: "google.privateca.Certificate"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<CA pool / certificate node>"
+      permissions: ["privateca.certificates.get", "privateca.certificates.list"]
+      narrative: "{principal.name} can retrieve certificates issued by {capool.name} (privateca.certificates.get/list — public cert material, not the CA private key)."
+
+  # --- Modify the CA pool issuance policy / config --------------------------
+  - id: gcp-certmanager-can-modify-configuration
+    emits: CanModifyConfiguration
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "privateca.caPools.update"
+      resource_type: "google.privateca.CaPool"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<CA pool node>"
+      permissions: ["privateca.caPools.update", "privateca.certificateTemplates.update"]
+      narrative: "{principal.name} can update the issuance policy/config of CA pool {capool.name} (privateca.caPools.update), e.g. loosen identity constraints to permit arbitrary-subject forgery."
+
+  # --- Enable/disable a CA (restore or block issuance) ----------------------
+  - id: gcp-certmanager-can-modify-ca-state
+    emits: CanModifyConfiguration
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "privateca.certificateAuthorities.update"
+      resource_type: "google.privateca.CertificateAuthority"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<CertificateAuthority node>"
+      permissions: ["privateca.certificateAuthorities.update"]
+      narrative: "{principal.name} can change configuration/state of CA {ca.name} (privateca.certificateAuthorities.update), e.g. re-enable a disabled CA to restore issuance."
+
+  # --- Modify the CA pool IAM allow policy (self-grant issuance) ------------
+  - id: gcp-certmanager-can-modify-policy
+    emits: CanModifyPolicy
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "privateca.caPools.setIamPolicy"
+      resource_type: "google.privateca.CaPool"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<CA pool allow policy node>"
+      permissions: ["privateca.caPools.setIamPolicy"]
+      narrative: "{principal.name} can rewrite the IAM allow policy of CA pool {capool.name} (privateca.caPools.setIamPolicy) to grant itself/others issuance."
+
+  # --- Full administrative control over the CA pool -------------------------
+  - id: gcp-certmanager-can-administer
+    emits: CanAdminister
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "privateca.*"
+      resource_type: "google.privateca.CaPool"
+    where: ["principal holds roles/privateca.admin or equivalent full privateca.* on the pool scope"]
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<CA pool node>"
+      permissions: ["privateca.*"]
+      narrative: "{principal.name} has full administrative control over CA pool {capool.name} (roles/privateca.admin / privateca.*)."
+
+  # --- KMS-backed CA signing-key reference (drives service-agent gate) -------
+  - id: gcp-certmanager-kms-key-ref
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    match_record: {resource_type: "google.privateca.CertificateAuthority", field: "keySpec.cloudKmsKeyVersion | tier"}
+    where: ["CA is KMS-backed (Enterprise tier over a customer Cloud KMS/HSM key)"]
+    emit:
+      target_type: "*"
+      source: "<CertificateAuthority node>"
+      target: "<Cloud KMS CryptoKeyVersion referenced by keySpec>"
+      api_source: "privateca.projects.locations.caPools.certificateAuthorities.get"
+      evidence_field: "keySpec.cloudKmsKeyVersion / tier"
+      note: >-
+        The CAS service agent (service-PROJECT_NUMBER@gcp-sa-privateca.iam.gserviceaccount.com),
+        not the caller, signs with this key via cloudkms.cryptoKeyVersions.useToSign;
+        drives the key_permission service-agent gate in gcp-certmanager-sign-cmek-gate.
+      narrative: "{ca.name} signs with Cloud KMS key {key.name}; the CAS service agent (not the caller) must hold cloudkms.cryptoKeyVersions.useToSign on it."
+
+  # --- Issuance-policy evidence (drives the forgery condition gate) ---------
+  - id: gcp-certmanager-issuance-policy-ref
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    match_record: {resource_type: "google.privateca.CaPool", field: "issuancePolicy"}
+    where: ["record identityConstraints.allowSubjectPassthrough / allowSubjectAltNamesPassthrough / celExpression / allowedIssuanceModes / allowedKeyTypes and any bound certificate template"]
+    emit:
+      target_type: "*"
+      source: "<CA pool node>"
+      target: "<issuancePolicy evidence node>"
+      api_source: "privateca.projects.locations.caPools.get"
+      evidence_field: "issuancePolicy.identityConstraints / baselineValues / allowedIssuanceModes"
+      narrative: "{capool.name} issuance policy defines whether a requester may set an arbitrary subject/SAN (forgery gate for gcp-certmanager-impersonate-via-forged-cert)."
+
+  # --- Cross-project issuance trust (cross-project pool binding) ------------
+  - id: gcp-certmanager-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record: {resource_type: "google.privateca.CaPool", field: "iamPolicy.bindings[].members"}
+    where:
+      - "a member (user/SA/group) belongs to a different project than the CA pool"
+      - "the bound role grants certificateRequester / caPools.use / certificates.create"
+    emit:
+      source: "<capool.project>"
+      target: "<member.project | external identity>"
+      api_source: "privateca.projects.locations.caPools.getIamPolicy"
+      evidence_field: "iamPolicy.bindings[].members / role"
+      narrative: "{capool.name} grants certificate issuance to {external.name} in project {project}, enabling cross-project cert forgery."
+
+  # --- Regional CA pool placement -> LocatedIn ------------------------------
+  - id: gcp-certmanager-located-in
+    emits: LocatedIn
+    applies_to: [gcp]
+    match_record: {resource_type: "google.privateca.CaPool", field: "name (locations/*)"}
+    where: ["CA pool is regional (projects/*/locations/<region>/caPools/*)"]
+    emit:
+      source_type: "*"
+      source: "<CA pool node>"
+      target: "<region / location boundary>"
+      api_source: "privateca.projects.locations.caPools.get"
+      evidence_field: "name"
+      narrative: "{capool.name} is located in {region}."

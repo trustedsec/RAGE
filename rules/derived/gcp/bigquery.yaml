@@ -1,0 +1,240 @@
+# GCP BigQuery — Derived attack-path rules (Phase 11 — data / analytics / ML)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:bigquery. Emits ONLY common edge types from schema/edges.yaml.
+# All permissions are taken verbatim from the BigQuery IAM reference:
+#   cloud.google.com/bigquery/docs/access-control
+#   cloud.google.com/bigquery/docs/access-control-primitive-roles
+#   cloud.google.com/bigquery/docs/scheduling-queries
+#   cloud.google.com/bigquery/docs/connections-api-intro
+#   cloud.google.com/bigquery/docs/exporting-data
+#   cloud.google.com/bigquery/docs/authorized-views
+#   cloud.google.com/bigquery/docs/authorized-datasets
+#
+# CENTRAL ATTACK-PATH THEME (Phase 11):
+#   BigQuery is a data-warehouse / query engine. Its dominant primitives are
+#   DATA ACCESS and EXFILTRATION, not traditional code execution.
+#
+#   (1) EXECUTION / IDENTITY ABUSE:
+#       Scheduled queries (BigQuery Data Transfer Service) run as a service
+#       account when serviceAccountName is set on the TransferConfig. An attacker
+#       who holds bigquery.transfers.update modifies the query SQL (CanModifyCode
+#       on the Scheduler node) and, if they can also update serviceAccountName
+#       (via iam.serviceAccounts.actAs), re-bind which SA the query runs as.
+#       The cicd-chains linchpin rolls this up: CanModifyCode + ExecutesAs =>
+#       CanExecuteAs (cicd-modify-buildspec-executes-as). This file emits the FACTS
+#       (CanModifyCode on the TransferConfig, CanPassIdentity, ExecutesAs) and
+#       CITES those linchpins for the roll-up. The attacker does not receive a raw
+#       SA token — the query runs server-side — but they control the SQL's data-
+#       plane reach: effective exfiltration under the SA's IAM grants.
+#
+#   (2) DATA ACCESS + EXFILTRATION:
+#       bigquery.tables.getData + bigquery.jobs.create => CanReadData.
+#       EXPORT DATA / bq extract to GCS + storage.objects.create => CanExfiltrate.
+#
+#   (3) DATA-PLANE GRANTS:
+#       bigquery.datasets.setIamPolicy => CanGrantPermission (grant self/others
+#       full dataset access).
+#       Authorized views / authorized datasets => CrossProjectTrust (cross-project
+#       data read without direct IAM bindings in the source project).
+#
+#   (4) CREDENTIALS:
+#       BigQuery Connection resources (JDBC / Cloud SQL) store or proxy credentials
+#       to external data sources => ExposesCredential / ContainsSecret.
+#
+# LINCHPIN CITATIONS (do NOT re-derive the roll-ups listed here):
+#   * /rules/derived/can-execute-as.yaml — execute-as-via-code-modify
+#     collapses CanModifyCode + ExecutesAs => CanExecuteAs for any Compute.
+#   * /rules/derived/cicd-chains.yaml — cicd-modify-buildspec-executes-as
+#     applies the CI/CD framing to scheduled-query modification; the Scheduler
+#     node (TransferConfig) plays the "runner" role.
+#   * /rules/derived/credential-chains.yaml — read-secret-yields-identity,
+#     execute-then-read-secret collapse credential pivot chains.
+#   * /rules/derived/can-control.yaml — escalate-via-execute-as and
+#     control-via-admin roll CanExecuteAs / CanAdminister into CanEscalateTo /
+#     Controls. Do NOT re-derive those here.
+#
+# PERMISSIONS ARE EFFECTIVE: the permission evaluator has already resolved
+# project-level role bindings, dataset-level ACL entries, and resource-level
+# IAM policy before these rules fire. State defaults to ACTIVE; an unmet
+# condition yields CONDITIONAL/POTENTIAL; an explicit deny / VPC-SC perimeter
+# yields BLOCKED.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 11-data-analytics-ml
+service: bigquery
+applies_to: [gcp]
+
+rules:
+
+  # =====================================================================
+  # SECTION 1 — EXECUTION PATH (via code modification + execution identity)
+  # =====================================================================
+  # CanModifyCode rules on scheduled queries and remote functions are
+  # EXPLICIT-NATURE and live in /rules/explicit/gcp-bigquery.yaml.
+  # They normalize permission evaluator decisions directly, not derived paths.
+
+  # =====================================================================
+  # SECTION 2 — DATA ACCESS + EXFILTRATION
+  # =====================================================================
+  # CanReadData is an EXPLICIT edge (normalized from permission evaluator).
+  # It lives in /rules/explicit/gcp-bigquery.yaml. This section contains
+  # only DERIVED rules that compose explicit edges.
+
+  # --- CanExfiltrate: EXPORT DATA / bq extract to GCS -----------------------
+  - id: gcp-bigquery-exfiltrate
+    emits: CanExfiltrate
+    description: "An EXPORT DATA statement or bq extract job copies BigQuery table contents to a GCS bucket — effective data exfiltration across the project boundary."
+    match:
+      - [ ?principal, CanReadData, ?dataset ]
+    where:
+      - "?principal has EFFECTIVE bigquery.tables.export on the dataset/tables (required for EXPORT DATA / bq extract)"
+      - "?principal has EFFECTIVE storage.objects.create on a destination GCS bucket (attacker-controlled or accessible)"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: ?dataset
+      permissions: ["bigquery.tables.getData", "bigquery.jobs.create", "bigquery.tables.export", "storage.objects.create"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: "ACTIVE when CanReadData(?principal, ?dataset) is ACTIVE AND bigquery.tables.export is confirmed ACTIVE AND storage.objects.create on a writable destination bucket is confirmed; CONDITIONAL(iam_permission) when bigquery.tables.export is uncertain or bucket write rights are uncertain; BLOCKED when tables.export is explicitly denied."
+      false_positive_note: >-
+        EXPORT DATA / bq extract requires THREE permissions on the principal's identity:
+        (1) bigquery.tables.getData (read the table data),
+        (2) bigquery.jobs.create (submit the export job),
+        (3) bigquery.tables.export (execute EXPORT DATA / extract — NOT included in
+        roles/bigquery.dataViewer, only in roles/bigquery.dataEditor and higher).
+        Additionally, storage.objects.create is required on the DESTINATION bucket.
+        A principal with roles/bigquery.dataViewer + bigquery.jobUser satisfies
+        CanReadData but CANNOT export without tables.export. Without bucket write
+        rights the export fails (CanExfiltrate is CONDITIONAL(iam_permission) on that
+        right). The destination can be any GCS bucket the principal can write to —
+        including buckets in other projects or owned by the attacker. VPC-SC perimeters
+        can restrict cross-perimeter GCS writes (bigquery + GCS must be co-perimeterized
+        or the export blocked). Authorized views do NOT grant EXPORT capability — a
+        view reader cannot export the underlying base table unless they also hold
+        getData + tables.export on it. Only emit when the source node is a DataWarehouse
+        or its containing dataset.
+      narrative: >-
+        {principal.name} can submit an EXPORT DATA job to copy tables from
+        {dataset.name} to a GCS bucket it controls (bigquery.tables.getData +
+        bigquery.jobs.create + bigquery.tables.export + storage.objects.create),
+        exfiltrating data outside the project boundary.
+      derived_from: ["?principal CanReadData ?dataset", "bigquery.tables.export effective permission", "storage.objects.create on destination bucket"]
+
+  # =====================================================================
+  # SECTION 3 — IAM / DATA-PLANE GRANTS (EXPLICIT)
+  # =====================================================================
+  # Permission-evaluator rules (CanGrantPermission, CanModifyPolicy via
+  # match_effective_permission) are EXPLICIT-NATURE and live in
+  # /rules/explicit/gcp-bigquery.yaml. This section is reserved for DERIVED
+  # rules that reference graph edges.
+
+  # =====================================================================
+  # SECTION 4 — CROSS-PROJECT TRUST (AUTHORIZED VIEWS / DATASETS)
+  # =====================================================================
+  # CrossProjectTrust rules are EXPLICIT-NATURE and live in
+  # /rules/explicit/gcp-bigquery.yaml. They normalize API records
+  # (access[] array in datasets), not derived attack paths.
+
+  # =====================================================================
+  # SECTION 5 — INTERNET / TENANT EXPOSURE
+  # =====================================================================
+  # Exposure edges (ExposedToInternet, ExposedToTenant) normalize from
+  # access[] array and are EXPLICIT-NATURE. They live in
+  # /rules/explicit/gcp-bigquery.yaml, not here.
+
+  # =====================================================================
+  # SECTION 6 — CREDENTIAL EXPOSURE (CONNECTIONS)
+  # =====================================================================
+  # ExposesCredential and ContainsCredential are EXPLICIT-NATURE edges
+  # that normalize BigQuery Connection API records. They live in
+  # /rules/explicit/gcp-bigquery.yaml. These rules do not derive from
+  # other edges; they are API materializations.
+
+  # =====================================================================
+  # SECTION 7 — ESCALATION ROLL-UP
+  # =====================================================================
+
+  # --- CanEscalateTo: setIamPolicy self-grant -> escalation ------------------
+  - id: gcp-bigquery-escalate-via-grant-permission
+    emits: CanEscalateTo
+    description: "A principal with bigquery.datasets.setIamPolicy can self-grant roles/bigquery.dataOwner and escalate its data-plane privilege."
+    match:
+      - [ ?principal, CanGrantPermission, ?dataset ]
+    where:
+      - "node_type(?dataset) == DataWarehouse   # BigQuery Dataset node"
+      - "?principal.privilege_level < elevated  # self-grant yields elevated/admin data access"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?principal
+      permissions: ["bigquery.datasets.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: "ACTIVE when CanGrantPermission on the dataset is ACTIVE and the self-grant would yield a privilege level above the current one; inherits state from the CanGrantPermission contributor."
+      false_positive_note: >-
+        Self-escalation via setIamPolicy is only meaningful when the resulting role
+        (e.g. roles/bigquery.dataOwner or roles/bigquery.admin) gives the principal
+        more data access than it currently holds. If the principal already holds
+        roles/bigquery.admin or equivalent, no escalation. This is a data-plane
+        escalation (read/exfiltrate more data), not a management-plane IAM escalation
+        (the setIamPolicy is scoped to BigQuery dataset resources, not the project or
+        organization IAM). For full project/org privilege escalation the attacker
+        would also need resourcemanager.projects.setIamPolicy (a different edge).
+        can-control.yaml escalate-via-execute-as handles the CanExecuteAs path;
+        cite, do not re-derive.
+      narrative: >-
+        {principal.name} holds bigquery.datasets.setIamPolicy on {dataset.name}
+        and can grant itself roles/bigquery.dataOwner, escalating to full data-plane
+        access over all tables in {dataset.name}.
+      derived_from: ["?principal CanGrantPermission ?dataset", "bigquery.datasets.setIamPolicy"]
+
+  # --- CanReadData via cross-project trust ------------------------------------
+  # Cross-project data access via authorized views/datasets is best modeled as
+  # CanReadData(principal, foreign_dataset) + CrossProjectTrust structural edge.
+  # CanEnterProject implies management-plane access; data-only read is CanReadData.
+  # Removed: gcp-bigquery-enter-project-via-data-trust (over-claimed boundary).
+  # Analysis should use: CrossProjectTrust(projectA.dataset, projectB) +
+  # CanReadData(principal_in_projectB, projectA.dataset) as the attack chain.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-EDGE GUIDANCE:
+#   - A VPC-SC perimeter that includes the bigquery API enforces source-IP /
+#     VPN / service-account membership checks; callers outside the perimeter
+#     receive a 403 PERMISSION_DENIED even with valid IAM -> emit CanReadData /
+#     CanExfiltrate / CanGrantPermission edges as BLOCKED(resource_policy) with
+#     denied_by = <perimeter resource name>. See /rules/derived/gcp/
+#     accesscontextmanager.yaml for perimeter modeling.
+#   - Org policy constraints.gcp.disableCloudSQL (hypothetical) or
+#     constraints.bigquery.disableNonInteractiveQueries would block scheduled
+#     queries -> CanModifyCode edges on TransferConfig -> BLOCKED.
+#   - An IAM deny policy denying bigquery.datasets.setIamPolicy ->
+#     CanGrantPermission BLOCKED(denied_by=<deny-policy>).
+#   - Org policy iam.allowedPolicyMemberTypes restricting allAuthenticatedUsers /
+#     allUsers -> ExposedToTenant / ExposedToInternet BLOCKED.
+#
+# LINCHPIN CROSS-REFERENCES (edges this file emits feed into):
+#   * gcp-bigquery-transfer-config-executes-as (ExecutesAs) +
+#     gcp-bigquery-modify-scheduled-query (CanModifyCode) ->
+#     can-execute-as.yaml execute-as-via-code-modify +
+#     cicd-chains.yaml cicd-modify-buildspec-executes-as
+#     => CanExecuteAs(?principal, ?sa) — the scheduled-query escalation.
+#   * gcp-bigquery-transfer-config-passidentity (CanPassIdentity) +
+#     gcp-bigquery-transfer-config-executes-as (ExecutesAs with new SA) ->
+#     can-execute-as.yaml execute-as-via-config-identity-swap
+#     => CanExecuteAs(?principal, ?chosen_sa).
+#   * gcp-bigquery-read-data (CanReadData) + gcp-bigquery-exfiltrate
+#     (CanExfiltrate) — data exfil chain.
+#   * gcp-bigquery-connection-exposes-credential (ExposesCredential) ->
+#     credential-chains.yaml execute-then-read-secret => CanImpersonate if the
+#     connection SA's key is separately readable.
+#   * gcp-bigquery-escalate-via-grant-permission (CanEscalateTo) ->
+#     can-control.yaml escalate-via-execute-as (for CanExecuteAs paths).
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION RULES have been moved to:
+#   /rules/explicit/gcp-bigquery.yaml
+# This file contains DERIVED RULES ONLY.
+# ---------------------------------------------------------------------------

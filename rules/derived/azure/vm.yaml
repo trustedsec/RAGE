@@ -1,0 +1,267 @@
+# Azure — Virtual Machines (Microsoft.Compute) execution rules (Phase 4)
+# ---------------------------------------------------------------------------
+# Core Azure VM escalation primitive:
+#   an attacker who runs code on a VM inherits every managed identity (MI) bound
+#   to it, because that code can mint MI tokens from IMDS
+#   (169.254.169.254/metadata/identity/oauth2/token, header "Metadata: true").
+#
+# Control-plane execution needs NO OS credential:
+#   - Microsoft.Compute/virtualMachines/runCommand/action
+#   - Microsoft.Compute/virtualMachines/extensions/write (CustomScript / RunCommand)
+#   - Microsoft.Compute/virtualMachines/write (customData / attach user-assigned MI)
+#
+# All operation strings verified against the Azure resource-provider operations
+# reference (Microsoft.Compute) and IMDS docs. Every rule records the effective
+# operation the evaluator must confirm at the VM (or MI) scope. Deny assignments
+# override -> BLOCKED. Escalation edges require the MI to out-privilege the caller.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 4-compute-serverless
+applies_to: [azure]
+
+rules:
+
+  # === Administrative control over the VM object =============================
+  - id: azure-vm-contributor
+    emits: CanAdminister
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachines/*", scope_type: "resource|resourceGroup|subscription"}
+    where: ["principal effectively holds the Microsoft.Compute/virtualMachines/* wildcard (Virtual Machine Contributor / Contributor / Owner) at the scope"]
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<virtualMachine in scope>"
+      permissions: ["Microsoft.Compute/virtualMachines/*"]
+      false_positive_note: "CanAdminister requires the Microsoft.Compute/virtualMachines/* wildcard (VM Contributor/Owner). A custom role granting only .../virtualMachines/write (without runCommand/extensions/start) does NOT get CanAdminister here; it is instead covered by azure-vm-write-config (CanModifyConfiguration). The wildcard grants full control of the VM object but NOT Microsoft.Authorization/*/write and NOT the login/loginAsAdmin data actions; it is still sufficient for code execution via runCommand/extensions."
+      narrative: "{principal.name} has full control of VM {target.name} (Microsoft.Compute/virtualMachines/*)."
+
+  # === Code / command execution on the host =================================
+  - id: azure-vm-run-command
+    emits: CanExecuteCommand
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachines/runCommand/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<virtualMachine>"
+      permissions: ["Microsoft.Compute/virtualMachines/runCommand/action"]
+      conditions: [service_state]
+      state_logic: "ACTIVE if VM power state is running; else CONDITIONAL(service_state) and pair with azure-vm-start"
+      false_positive_note: "runCommand only executes on a running VM; on a stopped/deallocated VM emit CONDITIONAL(service_state). No OS credential is required."
+      narrative: "{principal.name} can run arbitrary scripts as SYSTEM/root on {target.name} (Microsoft.Compute/virtualMachines/runCommand/action)."
+
+  - id: azure-vm-extension-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachines/extensions/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<virtualMachine>"
+      permissions: ["Microsoft.Compute/virtualMachines/extensions/write"]
+      conditions: [service_state]
+      escalation: "Install/replace a CustomScript or RunCommand extension that executes attacker script as SYSTEM/root."
+      false_positive_note: "Extension handler runs on a running VM; if deallocated, CONDITIONAL(service_state) + CanStart."
+      narrative: "{principal.name} can install a script extension on {target.name} (extensions/write), running attacker code on the host."
+
+  - id: azure-vm-write-config
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachines/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<virtualMachine>"
+      permissions: ["Microsoft.Compute/virtualMachines/write"]
+      note: "Can set osProfile.customData/cloud-init or change the identity block; realizes execution at next (re)deploy/boot."
+      narrative: "{principal.name} can rewrite the configuration of {target.name} (virtualMachines/write) including customData and the identity binding."
+
+  - id: azure-vm-login-dataaction
+    emits: CanExecuteCommand
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachines/login/action OR Microsoft.Compute/virtualMachines/loginAsAdmin/action", data_action: true, scope_type: "resource|resourceGroup|subscription"}
+    where: ["VM has the AADSSHLoginForLinux / AADLoginForWindows extension", "network path to SSH/RDP or Bastion exists"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<virtualMachine>"
+      permissions: ["Microsoft.Compute/virtualMachines/loginAsAdmin/action"]
+      conditions: [service_state, network_reachability]
+      false_positive_note: "These are DATA actions granted ONLY by Virtual Machine Administrator/User Login roles; VM Contributor/Owner do NOT include them. Require the Entra-login extension AND a reachable SSH/RDP/Bastion path."
+      narrative: "{principal.name} can interactively log in to {target.name} as admin (loginAsAdmin data action) and run commands."
+
+  - id: azure-vm-start
+    emits: CanStart
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachines/start/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<virtualMachine>"
+      permissions: ["Microsoft.Compute/virtualMachines/start/action"]
+      note: "Realizes CONDITIONAL(service_state) execution edges on stopped VMs."
+      narrative: "{principal.name} can start stopped VM {target.name} (start/action) to enable command execution."
+
+  # === Identity attachment (Azure PassRole analog) ==========================
+  - id: azure-vm-attach-user-mi
+    emits: CanAttachIdentity
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?userMI"
+      - "?principal has EFFECTIVE Microsoft.Compute/virtualMachines/write on the target VM (existing or new)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<virtualMachine (existing or new)>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Compute/virtualMachines/write"]
+      conditions: [role_compatibility]
+      false_positive_note: "BOTH permissions are required: assign/action on the MI AND virtualMachines/write on the VM. Neither alone attaches the MI. Honor the assign/action resource scope."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to VM {target.name} (assign/action + virtualMachines/write)."
+
+  # === IMDS credential exposure / token retrieval ===========================
+  - id: azure-vm-imds-token
+    emits: CanRetrieveToken
+    description: "Any code on a VM can mint a bearer token for each bound managed identity via IMDS."
+    match:
+      - [ ?vm, ExecutesAs, ?mi ]
+    emit:
+      source: "<virtualMachine>"
+      target: "<managed identity bound to the VM>"
+      permissions: []
+      note: "IMDS: GET http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=<aud> with header 'Metadata: true'. Arc: http://localhost:40342/... See azure-vm-imds-exposescred for the paired ExposesCredential(vm -> mi) fact."
+      false_positive_note: "Only fires when the VM actually has a managed identity (identity.type != None). No MI => no token; do NOT emit."
+      narrative: "Any code running on {vm.name} can request a bearer token for {mi.name} from IMDS (169.254.169.254) with no OS credential."
+
+  - id: azure-vm-imds-exposescred
+    emits: ExposesCredential
+    description: "A VM bound to a managed identity leaks that identity's credential via the IMDS token endpoint (the exposure fact paired with azure-vm-imds-token)."
+    match:
+      - [ ?vm, ExecutesAs, ?mi ]
+    emit:
+      source: "<virtualMachine>"
+      target: "<managed identity bound to the VM>"
+      permissions: []
+      note: "IMDS on the VM exposes a mintable bearer token for each bound MI; complements azure-vm-imds-token (CanRetrieveToken) with the credential-leak fact consumers key on."
+      false_positive_note: "Only fires when the VM actually has a managed identity (identity.type != None). No MI => no exposure; do NOT emit."
+      narrative: "{vm.name} exposes the credential of managed identity {mi.name} via IMDS (169.254.169.254) to any code running on it."
+
+  # === Derived: attacker code -> execute as the VM's managed identity ========
+  - id: azure-vm-execute-as-via-command
+    emits: CanExecuteAs
+    description: "Command/code execution on a VM + the VM runs as an MI => execute as that MI (via IMDS)."
+    match:
+      - [ ?principal, CanExecuteCommand, ?vm ]
+      - [ ?vm, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?vm) == VirtualMachine"
+      - "?mi.privilege_level >= ?principal.privilege_level   # escalation only"
+    optional:
+      - [ ?principal, CanStart, ?vm ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      state_logic: |
+        if ?vm running: ACTIVE
+        elif matched(optional[0]): CONDITIONAL(service_state)   # CanStart realizes it, but starting is an action that may itself be gated (deny assignment, quota, boot time)
+        else: CONDITIONAL(service_state)
+      conditions_from: [ ?vm, ?mi ]
+      permissions: ["Microsoft.Compute/virtualMachines/runCommand/action | extensions/write | login data action"]
+      derived_from: [ "<CanExecuteCommand edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Emit only when the VM has a managed identity and that MI out-privileges the caller. On a stopped VM without CanStart -> CONDITIONAL(service_state)."
+      narrative: "{principal.name} can execute code on {vm.name} (runCommand/extension/login) and mint the token of its identity {mi.name} from IMDS, executing as {mi.name}."
+
+  - id: azure-vm-execute-as-via-attach-mi
+    emits: CanExecuteAs
+    description: "Attach a privileged user-assigned MI to an existing VM the caller can run code on, then execute as that MI via IMDS."
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+      - [ ?principal, CanAttachIdentity, ?vm ]
+      - [ ?principal, CanExecuteCommand, ?vm ]
+    where:
+      - "node_type(?vm) == VirtualMachine"
+      - "?userMI.privilege_level >= ?principal.privilege_level   # escalation only"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Compute/virtualMachines/write", "runCommand/extensions"]
+      conditions: [role_compatibility]
+      derived_from: [ "<CanPassIdentity edge_id>", "<CanAttachIdentity edge_id>", "<CanExecuteCommand edge_id>" ]
+      false_positive_note: "Requires the attach chain (CanPassIdentity via assign/action + VM write) AND a code-exec primitive on that VM. This is the EXISTING-VM chain (attach MI, then run) so it emits CanExecuteAs, not CanCreateWorkloadAs. Escalation only if the attached MI out-privileges the caller."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to VM {vm.name} it can run code on, then mint {userMI.name}'s token from IMDS, executing as {userMI.name}."
+
+  # === Data-plane / exfil: snapshot export ==================================
+  - id: azure-vm-snapshot-export
+    emits: CanExfiltrate
+    match_effective_permission: {action: "Microsoft.Compute/snapshots/beginGetAccess/action", scope_type: "resource|resourceGroup|subscription"}
+    where: ["principal also has Microsoft.Compute/snapshots/write or /disks/beginGetAccess/action to create/export"]
+    emit:
+      source: "<principal>"
+      target: "<managed disk / snapshot>"
+      permissions: ["Microsoft.Compute/snapshots/beginGetAccess/action", "Microsoft.Compute/snapshots/write"]
+      note: "Snapshot a disk and generate a SAS download URL -> offline theft of OS/data disk incl. embedded secrets."
+      narrative: "{principal.name} can snapshot and export the disk of a VM (snapshots/beginGetAccess) and read its contents offline."
+
+  # === Network exposure =====================================================
+  - id: azure-vm-exposed-internet
+    emits: ExposedToInternet
+    description: "VM with a public IP and an NSG rule allowing an inbound port."
+    where:
+      - "VM NIC has an associated Microsoft.Network/publicIPAddresses"
+      - "effective NSG (subnet or NIC) allows inbound on the service port (e.g. 22/3389/app)"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<virtualMachine>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      false_positive_note: "Do not emit if the effective NSG denies the port or the VM has no public IP; a public IP alone without an allow rule is not exposure."
+      narrative: "{vm.name} is reachable from the internet on an open port (public IP + permissive NSG)."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: any action above covered by an applicable DENY
+# ASSIGNMENT (Azure Blueprint / Managed Application) or an explicit deny in a
+# custom role is emitted with state: BLOCKED and denied_by=<deny assignment>,
+# so the UI can explain why an otherwise-present execution path does not work.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization (raw config -> explicit edges). These belong in
+# /rules/explicit/azure/ but are noted here for completeness; they emit the
+# ExecutesAs / AttachedTo facts the derived rules above consume.
+# ---------------------------------------------------------------------------
+explicit_rules:
+  - id: azure-vm-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Microsoft.Compute/virtualMachines", field: "identity"}
+    where: ["identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned']"]
+    emit:
+      source: "<virtualMachine>"
+      target: "<each MI: system-assigned SP (principalId) and every userAssignedIdentities key>"
+      note: "System-assigned principalId is the VM's Entra SP; user-assigned keys are Microsoft.ManagedIdentity/userAssignedIdentities resource ids."
+      narrative: "{vm.name} runs as managed identity {mi.name}."
+
+  - id: azure-vm-mi-attached
+    emits: AttachedTo
+    source_config: {resource_type: "Microsoft.Compute/virtualMachines", field: "identity.userAssignedIdentities"}
+    emit:
+      source: "<user-assigned managed identity>"
+      target: "<virtualMachine>"
+      narrative: "User-assigned MI {mi.name} is attached to VM {vm.name}."
+
+  # === Secrets embedded in VM config (customData / extension protectedSettings) ===
+  # providers/azure/vm.md sec 8 & 21: osProfile.customData/cloud-init and extension
+  # protectedSettings frequently embed plaintext credentials. Emit ContainsSecret so
+  # the credential-exposure path is represented.
+  - id: azure-vm-customdata-secret
+    emits: ContainsSecret
+    source_config: {resource_type: "Microsoft.Compute/virtualMachines", field: "osProfile.customData"}
+    where: ["customData/cloud-init or an extension protectedSettings value pattern-matches credential material (password, key, token, connection string)"]
+    emit:
+      source: "<virtualMachine>"
+      target: "<embedded secret>"
+      note: "osProfile.customData (base64 cloud-init) and Microsoft.Compute/virtualMachines/extensions protectedSettings can carry plaintext secrets readable by anyone with virtualMachines/read (customData) or on-host access."
+      false_positive_note: "Only emit when the field actually contains credential-like material; empty/benign customData is not a secret."
+      narrative: "VM {vm.name} embeds a secret in osProfile.customData / extension protectedSettings."

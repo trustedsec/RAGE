@@ -1,0 +1,322 @@
+# GCP Workload Identity Federation (WIF) — Derived attack-path rules (Phase 14 — identity federation)
+# ===========================================================================
+# Emits ONLY common edge types from schema/edges.yaml. The trust config is
+# normalized to explicit edges in /rules/explicit/gcp-wif.yaml
+# (TrustsExternalIdentity + ExternalIdentityMapsTo + CredentialValidFor); these
+# derived rules combine those with the SA's IAM binding facts to produce the
+# CanFederateAs takeover, the CanEnterProject foothold, and the config-side
+# CanModifyTrust privesc.
+#
+# THE WIF ADAPTER CONTRACT (Phase 14): this is a per-service ADAPTER for the
+# provider-agnostic collapse in /rules/derived/federation-chains.yaml. It emits
+# the GCP-specific CanFederateAs (rule 1) and the trust-write privesc (rules 3/4),
+# and DEFERS the generic roll-ups to that linchpin file:
+#   * federation-chains  federate-then-enter-project   -> CanEnterProject foothold
+#       (rule 2 below is the GCP-named, dedup-safe restatement so the WIF
+#        narrative fires even before the generic rule runs — see its note)
+#   * federation-chains  federate-inherits-capabilities -> CanImpersonate(SA) +
+#       capability inheritance (traversal of the SA's outbound edges)
+#   * credential-chains  impersonate-is-escalation      -> CanEscalateTo
+#   * hierarchy-chains   enter-boundary-rollups         -> Controls if the SA is a
+#       project admin
+# CITE, DO NOT DUPLICATE those.
+#
+# CITE, DO NOT RE-DERIVE the Phase-2 SA primitives in
+# /rules/derived/gcp/identity-escalation.yaml:
+#   * gcp-sa-get-access-token      (iam.serviceAccounts.getAccessToken -> CanImpersonate):
+#       the STS-exchanged federated token calls THIS to obtain the SA's OAuth2 token.
+#       We do not re-derive SA impersonation; we produce the CanFederateAs that
+#       precedes it and let federation-chains roll up CanImpersonate.
+#   * gcp-sa-set-iam-policy         (iam.serviceAccounts.setIamPolicy -> CanModifyTrust):
+#       rule 4 is the WIF-specific case (add a workloadIdentityUser binding) — it
+#       shares the setIamPolicy permission but is scoped to the WIF trust write;
+#       dedupe on (CanModifyTrust, principal, SA).
+#   * gcp-workload-identity-federation: the Phase-2 stub that first emitted
+#       CanFederateAs from a WIF attribute mapping. THIS file supersedes it with the
+#       normalized-trust-pair form (federation-chains' contract) and typed refs;
+#       dedupe on (CanFederateAs, ext, SA).
+#
+# THE MECHANISM (grounded in cloud.google.com/iam/docs/workload-identity-federation):
+#   external OIDC/SAML/AWS token
+#     -> sts.googleapis.com token-exchange (grant_type=token-exchange)
+#     -> federated access token for the principal:// / principalSet:// member
+#     -> iamcredentials generateAccessToken / iam.serviceAccounts.getAccessToken
+#     -> impersonated SA's OAuth2 access token -> SA's project roles.
+#   No iam.serviceAccountKeys.create (no static key) is involved.
+#
+# STATE default per federation-chains: the trust_condition gate decides.
+#   BROAD/UNPINNED (principalSet:// on an attribute only, or /subject/* or
+#   /* — any workload from the issuer matches): ACTIVE.
+#   PINNED to a specific google.subject / repo:ref the attacker cannot present:
+#   CONDITIONAL(trust_condition). Disabled/deleted provider: BLOCKED (no trust emitted).
+# ===========================================================================
+
+provider: gcp
+phase: 14-identity-federation
+applies_to: [gcp]
+
+rules:
+
+  # --- 1) Realized WIF mapping -> federate into the ServiceAccount -----------
+  # THE takeover. An external subject accepted by the pool provider (issuer +
+  # audience + attribute condition) AND resolved to a concrete SA by a
+  # roles/iam.workloadIdentityUser principalSet:// binding can obtain the SA's
+  # token via the STS exchange with no static credential. This is the GCP
+  # realization of federation-chains' federation-maps-to-identity; it fires
+  # here (typed, GCP-specific narrative) and dedupes with that generic rule on
+  # (CanFederateAs, ?ext, ?sa).
+  - id: gcp-wif-federate-into-sa
+    emits: CanFederateAs
+    description: "An external identity the WIF provider accepts and a workloadIdentityUser binding resolves can federate into the impersonated ServiceAccount."
+    applies_to: [gcp]
+    match:
+      - [ ?ext, ExternalIdentityMapsTo, ?sa ]
+    where:
+      - "node_type(?ext) in [ExternalIdentity, FederatedIdentity]"
+      - "node_type(?sa) == ServiceAccount"
+      # the backing provider trust: the SA (or pool provider) accepts ?ext under
+      # a pinned issuer, allowedAudiences, and attributeCondition.
+      - "exists TrustsExternalIdentity(?anchor -> ?ext) backing this mapping, with the WIF condition C (issuer/audience/attribute-condition/subject-pin) recorded on the edge"
+      # the mapping is realized by a roles/iam.workloadIdentityUser binding whose
+      # principalSet://.../attribute.<x>/<v> or principal://.../subject/<s> member
+      # ?ext satisfies.
+    optional:
+      # BROAD/UNPINNED breadth: the workloadIdentityUser member is attribute-only
+      # (principalSet://.../attribute.aud/<v>, .../attribute.repository/*, or
+      # .../subject/*) OR the attributeCondition/allowedAudiences do not pin the
+      # subject -> any workload from the issuer matches. Present => ACTIVE.
+      - [ ?ext, TrustsExternalIdentity, ?sa ]   # placeholder: attacker_controllable(?ext)==true (unpinned subject)
+    emit:
+      source_type: FederatedIdentity
+      target_type: ServiceAccount
+      source: ?ext
+      target: ?sa
+      permissions: ["roles/iam.workloadIdentityUser", "iam.serviceAccounts.getAccessToken", "sts.googleapis.com token-exchange"]
+      conditions: [trust_relationship, condition_expression, trust_condition]
+      state_logic: >-
+        if the WIF trust is BROAD/UNPINNED so an attacker can present a matching
+        external identity RIGHT NOW (workloadIdentityUser principalSet:// scoped to
+        an attribute only / .../subject/* / .../* ; OR attributeCondition absent/broad;
+        OR allowedAudiences accepts an attacker-mintable aud) OR the attacker
+        demonstrably controls a matching ?ext (a repo/project/pod under the pinned
+        issuer): ACTIVE. If the binding pins a specific google.subject / repo:ref /
+        attribute value the attacker does NOT control: CONDITIONAL(trust_condition)
+        — realizable only once the attacker obtains a matching external identity
+        (e.g. runs a workflow on that repo/ref). BLOCKED if the provider/pool is
+        DISABLED/DELETED or an IAM deny policy denies getAccessToken at the SA scope
+        (in which case the explicit trust is not emitted / emitted BLOCKED).
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?ext ExternalIdentityMapsTo ?sa", "?anchor TrustsExternalIdentity ?ext (backing WIF provider trust, condition C)" ]
+      false_positive_note: >-
+        The whole judgment is the WIF trust CONDITION. UNPINNED => ACTIVE: a
+        roles/iam.workloadIdentityUser binding on principalSet://.../attribute.aud/<v>,
+        .../attribute.repository/* or .../subject/* (any workload from the issuer),
+        or a provider with no/broad attributeCondition. PINNED => CONDITIONAL: the
+        member is principal://.../subject/<exact> or
+        principalSet://.../attribute.repository/<org>/<repo> WITH an
+        attributeCondition on the ref the attacker cannot present. Empty
+        allowedAudiences is NOT a wildcard — it still requires aud == the provider
+        resource URL (a pin); do not treat it as broad. Requires BOTH the provider
+        to accept ?ext AND an SA to carry the workloadIdentityUser binding — a broad
+        provider with no such binding yields NO federation. A DISABLED/DELETED pool
+        or provider, or a deny policy on getAccessToken, => no ACTIVE edge. Do NOT
+        treat the mere existence of WIF as compromise — a correctly pinned trust is
+        a legitimate control. Dedupe with federation-chains federation-maps-to-identity
+        and Phase-2 gcp-workload-identity-federation on (CanFederateAs, ?ext, ?sa).
+      narrative: >-
+        {ext.name} is accepted by the workload identity pool provider {anchor.name}
+        (issuer/audience/attribute condition) and resolved to {sa.name} by a
+        roles/iam.workloadIdentityUser binding; because that binding's condition is
+        {trust_condition_summary}, an identity the attacker controls satisfies it and
+        federates in as {sa.name} via the STS token exchange — obtaining the SA's
+        access token with no static key.
+
+  # --- 2) Federating into an SA homed in a project = foothold ---------------
+  # GCP-named restatement of federation-chains' federate-then-enter-project so the
+  # WIF-specific narrative fires. Dedup-safe on (CanEnterProject, ?ext, project).
+  # Generic roll-up already exists there and in hierarchy-chains — this exists for
+  # explainability and to fire early in the fixpoint. Inherits the federation state.
+  - id: gcp-wif-enter-project
+    emits: CanEnterProject
+    description: "Federating into a WIF-impersonated ServiceAccount gives the external principal a foothold in the SA's home project."
+    applies_to: [gcp]
+    match:
+      - [ ?ext, CanFederateAs, ?sa ]
+    where:
+      - "node_type(?sa) == ServiceAccount"
+      - "node_class(?ext) in [Identity]  # ExternalIdentity/FederatedIdentity are Identity subtypes"
+      - "node_type(home_boundary(?sa)) == Project"
+      - "home_boundary(?sa) is a project the external principal is not already in"
+    emit:
+      source_type: Identity
+      target_type: Project
+      source: ?ext
+      target: "home_boundary(?sa)  (Project)"
+      permissions: ["roles/iam.workloadIdentityUser", "iam.serviceAccounts.getAccessToken"]
+      conditions: [trust_condition]
+      state_logic: >-
+        inherit from the CanFederateAs input: ACTIVE only when the federation is
+        ACTIVE (broad/unpinned WIF binding the attacker satisfies);
+        CONDITIONAL(trust_condition) when the federation is CONDITIONAL (subject-pinned);
+        BLOCKED if the federation is BLOCKED. The foothold is exactly as strong as the
+        takeover that produces it.
+      confidence: "min(contributing_confidences)"
+      derived_from: [ "?ext CanFederateAs ?sa", "home_boundary(?sa) == Project" ]
+      false_positive_note: >-
+        The foothold is entry AS ?sa — it grants whatever the SA can do in the project,
+        NOT the project's full privilege (Controls only if the SA is itself a project
+        admin; that upgrade is hierarchy-chains enter-boundary-rollups, not here).
+        Dedupes with federation-chains federate-then-enter-project on
+        (CanEnterProject, ?ext, project) — do not double-count weight. Never upgrade a
+        CONDITIONAL federation to an ACTIVE foothold. Do not emit if the SA is homed in
+        a project the principal already controls (no boundary crossed).
+      narrative: >-
+        {ext.name} can federate in as {sa.name}, which is homed in project
+        {project.name}; the WIF takeover therefore lands the attacker inside
+        {project.name}, operating with {sa.name}'s roles.
+
+  # --- 3) Config-side: create/loosen the pool provider trust ----------------
+  # The attacker does not need the trust to already be weak — it MAKES it weak.
+  # iam.workloadIdentityPoolProviders.create/.update (and .pools.create/.update)
+  # let a principal add a provider for an attacker-controlled IdP, or loosen the
+  # issuer/allowedAudiences/attributeCondition of an existing one, so an identity
+  # it controls becomes acceptable. Emits CanModifyTrust(Identity -> pool provider).
+  - id: gcp-wif-modify-trust-provider
+    emits: CanModifyTrust
+    description: "Creating or updating a WIF pool provider lets a principal add/loosen the trust to an attacker-controlled external IdP."
+    applies_to: [gcp]
+    match:
+      - [ ?principal, CanControl, ?pool ]   # or an effective-permission match below
+    where:
+      - "?principal has EFFECTIVE iam.workloadIdentityPoolProviders.update OR .create (or iam.workloadIdentityPools.update/.create) on ?pool / its project"
+      # The pool provider config IS the trust policy for the federation; class it as
+      # TrustPolicy for THIS CanModifyTrust emit (CanModifyTrust.target set is
+      # [Role, TrustPolicy, ServiceAccount, MachineIdentity]). The same node is a
+      # FederatedIdentity namespace elsewhere; here it carries the issuer/audience/
+      # attribute-condition trust rules the principal can rewrite.
+      - "node_type(?pool) == TrustPolicy  # Workload Identity Pool provider trust config"
+    emit:
+      source_type: Identity
+      target_type: TrustPolicy
+      source: ?principal
+      target: ?pool
+      permissions: ["iam.workloadIdentityPoolProviders.create", "iam.workloadIdentityPoolProviders.update", "iam.workloadIdentityPools.create", "iam.workloadIdentityPools.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE for the trust-write capability when the principal has the effective
+        create/update permission at the pool/project scope and no deny policy denies it.
+        Note this is the CONFIG-side capability: it becomes a federation only once the
+        principal (or an IdP it controls) presents a matching token AND an SA carries a
+        workloadIdentityUser binding for the (now-loosened) provider — chain via
+        rule 1. BLOCKED if an IAM deny policy or org policy (e.g.
+        iam.workloadIdentityPoolProviders allowed-issuer constraint) denies the write.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "?principal effective iam.workloadIdentityPoolProviders.update/.create on ?pool" ]
+      false_positive_note: >-
+        This is a config-side PRIVESC PRIMITIVE, not a realized takeover by itself:
+        adding/loosening a provider only yields access when combined with an SA
+        workloadIdentityUser binding an attacker-controlled subject can satisfy
+        (rule 1). An org policy constraint restricting allowed issuers
+        (constraints/iam.workloadIdentityPoolProviders.allowedIssuers or an
+        allowedAudiences constraint) narrows or BLOCKS the loosening — honor it. Do not
+        emit ACTIVE if the principal only has read (.get/.list) on the pool.
+      narrative: >-
+        {principal.name} can create or update the workload identity pool provider
+        {pool.name} (iam.workloadIdentityPoolProviders.create/.update) to trust an
+        attacker-controlled IdP or loosen its issuer/audience/attribute condition,
+        making an external identity it controls acceptable.
+
+  # --- 4) Config-side: add/loosen the workloadIdentityUser SA binding -------
+  # The other half of the config-side privesc: iam.serviceAccounts.setIamPolicy on
+  # the target SA lets a principal ADD a roles/iam.workloadIdentityUser binding for a
+  # principalSet:// member an attacker-controlled subject satisfies (or broaden an
+  # existing one). Emits CanModifyTrust(Identity -> ServiceAccount). Shares the
+  # setIamPolicy permission with Phase-2 gcp-sa-set-iam-policy but is the WIF-scoped
+  # trust-write; dedupe on (CanModifyTrust, ?principal, ?sa).
+  - id: gcp-wif-add-workload-user-binding
+    emits: CanModifyTrust
+    description: "setIamPolicy on a ServiceAccount lets a principal add/loosen the workloadIdentityUser binding that maps an external WIF subject to the SA."
+    applies_to: [gcp]
+    match:
+      - [ ?principal, CanModifyTrust, ?sa ]   # from Phase-2 gcp-sa-set-iam-policy (iam.serviceAccounts.setIamPolicy)
+    where:
+      - "node_type(?sa) == ServiceAccount"
+      - "?principal has EFFECTIVE iam.serviceAccounts.setIamPolicy on ?sa"
+      - "a WIF pool/provider exists whose principalSet:// members could be bound to ?sa"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: ?principal
+      target: ?sa
+      permissions: ["iam.serviceAccounts.setIamPolicy", "roles/iam.workloadIdentityUser"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE for the trust-write when the principal has effective
+        iam.serviceAccounts.setIamPolicy on ?sa and no deny policy denies it. Becomes a
+        realized federation only once a WIF provider accepts an attacker-controllable
+        subject the new/loosened principalSet:// binding resolves — chain via rule 1.
+        BLOCKED if an IAM deny policy denies setIamPolicy at the SA scope.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "?principal CanModifyTrust ?sa (Phase-2 gcp-sa-set-iam-policy, iam.serviceAccounts.setIamPolicy)" ]
+      false_positive_note: >-
+        Config-side primitive only — adding a workloadIdentityUser binding yields
+        federation only if a pool provider will ALSO accept a subject the attacker
+        controls (rule 1 / rule 3). This CanModifyTrust reuses the same
+        iam.serviceAccounts.setIamPolicy permission as Phase-2 gcp-sa-set-iam-policy
+        (which already emits CanModifyTrust for the SA-token-creator self-grant case);
+        dedupe on (CanModifyTrust, ?principal, ?sa) and do not double-count weight. This
+        rule exists to make the WIF-binding-write intent explicit in the narrative.
+      narrative: >-
+        {principal.name} can set the IAM policy of {sa.name}
+        (iam.serviceAccounts.setIamPolicy) and add or broaden a
+        roles/iam.workloadIdentityUser binding for a principalSet:// member an
+        attacker-controlled external subject satisfies — wiring WIF impersonation of
+        {sa.name}.
+
+# ===========================================================================
+# WORKED EXAMPLES
+#
+# UNPINNED GITHUB-ACTIONS WIF (rule 1 -> 2):
+#   provider issuer = https://token.actions.githubusercontent.com,
+#   attributeMapping: google.subject = assertion.sub, attribute.repository = assertion.repository,
+#   NO attributeCondition; SA deployer-sa has
+#     roles/iam.workloadIdentityUser on principalSet://.../attribute.repository/*   (ANY repo)
+#   normalized:
+#     [gha-ext(ExternalIdentity) ExternalIdentityMapsTo deployer-sa(ServiceAccount)]
+#     backed by [deployer-sa TrustsExternalIdentity gha-ext], condition: issuer only, subject unpinned
+#       => gcp-wif-federate-into-sa: [gha-ext CanFederateAs deployer-sa] ACTIVE
+#          (any GitHub repo's workflow token matches)
+#   + home_boundary(deployer-sa) = project prod-123
+#       => gcp-wif-enter-project: [gha-ext CanEnterProject prod-123] ACTIVE
+#   deployer-sa's own roles (traversal) => attacker acts as deployer-sa in prod-123
+#   (federation-chains federate-inherits-capabilities rolls up CanImpersonate;
+#    credential-chains impersonate-is-escalation rolls up CanEscalateTo — CITED).
+#
+# PINNED WIF (rule 1, stays CONDITIONAL):
+#   same provider, but the binding is
+#     principalSet://.../attribute.repository/my-org/app  AND attributeCondition
+#     assertion.ref == 'refs/heads/main'
+#       => gcp-wif-federate-into-sa: [gha-ext CanFederateAs deployer-sa]
+#          CONDITIONAL(trust_condition) — realizable only if the attacker can run a
+#          workflow on my-org/app@main (poisoned PR / fork pwn-request / branch write).
+#
+# CONFIG-SIDE PRIVESC (rule 3 / rule 4 -> rule 1):
+#   [p effective iam.workloadIdentityPoolProviders.update on pool-x]
+#       => gcp-wif-modify-trust-provider: [p CanModifyTrust pool-x] ACTIVE
+#   [p effective iam.serviceAccounts.setIamPolicy on target-sa]  (Phase-2 CanModifyTrust)
+#       => gcp-wif-add-workload-user-binding: [p CanModifyTrust target-sa] ACTIVE
+#   p loosens the provider to its own OIDC issuer + adds a broad workloadIdentityUser
+#   binding => a subject p controls now satisfies rule 1 => CanFederateAs ACTIVE.
+#
+# BLOCKED-edge guidance:
+#  - A DISABLED/DELETED pool or provider => explicit adapter emits no trust => rules
+#    do not fire.
+#  - An IAM deny policy denying iam.serviceAccounts.getAccessToken at the SA scope, or
+#    denying iam.workloadIdentityPool(Providers).update/.create, => emit BLOCKED with
+#    denied_by=<deny policy>.
+#  - An org policy constraint restricting allowed WIF issuers/audiences => loosening is
+#    narrowed or BLOCKED (rule 3).
+#  - A correctly PINNED subject (specific google.subject / repo:ref the attacker cannot
+#    present) => CONDITIONAL(trust_condition), never ACTIVE.
+#  - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ===========================================================================

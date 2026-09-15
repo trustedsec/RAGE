@@ -1,0 +1,240 @@
+# GCP Cloud Firestore / Cloud Datastore — Explicit normalization rules
+# (Phase 6 — Storage & Databases)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:firestore. Emits ONLY raw-record-matched edges from schema/edges.yaml.
+# Rules in this file match raw Firestore API records (not derived graph edges).
+# All edges emitted here have nature: explicit (or both for CrossProjectTrust, which
+# can also be derived from CanGrantPermission chains).
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 6-storage-databases
+service: firestore
+applies_to: [gcp]
+
+rules:
+
+  # =====================================================================
+  # SECTION 1 — CROSS-BOUNDARY TRUST (explicit from IAM policy)
+  # =====================================================================
+
+  # --- CrossProjectTrust: cross-project member in Firestore IAM binding ----
+  - id: gcp-firestore-explicit-cross-project-trust
+    emits: CrossProjectTrust
+    description: "A Firestore database IAM binding granting any role to a principal in a different GCP project is a cross-project trust on the database's data."
+    match_record:
+      api: "firestore.projects.databases.getIamPolicy"
+      resource_type: "google.firestore.Database"
+      field: "iamPolicy.bindings[].members"
+    where:
+      - "a member (serviceAccount / user / group) belongs to a different GCP project than the database"
+    emit:
+      source_type: Project
+      target_type: Project
+      source: "<database's project>"
+      target: "<foreign project the member belongs to>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the cross-project binding is present in the effective IAM policy
+        at the project or database scope; CONDITIONAL(resource_policy) when the
+        foreign principal's own IAM cannot be confirmed.
+      confidence: "0.94"
+      derived_from: ["google.firestore.Database iamPolicy.bindings[].members (cross-project principal)"]
+      false_positive_note: >-
+        A cross-project SA bound to roles/datastore.viewer means a principal from
+        project B can read documents in project A's Firestore database — a deliberate
+        but potentially over-broad trust. The SA must also be usable by an attacker
+        (hold iam.serviceAccounts.actAs or be compromised independently). GCP-managed
+        service agents (service-PROJECT_NUMBER@gcp-sa-*.iam) are expected and should
+        be de-prioritized. Flag only when the member is a non-service-agent SA,
+        human user, or external domain in a different project. Firestore project-level
+        IAM bindings cover ALL databases in the project; database-level bindings
+        are scoped to a single database. Note whether the binding is project-level
+        or database-level.
+      narrative: >-
+        Firestore database {database.name} (project {projectA.name}) grants data access
+        to a principal in project {projectB.name} via an IAM binding; {projectB.name}
+        can read/write Firestore documents without holding IAM bindings independently
+        in project {projectA.name}.
+
+  # =====================================================================
+  # SECTION 2 — DATA CONTAINS SECRETS (explicit from collection names)
+  # =====================================================================
+
+  # --- ContainsSecret: Firestore collection/kind name heuristics -----------
+  - id: gcp-firestore-explicit-contains-secret
+    emits: ContainsSecret
+    description: "A Firestore database contains collections or document field names whose names indicate credential material (API keys, SA keys, OAuth tokens, database passwords)."
+    match_record:
+      api: "firestore.projects.databases.get + datastore.namespaces.list"
+      resource_type: "google.firestore.Database"
+      field: "collectionGroup.collectionId | kind.name"
+    where:
+      - "collection or kind name matches a credential-indicator pattern: e.g. 'apiKeys', 'serviceAccountKeys', 'secrets', 'credentials', 'tokens', 'oauthTokens', 'passwords', 'privateKeys', 'accessKeys'"
+      - "OR database/collection labels or annotations explicitly classify content as credential storage"
+    emit:
+      source_type: Data
+      target_type: Secret
+      source: "<Firestore Database / NoSQLDatabase node>"
+      target: "<Secret node (heuristic classification from collection name)>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when collection/kind name pattern match is strong (e.g. exact names
+        'apiKeys', 'serviceAccountKeys', 'secrets', 'credentials');
+        POTENTIAL when the match is weak (generic name like 'config', 'settings',
+        'data' that may or may not contain secrets). Confidence:
+        0.60 for weak name-only match; 0.80 for strong name match (exact credential-
+        indicator term); 0.90 when collection name + database labels corroborate.
+      confidence: "0.70 (heuristic — raise to 0.85 when collection name exactly matches a credential-indicator term)"
+      derived_from: ["google.firestore.Database collectionGroup.collectionId or kind.name heuristic classification"]
+      false_positive_note: >-
+        HEURISTIC assertion — NEVER read document content to confirm. A collection
+        named 'users' does NOT indicate credentials; a collection named 'apiKeys' or
+        'serviceAccountKeys' very likely does. Emit with POTENTIAL state for weak
+        matches; ACTIVE for strong matches where the collection name is explicitly a
+        credential-indicator term. Do NOT emit CanReadSecret directly from this rule —
+        only ContainsSecret. The credential-chains linchpin (read-secret-yields-identity)
+        then chains ContainsSecret + CanReadData -> CredentialsFor -> CanImpersonate.
+        ALWAYS cite credential-chains in derived_from for the roll-up. Firestore
+        collection names visible via datastore.namespaces.list / indexes.list without
+        datastore.entities.get — collector can enumerate collection structure without
+        reading documents.
+      narrative: >-
+        Firestore database {database.name} contains a collection whose name indicates
+        credential material (e.g. 'apiKeys', 'serviceAccountKeys', 'credentials');
+        a principal with datastore.entities.get can read these documents and potentially
+        obtain credentials for another identity. See credential-chains.yaml for the
+        roll-up to CanImpersonate.
+
+  # =====================================================================
+  # SECTION 3 — PUBLIC EXPOSURE (IAM surface — allUsers/allAuthenticatedUsers)
+  # =====================================================================
+
+  # --- ExposedToInternet: IAM binding to allUsers principal ----------------
+  - id: gcp-firestore-iam-allusers-public
+    emits: ExposedToInternet
+    description: "An IAM binding on a Firestore database naming 'allUsers' as a principal allows unauthenticated access to the database via the Cloud IAM / Admin SDK surface."
+    match_record:
+      api: "firestore.projects.databases.getIamPolicy"
+      resource_type: "google.firestore.Database"
+      field: "iamPolicy.bindings[].members"
+    where:
+      - "an IAM binding member is 'allUsers' (literal string or principal:allUsers)"
+    emit:
+      source_type: Data
+      target_type: AnonymousIdentity
+      source: "<Firestore Database / NoSQLDatabase node>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the IAM binding explicitly names 'allUsers' and the binding grants
+        a role that includes datastore read/write permissions (e.g. roles/datastore.viewer,
+        roles/datastore.editor, roles/datastore.owner). The Firestore API endpoint
+        (firestore.googleapis.com) is publicly reachable; any internet user with the
+        GCP project ID can call Admin SDK methods. VPC-SC perimeter including Firestore
+        may block external callers -> BLOCKED(resource_policy).
+      confidence: "0.95"
+      derived_from: ["google.firestore.Database iamPolicy.bindings[] naming allUsers"]
+      false_positive_note: >-
+        This is RARE for Firestore and EXTREMELY unusual. allUsers binding on a Firestore
+        database grants unauthenticated data access to any internet user. Do NOT confuse
+        with Firebase Security Rules (which govern the Firebase client SDK, not IAM).
+        IAM allUsers bindings on Firestore databases are almost always misconfigurations.
+        VPC-SC can mitigate if the perimeter includes firestore.googleapis.com and the
+        caller is outside the perimeter -> emit CONDITIONAL(resource_policy) if VPC-SC
+        may apply. Org policy constraints denying IAM mutations may prevent this
+        binding from being added.
+      narrative: >-
+        Firestore database {database.name} has an IAM binding granting access to 'allUsers',
+        meaning any unauthenticated internet user can access it via the Admin SDK. This
+        is a critical misconfiguration; any internet client with the project ID and
+        database name can read/write all documents (if the role includes datastore.entities.*).
+
+  # --- ExposedToTenant: IAM binding to allAuthenticatedUsers principal -----
+  - id: gcp-firestore-iam-allauthenticated-public
+    emits: ExposedToTenant
+    description: "An IAM binding on a Firestore database naming 'allAuthenticatedUsers' allows access to any GCP-authenticated user, exposing data tenant-wide."
+    match_record:
+      api: "firestore.projects.databases.getIamPolicy"
+      resource_type: "google.firestore.Database"
+      field: "iamPolicy.bindings[].members"
+    where:
+      - "an IAM binding member is 'allAuthenticatedUsers' (literal string or principal:allAuthenticatedUsers)"
+    emit:
+      source_type: Data
+      target_type: Organization
+      source: "<Firestore Database / NoSQLDatabase node>"
+      target: "<GCP Organization node>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the IAM binding explicitly names 'allAuthenticatedUsers' and grants
+        a role including datastore read/write permissions. Any GCP-authenticated user
+        (including users in other projects/organizations with a Google account) can
+        access the database. VPC-SC perimeter may block external callers -> CONDITIONAL.
+      confidence: "0.92"
+      derived_from: ["google.firestore.Database iamPolicy.bindings[] naming allAuthenticatedUsers"]
+      false_positive_note: >-
+        allAuthenticatedUsers is broader than organization scope — it includes any user
+        with a Google account (Gmail, corporate Google Workspace, external federation).
+        Intended for truly public services, not organizational data. VPC-SC and org
+        policy constraints may mitigate. This is distinct from Firebase Security Rules
+        (which can also expose via 'allUsers' / 'allAuthenticatedUsers' but only via
+        the client SDK, not Admin SDK).
+      narrative: >-
+        Firestore database {database.name} has an IAM binding granting access to 'allAuthenticatedUsers',
+        meaning any GCP-authenticated user can access it. This exposes the database to
+        a broad set of internet principals outside the organization.
+
+  # =====================================================================
+  # SECTION 4 — POLICY INFORMATION (HasPolicy edge — Identity/Identity source)
+  # =====================================================================
+
+  # --- HasPolicy: database has an IAM policy ---------------------------------
+  - id: gcp-firestore-explicit-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record:
+      api: "firestore.projects.databases.getIamPolicy"
+      resource_type: "google.firestore.Database"
+      field: "bindings"
+    where:
+      - "iamPolicy.bindings is present (non-empty)"
+    emit:
+      source_type: Data
+      target_type: Policy
+      source: "<Firestore Database node>"
+      target: "<database ResourcePolicy node>"
+      api_source: "firestore.projects.databases.getIamPolicy"
+      evidence_field: "iamPolicy.bindings"
+      narrative: "{database.name} has an IAM allow policy governing who may access its documents."
+
+  # =====================================================================
+  # SECTION 5 — EVIDENCE: CMEK KEY REFERENCE
+  # =====================================================================
+
+  # --- Evidence: CMEK key reference on database ----------------------------
+  - id: gcp-firestore-explicit-cmek-ref
+    emits: null
+    kind: evidence
+    applies_to: [gcp]
+    match_record:
+      api: "firestore.projects.databases.get"
+      resource_type: "google.firestore.Database"
+      field: "cmekConfig.kmsKeyName"
+    where:
+      - "cmekConfig.kmsKeyName is set (database is CMEK-encrypted)"
+    record:
+      on_node: "<Firestore Database node>"
+      field: "cmek_key"
+      value: "<Cloud KMS CryptoKey referenced by cmekConfig.kmsKeyName>"
+      api_source: "firestore.projects.databases.get"
+      evidence_field: "cmekConfig.kmsKeyName"
+      note: >-
+        Evidence for gcp-firestore-read-data-cmek: the key_permission gate is on
+        the Firestore Service Agent (service-PROJECT_NUMBER@gcp-sa-firestore.iam.gserviceaccount.com),
+        NOT the accessing principal. No graph edge is emitted from the Database to
+        the key; the reference is recorded as evidence on the Database node.

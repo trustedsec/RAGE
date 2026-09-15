@@ -1,0 +1,862 @@
+# AWS EventBridge — Derived attack-path rules (Phase 10 — messaging / event systems)
+# ---------------------------------------------------------------------------
+# Service facts: EventBridge custom event buses, rules, and Scheduler schedules
+# are the Phase-10 canonical AWS event-routing fabric.
+#
+# PHASE-10 PRIMITIVES THIS FILE EMITS:
+#   CanWriteData(p, bus)    — events:PutEvents on a custom bus (publish fact)
+#   CanTrigger(bus, rule)   — structural: events matching a rule's pattern flow
+#                             through the bus into the rule
+#   CanTrigger(rule, cmp)   — a rule's targets are invoked when it fires
+#   CanSchedule(p, rule)    — events:PutRule + events:PutTargets (rule persistence)
+#   CanSchedule(p, sched)   — scheduler:CreateSchedule (schedule persistence)
+#   ExecutesAs(rule, role)  — rule invocation role assumed by events.amazonaws.com
+#   ExecutesAs(sched, role) — schedule execution role assumed by scheduler.amazonaws.com
+#   CrossAccountTrust       — bus policy grants cross-account events:PutEvents
+#   CanReadSecret           — events:RetrieveConnectionCredentials on a Connection
+#
+# WHAT THIS FILE DOES NOT DUPLICATE:
+#   * CanExecuteAs derivations (trigger + ExecutesAs roll-up) — owned by
+#     messaging-chains.yaml (rules 1 + 2: messaging-publish-triggers-consumer,
+#     messaging-trigger-executes-as) and can-execute-as.yaml. This file emits the
+#     FACTS those linchpins consume.
+#   * CanExecuteAs from CanSchedule + CanPassIdentity — owned by
+#     messaging-chains.yaml rule 3 (messaging-schedule-persists-executes-as).
+#     This file emits CanSchedule + CanPassIdentity FACTS.
+#   * CrossAccountTrust → CanEnterAccount — owned by can-control.yaml
+#     (enter-account-via-assume). This file emits CrossAccountTrust FACTS.
+#   * CanReadSecret → CanImpersonate / CredentialsFor chains — owned by
+#     credential-chains.yaml. This file emits CanReadSecret + ContainsCredential.
+#   * CanEscalateTo / Controls terminal edges — owned by can-control.yaml.
+#
+# Lambda event source mappings are covered by /rules/explicit/aws-lambda.yaml
+# (aws-lambda-event-source-trigger). Those ESM-based CanTrigger(queue -> Lambda)
+# edges are separate from EventBridge rule-based triggers.
+#
+# GOLD-STANDARD FORMAT: /rules/derived/aws/lambda.yaml
+# Permissions: AWS Service Authorization Reference — EventBridge + Scheduler
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 10-messaging
+applies_to: [aws]
+
+rules:
+
+  # --- 1) Publish to a custom event bus (CanWriteData) ---------------------------
+  # events:PutEvents on a custom bus = the Phase-10 "publish" fact. Adapter emits
+  # this when the effective IAM/resource-policy evaluation grants events:PutEvents
+  # on the bus ARN. The default bus accepts only same-account AWS-service events
+  # (cannot be forged by an arbitrary IAM principal for service sources); model
+  # events:PutEvents on the DEFAULT bus as CanWriteData ONLY for custom-source events
+  # (source not starting with "aws.").  Custom event buses accept this freely when
+  # the bus policy allows. Feeds messaging-chains rule 1.
+  - id: aws-eb-putevent-canwritedata
+    emits: CanWriteData
+    description: "events:PutEvents on a custom event bus lets a principal inject events that can match rules and trigger compute consumers."
+    match:
+      - [ ?principal, HasPermission, ?bus ]
+    where:
+      - "node_type(?bus) == EventBus"
+      - "effective_action(?principal, ?bus) includes 'events:PutEvents'"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: ?principal
+      target: ?bus
+      permissions: ["events:PutEvents"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when events:PutEvents is granted by the caller's IAM policy AND not
+        denied by the bus resource policy, an SCP, or a permission boundary. For the
+        DEFAULT bus, CONDITIONAL(condition_expression): an attacker can inject custom-
+        source events but cannot spoof service-reserved sources (source starting with
+        "aws."); rules pattern-matching only aws.* sources are unreachable for a human
+        caller. BLOCKED by an SCP or deny statement that prevents events:PutEvents.
+      confidence: 0.95
+      derived_from: ["effective IAM evaluation: events:PutEvents on ?bus"]
+      false_positive_note: >-
+        For the DEFAULT bus, a caller with events:PutEvents can only inject events with
+        non-aws.* sources; rules that match only aws.* source events (e.g., source:
+        aws.ec2) cannot be triggered by an arbitrary IAM principal — downgrade those
+        rule-target paths to BLOCKED or CONDITIONAL(condition_expression). For a CUSTOM
+        bus the restriction does not apply unless the bus policy conditions further
+        constrain the source field. Always check that the IAM policy grant is not offset
+        by a resource-policy explicit Deny or SCP.
+      narrative: >-
+        {principal.name} can publish events to {bus.name} (events:PutEvents); a crafted
+        event matching an enabled rule's pattern triggers the rule's targets with an
+        attacker-influenced payload.
+
+
+  # --- 3) Rule → target CanTrigger (rule fires → compute runs) ------------------
+  # Each rule target is a compute resource or another bus that the rule invokes when
+  # it fires. Emitted per target from events:ListTargetsByRule. The invocation role
+  # (RoleArn field on the target) is the identity the EventBridge service assumes to
+  # make the API call to the target — it is a separate ExecutesAs relationship.
+  - id: aws-eb-rule-triggers-target
+    emits: CanTrigger
+    description: "A firing EventBridge rule invokes its configured target (Lambda, Step Functions, ECS, SQS, another bus, etc.) with the event payload."
+    match:
+      - [ ?rule, HasPolicy, ?target_binding ]
+    where:
+      - "node_type(?rule) == EventRule"
+      - "?target_binding references a target ARN (?compute or ?downstream_bus)"
+      - "node_class(?compute) == Compute or node_type(?compute) in [EventBus, Queue, Topic, Workflow]"
+    emit:
+      source_type: Messaging
+      target_type: Compute
+      source: ?rule
+      target: ?compute
+      permissions: []
+      conditions: [service_state, resource_policy]
+      state_logic: >-
+        ACTIVE when the rule is ENABLED and the target is reachable (resource policy or
+        invocation role permits the target API call — for Lambda, the function resource
+        policy grants events.amazonaws.com lambda:InvokeFunction; for SQS/Step Functions/
+        ECS the rule invocation role is present and has the required action). CONDITIONAL
+        (resource_policy) when the target's resource policy or invocation role permissions
+        are unknown. CONDITIONAL(service_state) when the rule is DISABLED.
+      confidence: 0.95
+      derived_from: ["events:ListTargetsByRule → Targets[*].Arn", "events:DescribeRule → State"]
+      false_positive_note: >-
+        For Lambda targets: EventBridge invokes Lambda via the function's resource-based
+        policy (grantee: events.amazonaws.com), NOT via the rule's RoleArn — do NOT
+        propagate the rule's invocation role as the Lambda execution identity. Lambda's own
+        execution role is the ExecutesAs on the Lambda node. For targets requiring a
+        RoleArn (SQS, Step Functions, ECS, Kinesis, Firehose), the rule invocation role
+        IS the caller identity — model ExecutesAs(rule, invocation_role) separately.
+        A rule with multiple targets emits one CanTrigger per target. A dead-letter queue
+        or error destination is NOT a primary trigger target; skip it for CanTrigger.
+      narrative: >-
+        When {rule.name} fires, it invokes {compute.name} (via the EventBridge service
+        using the rule's invocation role or the target's resource policy), delivering the
+        matching event payload as attacker-influenced input.
+
+  # --- 4) Rule invocation role (ExecutesAs on the rule node) --------------------
+  # An EventBridge rule's RoleArn is the IAM role that events.amazonaws.com assumes to
+  # call targets requiring caller identity (SQS SendMessage, Step Functions
+  # StartExecution, ECS RunTask, Kinesis PutRecord, etc.). This ExecutesAs allows
+  # messaging-chains rule 2 to roll up CanTrigger(p, rule) + ExecutesAs(rule, role) =>
+  # CanExecuteAs(p, role) — the attacker triggers the rule, the rule runs as the role.
+  # Note: Lambda targets do NOT use the rule's RoleArn; skip ExecutesAs for Lambda-only
+  # rule targets and rely on Lambda's own ExecutesAs.
+  - id: aws-eb-rule-executes-as
+    emits: ExecutesAs
+    description: "An EventBridge rule assumes its invocation RoleArn (via events.amazonaws.com) to call targets that require IAM authorization; code running as that rule effectively runs as the invocation role."
+    match:
+      - [ ?rule_record, HasProperty, "RoleArn" ]
+    where:
+      - "node_type(?rule_record) == EventRule"
+      - "?rule_record.RoleArn is set (non-empty)"
+      - "?role is the IAM role at ?rule_record.RoleArn"
+    emit:
+      source_type: Messaging
+      target_type: Role
+      source: ?rule_record
+      target: ?role
+      permissions: []
+      conditions: [trust_relationship]
+      state_logic: >-
+        ACTIVE when the role trust policy allows events.amazonaws.com to assume it and the
+        role is not deleted/disabled. CONDITIONAL(trust_relationship) when the trust cannot
+        be confirmed. BLOCKED when the role does not trust events.amazonaws.com or an SCP
+        denies sts:AssumeRole for the service principal.
+      confidence: 0.95
+      derived_from: ["events:DescribeRule → RoleArn"]
+      false_positive_note: >-
+        Only emit when the rule actually HAS a RoleArn (most rules targeting Lambda do not
+        include a RoleArn; Lambda is invoked via the function resource policy not this role).
+        The invocation role is assumed by the EventBridge SERVICE, not by the attacker
+        directly — the escalation path is CanTrigger(attacker, rule) + this ExecutesAs,
+        which messaging-chains rule 2 collapses into CanExecuteAs. Do not conflate this
+        role with the execution roles of individual Lambda/ECS targets.
+      narrative: >-
+        {rule.name} assumes the IAM invocation role {role.name} (via events.amazonaws.com)
+        to call its targets; any principal that can trigger {rule.name} effectively executes
+        API calls as {role.name}.
+
+  # --- 5) Scheduler schedule execution role (ExecutesAs on the schedule node) ---
+  # An EventBridge Scheduler schedule holds a Target.RoleArn that scheduler.amazonaws.com
+  # assumes to invoke the schedule's target at each fire time. This is the Scheduler's
+  # ExecutesAs — structurally identical to a rule invocation role but for Scheduler.
+  # Feeds messaging-chains rule 2: CanTrigger(attacker, schedule) + ExecutesAs(sched, role)
+  # => CanExecuteAs(attacker, role). Also feeds rule 3 when combined with CanPassIdentity.
+  - id: aws-eb-scheduler-executes-as
+    emits: ExecutesAs
+    description: "An EventBridge Scheduler schedule assumes its Target.RoleArn (via scheduler.amazonaws.com) at each fire; anyone who can modify the schedule or the role effectively runs as that role on a cadence."
+    match:
+      - [ ?schedule_record, HasProperty, "Target.RoleArn" ]
+    where:
+      - "node_type(?schedule_record) == Scheduler"
+      - "?schedule_record.Target.RoleArn is set"
+      - "?role is the IAM role at ?schedule_record.Target.RoleArn"
+    emit:
+      source_type: Messaging
+      target_type: Role
+      source: ?schedule_record
+      target: ?role
+      permissions: []
+      conditions: [trust_relationship]
+      state_logic: >-
+        ACTIVE when the role trust policy allows scheduler.amazonaws.com to assume it and
+        the schedule is ENABLED. CONDITIONAL(service_state) when the schedule state is
+        DISABLED. CONDITIONAL(trust_relationship) when the trust policy is unknown.
+        BLOCKED when the role does not trust scheduler.amazonaws.com or an SCP denies
+        sts:AssumeRole for that principal.
+      confidence: 0.95
+      derived_from: ["scheduler:GetSchedule → Target.RoleArn, State"]
+      false_positive_note: >-
+        The execution role is assumed by the SCHEDULER SERVICE, not the attacker directly.
+        The attack path requires either (a) CanTrigger(attacker, schedule) + this
+        ExecutesAs => CanExecuteAs (via messaging-chains rule 2); or (b) CanSchedule +
+        CanPassIdentity => CanExecuteAs (via messaging-chains rule 3, persistence). A
+        schedule in DISABLED state contributes CONDITIONAL(service_state) to the chain, not
+        ACTIVE. Honor iam:PassedToService for scheduler.amazonaws.com when evaluating
+        CanPassIdentity; PassRole granted only for ec2/ecs does NOT yield this path.
+      narrative: >-
+        {schedule.name} assumes {role.name} (via scheduler.amazonaws.com) at each
+        scheduled fire; an attacker who can create or modify the schedule and pass the role
+        obtains persistent execution as {role.name}.
+
+  # --- 6) events:PutRule + events:PutTargets → CanSchedule on an EventRule ------
+  # An identity with BOTH events:PutRule AND events:PutTargets on a bus can create or
+  # modify a rule and set its targets and invocation role. This is the rule-creation
+  # persistence primitive: the attacker creates a rule that fires on a recurring or
+  # event-driven basis, picks a target, and (with iam:PassRole) picks the invocation
+  # role. Emitting CanSchedule(principal, EventRule) here feeds messaging-chains rule 3
+  # (scheduling-schedule-persists-executes-as) when combined with CanPassIdentity.
+  - id: aws-eb-putrule-canschedule
+    emits: CanSchedule
+    description: "events:PutRule + events:PutTargets on a bus lets a principal create/modify rules and set invocation targets and roles — a rule-based persistence and trigger creation primitive."
+    match:
+      - [ ?principal, HasPermission, ?bus ]
+    where:
+      - "node_type(?bus) == EventBus"
+      - "effective_action(?principal, ?bus) includes 'events:PutRule'"
+      - "effective_action(?principal, ?bus) includes 'events:PutTargets'"
+    emit:
+      source_type: Identity
+      target_type: EventRule
+      source: ?principal
+      target: "<EventRule created on ?bus>"
+      permissions: ["events:PutRule", "events:PutTargets"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when both events:PutRule and events:PutTargets are granted on the bus scope
+        and not denied by an SCP or permission boundary. BLOCKED when either action is
+        denied. The CanSchedule edge represents the CAPABILITY to create rules; the
+        resulting CanExecuteAs (via messaging-chains rule 3 + CanPassIdentity) is
+        CONDITIONAL(role_compatibility) unless iam:PassRole for events.amazonaws.com is
+        also confirmed.
+      confidence: 0.9
+      derived_from: ["effective IAM evaluation: events:PutRule + events:PutTargets on ?bus"]
+      false_positive_note: >-
+        events:PutRule alone (without events:PutTargets) lets an attacker create a rule
+        but not set targets — reduce to POTENTIAL(iam_permission) in that case. Similarly,
+        events:PutTargets without events:PutRule cannot create NEW rules (only modify
+        existing targets) — emit with a note that the capability is limited to modifying
+        existing rules. Full CanSchedule (create + target) requires both actions. Honor
+        iam:ResourceTag conditions if the bus uses tag-based ABAC for rule creation.
+      narrative: >-
+        {principal.name} can create EventBridge rules on {bus.name} and set their targets
+        (events:PutRule + events:PutTargets); combined with iam:PassRole, this is
+        persistence: a rule fires on its schedule or event pattern and invokes the chosen
+        target as the chosen invocation role.
+
+  # --- 7) scheduler:CreateSchedule → CanSchedule on the Scheduler node ----------
+  # An identity with scheduler:CreateSchedule can create a new Scheduler schedule
+  # with any target and any execution role it can pass (iam:PassRole for
+  # scheduler.amazonaws.com). This is the cron-based persistence primitive: fires on a
+  # cadence, no further attacker action needed once created.
+  # Feeds messaging-chains rule 3: CanSchedule + CanPassIdentity => CanExecuteAs.
+  - id: aws-eb-scheduler-create-canschedule
+    emits: CanSchedule
+    description: "scheduler:CreateSchedule lets a principal create a persistent cron/rate/one-time schedule that fires and invokes a target as the chosen execution role — a schedule-based persistence primitive."
+    match:
+      - [ ?principal, HasPermission, ?schedule_group ]
+    where:
+      - "node_type(?schedule_group) == Scheduler"
+      - "effective_action(?principal, ?schedule_group) includes 'scheduler:CreateSchedule'"
+    emit:
+      source_type: Identity
+      target_type: Scheduler
+      source: ?principal
+      target: ?schedule_group
+      permissions: ["scheduler:CreateSchedule"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when scheduler:CreateSchedule is effective on the schedule group scope and
+        not denied by SCP or permission boundary. BLOCKED when the action is denied.
+        The full persistence path (CanExecuteAs) requires ALSO iam:PassRole for
+        scheduler.amazonaws.com — that gate is in messaging-chains rule 3 (role_compatibility
+        condition); emit this CanSchedule regardless, as it is the half-step fact.
+      confidence: 0.9
+      derived_from: ["effective IAM evaluation: scheduler:CreateSchedule on ?schedule_group"]
+      false_positive_note: >-
+        scheduler:UpdateSchedule (without CreateSchedule) can modify EXISTING schedules
+        but not create new ones — model that as CanModifyConfiguration(principal,
+        existing_schedule) rather than CanSchedule. CanSchedule here specifically
+        represents the ability to CREATE a new schedule (new persistence). Honor
+        iam:PassedToService = scheduler.amazonaws.com in the PassRole evaluation; a
+        principal without that PassRole cannot assign an execution role and the
+        full CanExecuteAs path is CONDITIONAL(role_compatibility) until confirmed.
+      narrative: >-
+        {principal.name} can create Scheduler schedules (scheduler:CreateSchedule) and,
+        with iam:PassRole for scheduler.amazonaws.com, bind a chosen execution role;
+        the schedule fires on its cadence executing as that role — persistent code execution
+        requiring no further attacker interaction.
+
+  # --- 8) Cross-account events:PutEvents via bus policy → CrossAccountTrust ------
+  # When a custom event bus policy grants events:PutEvents to a principal in another
+  # account (or aws:PrincipalOrgID, or Principal: *), that is cross-boundary publish
+  # trust. Feeds messaging-chains rule 4, which in turn feeds can-control's
+  # enter-account-via-assume for CanEnterAccount derivation. Wildcard Principal
+  # ("*") yields ExposedToInternet instead (handled by network rules, not this edge).
+  - id: aws-eb-bus-policy-cross-account-trust
+    emits: CrossAccountTrust
+    description: "An EventBridge custom bus resource policy granting events:PutEvents to a principal in another account establishes cross-account publish trust; the external principal can inject events that trigger compute consumers in this account."
+    match:
+      - [ ?bus_policy, HasPolicy, ?bus ]
+    where:
+      - "node_type(?bus) == EventBus"
+      - "node_type(?bus_policy) == ResourcePolicy"
+      - "?bus_policy grants 'events:PutEvents' to a Principal in a different account than ?bus.account"
+      - "Principal is NOT '*' (wildcard — ExposedToInternet, separate edge)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: ?bus_policy
+      target: "<external account named in the bus policy principal>"
+      permissions: []
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the bus policy unconditionally grants events:PutEvents to a named
+        cross-account principal (arn:aws:iam::<other-account>:root or a specific role/user
+        ARN). CONDITIONAL(condition_expression) when scoped by aws:SourceAccount,
+        aws:SourceArn, aws:PrincipalOrgID, or other condition keys — the external principal
+        must satisfy the condition. BLOCKED by an SCP or explicit deny that overrides the
+        grant. On aws:PrincipalOrgID-scoped grants, the ACTIVE set is the entire org — emit
+        CrossAccountTrust targeting the Organization node with CONDITIONAL.
+      confidence: 0.95
+      derived_from: ["events:DescribeEventBus → Policy (parsed principal)"]
+      false_positive_note: >-
+        Do NOT emit CrossAccountTrust for Principal: '*' — that is internet exposure
+        (ExposedToInternet), not a named cross-account trust. Do NOT emit for same-account
+        principals (no cross-boundary value). Honor condition key scoping:
+        aws:SourceAccount-scoped grants are CONDITIONAL on the source account satisfying
+        the condition, not unconditional cross-account access. The CanEnterAccount
+        consequence is produced by can-control (cited, not re-derived here) — this rule
+        only asserts the trust FACT. A publish-only grant that reaches no bound consumer
+        in this account does not enable account entry by itself.
+      narrative: >-
+        The resource policy on {bus.name} grants events:PutEvents to a principal in
+        {external_account}; that external principal can inject events into {bus.name},
+        potentially triggering compute consumers (rules/targets) inside this account.
+
+  # --- 9) events:RetrieveConnectionCredentials → CanReadSecret on Connection ----
+  # An EventBridge Connection stores OAuth2 client credentials or an API key for API
+  # destination calls. events:RetrieveConnectionCredentials returns the raw credential
+  # value. Any principal with this action can read the stored credential — a direct
+  # CanReadSecret. Feeds credential-chains (read-secret-yields-identity) when the
+  # Connection stores credentials for an identity-bearing API.
+  - id: aws-eb-connection-canreadsecret
+    emits: CanReadSecret
+    description: "events:RetrieveConnectionCredentials returns the raw OAuth2/API-key credential stored in an EventBridge Connection; anyone with this action can read the credential."
+    match:
+      - [ ?principal, HasPermission, ?connection ]
+    where:
+      - "node_type(?connection) == ConnectionString"
+      - "effective_action(?principal, ?connection) includes 'events:RetrieveConnectionCredentials'"
+    emit:
+      source_type: Identity
+      target_type: ConnectionString  # CanReadSecret.target includes [Secret, ConnectionString, ...]; ConnectionString is the exact node type.
+      source: ?principal
+      target: ?connection
+      permissions: ["events:RetrieveConnectionCredentials"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when events:RetrieveConnectionCredentials is effective on the Connection
+        ARN and not denied by SCP or permission boundary. BLOCKED by a deny override.
+        Confidence reflects that the credential must be used to authenticate to the target
+        API; the path value depends on what the credential authenticates to.
+      confidence: 0.9
+      derived_from: ["effective IAM evaluation: events:RetrieveConnectionCredentials on ?connection"]
+      false_positive_note: >-
+        events:DescribeConnection does NOT return the credential value — only
+        events:RetrieveConnectionCredentials does. Do not emit CanReadSecret for
+        principals that only have DescribeConnection. The credential retrieved is typed
+        by the connection AuthorizationType (API_KEY, OAUTH_CLIENT_CREDENTIALS,
+        BASIC) — a credential-chains CredentialsFor edge is needed to link it to the
+        target API identity; emit this CanReadSecret as the first step. If the connection
+        stores short-lived OAuth tokens that may be already-expired, downgrade confidence.
+      narrative: >-
+        {principal.name} can retrieve the raw credential from EventBridge Connection
+        {connection.name} (events:RetrieveConnectionCredentials); this credential
+        authenticates to the connection's target API endpoint.
+
+  # --- 10) EventBridge Connection ContainsCredential (structural fact) -----------
+  # An EventBridge Connection that is configured with API_KEY, OAUTH_CLIENT_CREDENTIALS,
+  # or BASIC authorization stores a credential. Emit ContainsCredential so the
+  # credential-chains linchpin can link it forward (CredentialsFor → target identity).
+  # This is a structural FACT emitted from collection — no match on edges needed; based
+  # on the Connection's AuthorizationType from events:DescribeConnection.
+  - id: aws-eb-connection-contains-credential
+    emits: ContainsSecret
+    description: "An EventBridge Connection with API_KEY, OAUTH_CLIENT_CREDENTIALS, or BASIC auth contains a stored credential used to authenticate API destination calls."
+    match:
+      - [ ?connection, HasProperty, "AuthorizationType" ]
+    where:
+      - "node_type(?connection) == ConnectionString"
+      - "?connection.AuthorizationType in ['API_KEY', 'OAUTH_CLIENT_CREDENTIALS', 'BASIC']"
+    emit:
+      source_type: Messaging
+      target_type: Credential
+      source: ?connection
+      target: "<credential stored in ?connection>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the Connection exists and its AuthorizationType is credential-bearing
+        (API_KEY, OAUTH_CLIENT_CREDENTIALS, or BASIC). Credentials may be short-lived
+        (OAuth access tokens refresh automatically by Scheduler) — confidence reflects
+        that the stored value is a long-lived client secret / API key, not a transient token.
+      confidence: 0.85
+      derived_from: ["events:DescribeConnection → AuthorizationType"]
+      false_positive_note: >-
+        The EventBridge Connections API does NOT expose the raw credential value via
+        DescribeConnection — only RetrieveConnectionCredentials does. This edge models
+        the STRUCTURAL FACT that a credential exists in the Connection, feeding
+        credential-chains; it does not represent read access (that is CanReadSecret above).
+        If the credential is an OAuth access token (short-lived), the CredentialsFor chain
+        may be time-gated — note this in the confidence annotation.
+      narrative: >-
+        EventBridge Connection {connection.name} stores a {auth_type} credential used
+        for API destination authentication; this credential can be retrieved (with
+        events:RetrieveConnectionCredentials) and used to authenticate to the target API.
+
+  # --- 11) Public bus policy (wildcard Principal) → ExposedToInternet ------------
+  # A bus policy granting events:PutEvents to Principal: * makes the bus publicly
+  # writable — any internet principal can inject events. This drives ExposedToInternet
+  # from the bus to AnonymousIdentity, consistent with the network rule pattern.
+  - id: aws-eb-bus-public-putevents
+    emits: ExposedToInternet
+    description: "An EventBridge custom bus policy granting events:PutEvents to Principal '*' is publicly writable; any internet actor can inject events and potentially trigger compute consumers."
+    match:
+      - [ ?bus_policy, HasPolicy, ?bus ]
+    where:
+      - "node_type(?bus) == EventBus"
+      - "node_type(?bus_policy) == ResourcePolicy"
+      - "?bus_policy grants 'events:PutEvents' with Principal: '*'"
+    emit:
+      source_type: Messaging
+      target_type: AnonymousIdentity
+      source: ?bus
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the bus policy explicitly grants events:PutEvents to Principal: '*'
+        (or aws:PrincipalArn: '*') with no condition limiting the principal to specific
+        accounts. CONDITIONAL(condition_expression) when a condition key scopes the grant
+        (e.g., aws:SourceAccount or aws:PrincipalOrgID limits it to specific accounts —
+        not truly public). BLOCKED by an SCP denying events:PutEvents to external
+        principals or a VPC endpoint policy limiting access.
+      confidence: 0.9
+      derived_from: ["events:DescribeEventBus → Policy (Principal: *)"]
+      false_positive_note: >-
+        A wildcard Principal scoped by aws:SourceAccount or aws:PrincipalOrgID is NOT
+        public — downgrade to CrossAccountTrust CONDITIONAL rather than ExposedToInternet.
+        The default bus does not accept cross-account events:PutEvents by default; this
+        edge only applies to custom buses with an explicit public policy. Even when public,
+        the injected event must match an enabled rule's pattern to trigger compute; if no
+        enabled rules match public-source events, the ExposedToInternet bus has limited
+        downstream impact (still model it — the rule may be created later).
+      narrative: >-
+        {bus.name} has a resource policy granting events:PutEvents to any principal
+        (Principal: '*'); any internet actor can inject events, potentially matching rules
+        that trigger compute consumers inside this account.
+
+  # --- 12) Scheduler UpdateSchedule → CanModifyConfiguration on existing schedule
+  # scheduler:UpdateSchedule on an existing schedule lets a principal change the target
+  # ARN, execution role ARN, and schedule expression. This is CanModifyConfiguration on
+  # the schedule node — a weaker path than creating a new schedule (CanSchedule) because
+  # it targets an EXISTING schedule's behavior rather than creating persistence from
+  # scratch. Combined with CanPassIdentity, feeds can-execute-as's
+  # execute-as-via-config-identity-swap.
+  - id: aws-eb-scheduler-update-canmodifyconfig
+    emits: CanModifyConfiguration
+    description: "scheduler:UpdateSchedule lets a principal change an existing schedule's target ARN, execution role, or schedule expression — re-routing or re-timing execution."
+    match:
+      - [ ?principal, HasPermission, ?schedule ]
+    where:
+      - "node_type(?schedule) == Scheduler"
+      - "effective_action(?principal, ?schedule) includes 'scheduler:UpdateSchedule'"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: ?principal
+      target: ?schedule
+      permissions: ["scheduler:UpdateSchedule"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when scheduler:UpdateSchedule is effective on the schedule ARN and not
+        denied. BLOCKED by SCP or explicit deny. This enables the config-identity-swap
+        CanExecuteAs path (can-execute-as: execute-as-via-config-identity-swap) when
+        combined with CanPassIdentity for a new execution role, and the messaging-chains
+        rule 3 path when combined with CanPassIdentity.
+      confidence: 0.85
+      derived_from: ["effective IAM evaluation: scheduler:UpdateSchedule on ?schedule"]
+      false_positive_note: >-
+        Changing the schedule's Target.RoleArn via UpdateSchedule requires iam:PassRole
+        for the new role scoped to scheduler.amazonaws.com — without that, the attacker
+        can change the target ARN (re-point to a different resource) but not the execution
+        role. The CanExecuteAs consequence requires BOTH UpdateSchedule AND PassRole; emit
+        this CanModifyConfiguration as a half-step; the derivation engine applies the
+        execute-as-via-config-identity-swap rule only when CanPassIdentity is also present.
+      narrative: >-
+        {principal.name} can modify the configuration of Scheduler schedule {schedule.name}
+        (scheduler:UpdateSchedule), including re-pointing the target or (with iam:PassRole)
+        changing the execution role, redirecting or escalating its scheduled execution.
+
+  # --- 13) events:PutPermission → CanModifyPolicy on EventBus resource policy ----
+  # events:PutPermission on a custom bus allows a principal to rewrite the bus resource
+  # policy. This is a CanModifyPolicy: add cross-account principals, grant Principal:*,
+  # or self-escalate. Combined with can-control's CrossAccountTrust → CanEnterAccount
+  # chain, this is a first-class escalation/persistence primitive for cross-boundary
+  # access. The target is the bus's resource policy (modeled as a Policy node).
+  - id: aws-eb-putpermission-canmodifypolicy
+    emits: CanModifyPolicy
+    description: "events:PutPermission allows a principal to rewrite a custom bus resource policy, injecting cross-account trust or public access."
+    match:
+      - [ ?principal, HasPermission, ?bus ]
+    where:
+      - "node_type(?bus) == EventBus"
+      - "effective_action(?principal, ?bus) includes 'events:PutPermission'"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: ?principal
+      target: "<bus resource policy node>"
+      permissions: ["events:PutPermission"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when events:PutPermission is effective on the bus ARN and not denied by
+        SCP or permission boundary. BLOCKED when an SCP or explicit deny prevents the
+        action. The consequence (CrossAccountTrust injection) is produced by can-control's
+        enter-account-via-assume rule and is CONDITIONAL(condition_expression) when the
+        attacker injects a scoped condition (aws:SourceAccount, aws:PrincipalOrgID).
+      confidence: 0.95
+      derived_from: ["effective IAM evaluation: events:PutPermission on ?bus"]
+      false_positive_note: >-
+        events:RemovePermission alone (without PutPermission) cannot create new policies
+        — it only removes existing statements. Only emit CanModifyPolicy when
+        events:PutPermission is confirmed. Verify that the principal can actually
+        re-write the policy statement (full PutPermission semantics, not a partial grant
+        that is scoped to specific actions within the policy).
+      narrative: >-
+        {principal.name} can rewrite the resource policy of EventBridge bus {bus.name}
+        (events:PutPermission), allowing injection of cross-account publish trust,
+        principal:* grants, or self-escalation via new policy statements.
+
+  # --- 14) events:StartReplay → CanWriteData on target bus (conditional) ------
+  # events:StartReplay re-delivers archived events to a target bus, triggering any
+  # matching enabled rules without requiring events:PutEvents. This is a CanWriteData
+  # equivalent: attacker injects events by replaying archived ones. State is CONDITIONAL
+  # (trigger_exists) because the replayed events must match an enabled rule's pattern.
+  - id: aws-eb-startreplay-canwritedata
+    emits: CanWriteData
+    description: "events:StartReplay re-delivers archived events to a target bus, triggering matching enabled rules — a CanWriteData equivalent that bypasses events:PutEvents."
+    match:
+      - [ ?principal, HasPermission, ?archive ]
+    where:
+      - "node_type(?archive) == GenericStorage"
+      - "?archive.SourceArn references ?bus (the target bus for replay)"
+      - "effective_action(?principal, ?archive) includes 'events:StartReplay'"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: ?principal
+      target: ?bus
+      permissions: ["events:StartReplay"]
+      conditions: [iam_permission, trigger_exists]
+      state_logic: >-
+        ACTIVE when events:StartReplay is effective on the archive ARN AND at least one
+        enabled rule exists on the target bus whose event pattern matches the archived
+        events (trigger_exists). CONDITIONAL(trigger_exists) when the archive exists but
+        no matching enabled rules are present on the target bus. BLOCKED by SCP or
+        explicit deny on events:StartReplay.
+      confidence: 0.85
+      derived_from: ["effective IAM evaluation: events:StartReplay on ?archive; archive SourceArn references ?bus"]
+      false_positive_note: >-
+        Replay only triggers rules whose event pattern matches the archived events. If
+        the archive contains events with source: "aws.s3" but all enabled rules require
+        a different source, the replay will not trigger anything — downgrade to
+        CONDITIONAL(trigger_exists) with a note on the event filter. Always check both
+        that StartReplay is effective on the archive AND that the target bus has enabled
+        rules (service_state: ENABLED) that match the archive's event schema.
+      narrative: >-
+        {principal.name} can replay archived events to {bus.name} (events:StartReplay),
+        triggering any matching enabled rules on the bus — delivering attacker-influenced
+        payloads to compute consumers without needing events:PutEvents.
+
+  # --- 15) pipes:CreatePipe + iam:PassRole → CanSchedule + ExecutesAs on Pipe ----
+  # EventBridge Pipes can be created with a source (SQS, Kinesis, DynamoDB, Kafka, MQ),
+  # optional filter/enrichment, and a target. Each pipe executes with a role
+  # (Target.RoleArn). pipes:CreatePipe + iam:PassRole is the creation persistence
+  # primitive (analogous to scheduler:CreateSchedule). Emits CanSchedule on the Pipe
+  # node and ExecutesAs(pipe, role).
+  - id: aws-eb-pipes-create-canschedule
+    emits: CanSchedule
+    description: "pipes:CreatePipe + iam:PassRole lets a principal create an EventBridge Pipe with a chosen target and execution role — a persistent source-to-target data flow."
+    match:
+      - [ ?principal, HasPermission, ?pipe_scope ]
+    where:
+      - "node_type(?pipe_scope) in [AdministrativeBoundary, '*']"
+      - "effective_action(?principal, ?pipe_scope) includes 'pipes:CreatePipe'"
+    emit:
+      source_type: Identity
+      target_type: EventRule
+      source: ?principal
+      target: "<EventRule/Pipe created in ?pipe_scope>"
+      permissions: ["pipes:CreatePipe"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when pipes:CreatePipe is effective on the resource scope and not denied
+        by SCP or permission boundary. CONDITIONAL(role_compatibility) when iam:PassRole
+        for the chosen role is unknown or not scoped to pipes.amazonaws.com. The full
+        CanExecuteAs (pipe execution as chosen role) requires ALSO CanPassIdentity;
+        messaging-chains rule 3 derives it when both are present.
+      confidence: 0.9
+      derived_from: ["effective IAM evaluation: pipes:CreatePipe on ?pipe_scope"]
+      false_positive_note: >-
+        pipes:UpdatePipe (without CreatePipe) can modify EXISTING pipes — model that as
+        CanModifyConfiguration separately. CanSchedule here specifically represents the
+        ability to CREATE a new pipe. The execution role assignment requires
+        iam:PassRole scoped to pipes.amazonaws.com; PassRole for ec2/ecs does NOT yield
+        this path. Honor iam:PassedToService when evaluating the role-passing capability.
+      narrative: >-
+        {principal.name} can create EventBridge Pipes (pipes:CreatePipe) and, with
+        iam:PassRole for pipes.amazonaws.com, bind a chosen execution role; the pipe
+        continuously polls its source and invokes the target as the chosen role —
+        persistent data-driven execution.
+
+  # --- 16) pipes:UpdatePipe → CanModifyConfiguration on existing Pipe --------
+  # pipes:UpdatePipe allows changing a Pipe's target, source filter, enrichment,
+  # execution role, or schedule expression. This is CanModifyConfiguration on the Pipe
+  # node — re-routing or role-swapping. Combined with CanPassIdentity, feeds
+  # can-execute-as's execute-as-via-config-identity-swap.
+  - id: aws-eb-pipes-update-canmodifyconfig
+    emits: CanModifyConfiguration
+    description: "pipes:UpdatePipe lets a principal change an existing Pipe's target, enrichment, source filter, or execution role — re-routing or re-escalating persistent data flow."
+    match:
+      - [ ?principal, HasPermission, ?pipe ]
+    where:
+      - "node_type(?pipe) == EventRule"
+      - "?pipe.provider_type == 'AWS::Pipes::Pipe'"
+      - "effective_action(?principal, ?pipe) includes 'pipes:UpdatePipe'"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: ?principal
+      target: ?pipe
+      permissions: ["pipes:UpdatePipe"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when pipes:UpdatePipe is effective on the pipe ARN and not denied by
+        SCP or permission boundary. BLOCKED by SCP or explicit deny. This enables the
+        config-identity-swap CanExecuteAs path (can-execute-as:
+        execute-as-via-config-identity-swap) when combined with CanPassIdentity for
+        a new execution role.
+      confidence: 0.85
+      derived_from: ["effective IAM evaluation: pipes:UpdatePipe on ?pipe"]
+      false_positive_note: >-
+        Changing the Pipe's Target.RoleArn via UpdatePipe requires iam:PassRole for the
+        new role scoped to pipes.amazonaws.com — without that, the attacker can change
+        the target ARN (re-point to a different resource) but not the execution role.
+        The CanExecuteAs consequence requires BOTH UpdatePipe AND PassRole; emit this
+        CanModifyConfiguration as a half-step; the derivation engine applies the
+        execute-as-via-config-identity-swap rule only when CanPassIdentity is also present.
+      narrative: >-
+        {principal.name} can modify an existing EventBridge Pipe {pipe.name}
+        (pipes:UpdatePipe), including changing its target resource or (with iam:PassRole)
+        its execution role, redirecting or escalating the persistent data-flow execution.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP denying events:PutEvents on all buses -> CanWriteData BLOCKED;
+#    downstream CanTrigger/CanExecuteAs BLOCKED.
+#  - A rule with State == DISABLED -> CanTrigger(bus, rule) and CanTrigger(rule, cmp)
+#    both CONDITIONAL(service_state).
+#  - An event pattern that requires source == "aws.*" -> CanTrigger from a human
+#    caller's CanWriteData BLOCKED for those pattern-matched rules (attacker cannot
+#    spoof aws.* sources on default bus).
+#  - iam:PassRole with iam:PassedToService NOT including events.amazonaws.com /
+#    scheduler.amazonaws.com -> messaging-chains rule 3 CanExecuteAs BLOCKED
+#    (POTENTIAL when unknown).
+#  - An SCP denying sts:AssumeRole for events.amazonaws.com / scheduler.amazonaws.com
+#    -> ExecutesAs(rule/sched, role) BLOCKED; downstream CanExecuteAs BLOCKED.
+#
+# LINCHPIN CITATIONS (these rules produce the CanExecuteAs / CanEnter* edges):
+#   messaging-chains.yaml rule 1 (messaging-publish-triggers-consumer):
+#     CanWriteData(p, bus) + CanTrigger(bus → rule → compute) => CanTrigger(p, compute)
+#   messaging-chains.yaml rule 2 (messaging-trigger-executes-as):
+#     CanTrigger(p, rule) + ExecutesAs(rule, role) => CanExecuteAs(p, role) CONDITIONAL
+#   messaging-chains.yaml rule 3 (messaging-schedule-persists-executes-as):
+#     CanSchedule(p, rule/sched) + CanPassIdentity(p, role) => CanExecuteAs(p, role)
+#   messaging-chains.yaml rule 4 (messaging-resource-policy-cross-boundary-trust):
+#     CrossAccountTrust(bus_policy, acct) feeds can-control CanEnterAccount
+#   can-execute-as.yaml (execute-as-via-config-identity-swap):
+#     CanModifyConfiguration(p, sched) + CanPassIdentity(p, role) => CanExecuteAs(p, role)
+#   can-control.yaml (enter-account-via-assume):
+#     CrossAccountTrust feeds CanEnterAccount derivation
+#   credential-chains.yaml (read-secret-yields-identity):
+#     CanReadSecret(p, connection) + ContainsCredential + CredentialsFor => CanImpersonate
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/aws-eventbridge.yaml (ExecutesAs from raw config, CanWriteData from
+# effective permissions, CrossAccountTrust from bus policy parsing, CanReadSecret from
+# IAM evaluation, ContainsCredential from Connection config). The structural bus-to-rule
+# relationship is also captured explicitly from the rule's EventBusName field, feeding
+# downstream CanTrigger derivations in messaging-chains.yaml.
+explicit_rules:
+
+  - id: aws-eb-bus-rule-structural
+    emits: LocatedIn
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::Events::Rule", field: "EventBusName"}
+    emit:
+      source_type: Messaging
+      source: "<EventRule node>"
+      target: "<EventBus node from EventBusName>"
+      api_source: "events:DescribeRule"
+      evidence_field: "EventBusName, State"
+      narrative: "{rule.name} is located on {bus.name}; when the rule is ENABLED, events matching its pattern cause it to fire."
+
+  - id: aws-eb-rule-executes-as-explicit
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::Events::Rule", field: "RoleArn"}
+    emit:
+      source_type: Messaging
+      source: "<EventRule node>"
+      target: "<IAM role from RoleArn>"
+      api_source: "events:DescribeRule"
+      evidence_field: "RoleArn"
+      narrative: "{rule.name} invokes targets as IAM role {role.name} (events.amazonaws.com assumes it at rule fire time)."
+
+  - id: aws-eb-scheduler-executes-as-explicit
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::Scheduler::Schedule", field: "Target.RoleArn"}
+    emit:
+      source_type: Messaging
+      source: "<Scheduler node>"
+      target: "<IAM role from Target.RoleArn>"
+      api_source: "scheduler:GetSchedule"
+      evidence_field: "Target.RoleArn"
+      narrative: "{schedule.name} invokes its target as IAM role {role.name} (scheduler.amazonaws.com assumes it at fire time)."
+
+  - id: aws-eb-rule-target-cantrigger-explicit
+    emits: CanTrigger
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::Events::Rule", field: "Targets[*].Arn"}
+    emit:
+      source_type: Messaging
+      source: "<EventRule node>"
+      target: "<target Compute/Messaging node from Targets[*].Arn>"
+      api_source: "events:ListTargetsByRule"
+      evidence_field: "Targets[*].Arn"
+      narrative: "When {rule.name} fires, it invokes {target.name}."
+
+  - id: aws-eb-scheduler-target-cantrigger-explicit
+    emits: CanTrigger
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::Scheduler::Schedule", field: "Target.Arn"}
+    emit:
+      source_type: Messaging
+      source: "<Scheduler node>"
+      target: "<target Compute/Messaging node from Target.Arn>"
+      api_source: "scheduler:GetSchedule"
+      evidence_field: "Target.Arn"
+      narrative: "{schedule.name} invokes {target.name} at each scheduled fire."
+
+  - id: aws-eb-bus-policy-cross-account-explicit
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::Events::EventBus", field: "Policy"}
+    where: ["principal in Policy is in a different account and is not '*'"]
+    emit:
+      source_type: ResourcePolicy
+      source: "<bus ResourcePolicy node>"
+      target: "<external account>"
+      api_source: "events:DescribeEventBus"
+      evidence_field: "Policy"
+      narrative: "{bus.name} policy grants events:PutEvents to {external.name} in {account}."
+
+  - id: aws-eb-can-putevents-explicit
+    emits: CanWriteData
+    applies_to: [aws]
+    match_effective_permission:
+      action: "events:PutEvents"
+      resource_type: "AWS::Events::EventBus"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<EventBus node>"
+      permissions: ["events:PutEvents"]
+      narrative: "{principal.name} can inject events into {bus.name} (events:PutEvents)."
+
+  - id: aws-eb-can-putrule-explicit
+    emits: CanSchedule
+    applies_to: [aws]
+    match_effective_permission:
+      action: "events:PutRule"
+      resource_type: "AWS::Events::EventBus"
+    where: ["also has events:PutTargets on the same bus"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<EventBus node>"
+      permissions: ["events:PutRule", "events:PutTargets"]
+      narrative: "{principal.name} can create and configure rules on {bus.name} (events:PutRule + events:PutTargets)."
+
+  - id: aws-eb-scheduler-create-explicit
+    emits: CanSchedule
+    applies_to: [aws]
+    match_effective_permission:
+      action: "scheduler:CreateSchedule"
+      resource_type: "AWS::Scheduler::ScheduleGroup"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Scheduler/ScheduleGroup node>"
+      permissions: ["scheduler:CreateSchedule"]
+      narrative: "{principal.name} can create Scheduler schedules (scheduler:CreateSchedule)."
+
+  - id: aws-eb-connection-credential-explicit
+    emits: ContainsSecret
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::Events::Connection", field: "AuthorizationType"}
+    where: ["AuthorizationType in ['API_KEY', 'OAUTH_CLIENT_CREDENTIALS', 'BASIC']"]
+    emit:
+      source_type: Messaging
+      source: "<Connection node>"
+      target: "<Credential node>"
+      api_source: "events:DescribeConnection"
+      evidence_field: "AuthorizationType"
+      narrative: "{connection.name} stores a {auth_type} credential for API destination calls."
+
+  - id: aws-eb-retrieve-connection-creds-explicit
+    emits: CanReadSecret
+    applies_to: [aws]
+    match_effective_permission:
+      action: "events:RetrieveConnectionCredentials"
+      resource_type: "AWS::Events::Connection"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Connection node>"
+      permissions: ["events:RetrieveConnectionCredentials"]
+      narrative: "{principal.name} can retrieve the raw credential from Connection {connection.name} (events:RetrieveConnectionCredentials)."

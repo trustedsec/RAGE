@@ -1,0 +1,330 @@
+# AWS QuickSight — Derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# QuickSight is a BI service with a medium/conservative attack surface.
+# It is NOT a general-purpose compute surface (no user-submitted code); its
+# primary threats are:
+#
+#   (1) SERVICE ROLE SWAP: quicksight:UpdateAccountSettings + iam:PassRole lets
+#       an attacker replace the IAM role QuickSight uses for all data access.
+#       All downstream data queries run as that role -> CanPassIdentity leading
+#       to CanCreateWorkloadAs / effective CanExecuteAs-level data access.
+#       Cite can-execute-as.yaml for the roll-up.
+#
+#   (2) STORED DATA-SOURCE CREDENTIALS: QuickSight stores DB credentials
+#       (username/password for RDS, Redshift, JDBC, SaaS API keys) internally.
+#       The data source node ContainsSecret; the ExposesCredential fact is the
+#       pivot feeding credential-chains.yaml.
+#
+#   (3) SSRF-STYLE CREDENTIAL EXFILTRATION: quicksight:CreateDataSource with an
+#       attacker-controlled endpoint causes QuickSight to transmit stored/provided
+#       credentials to that endpoint on test/ingestion -> ExposesCredential.
+#
+# Permissions are exact names from the QuickSight Service Authorization Reference:
+# https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonquicksight.html
+#
+# Explicit normalization (ExecutesAs, ContainsSecret) belongs in
+# /rules/explicit/aws-quicksight.yaml (none created; no special normalization
+# needed beyond the standard match_record patterns noted in explicit_rules below).
+#
+# LINCHPIN CITATIONS (do not re-derive their roll-ups here):
+#   can-execute-as.yaml  — execute-as-via-config-identity-swap collapses
+#                          CanModifyConfiguration + CanPassIdentity -> CanExecuteAs
+#   credential-chains.yaml — read-secret-yields-identity collapses
+#                            CanReadSecret + CredentialsFor -> CanImpersonate
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 11-data-analytics-ml
+applies_to: [aws]
+
+rules:
+
+  # NOTE: aws-quicksight-pass-service-role has been MOVED to explicit rules
+  # (/rules/explicit/aws-quicksight.yaml) because CanPassIdentity has nature: explicit
+  # in schema/edges.yaml and cannot be emitted from derived rules (nature: both or derived only).
+  # A derived rule aws-quicksight-config-identity-swap (below) composes
+  # CanModifyConfiguration + CanPassIdentity -> CanExecuteAs without relying on the
+  # can-execute-as.yaml linchpin's Compute guard, since QuickSight is GenericData.
+
+  # --- QuickSight-specific CanExecuteAs derivation (GenericData variant) ------
+  # The standard can-execute-as.yaml execute-as-via-config-identity-swap rule has a
+  # guard 'node_class(?compute) == Compute' and will not fire on QuickSight
+  # (class: Data). This rule re-expresses the same composition for the QuickSight
+  # service node (GenericData) without the Compute guard.
+  - id: aws-quicksight-config-identity-swap
+    emits: CanExecuteAs
+    description: "An attacker who can modify QuickSight's configuration (UpdateAccountSettings) and pass an IAM role to it gains execution as that role for all data queries."
+    applies_to: [aws]
+    match:
+      - [ ?attacker, CanModifyConfiguration, ?quicksight ]
+      - [ ?attacker, CanPassIdentity,        ?role ]
+    where:
+      - "node_type(?quicksight) == GenericData"
+      - "?quicksight.provider_type == 'AWS::QuickSight::AccountSettings' or 'AWS::QuickSight::Account'"
+      - "role_compatible(?role, ?quicksight)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "?attacker"
+      target: "?role"
+      permissions: ["quicksight:UpdateAccountSettings", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when both CanModifyConfiguration(attacker, QuickSight) and
+        CanPassIdentity(attacker, role) edges are ACTIVE and the role is compatible.
+        CONDITIONAL otherwise.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["aws-quicksight-pass-service-role (explicit)", "CanModifyConfiguration edges"]
+      false_positive_note: >-
+        This composition assumes the QuickSight account settings resource maps to a
+        GenericData node (the service node). Standard path queries should prefer the
+        linchpin rule execute-as-via-config-identity-swap for Compute nodes; this rule
+        specializes to QuickSight's architecture.
+      narrative: >-
+        {attacker.name} can modify QuickSight's account settings
+        (quicksight:UpdateAccountSettings) and pass {role.name} to it, causing
+        {attacker.name} to execute as {role.name} for all subsequent QuickSight
+        data queries.
+
+  # --- (2) STORED DATA-SOURCE CREDENTIALS: data source ExposesCredential -------
+  # A QuickSight data source that uses CredentialPair (username/password) or a
+  # SaaS API key stores those credentials in QuickSight's internal metadata.
+  # The data source node ContainsSecret (emitted by explicit normalization).
+  # This derived rule collapses ContainsSecret -> ExposesCredential so that
+  # credential-chains.yaml can continue the pivot to CanImpersonate.
+  - id: aws-quicksight-datasource-exposes-credential
+    emits: ExposesCredential
+    description: "A QuickSight data source that stores database credentials (CredentialPair / API key) exposes those credentials — readable by the QuickSight service and potentially exfiltrable by updating the data source endpoint."
+    match:
+      - [ ?datasource, ContainsSecret, ?secret ]
+    where:
+      - "node_type(?datasource) == GenericData"
+      - "?datasource.provider_type == 'AWS::QuickSight::DataSource'"
+      - "?datasource.credential_type in ['USERNAME_PASSWORD', 'API_KEY', 'CREDENTIAL_PAIR']"
+    emit:
+      source_type: Data
+      target_type: Credential
+      source: "?datasource"
+      target: "?secret"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        CONDITIONAL(service_state) when the data source status cannot be confirmed as
+        CREATION_SUCCESSFUL (status is absent/uncollected/UNKNOWN). ACTIVE only when
+        the data source is explicitly in CREATION_SUCCESSFUL state and configured with
+        a non-AWS-IAM credential type (CredentialPair / API key). BLOCKED when credential
+        type is IAM (no stored credential; QuickSight uses the service role instead).
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: ["aws-quicksight-datasource-contains-secret"]
+      false_positive_note: >-
+        QuickSight does NOT expose plaintext credentials via DescribeDataSource API —
+        the credential fields are redacted. This edge expresses that the credentials
+        ARE stored and used by the service (they can be exfiltrated indirectly via
+        UpdateDataSource endpoint replacement — see rule aws-quicksight-ssrf-datasource-cred).
+        Do NOT emit for IAM-credential data sources (S3, Athena, Redshift via IAM) —
+        those use the QuickSight service role, not stored credentials; the role's access
+        is modeled via CanReadData. credential-chains.yaml read-secret-yields-identity
+        can only fire when CredentialsFor(secret -> DB identity) is also emitted by the
+        explicit normalization.
+      narrative: >-
+        QuickSight data source {datasource.name} stores {secret.credential_type}
+        credentials for its backend. These credentials are held internally by QuickSight
+        and used to authenticate to the data source on every query and refresh.
+
+  # --- (3) SSRF-STYLE CREDENTIAL EXFILTRATION via CreateDataSource -------------
+  # quicksight:CreateDataSource lets any authorized principal specify an arbitrary
+  # endpoint. For relational data source types (MySQL, PostgreSQL, SQL Server, etc.),
+  # QuickSight sends the provided credentials to the endpoint on connection test and
+  # on dataset ingestion. An attacker can point this at attacker-controlled infrastructure
+  # to capture DB passwords or API keys.
+  # The source of ExposesCredential is the newly-created data source node (which holds
+  # the credential), not the acting principal. The principal's capability is modeled as
+  # CanCreate(principal -> DataSource), which is a prerequisite.
+  - id: aws-quicksight-ssrf-datasource-cred
+    emits: ExposesCredential
+    description: "quicksight:CreateDataSource (relational types) with an attacker-controlled endpoint causes QuickSight to transmit credentials to that host on connection test/ingestion — SSRF-style credential exfiltration."
+    match_effective_permission:
+      action: "quicksight:CreateDataSource"
+      resource_type: "AWS::QuickSight::DataSource"
+    where:
+      - "data source type is a relational/JDBC type that uses CredentialPair: MYSQL, POSTGRESQL, SQLSERVER, ORACLE, AURORA, AURORA_POSTGRESQL, MARIADB, SPARK, JIRA, SERVICENOW (not GITHUB; GitHub uses OAuth, not TCP credential handshake)"
+      - "principal can supply an arbitrary host/port in DataSourceParameters (no endpoint allow-list enforced)"
+      - "?new_datasource is the newly-created GenericData node with provider_type AWS::QuickSight::DataSource"
+    emit:
+      source_type: Data
+      target_type: Credential
+      source: "?new_datasource"
+      target: "<credential provided to / stored by the new data source>"
+      permissions: ["quicksight:CreateDataSource"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        ACTIVE when the principal has quicksight:CreateDataSource, the data source is
+        in CREATION_SUCCESSFUL state, and can supply an arbitrary endpoint (no IAM
+        condition or QuickSight VPC-connection restriction limits the endpoint).
+        CONDITIONAL(network_reachability) when QuickSight is restricted to a VPC
+        connection that limits reachable hosts (attacker endpoint must be in-VPC).
+        BLOCKED if a Service Control Policy or QuickSight account setting restricts
+        data source creation or endpoint ranges.
+      confidence: "min(contributing_confidences) * 0.80"
+      derived_from: []
+      false_positive_note: >-
+        This only applies to JDBC/relational data source types where QuickSight
+        actively opens a TCP connection to the endpoint and sends credentials. S3,
+        Athena, Redshift via IAM, OpenSearch, and other AWS-IAM data source types
+        do NOT use stored CredentialPair credentials — QuickSight uses its service
+        role; no credential exfiltration to an attacker endpoint is possible for
+        those types. SaaS types using API keys (not TCP credential handshake) such as
+        JIRA and SERVICENOW leak tokens differently (API replay rather than TCP auth).
+        Also requires that the QuickSight account does not enforce a VPC connection
+        allow-list that constrains reachable hosts. The attacker must be able to
+        receive the inbound connection from QuickSight's IP range (NAT gateway /
+        internet-facing endpoint).
+      narrative: >-
+        QuickSight data source {datasource.name} (type {datasource.type}) stores
+        {credential_type} credentials and connects to an attacker-controlled endpoint.
+        QuickSight will send the configured credentials to that endpoint when testing
+        the connection or refreshing the dataset, exfiltrating them to the attacker.
+
+  # --- (4) UPDATE DATA SOURCE CREDENTIAL OVERWRITE --------
+  # quicksight:UpdateDataSource can overwrite stored CredentialPair credentials on
+  # an existing data source. An attacker who can UpdateDataSource can (a) replace
+  # credentials to control what DB the source authenticates to, or (b) change the
+  # endpoint to an attacker-controlled host to trigger QuickSight to send new
+  # credentials there. This is distinct from CreateDataSource and uses the same
+  # permission gate.
+  - id: aws-quicksight-update-datasource-cred-overwrite
+    emits: CanModify
+    description: "quicksight:UpdateDataSource on a data source with stored credentials lets an attacker overwrite those credentials or change the endpoint, triggering credential exfiltration or database takeover."
+    match_effective_permission:
+      action: "quicksight:UpdateDataSource"
+      resource_type: "AWS::QuickSight::DataSource"
+    where:
+      - "?datasource is an existing GenericData node with provider_type AWS::QuickSight::DataSource"
+      - "?datasource has a ContainsSecret edge (stored credentials exist)"
+      - "?datasource.credential_type in ['USERNAME_PASSWORD', 'API_KEY', 'CREDENTIAL_PAIR']"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: "<principal with quicksight:UpdateDataSource>"
+      target: "?datasource"
+      permissions: ["quicksight:UpdateDataSource"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when principal has quicksight:UpdateDataSource and the data source is
+        in CREATION_SUCCESSFUL state with stored credentials (ContainsSecret edge exists).
+        CONDITIONAL(service_state) when data source status is uncollected/unknown.
+        BLOCKED if SCP denies quicksight:UpdateDataSource.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: []
+      false_positive_note: >-
+        This models CanModify on the data source itself, not direct credential
+        exfiltration. The attacker's ability to exfiltrate via endpoint replacement
+        is modeled separately; CanModify(principal, DataSource) combined with
+        ExposesCredential(DataSource, Credential) allows downstream inference of
+        credential exposure. Only emits for data sources with stored credentials
+        (not IAM-credential types).
+      narrative: >-
+        {principal.name} can update QuickSight data source {datasource.name}
+        (quicksight:UpdateDataSource), potentially overwriting its stored credentials
+        {credential_type} or replacing the endpoint to exfiltrate credentials to an
+        attacker-controlled host.
+
+  # --- (5) ADMIN PROMOTION VIA RegisterUser + UpdateUser ---
+  # Any principal who can register and promote users to QuickSight admin gains read
+  # access to all datasets, dashboards, and data source configurations. This maps to
+  # CanGrantPermission or CanAdminister on the QuickSight namespace/account boundary.
+  - id: aws-quicksight-admin-promotion
+    emits: CanGrantPermission
+    description: "quicksight:RegisterUser + quicksight:UpdateUser (role=ADMIN) lets an attacker promote themselves or others to QuickSight admin, gaining read access to all datasets, dashboards, and data source configurations."
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?p1 ]
+      - [ ?principal, HasPermission, ?p2 ]
+    where:
+      - "?p1.action == 'quicksight:RegisterUser'"
+      - "?p2.action == 'quicksight:UpdateUser'"
+      - "?p2.action_parameters.Role allows 'ADMIN'"
+      - "?quicksight_account is the QuickSight Account/Namespace node"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "?principal"
+      target: "?quicksight_account"
+      permissions: ["quicksight:RegisterUser", "quicksight:UpdateUser"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when principal has both quicksight:RegisterUser and
+        quicksight:UpdateUser with the role parameter permitting ADMIN promotion.
+        CONDITIONAL(iam_permission) if one of the permissions is missing or CONDITIONAL.
+        BLOCKED if either permission is denied by SCP or permission boundary.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from: []
+      false_positive_note: >-
+        QuickSight admin is scoped to QuickSight only; it does NOT grant AWS IAM admin
+        or downstream service access. However, a QuickSight admin can read all
+        datasets, dashboards, and data source configurations (including stored
+        credentials metadata) within the QuickSight namespace. To achieve data exfiltration,
+        the attacker must also have or escalate to the QuickSight service role or
+        possess credentials for the backend data sources (which may be readable if the
+        admin can edit the data source and export credentials via API or network
+        exfiltration). This is a namespace-scoped privilege escalation, not
+        account-level or cross-account escalation.
+      narrative: >-
+        {principal.name} can register and promote QuickSight users to admin role
+        (quicksight:RegisterUser + quicksight:UpdateUser), becoming or promoting to
+        QuickSight admin with read access to all datasets, dashboards, and data source
+        configurations in the namespace.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP denying quicksight:UpdateAccountSettings or iam:PassRole at the
+#    effective scope -> emit aws-quicksight-pass-service-role with state: BLOCKED.
+#  - iam:PassRole with iam:PassedToService NOT including quicksight.amazonaws.com
+#    blocks aws-quicksight-pass-service-role -> CONDITIONAL(role_compatibility) or
+#    BLOCKED when explicitly denied.
+#  - A VPC connection restriction on data source endpoints limits SSRF exfiltration
+#    scope -> downgrade aws-quicksight-ssrf-datasource-cred to
+#    CONDITIONAL(network_reachability).
+#  - IAM-credential data source types (S3, Athena) never emit ExposesCredential —
+#    they use the service role; emit CanReadData on the service role instead.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service. These belong in
+# /rules/explicit/aws-quicksight.yaml when the collection adapter is built.
+# Documented here for completeness; no explicit rule file is required yet
+# since ContainsSecret can be derived from the API field patterns below.
+explicit_rules:
+
+  - id: aws-quicksight-account-settings-executes-as
+    emits: ExecutesAs
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::QuickSight::AccountSettings"
+      field: "DefaultNamespace.RoleArn"
+    emit:
+      source_type: Data
+      source: "<QuickSight service (GenericData node representing the QuickSight account)>"
+      target: "<RoleArn (QuickSight service role)>"
+      api_source: "quicksight:DescribeAccountSettings"
+      evidence_field: "DefaultNamespace.RoleArn"
+      narrative: "QuickSight account {account.name} executes all data queries as service role {role.name}."
+
+  - id: aws-quicksight-datasource-contains-secret
+    emits: ContainsSecret
+    applies_to: [aws]
+    match_record:
+      resource_type: "AWS::QuickSight::DataSource"
+      field: "DataSourceParameters + Credentials.CredentialPair"
+    emit:
+      source_type: Data
+      source: "<QuickSight data source node>"
+      target: "<Credential (DB username/password or API key)>"
+      api_source: "quicksight:DescribeDataSource"
+      evidence_field: "Credentials.CredentialPair | Credentials.SecretArn"
+      note: >-
+        DescribeDataSource does not return plaintext credentials; emit ContainsSecret
+        when the Credentials field type is CredentialPair or SecretArn. When a
+        SecretArn is present, also emit CanReadSecret(QuickSight service role -> SecretArn)
+        which feeds credential-chains.yaml. This explicit rule ID is referenced by the
+        derived rule aws-quicksight-datasource-exposes-credential via derived_from.
+      narrative: "{datasource.name} stores {credential_type} credentials for its backend endpoint {endpoint}."

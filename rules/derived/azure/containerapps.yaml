@@ -1,0 +1,348 @@
+# Azure — Container Apps (Microsoft.App) execution rules (Phase 4)
+# ---------------------------------------------------------------------------
+# Core Azure Container Apps escalation primitive:
+#   an attacker who runs attacker-controlled code in a container inherits every
+#   managed identity (MI) bound to the app, because that code can mint MI tokens
+#   from the in-container identity endpoint:
+#     GET $IDENTITY_ENDPOINT?resource=<aud>&api-version=2019-08-01
+#     header "X-IDENTITY-HEADER: $IDENTITY_HEADER"
+#   (App Service-style local endpoint — NOT IMDS 169.254.169.254).
+#
+# Two independent ways to get attacker code running as the MI, neither needs a
+# container credential:
+#   - Microsoft.App/containerApps/write  -> replace template image/command/env
+#     (new revision runs the MI)                              [CanModifyCode]
+#   - Microsoft.App/containerApps/exec/action  (DATA ACTION)  -> shell into a
+#     running replica and read the identity endpoint          [CanExecuteCommand]
+#
+# All operation strings verified against the Microsoft.App resource-provider
+# operations reference, the built-in role definitions (Container Apps Contributor
+# id 358470bc-b998-42bd-ab17-a7e34c199c0f = containerApps/* control-plane, EMPTY
+# DataActions; Container Apps Operator id f3bd1b5c-91fa-40e7-afe7-0c11d331232c =
+# read + exec/debug/logstream data actions), and the managed-identity docs.
+# Deny assignments override -> BLOCKED. Escalation edges require the MI to
+# out-privilege the caller.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 4-compute-serverless
+applies_to: [azure]
+
+rules:
+
+  # === Administrative control over the app object ===========================
+  - id: azure-containerapps-contributor
+    emits: CanAdminister
+    match_effective_permission: {action: "Microsoft.App/containerApps/*", scope_type: "resource|resourceGroup|subscription"}
+    where: ["principal effectively holds the Microsoft.App/containerApps/* wildcard (Container Apps Contributor / Contributor / Owner) at the scope; a custom role granting only containerApps/write (without delete/listSecrets/action/revisions/*) does NOT satisfy this and must NOT emit CanAdminister -- that narrow case is covered by azure-containerapps-write-image (CanModifyCode) and azure-containerapps-write-config (CanModifyConfiguration)"]
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<containerApp in scope>"
+      permissions: ["Microsoft.App/containerApps/*"]
+      false_positive_note: "Container Apps Contributor (containerApps/*) grants full CONTROL-PLANE management but has EMPTY DataActions; it does NOT include exec/action, debug/action, or logstream/action. It is still sufficient for code execution via image/command replacement (see azure-containerapps-write-image)."
+      narrative: "{principal.name} has full control of Container App {target.name} (Microsoft.App/containerApps/*)."
+
+  # === Code modification: swap the image/command (runs as the MI) ===========
+  - id: azure-containerapps-write-image
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.App/containerApps/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<containerApp>"
+      permissions: ["Microsoft.App/containerApps/write"]
+      escalation: "Set template.containers[].image / command / args / env to an attacker-controlled image; the new revision runs as the app's managed identity."
+      false_positive_note: "Needs NO container credential and NO exec data action; the control-plane write alone creates a revision running attacker code as the MI. Only escalates if the app has an MI that out-privileges the caller."
+      narrative: "{principal.name} can replace the container image/command of {target.name} (containerApps/write), running attacker code as its managed identity."
+
+  - id: azure-containerapps-write-config
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "Microsoft.App/containerApps/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<containerApp>"
+      permissions: ["Microsoft.App/containerApps/write"]
+      note: "Same op edits the identity block (attach/enable MI -> changes ExecutesAs), configuration.secrets, registries, ingress, and scale rules."
+      narrative: "{principal.name} can rewrite the configuration of {target.name} (containerApps/write) including the identity binding, secrets, and ingress."
+
+  # === Command / code execution in a running replica (DATA ACTION) ==========
+  - id: azure-containerapps-exec
+    emits: CanExecuteCommand
+    match_effective_permission: {action: "Microsoft.App/containerApps/exec/action", data_action: true, scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<containerApp>"
+      permissions: ["Microsoft.App/containerApps/exec/action"]
+      conditions: [service_state]
+      state_logic: "ACTIVE if the app has >=1 running replica; if min-replicas 0 and idle, CONDITIONAL(service_state) and pair with a trigger/scale-up"
+      false_positive_note: "exec/action is a DATA ACTION granted by Container Apps Operator (or a custom role), NOT by Container Apps Contributor/Owner control-plane wildcards. Requires a running replica; a scaled-to-zero app yields CONDITIONAL(service_state)."
+      narrative: "{principal.name} can open a shell in a running replica of {target.name} (Microsoft.App/containerApps/exec/action) and read the container identity endpoint."
+
+  - id: azure-containerapps-job-exec
+    emits: CanExecuteCommand
+    match_effective_permission: {action: "Microsoft.App/jobs/exec/action", data_action: true, scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<containerApps job (running job execution)>"
+      permissions: ["Microsoft.App/jobs/exec/action"]
+      conditions: [service_state]
+      state_logic: "ACTIVE if the job has a running execution; if no execution is currently running, CONDITIONAL(service_state) and pair with jobs/start/action (azure-containerapps-job-start) to launch one"
+      false_positive_note: "jobs/exec/action is a DATA ACTION (Container Apps Operator / custom role), NOT granted by control-plane wildcards. Requires a RUNNING job execution to shell into; an idle job with no active execution yields CONDITIONAL(service_state) until started. Same identity-endpoint token-mint primitive as the app exec path."
+      narrative: "{principal.name} can open a shell in a running execution of job {target.name} (Microsoft.App/jobs/exec/action) and read the container identity endpoint to mint the job's managed-identity token."
+
+  # === Identity attachment (Azure PassRole analog) ==========================
+  - id: azure-containerapps-attach-user-mi
+    emits: CanAttachIdentity
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?userMI"
+      - "?principal has EFFECTIVE Microsoft.App/containerApps/write (or Microsoft.App/jobs/write) on the target app/job (existing or new)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<containerApp or job (existing or new)>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.App/containerApps/write"]
+      conditions: [role_compatibility]
+      false_positive_note: "BOTH permissions are required: assign/action on the MI AND containerApps/jobs write on the target. Neither alone attaches the MI. Honor the assign/action resource scope."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to Container App {target.name} (assign/action + containerApps/write)."
+
+  # === Secret / token-store access =========================================
+  - id: azure-containerapps-list-secrets
+    emits: CanReadSecret
+    match_effective_permission: {action: "Microsoft.App/containerApps/listSecrets/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<principal>"
+      target: "<app secret(s) of the containerApp>"
+      permissions: ["Microsoft.App/containerApps/listSecrets/action"]
+      note: "Reads configuration.secrets: connection strings, registry passwords, Key Vault references. Feeds ExposesCredential when a secret authenticates another identity/service. Microsoft.App/jobs/listSecrets/action is the job equivalent."
+      narrative: "{principal.name} can read the secrets of {target.name} (containerApps/listSecrets/action)."
+
+  - id: azure-containerapps-getauthtoken
+    emits: CanReadSecret
+    match_effective_permission: {action: "Microsoft.App/containerApps/getAuthtoken/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<principal>"
+      target: "<built-in auth/token-store of the containerApp>"
+      permissions: ["Microsoft.App/containerApps/getAuthtoken/action"]
+      false_positive_note: "getAuthtoken returns the app's BUILT-IN AUTH / token-store token (user session tokens), NOT a managed-identity token. Model as CanReadSecret on the token store only; do NOT emit CanRetrieveToken to any MI from this permission."
+      narrative: "{principal.name} can retrieve the built-in auth/token-store token of {target.name} (containerApps/getAuthtoken/action)."
+
+  # === MI token exposure via the in-container identity endpoint ==============
+  - id: azure-containerapps-identity-endpoint-token
+    emits: CanRetrieveToken
+    description: "Attacker-controlled code in a container can mint a bearer token for each reachable bound managed identity via the local identity endpoint."
+    match:
+      - [ ?app, ExecutesAs, ?mi ]
+    emit:
+      source: "<containerApp>"
+      target: "<managed identity reachable from the running container>"
+      permissions: []
+      note: "In-container: GET $IDENTITY_ENDPOINT?resource=<aud>&api-version=2019-08-01 with header X-IDENTITY-HEADER: $IDENTITY_HEADER. NOT IMDS 169.254.169.254. Also emits ExposesCredential(app -> mi)."
+      false_positive_note: "Only fires when the app has a managed identity AND that MI is reachable from the executing container: honor identitySettings.lifecycle (an MI with lifecycle None (ACR-pull/scale only) or Init is NOT reachable from the main container). No MI => do NOT emit."
+      narrative: "Attacker code running in {app.name} can request a bearer token for {mi.name} from the local identity endpoint ($IDENTITY_ENDPOINT, X-IDENTITY-HEADER) with no container credential."
+
+  # === Derived: attacker code -> execute as the app's managed identity =======
+  - id: azure-containerapps-execute-as-via-write
+    emits: CanExecuteAs
+    description: "Control-plane image/command replacement + the app runs as an MI => execute as that MI (via the identity endpoint)."
+    match:
+      - [ ?principal, CanModifyCode, ?app ]
+      - [ ?app, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?app) in [ContainerService, BatchJob]"
+      - "?mi.privilege_level > ?principal.privilege_level   # strict escalation only (equal-privilege lateral excluded)"
+      - "?mi is reachable from the main container (identitySettings.lifecycle in [All, Main] or unset)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      conditions_from: [ ?app, ?mi ]
+      permissions: ["Microsoft.App/containerApps/write"]
+      derived_from: [ "<CanModifyCode edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Emit only when the app has an MI reachable from the main container and that MI out-privileges the caller. containerApps/write alone (no exec) is sufficient because the new revision runs attacker code."
+      narrative: "{principal.name} can replace the image/command of {app.name} (containerApps/write) and mint the token of its identity {mi.name} from the local identity endpoint, executing as {mi.name}."
+
+  - id: azure-containerapps-execute-as-via-exec
+    emits: CanExecuteAs
+    description: "Exec into a running replica + the app runs as an MI => execute as that MI (read the identity endpoint from the shell)."
+    match:
+      - [ ?principal, CanExecuteCommand, ?app ]
+      - [ ?app, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?app) in [ContainerService, BatchJob]"
+      - "?mi.privilege_level > ?principal.privilege_level   # strict escalation only (equal-privilege lateral excluded)"
+      - "?mi reachable from the exec'd container/job execution (identitySettings.lifecycle in [All, Main] or unset)"
+    optional:
+      - [ ?principal, CanTrigger, ?app ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      state_logic: |
+        if ?app has a running replica: ACTIVE
+        elif matched(optional[0]): ACTIVE   # attacker can trigger scale-up
+        else: CONDITIONAL(service_state)
+      conditions_from: [ ?app, ?mi ]
+      permissions: ["Microsoft.App/containerApps/exec/action"]
+      derived_from: [ "<CanExecuteCommand edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Requires the exec DATA ACTION (not Contributor) AND a running replica; scaled-to-zero -> CONDITIONAL(service_state). Escalation only if the MI out-privileges the caller and is reachable from the container."
+      narrative: "{principal.name} can shell into a running replica of {app.name} (exec/action) and mint the token of its identity {mi.name} from $IDENTITY_ENDPOINT, executing as {mi.name}."
+
+  - id: azure-containerapps-execute-as-via-attach-mi
+    emits: CanCreateWorkloadAs
+    description: "Attach a privileged user-assigned MI to a controlled/new app or job, run it, and execute as the MI."
+    match:
+      - [ ?principal, CanAttachIdentity, ?app ]
+    where:
+      - "?principal can run/deploy the app (Microsoft.App/containerApps/write to create a revision, or Microsoft.App/jobs/start/action for a job)"
+      - "?userMI.privilege_level > ?principal.privilege_level   # strict escalation only (equal-privilege lateral excluded)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.App/containerApps/write"]
+      conditions: [role_compatibility]
+      derived_from: [ "<CanAttachIdentity edge_id>" ]
+      false_positive_note: "Requires the attach chain (assign/action + app/job write) AND the ability to run the workload. Escalation only if the attached MI out-privileges the caller."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to a Container App/job it can run, executing as {userMI.name}."
+
+  # === Container Apps Job trigger / start ===================================
+  - id: azure-containerapps-job-start
+    emits: CanStart
+    match_effective_permission: {action: "Microsoft.App/jobs/start/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<containerApps job>"
+      permissions: ["Microsoft.App/jobs/start/action"]
+      note: "Starts an on-demand job execution that runs the job's image as the job's MI; realizes CONDITIONAL execution edges and drives azure-containerapps-execute-as-via-write on jobs. Also expressible as CanTrigger."
+      narrative: "{principal.name} can start an execution of job {target.name} (jobs/start/action), running its image as the job's managed identity."
+
+  # === Dynamic Sessions (session pools) code execution ======================
+  - id: azure-containerapps-sessionpool-execute
+    emits: CanExecuteCommand
+    description: "Executing code in a custom-container session pool runs attacker-supplied code in the sandbox; if the pool binds a reachable MI this is a CanExecuteAs primitive identical to the app exec path."
+    match_effective_permission: {action: "Microsoft.App/sessionPools/executeSessionCommand/action", data_action: true, scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: ContainerService
+      source: "<principal>"
+      target: "<sessionPool (ContainerService)>"
+      permissions: ["Microsoft.App/sessionPools/executeSessionCommand/action"]
+      conditions: [service_state]
+      state_logic: "ACTIVE if the session pool has an allocated/ready session; otherwise CONDITIONAL(service_state) until a session is allocated"
+      false_positive_note: "Session execution is a DATA ACTION granted by the 'Azure ContainerApps Session Executor' role (or a custom role), NOT by control-plane wildcards. Only escalation-relevant for CUSTOM-CONTAINER session pools that bind a managed identity reachable from the executing session; the built-in code-interpreter pool type does not expose a bindable app MI to session code. Verify the exact data-action string and the pool container/identity binding via `az provider operation show --namespace Microsoft.App`."
+      narrative: "{principal.name} can execute code in a session of pool {target.name} (Microsoft.App/sessionPools/executeSessionCommand/action)."
+
+  - id: azure-containerapps-sessionpool-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Microsoft.App/sessionPools", field: "identity"}
+    where:
+      - "identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned', 'SystemAssigned,UserAssigned']"
+      - "the pool is a custom-container pool whose session containers can reach the identity endpoint (not a locked-down code-interpreter pool)"
+    emit:
+      source_type: Compute
+      source: "<sessionPool (ContainerService)>"
+      target: "<each MI bound to the session pool>"
+      note: "Only emit for custom-container session pools where executed code can reach the local identity endpoint. If the pool cannot expose a bindable MI to session code, omit this fact so no CanExecuteAs is derived."
+      narrative: "Session pool {pool.name} runs sessions as managed identity {mi.name}."
+
+  - id: azure-containerapps-execute-as-via-sessionpool
+    emits: CanExecuteAs
+    description: "Executing code in a custom-container session that binds a reachable MI => execute as that MI (read the identity endpoint from the session)."
+    match:
+      - [ ?principal, CanExecuteCommand, ?pool ]
+      - [ ?pool, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?pool) == ContainerService"
+      - "?mi.privilege_level > ?principal.privilege_level   # strict escalation only (equal-privilege lateral excluded)"
+      - "?mi reachable from the session container (identitySettings.lifecycle in [All, Main] or unset)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      conditions: [service_state]
+      state_logic: "ACTIVE if a session is allocated/ready; else CONDITIONAL(service_state) until a session is allocated"
+      conditions_from: [ ?pool, ?mi ]
+      permissions: ["Microsoft.App/sessionPools/executeSessionCommand/action"]
+      derived_from: [ "<CanExecuteCommand edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Requires the session-execute DATA ACTION AND a custom-container pool that binds an MI reachable from session code. Escalation only if the MI out-privileges the caller. If session pools cannot bind a reachable MI, this rule never fires (the ExecutesAs fact is absent)."
+      narrative: "{principal.name} can execute code in a session of pool {pool.name} and mint the token of its identity {mi.name} from the local identity endpoint, executing as {mi.name}."
+
+  # === Network exposure =====================================================
+  - id: azure-containerapps-exposed-internet
+    emits: ExposedToInternet
+    description: "Container App with external ingress and no denying IP restrictions."
+    where:
+      - "configuration.ingress.external == true"
+      - "no configuration.ingress.ipSecurityRestrictions denies the caller (or none set)"
+      - "the managed environment is not internal-only"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<containerApp>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      false_positive_note: "Do not emit if ingress.external is false/absent, the environment is internal-only, or ipSecurityRestrictions deny by default. Internal ingress is reachable only in-VNet -> use PrivateReachability instead."
+      narrative: "{app.name} is reachable from the internet on its ingress targetPort (external ingress, no denying IP restrictions)."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: any action above covered by an applicable DENY
+# ASSIGNMENT (Azure Blueprint / Managed Application) or an explicit deny in a
+# custom role is emitted with state: BLOCKED and denied_by=<deny assignment>,
+# so the UI can explain why an otherwise-present execution path does not work.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization (raw config -> explicit edges). These belong in
+# /rules/explicit/azure/ but are noted here for completeness; they emit the
+# ExecutesAs / AttachedTo / ContainsSecret facts the derived rules consume.
+# ---------------------------------------------------------------------------
+explicit_rules:
+  - id: azure-containerapps-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Microsoft.App/containerApps", field: "identity"}
+    where: ["identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned', 'SystemAssigned,UserAssigned']"]
+    emit:
+      source: "<containerApp>"
+      target: "<each MI: system-assigned SP (principalId) and every userAssignedIdentities key>"
+      note: "System-assigned principalId is the app's Entra SP; user-assigned keys are Microsoft.ManagedIdentity/userAssignedIdentities resource ids. Record identitySettings.lifecycle per MI so reachability rules can honor None/Init scoping."
+      narrative: "{app.name} runs as managed identity {mi.name}."
+
+  - id: azure-containerapps-job-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Microsoft.App/jobs", field: "identity"}
+    where: ["identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned', 'SystemAssigned,UserAssigned']"]
+    emit:
+      source: "<containerApps job>"
+      target: "<each MI bound to the job>"
+      narrative: "Job {job.name} runs as managed identity {mi.name}."
+
+  - id: azure-containerapps-mi-attached
+    emits: AttachedTo
+    source_config: {resource_type: "Microsoft.App/containerApps", field: "identity.userAssignedIdentities"}
+    emit:
+      source: "<user-assigned managed identity>"
+      target: "<containerApp>"
+      narrative: "User-assigned MI {mi.name} is attached to Container App {app.name}."
+
+  - id: azure-containerapps-contains-secret
+    emits: ContainsSecret
+    source_config: {resource_type: "Microsoft.App/containerApps", field: "configuration.secrets"}
+    emit:
+      source: "<containerApp>"
+      target: "<each app secret (name; value read only via listSecrets)>"
+      note: "Registry passwords, connection strings, Key Vault references. Drives ExposesCredential once listSecrets/action is held."
+      narrative: "Container App {app.name} stores secret {secret.name} in its configuration."

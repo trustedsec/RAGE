@@ -1,0 +1,792 @@
+# Azure SQL / SQL MI — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Covers:
+#   Microsoft.Sql/servers          (logical SQL server + Azure SQL Database)
+#   Microsoft.Sql/managedInstances (Azure SQL Managed Instance)
+#
+# Phase-6 dominant attack surfaces:
+#   (1) CREDENTIAL GRAB / ADMIN TAKEOVER:
+#         servers/administrators/write (set Entra admin) → any Entra identity becomes
+#         a dbo-equivalent on ALL databases in the server — CanReadData without needing
+#         a SQL login or a database-level grant.
+#   (2) DATA READ + EXFIL:
+#         SQL or Entra auth with db_datareader/db_owner → CanReadData;
+#         databases/export/action (BACPAC export to caller-controlled storage) → CanExfiltrate.
+#   (3) PUBLIC EXPOSURE:
+#         Logical server: publicNetworkAccess=Enabled + firewall rule
+#           startIpAddress=0.0.0.0 / endIpAddress=255.255.255.255 → ExposedToInternet.
+#         SQL MI: publicDataEndpointEnabled=true + NSG allows 3342 from internet → ExposedToInternet.
+#   (4) ARM CONTRIBUTOR → DATA ACCESS:
+#         ARM Contributor/Owner can open the firewall and (separately) read the SQL admin
+#         password from its storage location (Key Vault / App Config) — combines with
+#         credential-chains.yaml ExposesCredential path.
+#
+# KEY FALSE-POSITIVE GUARD:
+#   - AllowAllWindowsAzureIps (startIp=0.0.0.0, endIp=0.0.0.0) = Azure service tag IPs,
+#     NOT the public internet. DO NOT emit ExposedToInternet; emit ExposedToTenant.
+#   - publicNetworkAccess=Disabled overrides all firewall rules — no ExposedToInternet.
+#   - SQL MI has no public IP by default; requires publicDataEndpointEnabled=true + open NSG.
+#   - servers/administrators/write sets the ENTRA admin, not a SQL auth admin.
+#     The Entra admin gets full DBA; the effect is ACTIVE only once the Entra principal
+#     authenticates (Entra auth must be available — it always is for Azure SQL unless
+#     Entra-only auth is configured for a different principal).
+#
+# TDE NOTE: servers/encryptionProtector/write can change the CMK key URL. The primary
+# impact is availability (key removal = DB inaccessible). Data-read via TDE key control
+# requires the attacker to also hold the key in Key Vault (CanDecrypt) —
+# credential-chains.yaml decrypt-gates-secret-read handles that gate. Not separately
+# re-derived here.
+#
+# Permissions verified against:
+#   https://learn.microsoft.com/azure/role-based-access-control/permissions/databases#microsoftsql
+#   (2026 snapshot). All action strings are exact; none are invented.
+#
+# LINCHPIN CITATIONS (CITE, DO NOT DUPLICATE):
+#   credential-chains.yaml —
+#     read-secret-yields-identity: connection strings / SQL passwords in Key Vault
+#       → CanReadSecret → CredentialsFor(ConnectionString → RelationalDatabase) → CanImpersonate.
+#     execute-then-read-secret: a workload with CanExecuteAs on the server MI inherits
+#       the MI's CanReadSecret (Key Vault TDE key access).
+#     decrypt-gates-secret-read: TDE CMK-encrypted DB read is gated on CanDecrypt of the
+#       Key Vault key (if the attacker also holds the key, the read is upgraded to ACTIVE).
+#   can-control.yaml —
+#     control-via-admin: CanAdminister → Controls (SQL server).
+#     escalate-via-execute-as: CanExecuteAs → CanEscalateTo (not typical here, but via MI
+#       identity if the server MI has elevated permissions).
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 6-storage-databases
+applies_to: [azure]
+
+rules:
+
+  # ==========================================================================
+  # (3) PUBLIC EXPOSURE — Azure SQL Database (logical server)
+  # ==========================================================================
+  # A logical SQL server with publicNetworkAccess=Enabled and a firewall rule that
+  # covers the full IPv4 range (0.0.0.0–255.255.255.255) is reachable from any
+  # internet host on TCP 1433. Any host can attempt SQL or Entra authentication.
+  # This is the most common misconfiguration for Azure SQL Database.
+  #
+  # CRITICAL guards:
+  #   (a) publicNetworkAccess=Disabled overrides all firewall rules — no ExposedToInternet.
+  #   (b) AllowAllWindowsAzureIps (start=0.0.0.0, end=0.0.0.0) is a special Azure service
+  #       tag (Azure datacenter IPs only), NOT the public internet — do NOT emit here.
+  #       Only startIpAddress=0.0.0.0 AND endIpAddress=255.255.255.255 (true 0/0) qualifies.
+  - id: azure-sql-server-public-firewall
+    emits: ExposedToInternet
+    description: "SQL logical server with publicNetworkAccess=Enabled and a 0.0.0.0–255.255.255.255 firewall rule is reachable from the public internet on port 1433."
+    match:
+      - [ ?server, Contains, ?firewallRule ]
+    where:
+      - "node_type(?server) == RelationalDatabase"
+      - "?server.provider_type == 'Microsoft.Sql/servers'"
+      - "?server.properties.publicNetworkAccess != 'Disabled'  # Enabled or null/absent (default=Enabled for older servers)"
+      - "node_type(?firewallRule) == Firewall"
+      - "?firewallRule.provider_type == 'Microsoft.Sql/servers/firewallRules'"
+      - "?firewallRule.properties.startIpAddress == '0.0.0.0'"
+      - "?firewallRule.properties.endIpAddress == '255.255.255.255'  # true full-internet rule; endIp=0.0.0.0 is Azure-only tag — do NOT match"
+    emit:
+      source_type: RelationalDatabase
+      target_type: AnonymousIdentity
+      source: ?server
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE: the server is reachable from any internet IPv4 host on port 1433.
+        SQL auth is always available; Entra auth requires a valid Entra identity but
+        the TCP endpoint itself is open.
+        Note: the separate azure-sql-server-allow-azure-services rule handles the
+        AllowAllWindowsAzureIps special case (startIp/endIp=0.0.0.0/0.0.0.0).
+        The where clause guards publicNetworkAccess != 'Disabled' to prevent emission
+        when the service-level flag overrides all firewall rules.
+      confidence: "0.95"
+      derived_from: [ "<Contains edge_id (server → firewallRule)>", "<firewallRule.properties.startIpAddress/endIpAddress>", "<server.properties.publicNetworkAccess>" ]
+      false_positive_note: >-
+        Two critical guards must both pass before emitting:
+        (1) publicNetworkAccess must be 'Enabled' (or absent/null — old servers default
+            to Enabled); if 'Disabled', the service-level flag wins and the firewall
+            rule is irrelevant — skip entirely.
+        (2) The firewall rule must cover the FULL public internet: startIpAddress=0.0.0.0
+            AND endIpAddress=255.255.255.255. The special AllowAllWindowsAzureIps entry
+            has startIpAddress=endIpAddress=0.0.0.0 (a single IP) and means "allow Azure
+            datacenter ranges" — this is multi-tenant Azure risk, not public internet
+            exposure; emit ExposedToTenant for that pattern instead.
+        ExposedToInternet here means any unauthenticated TCP SYN can reach port 1433.
+        Actual data access also requires valid credentials (SQL login or Entra identity);
+        the network exposure edge is correct regardless — it represents the threat surface.
+        Private-endpoint-only servers (publicNetworkAccess=Disabled) are NOT affected.
+      narrative: >-
+        {server.name} has publicNetworkAccess=Enabled and a firewall rule allowing
+        all IPv4 addresses (0.0.0.0–255.255.255.255), exposing SQL Server port 1433
+        to the public internet. Any internet host can attempt SQL authentication or
+        Entra authentication against this server.
+
+  # ==========================================================================
+  # (3) PUBLIC EXPOSURE — Azure SQL Managed Instance
+  # ==========================================================================
+  # SQL MI is deployed inside a VNet by design and has no public IP by default.
+  # The optional public data endpoint (port 3342, TLS-only) must be explicitly
+  # enabled. When enabled, the NSG on the MI subnet also controls internet
+  # reachability — an open NSG rule for 3342 from the internet (*) is required
+  # for the full ExposedToInternet path.
+  #
+  # Guard: publicDataEndpointEnabled=false (default) → no ExposedToInternet.
+  # NOTE: NSG rules must be normalized during collection into Firewall nodes
+  # linked to subnets via Contains edges. The match pattern assumes this normalization.
+  - id: azure-sql-mi-public-endpoint
+    emits: ExposedToInternet
+    description: "SQL Managed Instance with publicDataEndpointEnabled=true and an NSG allowing inbound TCP 3342 from the internet is reachable by any internet host."
+    match:
+      - [ ?mi, LocatedIn, ?subnet ]
+      - [ ?subnet, Contains, ?nsg ]
+      - [ ?nsg, Contains, ?nsgRule ]
+    where:
+      - "node_type(?mi) == RelationalDatabase"
+      - "?mi.provider_type == 'Microsoft.Sql/managedInstances'"
+      - "?mi.properties.publicDataEndpointEnabled == true"
+      - "node_type(?subnet) == Network"
+      - "node_type(?nsg) == Firewall"
+      - "?nsg.provider_type == 'Microsoft.Network/networkSecurityGroups'"
+      - "node_type(?nsgRule) == Firewall"
+      - "?nsgRule.provider_type == 'Microsoft.Network/networkSecurityGroups/securityRules'"
+      - "?nsgRule.properties.direction == 'Inbound'"
+      - "?nsgRule.properties.access == 'Allow'"
+      - "?nsgRule.properties.destinationPortRange == '3342' OR contains(?nsgRule.properties.destinationPortRange, '3342')"
+      - "?nsgRule.properties.sourceAddressPrefix in ['0.0.0.0/0', '*', '<nw>/0', 'Internet']  # Allow rule from internet"
+    emit:
+      source_type: RelationalDatabase
+      target_type: AnonymousIdentity
+      source: ?mi
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if ?mi.properties.publicDataEndpointEnabled == false: DO NOT EMIT
+        (the MI has no public endpoint);
+        elif NSG has no inbound allow rule for port 3342 from 0.0.0.0/0 or Internet tag:
+        CONDITIONAL(network_reachability) — the endpoint is enabled but NSG blocks external access;
+        else ACTIVE: internet hosts can reach the MI on port 3342.
+        Note: SQL MI public endpoint always enforces TLS; the exposure is the
+        TCP reachability and authentication surface, not plaintext data.
+      confidence: "0.92"
+      derived_from: [ "<mi.properties.publicDataEndpointEnabled>", "<nsgRule inbound port 3342 from internet>" ]
+      false_positive_note: >-
+        publicDataEndpointEnabled=false (the default) means the MI has NO public
+        IP and is strictly VNet-internal — do not emit. When true, ALSO check the
+        NSG on the MI's delegated subnet: if the NSG denies inbound 3342, the
+        endpoint is configured but not reachable — emit as CONDITIONAL(network_reachability).
+        SQL MI always communicates on port 3342 (not 1433) on the public endpoint;
+        1433 is only used on the private VNet endpoint. The public endpoint enforces
+        server TLS; the exposure is the unauthenticated TCP reachability and
+        authentication surface (SQL auth or Entra auth over TLS).
+      narrative: >-
+        {mi.name} has its public data endpoint enabled (port 3342) and the subnet
+        NSG allows inbound internet traffic on that port. Any internet host can attempt
+        SQL or Entra authentication against this Managed Instance.
+
+  # ==========================================================================
+  # (1) CREDENTIAL GRAB — Set Entra admin → full DBA on all databases
+  # ==========================================================================
+  # servers/administrators/write (or managedInstances/administrators/write) allows
+  # a caller to set any Entra identity as the Entra administrator of the SQL server /
+  # MI. The Entra admin automatically receives the db_owner role on all databases
+  # without requiring any SQL-level CREATE USER or GRANT statements. This is a
+  # one-action full-DBA takeover for the entire logical server.
+  #
+  # The caller can set THEMSELVES as the Entra admin, so the emit is:
+  #   principal → CanReadData → server (all databases)
+  # because once the admin is set, the principal can immediately query any database
+  # using Entra token-based authentication. However, the ability to EXECUTE this
+  # query is gated by SQL endpoint REACHABILITY. The ARM write itself (setting the
+  # admin) is not gated by firewall, but the subsequent Entra auth to port 1433 (SQL
+  # Database) or 3342 (SQL MI public endpoint) IS gated by network configuration.
+  #
+  # This rule emits TWO edges with different state conditions:
+  #   - CanReadData / CanWriteData: ACTIVE if endpoint is publicly exposed OR principal
+  #     has network foothold in allowed subnet/private endpoint; CONDITIONAL(network_reachability)
+  #     if publicNetworkAccess=Disabled and no private endpoint access detected.
+  #
+  # Verified action: Microsoft.Sql/servers/administrators/write
+  # Verified action (MI): Microsoft.Sql/managedInstances/administrators/write
+  # Both require the ARM-level permission at the server/MI scope; sub-resource
+  # scoping at /databases/* is insufficient.
+  - id: azure-sql-entra-admin-takeover-database
+    emits: [CanReadData, CanWriteData]
+    description: "servers/administrators/write lets a caller set any Entra identity (including themselves) as full DBA on all databases in the SQL server, yielding complete data-plane read and write if the SQL endpoint is network-reachable."
+    match:
+      - [ ?principal, HasPermission, ?server ]
+    where:
+      - "node_type(?server) == RelationalDatabase"
+      - "?server.provider_type == 'Microsoft.Sql/servers'  # Azure SQL Database (logical server)"
+      - "?principal has EFFECTIVE Microsoft.Sql/servers/administrators/write at ?server scope (Owner, Contributor, SQL Server Contributor 6d8ee4ec-f05a-4a1d-8b00-a9b17e38b437, or custom role)"
+    emit:
+      - source_type: Identity
+        target_type: RelationalDatabase
+        source: ?principal
+        target: ?server
+        edge_type: CanReadData
+        permissions:
+          - "Microsoft.Sql/servers/administrators/write"
+        conditions: [iam_permission, network_reachability]
+        confidence: "0.97"
+        derived_from: [ "<HasPermission edge_id (administrators/write)>" ]
+      - source_type: Identity
+        target_type: RelationalDatabase
+        source: ?principal
+        target: ?server
+        edge_type: CanWriteData
+        permissions:
+          - "Microsoft.Sql/servers/administrators/write"
+        conditions: [iam_permission, network_reachability]
+        confidence: "0.97"
+        derived_from: [ "<HasPermission edge_id (administrators/write)>" ]
+    state_logic: >-
+      The ARM control-plane action (setting Entra admin) succeeds from any network that
+      can reach ARM (management.azure.com) and is NOT gated by SQL firewall. However, the
+      data-plane EXECUTION of queries as the Entra admin IS gated by SQL endpoint
+      reachability. State therefore depends on ?server network exposure:
+      (1) if ?server has ExposedToInternet edge: ACTIVE (endpoint reachable from internet);
+      (2) if ?server.properties.publicNetworkAccess == 'Disabled' AND no PrivateEndpoint
+          or VNet service endpoint is detected for ?principal: CONDITIONAL(network_reachability)
+          (endpoint not publicly exposed; principal must have pre-existing network access);
+      (3) else if firewall rule allows ?principal's IP or principal is in VNet with service
+          endpoint: ACTIVE (network path exists).
+      If a deny assignment or deny Azure Policy covers administrators/write at the effective
+      scope: BLOCKED.
+    false_positive_note: >-
+      CRITICAL DISTINCTION: The ARM control-plane action (set Entra admin) is NOT gated
+      by SQL network configuration. The permission evaluation must succeed at ARM. However,
+      the subsequent data-plane access (query execution) IS gated by SQL endpoint
+      reachability. An attacker who sets themselves as Entra admin on a SQL server with
+      publicNetworkAccess=Disabled cannot connect to port 1433 to exploit it without a
+      pre-existing foothold in the allowed network (private endpoint, VNet service endpoint,
+      or allowlisted IP). The CanReadData/CanWriteData edges therefore must incorporate
+      network_reachability in conditions. The rule emits network-gated state, not a blanket
+      ACTIVE. If the endpoint is publicly exposed (ExposedToInternet edge exists), the
+      condition automatically resolves to ACTIVE. If the server is private-only, the
+      condition is CONDITIONAL(network_reachability) unless a private endpoint or VNet
+      service endpoint can be proven for the principal.
+    narrative: >-
+      {principal.name} holds Microsoft.Sql/servers/administrators/write on {server.name},
+      allowing it to designate any Entra identity — including itself — as the Entra
+      administrator. The Entra admin automatically receives db_owner on all databases
+      in the server. Execution of queries as the admin requires network reachability to
+      the SQL endpoint (port 1433). If {server.name} has publicNetworkAccess=Disabled,
+      the attacker needs pre-existing access to a private endpoint or VNet service endpoint
+      to connect.
+
+  # SQL Managed Instance variant (separate rule for provider_type clarity)
+  - id: azure-sql-entra-admin-takeover-mi
+    emits: [CanReadData, CanWriteData]
+    description: "managedInstances/administrators/write lets a caller set any Entra identity (including themselves) as full DBA on all MI databases, yielding complete data-plane read and write if the MI endpoint is network-reachable."
+    match:
+      - [ ?principal, HasPermission, ?mi ]
+    where:
+      - "node_type(?mi) == RelationalDatabase"
+      - "?mi.provider_type == 'Microsoft.Sql/managedInstances'  # Azure SQL Managed Instance"
+      - "?principal has EFFECTIVE Microsoft.Sql/managedInstances/administrators/write at ?mi scope (Owner, Contributor, SQL MI Contributor 4939a1f6-9ae0-4e48-a1e0-f2cbe897382d, or custom role)"
+    emit:
+      - source_type: Identity
+        target_type: RelationalDatabase
+        source: ?principal
+        target: ?mi
+        edge_type: CanReadData
+        permissions:
+          - "Microsoft.Sql/managedInstances/administrators/write"
+        conditions: [iam_permission, network_reachability]
+        confidence: "0.97"
+        derived_from: [ "<HasPermission edge_id (administrators/write)>" ]
+      - source_type: Identity
+        target_type: RelationalDatabase
+        source: ?principal
+        target: ?mi
+        edge_type: CanWriteData
+        permissions:
+          - "Microsoft.Sql/managedInstances/administrators/write"
+        conditions: [iam_permission, network_reachability]
+        confidence: "0.97"
+        derived_from: [ "<HasPermission edge_id (administrators/write)>" ]
+    state_logic: >-
+      The ARM control-plane action (setting Entra admin) succeeds from any network that
+      can reach ARM (management.azure.com) and is NOT gated by SQL MI subnet NSG. However,
+      the data-plane EXECUTION of queries as the Entra admin IS gated by MI endpoint
+      reachability. MI is VNet-internal by default (private, 1433 only); the public
+      endpoint (3342) requires publicDataEndpointEnabled=true + NSG rule allowing inbound.
+      State therefore depends on ?mi network exposure:
+      (1) if ?mi has ExposedToInternet edge (public endpoint enabled + NSG allows 3342):
+          ACTIVE (endpoint reachable from internet);
+      (2) if ?mi.properties.publicDataEndpointEnabled == false OR NSG blocks inbound 3342:
+          CONDITIONAL(network_reachability) (only VNet-internal 1433 is available; principal
+          must be in the same VNet or have a peered network);
+      (3) else if principal is in same VNet as MI or has peered network access: ACTIVE.
+      If a deny assignment or deny Azure Policy covers administrators/write at the effective
+      scope: BLOCKED.
+    false_positive_note: >-
+      SQL MI is deployed inside a VNet and has no public IP by default. The private
+      endpoint (1433) is only accessible within the VNet or from peered networks. The
+      public endpoint (port 3342) requires publicDataEndpointEnabled=true AND an NSG
+      rule allowing inbound 3342 from the internet. An attacker who sets themselves as
+      Entra admin on a SQL MI with the public endpoint disabled cannot connect to query
+      the MI from the internet. The CanReadData/CanWriteData edges therefore must
+      incorporate network_reachability in conditions, with state depending on whether
+      the public endpoint is exposed. If the public endpoint is exposed (ExposedToInternet
+      edge exists), state is ACTIVE. If private-only, state is CONDITIONAL(network_reachability)
+      unless the principal can prove network access to the VNet (same subnet, peered network,
+      private endpoint).
+    narrative: >-
+      {principal.name} holds Microsoft.Sql/managedInstances/administrators/write on
+      {mi.name}, allowing it to designate any Entra identity — including itself — as
+      the Entra administrator. The Entra admin automatically receives db_owner on all
+      databases in the MI. Execution of queries as the admin requires network reachability
+      to the MI endpoint. If {mi.name} has the public data endpoint disabled, the attacker
+      needs pre-existing access to the MI's VNet (or a peered network) to connect on
+      the private endpoint.
+
+  # ==========================================================================
+  # (1a) POLICY MODIFICATION — Set Entra admin → modify SQL database access policy
+  # ==========================================================================
+  # servers/administrators/write (or managedInstances/administrators/write) does not
+  # merely grant data access — it modifies the SECURITY POLICY of the SQL server by
+  # changing who holds full DBA authority (db_owner) over all databases. This is a
+  # capability to alter an identity policy (who gets what role). Emit CanModifyPolicy
+  # in addition to the data access edges. This enables policy-change-specific query
+  # profiles (e.g., "find all paths that can modify SQL access policy").
+  #
+  # Target: RelationalDatabase (the SQL server resource whose policy is modified).
+  # This complements the CanReadData/CanWriteData emits from the takeover rule above.
+  - id: azure-sql-entra-admin-policy-mod-database
+    emits: CanModifyPolicy
+    description: "servers/administrators/write allows modifying the Entra admin assignment, which is equivalent to modifying the SQL access policy (who holds db_owner on all databases)."
+    match:
+      - [ ?principal, HasPermission, ?server ]
+    where:
+      - "node_type(?server) == RelationalDatabase"
+      - "?server.provider_type == 'Microsoft.Sql/servers'  # Azure SQL Database (logical server)"
+      - "?principal has EFFECTIVE Microsoft.Sql/servers/administrators/write at ?server scope"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?server
+      permissions:
+        - "Microsoft.Sql/servers/administrators/write"
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers administrators/write
+        at the effective scope: BLOCKED;
+        else ACTIVE: the principal can modify the Entra admin assignment on the server,
+        changing the security policy to grant db_owner role to any Entra identity
+        (including themselves). This is a security-policy mutation independent of
+        downstream data access.
+      confidence: "0.97"
+      derived_from: [ "<HasPermission edge_id (administrators/write)>" ]
+      false_positive_note: >-
+        This edge captures the POLICY-MODIFICATION aspect of administrators/write,
+        independent of whether the attacker will subsequently use the data access.
+        Both CanModifyPolicy and CanReadData/CanWriteData are emitted by separate rules
+        on the same permission, enabling analysts to query for either capability.
+      narrative: >-
+        {principal.name} can modify the SQL access policy by setting the Entra
+        administrator on {server.name} via Microsoft.Sql/servers/administrators/write.
+
+  - id: azure-sql-entra-admin-policy-mod-mi
+    emits: CanModifyPolicy
+    description: "managedInstances/administrators/write allows modifying the Entra admin assignment on the MI, which is equivalent to modifying the SQL access policy (who holds db_owner on all MI databases)."
+    match:
+      - [ ?principal, HasPermission, ?mi ]
+    where:
+      - "node_type(?mi) == RelationalDatabase"
+      - "?mi.provider_type == 'Microsoft.Sql/managedInstances'  # Azure SQL Managed Instance"
+      - "?principal has EFFECTIVE Microsoft.Sql/managedInstances/administrators/write at ?mi scope"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?mi
+      permissions:
+        - "Microsoft.Sql/managedInstances/administrators/write"
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers administrators/write
+        at the effective scope: BLOCKED;
+        else ACTIVE: the principal can modify the Entra admin assignment on the MI,
+        changing the security policy to grant db_owner role to any Entra identity
+        (including themselves).
+      confidence: "0.97"
+      derived_from: [ "<HasPermission edge_id (administrators/write)>" ]
+      false_positive_note: >-
+        This edge captures the POLICY-MODIFICATION aspect of administrators/write,
+        independent of downstream data access. Both CanModifyPolicy and CanReadData/
+        CanWriteData are emitted by separate rules on the same permission.
+      narrative: >-
+        {principal.name} can modify the SQL access policy by setting the Entra
+        administrator on {mi.name} via Microsoft.Sql/managedInstances/administrators/write.
+
+  # ==========================================================================
+  # (1b) CREDENTIAL GRAB — ARM Contributor + open firewall + SQL auth credential
+  # ==========================================================================
+  # An identity with ARM Contributor or Owner on a SQL logical server can:
+  # (1) open the firewall via servers/write → ExposedToInternet
+  # (2) read the SQL admin password from Key Vault / App Config (separate
+  #     CanReadSecret edge from credential-chains.yaml)
+  # The combination of firewall-open + SQL auth credential → immediate data read.
+  # Requires three conditions: (a) CanAdminister the SQL server (to open firewall),
+  # (b) internet reachability ExposedToInternet, and (c) a SQL login credential.
+  # This is a multi-hop derived capability; the linchpin credential-chains.yaml
+  # handles the secret-read path. This rule cites that path.
+  #
+  # NOTE: This rule is documented in sql.md Section 18 but left to the linchpin
+  # derivation (credential-chains.yaml). Not separately re-derived here because
+  # the credential access is orthogonal and already modeled by the linchpin.
+  # Keeping this as a comment for documentation clarity.
+  #
+  # If a collector detects a SQL admin password stored and exposed, the edges
+  # flow: CanReadSecret(principal, KVSecret) + CredentialsFor(KVSecret, SQLadmin)
+  # → CanImpersonate(principal, SQLadmin_credential) → CanReadData(principal, DB).
+  # See credential-chains.yaml read-secret-yields-identity.
+
+  # ==========================================================================
+  # (2) DATA EXFIL — BACPAC export to caller-controlled storage
+  # ==========================================================================
+  # Microsoft.Sql/servers/databases/export/action triggers an asynchronous BACPAC
+  # export of the full database (schema + data) to a caller-specified Azure Blob
+  # Storage URL. The export job runs under the server's system-assigned MI or uses
+  # a storage access key provided by the caller. An attacker with this permission
+  # can exfiltrate an entire database to a storage account they control, or to
+  # an existing storage account where they have write access.
+  #
+  # The export lands in Azure Blob Storage (ObjectStorage / Snapshot). This is
+  # full-data exfiltration — not a selective read — so CanExfiltrate is correct.
+  #
+  # Verified action: Microsoft.Sql/servers/databases/export/action
+  # Verified role: SQL Server Contributor (6d8ee4ec) does NOT include export/action.
+  # Owner/Contributor/SQL DB Contributor (9b7fa17d) DO include it.
+  # Check effective permission explicitly — export/action is often excluded from
+  # custom roles.
+  - id: azure-sql-database-export-exfiltrate
+    emits: CanExfiltrate
+    description: "databases/export/action exports the full DB as a BACPAC to a caller-specified storage URL, enabling complete data exfiltration outside the tenant."
+    match:
+      - [ ?principal, HasPermission, ?database ]
+    where:
+      - "node_type(?database) == RelationalDatabase"
+      - "?database.provider_type == 'Microsoft.Sql/servers/databases'"
+      - "?principal has EFFECTIVE Microsoft.Sql/servers/databases/export/action at ?database scope (Owner, Contributor, SQL DB Contributor 9b7fa17d-e63e-47b0-bb0a-15c516ac86ec, or custom role with export/action)"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?database
+      permissions: ["Microsoft.Sql/servers/databases/export/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers databases/export/action
+        at the effective scope: BLOCKED;
+        else ACTIVE: the principal can immediately invoke the export REST API
+        (POST /databases/{db}/export) supplying a caller-controlled storage URI
+        and access key/SAS token. The export is asynchronous but completes without
+        further confirmation from the data owner.
+        Network note: databases/export/action is an ARM control-plane call; it is NOT
+        gated by the SQL server firewall. The export job itself connects internally
+        (Azure fabric); the BACPAC lands in the caller-specified storage account.
+      confidence: "0.95"
+      derived_from: [ "<HasPermission edge_id (databases/export/action)>" ]
+      false_positive_note: >-
+        SQL Server Contributor (6d8ee4ec) does NOT include databases/export/action —
+        verify effective permissions explicitly; do not infer from the role name alone.
+        Owner and Contributor at subscription/RG scope DO include it. SQL DB Contributor
+        (9b7fa17d) at the database scope includes it. Custom roles must explicitly list
+        export/action. The export is an ARM call; the SQL server firewall rules and
+        private endpoint configuration do NOT block it — the exfiltration happens
+        regardless of network exposure settings. The target of CanExfiltrate is the
+        SQL Database (RelationalDatabase node); the landing storage account is modeled
+        as the write destination separately if it is in scope.
+        This rule only applies to Azure SQL Database (Microsoft.Sql/servers/databases);
+        SQL MI uses a different backup/export model (LTR backup to storage) — see
+        separate rule if warranted.
+      narrative: >-
+        {principal.name} holds databases/export/action on {database.name}, allowing
+        it to export the complete database (schema and all data) as a BACPAC file to
+        a caller-specified Azure Blob Storage location. The export bypasses the SQL
+        firewall and completes asynchronously, enabling full data exfiltration to any
+        storage account the attacker controls.
+
+  # ==========================================================================
+  # (2b) DATA EXFIL — SQL MI Long-Term Retention (LTR) backup redirect to attacker storage
+  # ==========================================================================
+  # Azure SQL Managed Instance supports Long-Term Retention (LTR) backups, which can be
+  # configured to store backups in Azure Blob Storage for extended retention (up to 10 years).
+  # The permission Microsoft.Sql/managedInstances/databases/backupLongTermRetentionPolicies/write
+  # allows a principal to modify LTR backup policies, including the storage account and
+  # credentials used for backup. An attacker with this permission can redirect LTR backups
+  # to a storage account they control, enabling full database exfiltration outside the tenant.
+  #
+  # Note: Azure SQL Database (logical server) also supports automated backups and backup
+  # retention, but the primary exfiltration vector is BACPAC export (databases/export/action),
+  # which is captured by the azure-sql-database-export-exfiltrate rule. LTR policy write
+  # is specific to SQL MI and warrants a separate rule.
+  #
+  # Verified action: Microsoft.Sql/managedInstances/databases/backupLongTermRetentionPolicies/write
+  # Verified role: Owner, Contributor, SQL MI Contributor (4939a1f6) at MI or database scope.
+  - id: azure-sql-mi-ltr-backup-exfiltrate
+    emits: CanExfiltrate
+    description: "backupLongTermRetentionPolicies/write allows redirecting SQL MI database backups to an attacker-controlled storage account, enabling full database exfiltration outside the tenant."
+    match:
+      - [ ?principal, HasPermission, ?miDatabase ]
+    where:
+      - "node_type(?miDatabase) == RelationalDatabase"
+      - "?miDatabase.provider_type == 'Microsoft.Sql/managedInstances/databases'"
+      - "?principal has EFFECTIVE Microsoft.Sql/managedInstances/databases/backupLongTermRetentionPolicies/write at ?miDatabase scope (Owner, Contributor, SQL MI Contributor 4939a1f6-9ae0-4e48-a1e0-f2cbe897382d, or custom role with backupLongTermRetentionPolicies/write)"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?miDatabase
+      permissions: ["Microsoft.Sql/managedInstances/databases/backupLongTermRetentionPolicies/write"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers backupLongTermRetentionPolicies/write
+        at the effective scope: BLOCKED;
+        else ACTIVE: the principal can modify the LTR backup policy, setting the storage
+        account and credentials to redirect backups. By specifying a storage account the
+        attacker controls (or has write access to), they can exfiltrate the full database
+        backup (schema + data). This is an ARM control-plane call; it is NOT gated by the
+        MI subnet NSG or network configuration. The backup job runs asynchronously under
+        the MI's system-assigned MI, which must have write access to the specified storage
+        account (via a storage key or SAS token provided in the policy).
+      confidence: "0.94"
+      derived_from: [ "<HasPermission edge_id (backupLongTermRetentionPolicies/write)>" ]
+      false_positive_note: >-
+        The LTR backup policy write permission is less commonly granted than database export
+        permission, but it is included in the Owner/Contributor roles at subscription or MI
+        scope. SQL Database (logical servers) also support automated backup retention, but
+        the policy is managed by Azure and not directly writable by principals — the primary
+        exfiltration vector for SQL Database is BACPAC export. For SQL MI, LTR policy write
+        is a distinct exfiltration capability. Verify that the principal actually has write
+        access to the target storage account (or that they can specify credentials/SAS tokens
+        in the policy) to complete the exfiltration chain. The backup process itself is
+        asynchronous; the ARM permission is the gate.
+      narrative: >-
+        {principal.name} holds Microsoft.Sql/managedInstances/databases/backupLongTermRetentionPolicies/write
+        on {miDatabase.name}, allowing it to modify the LTR backup policy and redirect
+        backups to an attacker-controlled storage account. This enables exfiltration of
+        the full database (schema and all data) outside the organization's tenant via the
+        backup file.
+
+  # ==========================================================================
+  # (3) PUBLIC EXPOSURE — AllowAllWindowsAzureIps → ExposedToTenant
+  # ==========================================================================
+  # The special Azure portal "Allow Azure services and resources to access this server"
+  # checkbox creates a firewall rule: startIpAddress=0.0.0.0, endIpAddress=0.0.0.0.
+  # This allows all Azure-datacenter IP ranges (any Azure tenant, any subscription),
+  # NOT the public internet. The blast radius is the full Azure public cloud.
+  # Model as ExposedToTenant-level risk (any Azure identity in any tenant can attempt
+  # SQL auth if they have credentials; or any Azure service can be the source).
+  #
+  # NOTE: ExposedToTenant target is Tenant; the rule fires when the firewall matches
+  # the special 0.0.0.0/0.0.0.0 sentinel (not the full internet range).
+  - id: azure-sql-server-allow-azure-services
+    emits: ExposedToTenant
+    description: "Allow Azure services rule (startIp=endIp=0.0.0.0) exposes the SQL server to all Azure tenants and multi-tenant services — not public internet but broad cross-tenant exposure."
+    match:
+      - [ ?server, Contains, ?firewallRule ]
+    where:
+      - "node_type(?server) == RelationalDatabase"
+      - "?server.provider_type == 'Microsoft.Sql/servers'"
+      - "?server.properties.publicNetworkAccess != 'Disabled'"
+      - "node_type(?firewallRule) == Firewall"
+      - "?firewallRule.provider_type == 'Microsoft.Sql/servers/firewallRules'"
+      - "?firewallRule.properties.startIpAddress == '0.0.0.0'"
+      - "?firewallRule.properties.endIpAddress == '0.0.0.0'  # the AllowAllWindowsAzureIps sentinel"
+    emit:
+      source_type: RelationalDatabase
+      target_type: Tenant
+      source: ?server
+      target: "<Azure public cloud Tenant boundary>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if ?server.properties.publicNetworkAccess == 'Disabled': DO NOT EMIT;
+        else ACTIVE: any Azure-hosted service (any tenant, any subscription) can reach
+        the SQL server on port 1433 from an Azure datacenter IP. The actual risk is
+        any Azure resource (compute, container, CI/CD runner) across ALL Azure tenants
+        can initiate a TCP connection to port 1433. Authentication is still required,
+        but the network exposure is tenant-broad.
+      confidence: "0.90"
+      derived_from: [ "<Contains edge_id (server → firewallRule)>", "<firewallRule.properties.startIpAddress/endIpAddress == 0.0.0.0/0.0.0.0>" ]
+      false_positive_note: >-
+        This is NOT ExposedToInternet — the 0.0.0.0/0.0.0.0 firewall rule maps to
+        Azure's internal "AllowAllWindowsAzureIps" service tag (Azure datacenter IPs
+        only). Home broadband or non-Azure cloud IPs cannot reach the server via this
+        rule. The risk is cross-tenant Azure-based attacker infrastructure (VMs, ACI,
+        Functions, GitHub Actions runners in Azure, etc.). ExposedToInternet applies
+        only when endIpAddress=255.255.255.255 (see azure-sql-server-public-firewall).
+        Do not collapse ExposedToTenant into ExposedToInternet in the UI.
+      narrative: >-
+        {server.name} has the "Allow Azure services and resources" firewall option
+        enabled (startIp=endIp=0.0.0.0). This allows any compute resource in any
+        Azure tenant or subscription to reach the SQL server on port 1433. While not
+        the full public internet, it is broad enough that any Azure-hosted attacker
+        infrastructure — across any tenant — can initiate TCP connections.
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - Azure deny assignment covering administrators/write → azure-sql-entra-admin-takeover BLOCKED.
+#   - Azure deny assignment covering databases/export/action → azure-sql-database-export-exfiltrate BLOCKED.
+#   - Azure Policy denying servers/write → azure-sql-arm-contributor-admin BLOCKED.
+#   - servers/properties.publicNetworkAccess=Disabled → azure-sql-server-public-firewall and
+#     azure-sql-server-allow-azure-services: DO NOT EMIT (service-level flag overrides).
+#   - SQL MI publicDataEndpointEnabled=false (default) → azure-sql-mi-public-endpoint: DO NOT EMIT.
+#   - NSG blocking inbound 3342 → azure-sql-mi-public-endpoint: CONDITIONAL(network_reachability).
+#
+# Explicit normalization recommended for /rules/explicit/azure-sql.yaml:
+#   - HasPermission: effective ARM RBAC at server/database/MI scope → HasPermission edges
+#     (match_effective_permission for administrators/write, databases/export/action, servers/write).
+#   - firewallRules: normalize startIpAddress/endIpAddress into Firewall nodes.
+#   - publicNetworkAccess: record on RelationalDatabase node property.
+#   - SQL MI publicDataEndpointEnabled: record on RelationalDatabase node property.
+#   - NSG rules on MI subnet: normalize into Firewall nodes (inbound/outbound rules).
+#
+# Linchpin cross-references (DO NOT RE-DERIVE here):
+#   credential-chains.yaml:
+#     - read-secret-yields-identity: SQL connection strings / passwords stored in Key Vault
+#       or App Config → CanReadSecret → CredentialsFor(ConnectionString → RelationalDatabase)
+#       → CanImpersonate. The connection string is the bridge from credential store to SQL.
+#     - decrypt-gates-secret-read: TDE CMK encryption protector (Key Vault key) is the gate
+#       on SQL data readability when CMK is used. A principal with CanDecrypt on the TDE key
+#       in Key Vault upgrades any CONDITIONAL(key_permission) read on the encrypted database
+#       to ACTIVE — this chain is derived entirely by credential-chains.yaml; not re-derived
+#       here.
+#   can-control.yaml:
+#     - control-via-admin: CanAdminister(principal, server) → Controls(principal, server).
+#     - escalate-via-execute-as: if the SQL MI system-assigned MI has been granted elevated
+#       ARM permissions (e.g., Directory Readers) and a principal CanExecuteAs that MI,
+#       the escalation chain is captured by can-execute-as.yaml; not re-derived here.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules recommended (add to /rules/explicit/azure-sql.yaml):
+explicit_rules:
+
+  - id: azure-sql-firewall-rule-record
+    emits: Contains
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Sql/servers/firewallRules"
+      parent_type: "Microsoft.Sql/servers"
+    emit:
+      source: "<parent SQL server node>"
+      target: "<firewall rule node (Firewall generic_type)>"
+      api_source: "Microsoft.Sql/servers/firewallRules - GET"
+      evidence_field: "properties.startIpAddress, properties.endIpAddress"
+      narrative: "{server.name} has firewall rule {rule.name} ({startIp}–{endIp})."
+
+  # NOTE: publicNetworkAccess is a scalar configuration property (Enabled/Disabled),
+  # not a Policy artifact. Store as a property on the RelationalDatabase node itself
+  # rather than emit a HasPolicy edge (which requires target to be a Policy subtype).
+  # This is recorded during collection as server.properties.publicNetworkAccess.
+  # No edge emit required; the property is consulted directly by derived rules.
+
+  - id: azure-sql-entra-admin-record
+    emits: HasPermission
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Sql/servers/administrators"
+      parent_type: "Microsoft.Sql/servers"
+    emit:
+      source: "<Entra admin identity node (resolved from ObjectId)>"
+      target: "<SQL server node>"
+      api_source: "Microsoft.Sql/servers/administrators - GET"
+      evidence_field: "properties.login, properties.sid, properties.administratorType"
+      permissions: ["db_owner (Entra admin)"]
+      narrative: >-
+        {admin.login} (objectId={admin.sid}) is the Entra administrator of {server.name},
+        granting full DBA access (db_owner role) on all databases in the server.
+
+  # NOTE: publicDataEndpointEnabled is a scalar configuration property (true/false),
+  # not a Policy artifact. Store as a property on the RelationalDatabase node itself
+  # rather than emit a HasPolicy edge (which requires target to be a Policy subtype).
+  # This is recorded during collection as mi.properties.publicDataEndpointEnabled.
+  # No edge emit required; the property is consulted directly by derived rules.
+
+  - id: azure-sql-effective-export-permission
+    emits: HasPermission
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Sql/servers/databases/export/action"
+      resource_type: "Microsoft.Sql/servers/databases"
+    emit:
+      source: "<principal>"
+      target: "<SQL database node>"
+      permissions: ["Microsoft.Sql/servers/databases/export/action"]
+      narrative: "{principal.name} has effective databases/export/action on {database.name}."
+
+  - id: azure-sql-effective-admin-write-permission
+    emits: HasPermission
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Sql/servers/administrators/write"
+      resource_type: "Microsoft.Sql/servers"
+    emit:
+      source: "<principal>"
+      target: "<SQL server node>"
+      permissions: ["Microsoft.Sql/servers/administrators/write"]
+      narrative: "{principal.name} has effective administrators/write on {server.name}."
+
+  - id: azure-sql-effective-server-write-permission
+    emits: HasPermission
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Sql/servers/write"
+      resource_type: "Microsoft.Sql/servers"
+    emit:
+      source: "<principal>"
+      target: "<SQL server node>"
+      permissions: ["Microsoft.Sql/servers/write"]
+      narrative: "{principal.name} has effective servers/write on {server.name}."
+
+  - id: azure-sql-effective-mi-write-permission
+    emits: HasPermission
+    applies_to: [azure]
+    match_effective_permission:
+      action: "Microsoft.Sql/managedInstances/write"
+      resource_type: "Microsoft.Sql/managedInstances"
+    emit:
+      source: "<principal>"
+      target: "<SQL MI node>"
+      permissions: ["Microsoft.Sql/managedInstances/write"]
+      narrative: "{principal.name} has effective managedInstances/write on {mi.name}."
+
+  # ==========================================================================
+  # (4) ARM CONTRIBUTOR → full control of SQL server
+  # ==========================================================================
+  # An identity with ARM Contributor or Owner on the SQL logical server (or its
+  # parent resource group / subscription) holds servers/write and can:
+  #   - Open the firewall to 0.0.0.0–255.255.255.255 (→ ExposedToInternet)
+  #   - Set the Entra admin (→ CanReadData via azure-sql-entra-admin-takeover rule)
+  #   - Trigger BACPAC export (→ CanExfiltrate via azure-sql-database-export-exfiltrate)
+  # CanAdminister is nature: explicit (edge declaration) and must be normalized from
+  # effective permission evaluation; placed here in explicit_rules.
+  # can-control.yaml control-via-admin then derives Controls from CanAdminister.
+  - id: azure-sql-arm-contributor-admin
+    emits: CanAdminister
+    applies_to: [azure]
+    match_effective_permission:
+      action: ["Microsoft.Sql/servers/write", "Microsoft.Sql/managedInstances/write"]
+      resource_type: ["Microsoft.Sql/servers", "Microsoft.Sql/managedInstances"]
+    emit:
+      source: "<principal>"
+      target: "<SQL server or MI node>"
+      permissions:
+        - "Microsoft.Sql/servers/write"
+        - "Microsoft.Sql/managedInstances/write"
+      evidence_field: "roleAssignment(s) granting servers/write or managedInstances/write"
+      narrative: >-
+        {principal.name} holds Microsoft.Sql/servers/write (or managedInstances/write) on
+        {server.name}, granting full ARM control-plane administration of the SQL server:
+        opening the firewall to the internet, setting the Entra administrator (yielding
+        full DBA access to all databases), exporting databases, rotating the TDE key, or
+        deleting the server.

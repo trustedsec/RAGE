@@ -1,0 +1,322 @@
+# Normalizing GCP Artifact Registry into explicit edges.
+# ===========================================================================
+# The adapter collects raw Artifact Registry records:
+#   * artifactregistry.projects.locations.repositories.list / .get
+#       -> repository (format, mode, ImmutableTags, remoteRepositoryConfig,
+#          virtualRepositoryConfig, createTime, kmsKeyName)
+#   * artifactregistry.projects.locations.repositories.getIamPolicy
+#       -> IAM allow policy (bindings: role, members, condition)
+#   * artifactregistry.projects.locations.repositories.packages.tags.list
+#       -> tags (name, version) for tag-to-digest mapping (mutable vs pinned)
+#   * Cloud Asset Inventory (recommended for bulk):
+#       cloudasset.assets.searchAllResources
+#       cloudasset.assets.searchAllIamPolicies
+#
+# These rules translate ONE observed fact into ONE explicit edge (schema/edges.yaml).
+# They do NOT combine edges — the derived combination lives in
+# /rules/derived/gcp/artifactregistry.yaml and container-chains.yaml.
+#
+# Key normalization decisions encoded here:
+#   * format == "DOCKER" | "OCI" -> node maps to ContainerRegistry
+#     format == "MAVEN" | "NPM" | "PYTHON" | "APT" | "YUM" | "GENERIC" | "GO" |
+#              "RUST" | "KFP" | "GOOGET" | "CONDA" -> ArtifactRepository
+#   * mode == "REMOTE" -> repo is a caching proxy for an upstream; record
+#     remoteRepositoryConfig.upstreamUri as a node property for dependency-confusion
+#     analysis (NOT a push attack unless uploadArtifacts is also held).
+#   * mode == "VIRTUAL" -> repo aggregates upstreams with priority; record
+#     virtualRepositoryConfig.upstreamPolicies (priority + repoRef) as properties.
+#   * ImmutableTags == true -> tag-overwrite push is rejected; modeled as a
+#     state-gate property on the repo node and surfaced in CanModifyCode state logic.
+#   * Effective permission evaluation (match_effective_permission in derived rules)
+#     runs over each principal's bindings to determine if uploadArtifacts,
+#     setIamPolicy, etc. are effective (not denied by IAM deny or org policy).
+#
+# Permission/field names verbatim from
+# cloud.google.com/artifact-registry/docs/access-control/iam#permissions.
+# ===========================================================================
+
+rules:
+
+  # --- Repository contained in project (structural) --------------------------
+  # A repository is located within a GCP project+region; record placement for
+  # boundary traversal and VPC-SC perimeter matching.
+  - id: gcp-ar-located-in
+    emits: LocatedIn
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.artifactregistry.Repository"
+      field: "name (locations/*)"
+    where:
+      - "repository name path contains a location segment (locations/<region>)"
+    emit:
+      source_type: "*"
+      source: "<Artifact Registry repository node>"
+      target: "<location / region boundary>"
+      api_source: "artifactregistry.projects.locations.repositories.list"
+      evidence_field: "name (location segment)"
+      narrative: "{repo.name} is located in {location} (Artifact Registry repos are region-scoped)."
+
+  # --- Repository IAM allow policy -> HasPolicy ------------------------------
+  # Every Artifact Registry repository has its own IAM allow policy. Record it
+  # so downstream derived rules and policy-mutation edges (CanModifyPolicy,
+  # CrossProjectTrust, TrustsExternalIdentity) have a ResourcePolicy node to
+  # target. One HasPolicy per repository.
+  - id: gcp-ar-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.artifactregistry.Repository"
+      field: "iamPolicy.bindings"
+    emit:
+      source_type: ArtifactRepository
+      target_type: ResourcePolicy
+      source: "<Artifact Registry repository node>"
+      target: "<ResourcePolicy node for the repository's IAM allow policy>"
+      api_source: "artifactregistry.projects.locations.repositories.getIamPolicy"
+      evidence_field: "iamPolicy.bindings"
+      narrative: "{repo.name} has an IAM allow policy governing who can push, pull, and administer the repository."
+
+  # --- ContainsResourceReference: workload -> repo (the run-image relation) ---
+  # A Compute/KubernetesWorkload node whose container spec references an image
+  # in this repository. This is the supply-chain consumption edge that
+  # container-chains::image-push-poisons-consumers reads to fan out a registry
+  # push to each consumer.
+  #
+  # The adapter must parse the image reference to determine:
+  #   (a) the repository (region-docker.pkg.dev/<project>/<repo-name>/[<image>])
+  #   (b) whether the reference is a mutable tag (:tag) or digest-pinned (@sha256)
+  # Record the mutability as an edge property (image_mutable: true/false) so
+  # container-chains can condition the fan-out on it.
+  - id: gcp-ar-workload-pulls-image
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    match_record:
+      resource_type:
+        - "google.container.Cluster"        # GKE pod spec image field
+        - "google.cloud.run.Service"         # Cloud Run service image
+        - "google.cloud.run.Job"             # Cloud Run job image
+        - "google.cloudfunctions.Function"   # Cloud Function container image
+        - "google.cloudbuild.Build"          # Cloud Build step name: (Docker image)
+        - "google.compute.Instance"          # GCE VM startup container (Container-Optimized OS)
+      field: "spec.containers[].image | spec.template.spec.containers[].image | build.steps[].name"
+    where:
+      - "image reference resolves to an Artifact Registry hostname: <region>-docker.pkg.dev or <project>.pkg.dev"
+    emit:
+      target_type: "*"
+      source_type: "*"
+      source: "<Compute / KubernetesWorkload / BuildWorker node>"
+      target: "<ContainerRegistry / ArtifactRepository node for the referenced repo>"
+      api_source: "artifactregistry.projects.locations.repositories.list + workload spec APIs"
+      evidence_field: "image reference string (containers[].image)"
+      properties:
+        reference_kind: "runs_image"
+        image_mutable: "<true if reference is a mutable tag; false if @sha256 digest-pinned>"
+        image_ref: "<full image reference string including tag or digest>"
+      narrative: >-
+        {consumer.name} pulls and runs a container image from repository {repo.name}
+        (reference: {image_ref}; mutable_tag: {image_mutable}); this is the supply-chain
+        consumption edge that container-chains uses to propagate a registry push to this
+        workload.
+
+  # --- ContainsResourceReference: Cloud Build step -> non-OCI repo -----------
+  # A Cloud Build step that fetches a package from a Maven/npm/PyPI Artifact
+  # Registry repository (e.g. via pip install --index-url, npm install via
+  # .npmrc, mvn with repository URL). This is the build-time dependency
+  # consumption edge for non-OCI package repos.
+  - id: gcp-ar-build-depends-package-repo
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.cloudbuild.Build"
+      field: "steps[].args | substitutions | artifacts | source"
+    where:
+      - "build step or artifact reference resolves to an Artifact Registry package repository URL (e.g. https://<region>-python.pkg.dev/<project>/<repo>)"
+      - "repo format is in [MAVEN, NPM, PYTHON, APT, YUM, GENERIC, GO, RUST, CONDA, GOOGET]"
+    emit:
+      source_type: BuildWorker
+      target_type: ArtifactRepository
+      source: "<Cloud Build worker / build job node>"
+      target: "<ArtifactRepository node>"
+      api_source: "cloudbuild.projects.builds.list + build step args / substitutions"
+      evidence_field: "step args or .npmrc / pip.conf reference URL"
+      properties:
+        reference_kind: "runs_image"
+        image_mutable: "true"
+      narrative: >-
+        Cloud Build job {build.name} fetches packages from Artifact Registry repository
+        {repo.name} at build time; a principal who can push a higher-version or
+        same-version malicious package to {repo.name} poisons this build's output and
+        the build worker's subsequent actions.
+
+  # --- Cross-project IAM binding -> CrossProjectTrust -------------------------
+  # An IAM allow-policy binding on the repository that names a principal from a
+  # different GCP project (serviceAccount:*@<other-project>.iam.gserviceaccount.com
+  # or user:*/group:* from another org domain). Emitted when the role or custom
+  # role includes artifactregistry.repositories.uploadArtifacts.
+  - id: gcp-ar-cross-project-binding
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.artifactregistry.Repository"
+      field: "iamPolicy.bindings"
+    where:
+      - "binding member is serviceAccount:*@<PROJECT_ID>.iam.gserviceaccount.com where PROJECT_ID != repository's project"
+      - "binding role includes artifactregistry.repositories.uploadArtifacts (roles/artifactregistry.writer, roles/artifactregistry.repoAdmin, roles/artifactregistry.admin, or a custom role with that permission)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: "<ResourcePolicy of the Artifact Registry repository>"
+      target: "<GCP project of the external ServiceAccount>"
+      api_source: "artifactregistry.projects.locations.repositories.getIamPolicy"
+      evidence_field: "iamPolicy.bindings[].members (cross-project serviceAccount)"
+      properties:
+        cross_project_sa: "<serviceAccount member string>"
+        role: "<binding role>"
+      narrative: >-
+        Repository {repo.name} (project {repo.project}) grants write access via
+        {role} to service account {cross_project_sa} from project {sa.project};
+        a principal that can act as {cross_project_sa} can push to {repo.name}
+        and poison workloads in {repo.project}.
+
+  # --- WIF principalSet/principal binding -> TrustsExternalIdentity -----------
+  # An IAM allow-policy binding using a Workload Identity Federation member
+  # (principalSet://iam.googleapis.com/... or principal://iam.googleapis.com/...)
+  # with uploadArtifacts. This records the WIF push trust so gcp-ar-wif-writer-trust
+  # (derived) and federation-chains can compute the CanFederateAs consequences.
+  # ONLY emit TrustsExternalIdentity when uploadArtifacts is granted (supply-chain
+  # write risk). Read-only WIF bindings (downloadArtifacts only) are not emitted
+  # as TrustsExternalIdentity, preventing false positives in supply-chain queries.
+  - id: gcp-ar-wif-binding
+    emits: TrustsExternalIdentity
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.artifactregistry.Repository"
+      field: "iamPolicy.bindings"
+    where:
+      - "binding member starts with principalSet://iam.googleapis.com/ or principal://iam.googleapis.com/"
+      - "binding role includes artifactregistry.repositories.uploadArtifacts"
+    emit:
+      source_type: ResourcePolicy
+      target_type: FederatedIdentity
+      source: "<ResourcePolicy of the Artifact Registry repository>"
+      target: "<FederatedIdentity / WIF principalSet or principal node>"
+      api_source: "artifactregistry.projects.locations.repositories.getIamPolicy"
+      evidence_field: "iamPolicy.bindings[].members (principalSet:// or principal://)"
+      properties:
+        wif_member: "<principalSet:// or principal:// string>"
+        role: "<binding role>"
+        grants_upload: "true"
+      narrative: >-
+        Repository {repo.name} grants {role} to WIF identity {wif_member}; an
+        external OIDC workload (e.g. GitHub Actions) satisfying the attribute
+        condition in the WIF pool can push to {repo.name} without a GCP service
+        account key — supply-chain injection vector from external CI.
+
+  # --- allUsers / allAuthenticatedUsers binding -> ExposedToInternet / ExposedToTenant
+  # Public or org-wide read/write access on a repository.
+  - id: gcp-ar-public-download
+    emits: ExposedToInternet
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.artifactregistry.Repository"
+      field: "iamPolicy.bindings"
+    where:
+      - "binding member is allUsers"
+      - "binding role or permissions include artifactregistry.repositories.downloadArtifacts"
+    emit:
+      source_type: ArtifactRepository
+      target_type: AnonymousIdentity
+      source: "<Artifact Registry repository node>"
+      target: "<AnonymousIdentity>"
+      api_source: "artifactregistry.projects.locations.repositories.getIamPolicy"
+      evidence_field: "iamPolicy.bindings[].members (allUsers)"
+      narrative: >-
+        Repository {repo.name} grants download access to allUsers (public internet);
+        any unauthenticated principal can pull images or packages from this repository.
+
+  # --- allUsers write access (public-writable repo) -> ExposedToInternet + CanModifyCode
+  # A repository IAM allow-policy binding that grants uploadArtifacts to allUsers
+  # is an extreme misconfiguration: any unauthenticated attacker can push code into
+  # a supply chain. This is a direct supply-chain injection vector from the public internet.
+  - id: gcp-ar-public-upload
+    emits: ExposedToInternet
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.artifactregistry.Repository"
+      field: "iamPolicy.bindings"
+    where:
+      - "binding member is allUsers"
+      - "binding role or permissions include artifactregistry.repositories.uploadArtifacts"
+    emit:
+      source_type: ArtifactRepository
+      target_type: AnonymousIdentity
+      source: "<Artifact Registry repository node>"
+      target: "<AnonymousIdentity>"
+      api_source: "artifactregistry.projects.locations.repositories.getIamPolicy"
+      evidence_field: "iamPolicy.bindings[].members (allUsers)"
+      narrative: >-
+        Repository {repo.name} grants uploadArtifacts access to allUsers (public internet);
+        any unauthenticated attacker on the public internet can push malicious container
+        images or packages into this repository. This is a critical supply-chain
+        injection vulnerability — every workload consuming from {repo.name} is at risk.
+
+  - id: gcp-ar-org-wide-download
+    emits: ExposedToTenant
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.artifactregistry.Repository"
+      field: "iamPolicy.bindings"
+    where:
+      - "binding member is allAuthenticatedUsers"
+      - "binding role or permissions include artifactregistry.repositories.downloadArtifacts"
+    emit:
+      source_type: ArtifactRepository
+      target_type: Organization
+      source: "<Artifact Registry repository node>"
+      target: "<GCP Organization>"
+      api_source: "artifactregistry.projects.locations.repositories.getIamPolicy"
+      evidence_field: "iamPolicy.bindings[].members (allAuthenticatedUsers)"
+      narrative: >-
+        Repository {repo.name} grants download access to allAuthenticatedUsers
+        (any authenticated Google identity, including external accounts);
+        any Google-authenticated principal can pull from this repository.
+
+  # --- Remote repository upstream config -> ContainsResourceReference (recon)
+  # A REMOTE-mode repository proxies an upstream. Record the upstream URI as a
+  # recon edge so analysts can identify dependency-confusion risk (the upstream
+  # is a public registry an attacker could publish to). Not a CanModifyCode edge
+  # on the GCP side — no GCP permission is required for the upstream attack.
+  - id: gcp-ar-remote-repo-upstream
+    emits: ContainsResourceReference
+    applies_to: [gcp]
+    match_record:
+      resource_type: "google.artifactregistry.Repository"
+      field: "remoteRepositoryConfig"
+    where:
+      - "repository.mode == REMOTE"
+      - "remoteRepositoryConfig.upstreamUri is set (public upstream registry URL)"
+    emit:
+      source_type: ArtifactRepository
+      target_type: "*"
+      source: "<remote Artifact Registry repository node>"
+      target: "<upstream registry / external ArtifactRepository node (or URL record)>"
+      api_source: "artifactregistry.projects.locations.repositories.get"
+      evidence_field: "remoteRepositoryConfig.upstreamUri"
+      properties:
+        reference_kind: "proxies_upstream"
+        upstream_uri: "<upstream registry URL>"
+        is_public: "<true if upstream is a public registry>"
+      narrative: >-
+        Repository {repo.name} is a REMOTE (proxy) repository caching artifacts
+        from upstream {upstream_uri}; if the upstream is a public registry and
+        the package namespace is not reserved, an attacker can publish a
+        higher-version package there (dependency confusion) to poison builds that
+        fetch via {repo.name}.
+
+  # --- Repository configuration: tag immutability (stored as node property)
+  # Tag immutability is a repository configuration setting that gates supply-chain
+  # attacks. Rather than emitting a duplicate HasPolicy edge, store this as a
+  # node property (immutable_tags) on the ContainerRegistry/ArtifactRepository
+  # node. The gcp-ar-upload-is-code-modify state logic references this property
+  # to determine if a push is BLOCKED (immutable) or ACTIVE (mutable).
+  # NOT EMITTED AS A GRAPH EDGE — collected as node metadata only.

@@ -1,0 +1,515 @@
+# Azure — Functions (Microsoft.Web/sites, kind=functionapp) execution rules (Phase 4)
+# ---------------------------------------------------------------------------
+# Core Azure Functions escalation primitive:
+#   an attacker who runs code in a Function app inherits every managed identity
+#   (MI) bound to it, because that code can mint MI tokens from the App Service
+#   identity endpoint (env IDENTITY_ENDPOINT + header IDENTITY_HEADER), NOT the
+#   169.254 IMDS used by VMs.
+#
+# Control-plane execution needs NO app secret. Any of these ARM operations gives
+# attacker-controlled code (verified against the Microsoft.Web operations ref):
+#   - Microsoft.Web/sites/functions/write            (replace a function + function.json)
+#   - Microsoft.Web/sites/extensions/write           (Kudu/SCM ZipDeploy / VFS write)
+#   - Microsoft.Web/sites/sourcecontrols/Write       (hijack CI/CD source)
+#   - Microsoft.Web/sites/config/Write               (WEBSITE_RUN_FROM_PACKAGE / image / startup)
+#   - Microsoft.Web/sites/functions/masterkey/read   (admin runtime API -> update/run code)
+#   - Microsoft.Web/sites/host/listkeys/action       (returns master + host + system keys)
+#   - Microsoft.Web/sites/publish/Action + config/list/Action (SCM/Kudu deploy creds)
+#
+# Every rule records the effective operation the evaluator must confirm at the
+# site (or MI) scope. Deny assignments override -> BLOCKED. Escalation edges
+# require the MI to out-privilege the caller. Quote any scalar containing ':'.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 4-compute-serverless
+applies_to: [azure]
+
+rules:
+
+  # === Administrative control over the Function app object ===================
+  - id: azure-func-contributor
+    emits: CanAdminister
+    match_effective_permission: {action: "Microsoft.Web/sites/write", scope_type: "resource|resourceGroup|subscription"}
+    where: ["principal effectively holds Website Contributor / Contributor / Owner (or custom role granting Microsoft.Web/sites/*) at the scope"]
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<function app (Microsoft.Web/sites) in scope>"
+      permissions: ["Microsoft.Web/sites/write"]
+      false_positive_note: "Microsoft.Web/sites/* grants full control of the site object but NOT Microsoft.Authorization/*/write; escalation is via the app's managed identity, not self role-assignment. Still sufficient for code execution."
+      narrative: "{principal.name} has full control of Function app {target.name} (Microsoft.Web/sites/*)."
+
+  # === Code modification primitives =========================================
+  - id: azure-func-functions-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Web/sites/functions/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<function app>"
+      permissions: ["Microsoft.Web/sites/functions/write"]
+      conditions: [service_state]
+      escalation: "Create/replace a function's code and function.json (incl. downgrading authLevel to anonymous), executed as the app's MI on next trigger."
+      false_positive_note: "Realized on next invoke/restart; without a trigger or CanInvoke -> CONDITIONAL(trigger_exists). On a stopped app CONDITIONAL(service_state) + CanStart."
+      narrative: "{principal.name} can overwrite function code on {target.name} (functions/write), running attacker code as its identity."
+
+  - id: azure-func-extensions-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Web/sites/extensions/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<function app>"
+      permissions: ["Microsoft.Web/sites/extensions/write"]
+      conditions: [service_state]
+      escalation: "Use the Kudu/SCM ZipDeploy / VFS write API to deploy a new package or write files into the container."
+      false_positive_note: "This is the SCM extensions API; if SCM basic auth is disabled it still works via AAD/ARM. Code runs on next invoke/restart -> CONDITIONAL(trigger_exists) absent a trigger."
+      narrative: "{principal.name} can deploy arbitrary code to {target.name} via the Kudu extensions API (extensions/write)."
+
+  - id: azure-func-sourcecontrols-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Web/sites/sourcecontrols/Write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<function app>"
+      permissions: ["Microsoft.Web/sites/sourcecontrols/Write"]
+      conditions: [service_state]
+      escalation: "Repoint CI/CD source control to an attacker repo; code is injected at the next sync/deploy (supply-chain)."
+      false_positive_note: "Only yields execution if continuous deployment / sync actually pulls the attacker source; if source control is not configured to auto-sync -> CONDITIONAL."
+      narrative: "{principal.name} can hijack the source control of {target.name} (sourcecontrols/Write), injecting code at next deploy."
+
+  # === Configuration modification ===========================================
+  - id: azure-func-config-write
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "Microsoft.Web/sites/config/Write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<function app>"
+      permissions: ["Microsoft.Web/sites/config/Write"]
+      conditions: [service_state]
+      escalation: "Set WEBSITE_RUN_FROM_PACKAGE to an attacker package, change linuxFxVersion/container image or startup command, or inject secrets/env."
+      false_positive_note: "Realizes execution at next restart/deploy; pair with a trigger/CanInvoke or CanStart for ACTIVE. config/Write alone is config change, not immediate exec."
+      narrative: "{principal.name} can rewrite app settings/config of {target.name} (config/Write), swapping the running package or injecting code."
+
+  # === Credential / key access ==============================================
+  - id: azure-func-master-key
+    emits: CanReadSecret
+    match_effective_permission: {action: "Microsoft.Web/sites/functions/masterkey/read", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<principal>"
+      target: "<master key of the function app>"
+      permissions: ["Microsoft.Web/sites/functions/masterkey/read"]
+      note: "The master key grants the admin runtime REST API (hostruntime/host) to overwrite and invoke any function -> de-facto code execution as the MI."
+      false_positive_note: "Master key is a durable data-plane secret surviving RBAC removal; treat as a backdoor. Master key without a running app -> CONDITIONAL(service_state)."
+      narrative: "{principal.name} can read the master key of {target.name} (functions/masterkey/read), unlocking the admin runtime API."
+
+  - id: azure-func-host-listkeys
+    emits: CanReadSecret
+    match_effective_permission: {action: "Microsoft.Web/sites/host/listkeys/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<principal>"
+      target: "<host + master + system keys of the function app>"
+      permissions: ["Microsoft.Web/sites/host/listkeys/action"]
+      note: "host/listkeys returns functionKeys, the _master key, and systemKeys in one call."
+      false_positive_note: "Returns the master key too -> equivalent to azure-func-master-key for admin-API code execution. Do not double-count the escalation."
+      narrative: "{principal.name} can list all host/master/system keys of {target.name} (host/listkeys/action)."
+
+  - id: azure-func-function-listkeys
+    emits: CanReadSecret
+    match_effective_permission: {action: "Microsoft.Web/sites/functions/listkeys/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<principal>"
+      target: "<per-function keys>"
+      permissions: ["Microsoft.Web/sites/functions/listkeys/action"]
+      note: "Per-function keys authorize invocation of function-auth HTTP triggers (not admin/master)."
+      false_positive_note: "Function-level keys do NOT grant the admin runtime API or code overwrite; they only authorize invoke. Do not derive CanExecuteAs from these alone."
+      narrative: "{principal.name} can list per-function keys of {target.name} (functions/listkeys/action) to invoke its HTTP functions."
+
+  - id: azure-func-publishing-creds
+    emits: CanReadSecret
+    match_effective_permission: {action: "Microsoft.Web/sites/config/list/Action", scope_type: "resource|resourceGroup|subscription"}
+    optional_permission: ["Microsoft.Web/sites/publish/Action", "Microsoft.Web/sites/publishxml/Action"]
+    where: ["Microsoft.Web/sites/config/list/Action alone returns the publishing credentials (List Web App security sensitive settings, such as publishing credentials, app settings and connection strings); publish/Action and publishxml/Action are strengthening evidence but not required"]
+    emit:
+      source: "<principal>"
+      target: "<SCM/Kudu + FTP publishing credentials>"
+      permissions: ["Microsoft.Web/sites/config/list/Action", "Microsoft.Web/sites/publish/Action", "Microsoft.Web/sites/publishxml/Action"]
+      conditions: [resource_policy]
+      false_positive_note: "config/list/Action alone is sufficient to obtain publishing credentials; publish/publishxml are optional strengthening evidence. If basicPublishingCredentialsPolicies (SCM/FTP basic auth) is DISABLED, these credentials are unusable -> BLOCKED / downgrade. Honor the policy state."
+      narrative: "{principal.name} can extract SCM/Kudu + FTP publishing credentials of {target.name} (config/list/Action; optionally strengthened by publish/publishxml)."
+
+  - id: azure-func-appsettings-read
+    emits: CanReadSecret
+    match_effective_permission: {action: "Microsoft.Web/sites/config/list/Action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<principal>"
+      target: "<app settings + connection strings of the function app>"
+      permissions: ["Microsoft.Web/sites/config/list/Action"]
+      note: "config/list returns decrypted appsettings + connectionStrings, often holding storage keys, SQL, Service Bus, Key Vault refs."
+      false_positive_note: "config/appsettings/read (ARM) returns settings but may mask Key Vault references; config/list/Action returns resolved values. Emit ContainsSecret only for settings that actually carry credentials."
+      narrative: "{principal.name} can read app settings + connection strings of {target.name} (config/list/Action), exposing embedded secrets."
+
+  # === Identity attachment (Azure PassRole analog) ==========================
+  - id: azure-func-attach-user-mi
+    emits: CanAttachIdentity
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?userMI"
+      - "?principal has EFFECTIVE Microsoft.Web/sites/write on the target app (existing or new)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<function app (existing or new)>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Web/sites/write"]
+      conditions: [role_compatibility]
+      false_positive_note: "BOTH permissions are required: assign/action on the MI AND sites/write on the app. Neither alone attaches the MI. Honor the assign/action resource scope."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to Function app {target.name} (assign/action + sites/write)."
+
+  # === App Service identity endpoint: token retrieval / credential exposure ==
+  - id: azure-func-identity-endpoint-token
+    emits: CanRetrieveToken
+    description: "Any code in a Function app can mint a bearer token for each bound MI via the App Service identity endpoint."
+    match:
+      - [ ?app, ExecutesAs, ?mi ]
+    emit:
+      source: "<function app>"
+      target: "<managed identity bound to the app>"
+      permissions: []
+      note: "GET %IDENTITY_ENDPOINT%?resource=<aud>&api-version=2019-08-01 with header X-IDENTITY-HEADER: %IDENTITY_HEADER%. NOT the 169.254 IMDS. Companion rule azure-func-identity-endpoint-exposescred emits the ExposesCredential(app -> mi) leak fact."
+      false_positive_note: "Only fires when the app actually has a managed identity (identity.type != None). No MI => no token; do NOT emit."
+      narrative: "Any code running in {app.name} can request a bearer token for {mi.name} from the App Service identity endpoint (IDENTITY_ENDPOINT/IDENTITY_HEADER), no app secret required."
+
+  - id: azure-func-identity-endpoint-exposescred
+    emits: ExposesCredential
+    description: "A Function app with a bound MI leaks that MI's credential to any code running in the app via the App Service identity endpoint."
+    match:
+      - [ ?app, ExecutesAs, ?mi ]
+    emit:
+      source: "<function app>"
+      target: "<managed identity bound to the app>"
+      permissions: []
+      note: "The identity endpoint (IDENTITY_ENDPOINT/IDENTITY_HEADER) makes the bound MI's token reachable from app code; this is the leak fact paired with azure-func-identity-endpoint-token (the token-mint capability)."
+      false_positive_note: "Only fires when the app actually has a managed identity (identity.type != None). No MI => no exposure; do NOT emit."
+      narrative: "Function app {app.name} exposes the credential of its managed identity {mi.name} to any code running in the app (App Service identity endpoint)."
+
+  # === Direct invocation ====================================================
+  - id: azure-func-masterkey-invoke
+    emits: CanInvoke
+    match_effective_permission: {action: "Microsoft.Web/sites/hostruntime/host/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<function app>"
+      permissions: ["Microsoft.Web/sites/hostruntime/host/action"]
+      note: "Admin runtime API (master-key gated) can update and invoke any function -> completes a code-swap escalation."
+      narrative: "{principal.name} can invoke/update functions of {target.name} via the admin runtime API (hostruntime/host/action)."
+
+  - id: azure-func-hostruntime-modifycode
+    emits: CanModifyCode
+    description: "The admin runtime action can add/replace/delete functions, not just invoke them -> code modification."
+    match_effective_permission: {action: "Microsoft.Web/sites/hostruntime/host/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<function app>"
+      permissions: ["Microsoft.Web/sites/hostruntime/host/action"]
+      conditions: [service_state]
+      escalation: "Perform Function App runtime actions (sync triggers, ADD functions, invoke functions, DELETE functions); adding/replacing functions is attacker code execution as the app's MI."
+      false_positive_note: "hostruntime/host/action officially permits add/replace/delete of functions, so a principal holding it via ARM (not just via the master key) can modify code. Realized on next invoke/restart -> CONDITIONAL(trigger_exists) absent a trigger. Overlaps azure-func-execute-as-via-masterkey when reached via the master key -> do not double-count the escalation."
+      narrative: "{principal.name} can add/replace/delete functions on {target.name} via the admin runtime API (hostruntime/host/action), running attacker code as its identity."
+
+  - id: azure-func-http-invoke
+    emits: CanInvoke
+    description: "Invoke an HTTP-triggered function using a held key (or anonymously)."
+    where:
+      - "principal holds a function/host key (via listkeys) OR the target function authLevel is anonymous"
+      - "the app's default hostname or private endpoint is network-reachable by the principal"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<function app / HTTP-triggered function>"
+      conditions: [network_reachability]
+      false_positive_note: "Invoke alone only runs the EXISTING code as the MI; it becomes escalation only combined with a code/config change or when the existing code is exploitable. authLevel=anonymous needs no key."
+      narrative: "{principal.name} can invoke HTTP functions of {target.name} (function/host key or anonymous auth)."
+
+  - id: azure-func-start
+    emits: CanStart
+    match_effective_permission: {action: "Microsoft.Web/sites/start/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<function app>"
+      permissions: ["Microsoft.Web/sites/start/action"]
+      note: "Realizes CONDITIONAL(service_state) execution edges on a stopped app."
+      narrative: "{principal.name} can start stopped Function app {target.name} (start/action) to enable execution."
+
+  # === Derived: attacker code -> execute as the app's managed identity =======
+  - id: azure-func-execute-as-via-code
+    emits: CanExecuteAs
+    description: "Code modification on a Function app + the app runs as an MI => execute as that MI (via the identity endpoint)."
+    match:
+      - [ ?principal, CanModifyCode, ?app ]
+      - [ ?app, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?app) in [ServerlessFunction, ApplicationPlatform]"
+      - "?mi.privilege_level >= ?principal.privilege_level   # escalation only"
+    optional:
+      - [ ?principal, CanInvoke, ?app ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      state_logic: |
+        if matched(optional[0]) or trigger_exists(?app): ACTIVE
+        else: CONDITIONAL(trigger_exists)
+      conditions_from: [ ?app, ?mi ]
+      permissions: ["Microsoft.Web/sites/functions/write | extensions/write | sourcecontrols/Write"]
+      derived_from: [ "<CanModifyCode edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Emit only when the app has a managed identity and that MI out-privileges the caller. No trigger and no CanInvoke -> CONDITIONAL(trigger_exists). Stopped app w/o CanStart -> CONDITIONAL(service_state)."
+      narrative: "{principal.name} can overwrite code on {app.name} and, on trigger/invoke, mint the token of its identity {mi.name} from the App Service identity endpoint, executing as {mi.name}."
+
+  - id: azure-func-execute-as-via-config
+    emits: CanExecuteAs
+    description: "Config modification (run-from-package / image / startup) + ExecutesAs => execute as the MI."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?app ]
+      - [ ?app, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?app) in [ServerlessFunction, ApplicationPlatform]"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    optional:
+      - [ ?principal, CanInvoke, ?app ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      state_logic: |
+        if matched(optional[0]) or trigger_exists(?app): ACTIVE
+        else: CONDITIONAL(trigger_exists)
+      conditions_from: [ ?app, ?mi ]
+      permissions: ["Microsoft.Web/sites/config/Write"]
+      derived_from: [ "<CanModifyConfiguration edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "config/Write is only execution when it changes the running package/image/startup or injects code; a benign setting change is not execution. Requires the MI to out-privilege the caller."
+      narrative: "{principal.name} can change {app.name} config (WEBSITE_RUN_FROM_PACKAGE / image / startup) and execute as its identity {mi.name}."
+
+  - id: azure-func-execute-as-via-masterkey
+    emits: CanExecuteAs
+    description: "Master/host key -> admin runtime API to overwrite+run code as the MI."
+    match:
+      - [ ?principal, CanReadSecret, ?key ]
+      - [ ?app, ExecutesAs, ?mi ]
+    where:
+      - "?key is the master key or host keys of ?app (rule azure-func-master-key OR azure-func-host-listkeys)"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    optional:
+      - [ ?principal, CanStart, ?app ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      state_logic: |
+        if service_running(?app): ACTIVE
+        elif matched(optional[0]): CONDITIONAL(service_state)
+        else: CONDITIONAL(service_state)
+      conditions_from: [ ?app, ?mi ]
+      permissions: ["Microsoft.Web/sites/functions/masterkey/read | Microsoft.Web/sites/host/listkeys/action", "Microsoft.Web/sites/hostruntime/host/action"]
+      derived_from: [ "<CanReadSecret(master key) edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "ONLY the master key (or host/listkeys which includes it) unlocks the admin runtime API for code overwrite; per-function keys (azure-func-function-listkeys) do NOT. On a running app -> ACTIVE; on a stopped app the edge is still emitted as CONDITIONAL(service_state), realized by CanStart (start/action)."
+      narrative: "{principal.name} can read the master key of {app.name} and use the admin runtime API to overwrite and run code as its identity {mi.name}."
+
+  - id: azure-func-execute-as-via-publish
+    emits: CanExecuteAs
+    description: "Publishing (SCM/Kudu/FTP) credentials -> push code -> execute as the MI."
+    match:
+      - [ ?principal, CanReadSecret, ?creds ]
+      - [ ?app, ExecutesAs, ?mi ]
+    where:
+      - "?creds are the SCM/FTP publishing credentials of ?app (rule azure-func-publishing-creds)"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+      - "SCM/FTP basic auth is ENABLED (basicPublishingCredentialsPolicies allow)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      conditions_from: [ ?app, ?mi ]
+      permissions: ["Microsoft.Web/sites/config/list/Action", "Microsoft.Web/sites/publish/Action"]
+      derived_from: [ "<CanReadSecret(publishing creds) edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "BLOCKED if SCM/FTP basic auth is disabled via basicPublishingCredentialsPolicies. Requires the MI to out-privilege the caller."
+      narrative: "{principal.name} can extract SCM/FTP publishing creds of {app.name}, push code via Kudu/FTP, and execute as its identity {mi.name}."
+
+  - id: azure-func-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new Function app bound to a passable user-assigned MI, deploy code, execute as the MI."
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+      - [ ?principal, CanModifyCode, ?app ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.Web/sites/write (create/configure the app) on ?app"
+      - "?userMI.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Web/sites/write", "Microsoft.Web/sites/functions/write | extensions/write"]
+      conditions: [role_compatibility]
+      derived_from: [ "<CanPassIdentity edge_id>", "<CanModifyCode edge_id>" ]
+      false_positive_note: "Requires the pass/attach chain (assign/action on ?userMI + sites/write) AND a code/deploy primitive on that app. ?userMI is bound by the CanPassIdentity match term. Escalation only if the passed MI out-privileges the caller."
+      narrative: "{principal.name} can create/configure a Function app bound to user-assigned MI {userMI.name}, deploy code, and execute as {userMI.name}."
+
+  # === Deployment slots (parallel abusable surface + swap escalation) =======
+  # Microsoft.Web/sites/slots is a ServerlessFunction node with a full parallel
+  # operation set. Rights on a low-privilege staging slot let an attacker stage
+  # code, then swap it into a higher-privilege slot (e.g. production) whose MI is
+  # more privileged -> CanExecuteAs(prod MI) with no direct rights on production.
+  - id: azure-func-slots-config-write
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "Microsoft.Web/sites/slots/config/Write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<function app deployment slot>"
+      permissions: ["Microsoft.Web/sites/slots/config/Write"]
+      conditions: [service_state]
+      escalation: "Slot-scoped analog of config/Write: set WEBSITE_RUN_FROM_PACKAGE, image, startup, or app settings on a slot; realized at slot restart/deploy or on swap into a live slot."
+      false_positive_note: "Config change on a slot is not immediate execution; realized on restart/deploy of the slot or when the slot is swapped into a running slot -> CONDITIONAL(service_state)."
+      narrative: "{principal.name} can rewrite config/app settings of slot {target.name} (slots/config/Write)."
+
+  - id: azure-func-slots-extensions-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Web/sites/slots/extensions/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<function app deployment slot>"
+      permissions: ["Microsoft.Web/sites/slots/extensions/write"]
+      conditions: [service_state]
+      escalation: "Slot-scoped Kudu/SCM ZipDeploy / VFS write: deploy attacker code into a slot, then swap it live."
+      false_positive_note: "Code runs on next invoke/restart of the slot or after a swap into a running slot -> CONDITIONAL(trigger_exists) absent a trigger."
+      narrative: "{principal.name} can deploy arbitrary code to slot {target.name} via the Kudu extensions API (slots/extensions/write)."
+
+  - id: azure-func-slots-functions-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Web/sites/slots/functions/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<function app deployment slot>"
+      permissions: ["Microsoft.Web/sites/slots/functions/write"]
+      conditions: [service_state]
+      escalation: "Slot-scoped functions/write: create/replace a function's code and function.json on a slot, then swap it live."
+      false_positive_note: "Realized on next invoke/restart of the slot or after a swap -> CONDITIONAL(trigger_exists) absent a trigger."
+      narrative: "{principal.name} can overwrite function code on slot {target.name} (slots/functions/write)."
+
+  - id: azure-func-slots-host-listkeys
+    emits: CanReadSecret
+    match_effective_permission: {action: "Microsoft.Web/sites/slots/host/listkeys/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<principal>"
+      target: "<host + master + system keys of the deployment slot>"
+      permissions: ["Microsoft.Web/sites/slots/host/listkeys/action"]
+      note: "Slot-scoped host/listkeys returns functionKeys, the _master key, and systemKeys for the slot."
+      false_positive_note: "Returns the slot master key too -> equivalent to azure-func-master-key for admin-API code execution on the slot. Do not double-count the escalation."
+      narrative: "{principal.name} can list all host/master/system keys of slot {target.name} (slots/host/listkeys/action)."
+
+  - id: azure-func-slots-swap
+    emits: CanModifyCode
+    description: "Swap a controlled slot into a higher-privilege slot -> the swapped-in code runs under the target slot's (more privileged) managed identity."
+    match_effective_permission: {action: "Microsoft.Web/sites/slotsswap/Action", scope_type: "resource|resourceGroup|subscription"}
+    where:
+      - "?principal effectively holds Microsoft.Web/sites/slotsswap/Action OR Microsoft.Web/sites/slots/slotsswap/Action on the source slot"
+      - "?principal can stage code/config on the source slot (slots/functions/write | slots/extensions/write | slots/config/Write) or already controls it"
+      - "the swap-target slot ExecutesAs a managed identity (its own binding is what the swapped-in code inherits)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<swap-target slot / production site>"
+      permissions: ["Microsoft.Web/sites/slotsswap/Action", "Microsoft.Web/sites/slots/slotsswap/Action"]
+      conditions: [service_state]
+      escalation: "Stage malicious code on a low-privilege slot, then swap it into the production slot; the swapped-in code then runs under the production slot's managed identity (potential privilege gain with no direct rights on production)."
+      false_positive_note: "Escalation only if the swap-target slot binds a managed identity that out-privileges the caller and the caller can stage code/config on the source slot. Slot settings marked as deployment (sticky) settings do NOT swap; a benign swap without staged code is not execution. Realized when the target slot is live -> CONDITIONAL(service_state)."
+      narrative: "{principal.name} can swap staged code from a controlled slot into swap-target {target.name} (slotsswap/Action), running attacker code under the target slot's managed identity."
+
+  # === Network exposure =====================================================
+  - id: azure-func-anonymous-http
+    emits: ExposedToInternet
+    description: "A Function app with a public hostname and an anonymous-auth HTTP trigger."
+    where:
+      - "app default hostname is public (no access restrictions, publicNetworkAccess != Disabled, no private-endpoint-only)"
+      - "at least one HTTP-triggered function has authLevel == anonymous"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<function app>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      false_positive_note: "Do not emit if access restrictions / private endpoint block public traffic, or if all HTTP functions require a key. A key-only function is not anonymously exposed."
+      narrative: "{app.name} exposes an anonymous HTTP-triggered function to the internet (public hostname + authLevel anonymous)."
+
+  - id: azure-func-public-endpoint
+    emits: ExposedToInternet
+    description: "Function app SCM/app surface reachable publicly (used with a held key or exploitable code)."
+    where:
+      - "app default hostname is public (no access restrictions / private endpoint)"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<function app>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      false_positive_note: "Public reachability alone is not unauthenticated compromise; pair with a held key (listkeys), anonymous trigger, or an exploitable function. Not exposure if publicNetworkAccess=Disabled or private-endpoint-only."
+      narrative: "{app.name} is reachable from the internet (public default hostname); combine with a key or anonymous trigger for invoke."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: any action above covered by an applicable DENY
+# ASSIGNMENT (Azure Blueprint / Managed Application) or an explicit deny in a
+# custom role is emitted with state: BLOCKED and denied_by=<deny assignment>.
+# Additionally, publishing-credential paths (azure-func-publishing-creds,
+# azure-func-execute-as-via-publish) are BLOCKED when SCM/FTP basic auth is
+# disabled via Microsoft.Web/sites/basicPublishingCredentialsPolicies.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization (raw config -> explicit edges). These belong in
+# /rules/explicit/azure/ but are noted here for completeness; they emit the
+# ExecutesAs / AttachedTo / ContainsSecret facts the derived rules consume.
+# ---------------------------------------------------------------------------
+explicit_rules:
+  - id: azure-func-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Microsoft.Web/sites", field: "identity"}
+    where: ["kind contains 'functionapp'", "identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned']"]
+    emit:
+      source: "<function app>"
+      target: "<each MI: system-assigned SP (principalId) and every userAssignedIdentities key>"
+      note: "System-assigned principalId is the app's Entra SP; user-assigned keys are Microsoft.ManagedIdentity/userAssignedIdentities resource ids."
+      narrative: "{app.name} runs as managed identity {mi.name}."
+
+  - id: azure-func-mi-attached
+    emits: AttachedTo
+    source_config: {resource_type: "Microsoft.Web/sites", field: "identity.userAssignedIdentities"}
+    emit:
+      source: "<user-assigned managed identity>"
+      target: "<function app>"
+      narrative: "User-assigned MI {mi.name} is attached to Function app {app.name}."
+
+  - id: azure-func-appsettings-contains-secret
+    emits: ContainsSecret
+    source_config: {resource_type: "Microsoft.Web/sites/config", field: "properties (appsettings + connectionStrings)"}
+    where: ["a setting/connection string value carries credential material (storage key, SQL/Service Bus conn string, API key)"]
+    emit:
+      source: "<function app>"
+      target: "<embedded secret / connection string>"
+      note: "Key Vault references (@Microsoft.KeyVault(...)) are pointers, not inline secrets; resolve separately."
+      narrative: "Function app {app.name} stores a credential in its app settings/connection strings."

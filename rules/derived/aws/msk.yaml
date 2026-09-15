@@ -1,0 +1,918 @@
+# AWS MSK (Managed Streaming for Apache Kafka) — Derived attack-path rules
+# (Phase 10 — Messaging)
+# ---------------------------------------------------------------------------
+# MSK is the AWS managed Kafka service. It contributes two distinct attack
+# surfaces to Phase 10:
+#
+# SURFACE 1 — KAFKA DATA PLANE (kafka-cluster:* IAM actions):
+#   A principal with kafka-cluster:WriteData on a topic can PRODUCE messages to
+#   that topic. If the topic is an event source for a Lambda function (via a
+#   Lambda event-source mapping, ESM), the produced message TRIGGERS the
+#   consumer with an attacker-influenced payload. This is the canonical Phase-10
+#   publish-trigger-execute chain:
+#
+#     kafka-cluster:WriteData    -> CanWriteData(principal, topic)        [A1]
+#     ESM binding (config fact)  -> CanTrigger(topic, Lambda)             [A2]
+#     messaging-chains rule 1    -> CanTrigger(principal, Lambda)         (CITE)
+#     messaging-chains rule 2    -> CanExecuteAs(principal, LambdaRole)   (CITE)
+#
+#   kafka-cluster:ReadData enables consuming from a topic -> CanReadData, and
+#   with a live consumer → CanExfiltrate of message contents.            [A3]
+#
+# SURFACE 2 — MSK CONNECT (kafkaconnect:* + iam:PassRole):
+#   MSK Connect runs Kafka connectors as a managed compute surface. Each
+#   connector executes AS its configured IAM service execution role.
+#   Connectors are the only MSK resource class that maps to a Compute node and
+#   gives a direct ExecutesAs pivot.
+#
+#     kafkaconnect:UpdateConnector -> CanModifyCode(principal, connector) [B1]
+#     ExecutesAs(connector, role) [from config]                           [B2]
+#     can-execute-as.execute-as-via-code-modify -> CanExecuteAs           (CITE)
+#     kafkaconnect:CreateConnector + iam:PassRole -> CanCreateWorkloadAs  [B3]
+#
+# SURFACE 3 — CLUSTER CONTROL PLANE (kafka:* actions):
+#   kafka:PutClusterPolicy writes the cluster resource-based policy, which can
+#   grant cross-account kafka-cluster:WriteData -> CrossAccountTrust      [C1]
+#   kafka:UpdateSecurity enables unauthenticated access -> broad data-plane
+#   exposure (CanModifyConfiguration + analyst flag)                      [C2]
+#   kafka:UpdateClusterConfiguration -> cluster-level CanModifyConfiguration [C3]
+#
+# SURFACE 4 — CLUSTER RESOURCE POLICY (cross-account trust):
+#   A cluster policy granting kafka-cluster:WriteData to a principal in another
+#   account is cross-account publish trust.                               [D1]
+#   Feeds messaging-chains rule 4 -> CrossAccountTrust -> can-control ->
+#   CanEnterAccount (CITE; not re-derived here).
+#
+# LINCHPIN CITATIONS (DO NOT RE-DERIVE):
+#   messaging-chains.yaml:
+#     messaging-publish-triggers-consumer  (rule 1) — CanWriteData(p, topic) +
+#       CanTrigger(topic, consumer) => CanTrigger(p, consumer). This file
+#       emits the contributing FACTS (CanWriteData via A1, CanTrigger binding
+#       via A2/explicit) so the linchpin fires.
+#     messaging-trigger-executes-as        (rule 2) — CanTrigger(p, consumer) +
+#       ExecutesAs(consumer, id) => CanExecuteAs(p, id) CONDITIONAL(trigger_exists).
+#     messaging-resource-policy-cross-boundary-trust (rule 4) — cluster policy
+#       cross-account grant -> CrossAccountTrust -> can-control CanEnterAccount.
+#   can-execute-as.yaml:
+#     execute-as-via-code-modify — CanModifyCode(p, connector) +
+#       ExecutesAs(connector, role) => CanExecuteAs (consumed from B1+B2).
+#     execute-as-via-config-identity-swap — generic CanModifyConfiguration +
+#       CanPassIdentity => CanExecuteAs (not applicable: UpdateConnector cannot
+#       change the execution role, so this rule does not fire here).
+#   credential-chains.yaml:
+#     execute-then-read-secret — CanExecuteAs(p, role) + CanReadSecret(role,
+#       secret) => CanReadSecret(p, secret) (connector role's secret reach).
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 10-messaging
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # SECTION A — KAFKA DATA-PLANE FACTS (kafka-cluster:* IAM actions)
+  # ===========================================================================
+
+  # --- A1) CanWriteData via kafka-cluster:WriteData ----------------------------
+  # The core Phase-10 publish primitive for MSK. A principal that can call
+  # kafka-cluster:WriteData on a topic (or on the cluster with no topic scoping)
+  # can PRODUCE messages to that topic. If the topic is an ESM event source for
+  # a Lambda, messaging-chains rule 1 collapses this into CanTrigger(p → Lambda).
+  #
+  # IAM action: kafka-cluster:WriteData
+  # Resource type: arn:aws:kafka:<region>:<account>:topic/<cluster-name>/<cluster-uuid>/<topic>
+  #   (or cluster ARN for cluster-scoped wildcards)
+  # Condition keys: kafka-cluster:topic (scopes to a specific topic name)
+  - id: aws-msk-can-write-data
+    emits: CanWriteData
+    description: "kafka-cluster:WriteData grants IAM-level produce permission to the target MSK topic; a published message reaches any consumer bound to that topic via an event-source mapping."
+    match_effective_permission:
+      action: "kafka-cluster:WriteData"
+      resource_type: ["topic", "AWS::MSK::Cluster"]
+    where:
+      - "resource_type == 'topic' OR (resource_type == 'AWS::MSK::Cluster' AND ARN suffix contains '/topic/' OR ends with '/*')"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<MSK topic (Queue) node, or GenericMessaging if cluster-scoped>"
+      permissions: ["kafka-cluster:WriteData"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the principal has effective kafka-cluster:WriteData at the topic or
+        cluster scope (IAM policy + any cluster resource-based policy grant, evaluated
+        together). Honor the kafka-cluster:topic condition key: a grant scoped to topic
+        ARN suffix <topic-name> covers only that topic — emit one CanWriteData edge per
+        distinctly-scoped topic when the condition is present.
+        CONDITIONAL(resource_policy) when the grant is in a resource-based policy but
+        the principal's identity-based policy has not been evaluated (conservative for
+        cross-account grants: the cluster policy alone is necessary but not sufficient —
+        the caller also needs kafka-cluster:Connect + kafka-cluster:WriteData in their
+        identity-based policy for cross-account access).
+        BLOCKED if an SCP, permission boundary, or explicit deny on
+        kafka-cluster:WriteData applies.
+      derived_from: ["effective kafka-cluster:WriteData at MSK topic/cluster scope"]
+      false_positive_note: >-
+        MSK supports TWO independent authorization planes: IAM and Kafka ACLs.
+        This edge models only the IAM plane. A cluster that uses BOTH IAM and Kafka
+        ACLs may DENY at the Kafka ACL level even when IAM grants WriteData — the
+        Kafka ACL decision is data-plane only and not collectible without broker access.
+        Lower confidence (0.8) when Kafka ACL authorization is also enabled on the
+        cluster (check DescribeCluster → clientAuthentication for ACL usage). Also:
+        kafka-cluster:Connect is a prerequisite for any data-plane action; the
+        principal must also be granted kafka-cluster:Connect on the cluster — verify
+        this in the effective-permission evaluation.
+        Honor topic-level scoping via kafka-cluster:topic condition key:
+        a grant limited to topic X does NOT cover topic Y.
+      confidence: 0.85
+      narrative: >-
+        {principal.name} can produce messages to MSK topic {target.name} on cluster
+        {cluster.name} (kafka-cluster:WriteData). Any consumer bound to this topic
+        via a Lambda event-source mapping will receive the attacker-influenced payload.
+
+  # --- A3) CanReadData via kafka-cluster:ReadData --------------------------------
+  # A principal with kafka-cluster:ReadData can consume messages from the topic.
+  # This enables direct data-plane reading (message exfiltration) or, when the
+  # topic contains credentials, feeds credential-chains.
+  - id: aws-msk-can-read-data
+    emits: CanReadData
+    description: "kafka-cluster:ReadData grants IAM-level consume permission from the target MSK topic, enabling data-plane read of message contents."
+    match_effective_permission:
+      action: "kafka-cluster:ReadData"
+      resource_type: ["topic", "AWS::MSK::Cluster"]
+    where:
+      - "resource_type == 'topic' OR (resource_type == 'AWS::MSK::Cluster' AND ARN suffix contains '/topic/' OR ends with '/*')"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: "<principal>"
+      target: "<MSK topic (Queue) node, or GenericMessaging if cluster-scoped>"
+      permissions: ["kafka-cluster:ReadData"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the principal has effective kafka-cluster:ReadData (+ implicitly
+        kafka-cluster:Connect and kafka-cluster:DescribeGroup for consumer group
+        coordination) at the topic or cluster scope. Same IAM + Kafka-ACL dual-plane
+        caveat as CanWriteData applies. BLOCKED if SCP, permission boundary, or explicit
+        deny applies. Honor kafka-cluster:topic scoping.
+      derived_from: ["effective kafka-cluster:ReadData at MSK topic/cluster scope"]
+      false_positive_note: >-
+        Same dual-authorization caveat as CanWriteData (A1): IAM grant alone may be
+        blocked at Kafka ACL level. kafka-cluster:ReadData requires kafka-cluster:Connect
+        and typically kafka-cluster:DescribeGroup as prerequisites. For consumer group
+        offset management, kafka-cluster:AlterGroup is also required. Verify all
+        prerequisites are present in the effective-permission evaluation to avoid
+        over-claiming. When messages contain secrets or credentials
+        (ContainsSecret/ContainsCredential), credential-chains.read-secret-yields-identity
+        rolls up the consequence — cite, do not re-derive.
+      confidence: 0.85
+      narrative: >-
+        {principal.name} can consume messages from MSK topic {target.name}
+        (kafka-cluster:ReadData). Reading from the topic allows direct data exfiltration
+        of message contents; if messages carry credentials, credential-chains will
+        surface the impersonation consequence.
+
+  # ===========================================================================
+  # SECTION B — MSK CONNECT COMPUTE SURFACE (kafkaconnect:* + iam:PassRole)
+  # ===========================================================================
+
+  # --- B1) ExecutesAs: connector runs as its service execution role -------------
+  # MSK Connect connectors run AS their configured IAM service execution role.
+  # This is the zero-cost ExecutesAs link that enables downstream CanExecuteAs
+  # derivations (via can-execute-as.execute-as-via-code-modify).
+  - id: aws-msk-connect-executes-as
+    emits: ExecutesAs
+    description: "An MSK Connect connector runs its plugin code as the configured IAM service execution role."
+    match_record:
+      resource_type: "AWS::MSKConnect::Connector"
+      field: "serviceExecutionRoleArn"
+    where:
+      - "connector.serviceExecutionRoleArn is non-empty (all valid MSK Connect connectors have a service execution role)"
+    emit:
+      source_type: GenericCompute
+      target_type: MachineIdentity
+      source: "<MSK Connect Connector (GenericCompute)>"
+      target: "<IAM role from connector.serviceExecutionRoleArn>"
+      state: ACTIVE
+      conditions: [service_state]
+      permissions: []
+      derived_from: ["AWS::MSKConnect::Connector.serviceExecutionRoleArn (kafkaconnect:DescribeConnector)"]
+      false_positive_note: >-
+        Every MSK Connect connector must have exactly one serviceExecutionRoleArn set at
+        creation time; it cannot be changed after creation (UpdateConnector does not
+        accept a new serviceExecutionRoleArn). Emit this edge for every connector
+        regardless of its running state. The role is bound at create time via
+        iam:PassRole to kafkaconnect.amazonaws.com; the connector trust policy must list
+        kafkaconnect.amazonaws.com. Verify the role's trust policy allows
+        kafkaconnect.amazonaws.com before emitting ACTIVE (otherwise downgrade to
+        CONDITIONAL(role_compatibility)).
+      narrative: >-
+        MSK Connect connector {connector.name} runs all plugin tasks as IAM role
+        {role.name} (connector.serviceExecutionRoleArn). Code executing within the
+        connector has {role.name}'s AWS credentials via the ECS container-credential
+        endpoint.
+
+  # --- B2) CanModifyCode via kafkaconnect:UpdateConnector (custom plugin) --------
+  # kafkaconnect:UpdateConnector can supply a new plugin revision (via
+  # customPlugin.customPluginArn + revision) to an existing connector. When the
+  # connector uses a custom plugin (vs. a built-in connector), updating to a
+  # new plugin version effectively replaces the connector's executable code
+  # (JAR/ZIP). Combined with ExecutesAs(connector → role), can-execute-as
+  # execute-as-via-code-modify fires -> CanExecuteAs.
+  - id: aws-msk-connect-can-modify-code
+    emits: CanModifyCode
+    description: "kafkaconnect:UpdateConnector with a new custom plugin revision replaces the connector's executable code, enabling arbitrary code execution as its service execution role."
+    match_effective_permission:
+      action: "kafkaconnect:UpdateConnector"
+      resource_type: "AWS::MSKConnect::Connector"
+    where:
+      - "connector uses a CUSTOM plugin (customPlugin config present, not a built-in Confluent/community connector)"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<MSK Connect Connector (GenericCompute)>"
+      permissions: ["kafkaconnect:UpdateConnector"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when the principal has effective kafkaconnect:UpdateConnector on the
+        connector scope AND the connector uses a custom plugin (the UpdateConnector API
+        accepts customPlugin.revision to switch to a new plugin version). When the
+        connector uses only built-in connectors (no custom plugin), UpdateConnector
+        only changes configuration parameters (task count, settings) — emit
+        CanModifyConfiguration (B3) instead, not CanModifyCode. BLOCKED if SCP or
+        permission boundary denies kafkaconnect:UpdateConnector. Note that deploying a
+        new custom plugin version also requires kafkaconnect:CreateCustomPlugin to upload
+        the JAR/ZIP; the combined capability (CreateCustomPlugin + UpdateConnector) is the
+        full code-replacement path.
+      derived_from: ["effective kafkaconnect:UpdateConnector on connector scope", "connector.customPlugin config present"]
+      false_positive_note: >-
+        Only emit CanModifyCode (vs. CanModifyConfiguration) when the connector is
+        confirmed to use a custom plugin ARN. Built-in connectors (Debezium, Confluent
+        S3 sink, etc. deployed without a custom plugin ARN in the kafkaconnect API
+        response) are not code-modifiable via UpdateConnector alone — the plugin binary
+        is managed by AWS. When the custom plugin status is UNKNOWN, emit
+        CanModifyConfiguration conservatively (B3). The can-execute-as linchpin
+        execute-as-via-code-modify consumes this CanModifyCode edge plus the
+        ExecutesAs(connector → role) fact (B1) to derive CanExecuteAs — cite, do not
+        re-derive.
+      narrative: >-
+        {principal.name} can call kafkaconnect:UpdateConnector on {connector.name} with
+        a new custom plugin revision, replacing the connector's executable code (JAR/ZIP);
+        the running connector tasks are restarted with the attacker-supplied code, which
+        executes as {role.name} (the connector's service execution role).
+
+  # --- B3) CanModifyConfiguration via kafkaconnect:UpdateConnector (non-code) ---
+  # Even when the connector uses a built-in plugin, UpdateConnector modifies task
+  # count, connector settings (e.g. topic mapping, Kafka bootstrap servers,
+  # downstream endpoint, auth credentials embedded in config). This is
+  # CanModifyConfiguration on the connector.
+  - id: aws-msk-connect-can-modify-configuration
+    emits: CanModifyConfiguration
+    description: "kafkaconnect:UpdateConnector modifies connector task count, settings (topic routing, downstream endpoint, embedded credentials), and capacity — configuration changes with security-relevant side effects."
+    match_effective_permission:
+      action: "kafkaconnect:UpdateConnector"
+      resource_type: "AWS::MSKConnect::Connector"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<MSK Connect Connector (GenericCompute)>"
+      permissions: ["kafkaconnect:UpdateConnector"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective kafkaconnect:UpdateConnector on the
+        connector scope. Connector settings can include JDBC connection strings with
+        embedded credentials, Kafka topic mappings, and downstream write targets —
+        changing them is a meaningful configuration modification. The execution role
+        cannot be changed via UpdateConnector (only at create time via CreateConnector),
+        so the config-identity-swap execute-as path does not apply here.
+        BLOCKED if SCP or permission boundary denies kafkaconnect:UpdateConnector.
+      derived_from: ["effective kafkaconnect:UpdateConnector on connector scope"]
+      false_positive_note: >-
+        CanModifyConfiguration on the connector does not by itself yield CanExecuteAs
+        (since the execution role is immutable post-creation and UpdateConnector does not
+        accept a new identity). The consequence is attacker-influenced connector behavior
+        (routing to a different topic or downstream endpoint, embedding new credentials),
+        not a direct execution-identity swap. If the connector uses a custom plugin and
+        the UpdateConnector also changes the plugin revision, co-emit CanModifyCode (B2).
+        Can-execute-as.execute-as-via-config-identity-swap does NOT fire here (no
+        CanPassIdentity to a new role via UpdateConnector).
+      narrative: >-
+        {principal.name} can call kafkaconnect:UpdateConnector on {connector.name},
+        changing its task count, Kafka topic mapping, downstream endpoint configuration,
+        or embedded connection credentials — modifications that influence what data the
+        connector routes and to where.
+
+  # --- B4) CanPassIdentity for the MSK Connect service execution role ----------
+  # Creating an MSK Connect connector requires iam:PassRole to
+  # kafkaconnect.amazonaws.com for the chosen execution role. This is the
+  # prerequisite for CanCreateWorkloadAs (B5). CanPassIdentity alone is the
+  # capability to pass the role; CreateConnector is checked in the B5 rule.
+  - id: aws-msk-connect-pass-role
+    emits: CanPassIdentity
+    description: "iam:PassRole to kafkaconnect.amazonaws.com allows the principal to bind any passable role to an MSK Connect connector."
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "PassedToService condition (if present) allows kafkaconnect.amazonaws.com OR condition is absent (unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: "<principal>"
+      target: "<IAM role passable to kafkaconnect.amazonaws.com>"
+      permissions: ["iam:PassRole"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      state_logic: >-
+        ACTIVE when iam:PassRole is not restricted by iam:PassedToService OR the
+        condition admits kafkaconnect.amazonaws.com.
+        CONDITIONAL(role_compatibility) when the PassedToService condition is present
+        but the service value is unknown/unresolved.
+        BLOCKED if iam:PassedToService explicitly excludes kafkaconnect.amazonaws.com
+        or an SCP denies iam:PassRole at the effective scope.
+      derived_from: ["effective iam:PassRole on role scope"]
+      false_positive_note: >-
+        Honor iam:PassedToService strictly. A role passable only to
+        lambda.amazonaws.com, ec2.amazonaws.com, or kafka.amazonaws.com does NOT create
+        a pass-to-kafkaconnect path. The role must also trust kafkaconnect.amazonaws.com
+        in its trust policy; a role without that principal trust will fail at connector
+        creation. Downgrade to POTENTIAL(role_compatibility) when the trust is not
+        confirmed. Also note that MSK replication uses kafka.amazonaws.com, not
+        kafkaconnect.amazonaws.com — these are distinct service principals.
+        CanPassIdentity here is the identity-pass capability only; the CreateConnector
+        gate is in aws-msk-connect-create-workload-as (B5).
+      narrative: >-
+        {principal.name} can pass {role.name} to MSK Connect (iam:PassRole scoped to
+        kafkaconnect.amazonaws.com). Any code running in a connector configured with
+        {role.name} executes as {role.name}.
+
+  # --- B5) CanCreateWorkloadAs: create a connector bound to a passable role ----
+  # kafkaconnect:CreateConnector + iam:PassRole = create a connector whose code
+  # runs as the chosen execution role. This is the MSK Connect analog of
+  # aws-lambda-create-workload-as.
+  - id: aws-msk-connect-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Creating a new MSK Connect connector bound to a passable execution role is CanCreateWorkloadAs: code in the connector runs as that role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE kafkaconnect:CreateConnector"
+      - "?role trust policy allows kafkaconnect.amazonaws.com (or unknown/unresolved — POTENTIAL)"
+      - "iam:PassRole for ?role admits kafkaconnect.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "kafkaconnect:CreateConnector"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when ?role trust policy allows kafkaconnect.amazonaws.com AND principal
+        has effective kafkaconnect:CreateConnector AND iam:PassRole admits
+        kafkaconnect.amazonaws.com.
+        POTENTIAL(role_compatibility) when the role trust is unknown/unresolved — the
+        connector will fail to start if the role does not trust kafkaconnect.amazonaws.com.
+        BLOCKED if PassedToService explicitly excludes kafkaconnect.amazonaws.com or SCP
+        denies iam:PassRole or kafkaconnect:CreateConnector.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["?principal CanPassIdentity ?role (aws-msk-connect-pass-role)", "kafkaconnect:CreateConnector check"]
+      false_positive_note: >-
+        Honor iam:PassedToService and the role trust policy. A role passable only to
+        ec2.amazonaws.com or lambda.amazonaws.com cannot be bound to MSK Connect.
+        CanCreateWorkloadAs captures the create+bind capability; the full CanExecuteAs
+        derivation is handled by can-execute-as.execute-as-via-new-workload once this
+        edge is present — cite, do not re-derive. Also requires creating a valid
+        connector configuration (plugin ARN, Kafka bootstrap servers, etc.) — not a
+        one-permission escalation, but the iam:PassRole + CreateConnector pair is the
+        binding gate.
+      narrative: >-
+        {principal.name} can create a new MSK Connect connector bound to {role.name}
+        (iam:PassRole + kafkaconnect:CreateConnector). Plugin code running in the
+        connector executes as {role.name}, reaching any service that role's permissions
+        cover.
+
+  # --- B6) ExposesCredential: connector exposes its execution role creds --------
+  # MSK Connect connector tasks run in ECS-managed containers; the execution role
+  # credentials are available to connector code via the ECS task credential
+  # endpoint. Any code running in the connector can retrieve these credentials.
+  - id: aws-msk-connect-exposes-credential
+    emits: ExposesCredential
+    description: "An MSK Connect connector exposes its service execution role credentials to all plugin code running within it via the ECS task-credential endpoint."
+    match:
+      - [ ?connector, ExecutesAs, ?role ]
+    where:
+      - "node_type(?connector) == GenericCompute"
+      - "?connector is an AWS::MSKConnect::Connector"
+    emit:
+      source_type: GenericCompute
+      target_type: MachineIdentity
+      source: ?connector
+      target: ?role
+      permissions: []
+      state: ACTIVE
+      derived_from: ["?connector ExecutesAs ?role (aws-msk-connect-executes-as)"]
+      false_positive_note: >-
+        This edge expresses the credential-exposure FACT: running code in the connector
+        equals holding the execution role's short-lived AWS credentials. Not an
+        escalation by itself; its attack value depends on a contributing CanModifyCode
+        or CanTrigger edge on the connector. Analogous to aws-lambda-exposes-exec-role-cred
+        in lambda.yaml. MSK Connect connectors use the ECS container-credentials endpoint
+        (AWS_CONTAINER_CREDENTIALS_FULL_URI / RELATIVE_URI), not IMDS.
+      narrative: >-
+        MSK Connect connector {connector.name} exposes the credentials of its service
+        execution role {role.name} to any plugin code running inside it via the ECS
+        task-credential endpoint.
+
+  # --- B7) CanPassIdentity for MSK Replication service execution role ----------
+  # MSK Replication allows cross-cluster data replication and requires a separate
+  # service principal (kafka.amazonaws.com, not kafkaconnect.amazonaws.com). A
+  # principal with iam:PassRole to kafka.amazonaws.com can create a replicator
+  # bound to any passable role (separate from MSK Connect's kafkaconnect path).
+  - id: aws-msk-replication-pass-role
+    emits: CanPassIdentity
+    description: "iam:PassRole to kafka.amazonaws.com allows the principal to bind any passable role as the replication execution role of a new MSK Replicator."
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "PassedToService condition (if present) allows kafka.amazonaws.com OR condition is absent (unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: "<principal>"
+      target: "<IAM role passable to kafka.amazonaws.com for replication>"
+      permissions: ["iam:PassRole"]
+      conditions: [iam_permission, condition_expression, role_compatibility]
+      state_logic: >-
+        ACTIVE when iam:PassRole is not restricted by iam:PassedToService OR the
+        condition admits kafka.amazonaws.com.
+        CONDITIONAL(role_compatibility) when the PassedToService condition is present
+        but the service value is unknown/unresolved.
+        BLOCKED if iam:PassedToService explicitly excludes kafka.amazonaws.com or an
+        SCP denies iam:PassRole at the effective scope.
+      derived_from: ["effective iam:PassRole on role scope"]
+      false_positive_note: >-
+        Honor iam:PassedToService strictly. A role passable only to kafkaconnect.amazonaws.com,
+        lambda.amazonaws.com, or ec2.amazonaws.com does NOT create a pass-to-kafka-replication
+        path. The role must also trust kafka.amazonaws.com in its trust policy; a role
+        without that principal trust will fail at replicator creation. Downgrade to
+        POTENTIAL(role_compatibility) when the trust is not confirmed. MSK Replication
+        uses kafka.amazonaws.com; MSK Connect uses kafkaconnect.amazonaws.com — these
+        are distinct service principals.
+      narrative: >-
+        {principal.name} can pass {role.name} to MSK Replication (iam:PassRole scoped to
+        kafka.amazonaws.com). A replicator configured with {role.name} runs as {role.name},
+        reaching both source and destination clusters with its credentials.
+
+  # --- B8) CanCreateWorkloadAs: create a replicator bound to a passable role ---
+  # kafka:CreateReplicator + iam:PassRole to kafka.amazonaws.com = create a
+  # replicator whose tasks run as the chosen execution role. This is the MSK
+  # Replication analog of aws-msk-connect-create-workload-as.
+  - id: aws-msk-replication-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Creating a new MSK Replicator bound to a passable execution role is CanCreateWorkloadAs: replication tasks run as that role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE kafka:CreateReplicator"
+      - "?role trust policy allows kafka.amazonaws.com (or unknown/unresolved — POTENTIAL)"
+      - "iam:PassRole for ?role admits kafka.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "kafka:CreateReplicator"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when ?role trust policy allows kafka.amazonaws.com AND principal
+        has effective kafka:CreateReplicator AND iam:PassRole admits kafka.amazonaws.com.
+        POTENTIAL(role_compatibility) when the role trust is unknown/unresolved — the
+        replicator will fail to start if the role does not trust kafka.amazonaws.com.
+        BLOCKED if PassedToService explicitly excludes kafka.amazonaws.com or SCP
+        denies iam:PassRole or kafka:CreateReplicator.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: ["?principal CanPassIdentity ?role (aws-msk-replication-pass-role)", "kafka:CreateReplicator check"]
+      false_positive_note: >-
+        Honor iam:PassedToService and the role trust policy. A role passable only to
+        kafkaconnect.amazonaws.com or ec2.amazonaws.com cannot be bound to MSK Replication.
+        CanCreateWorkloadAs captures the create+bind capability; the full CanExecuteAs
+        derivation is handled by can-execute-as.execute-as-via-new-workload once this
+        edge is present. Requires creating a valid replicator configuration (source &
+        destination cluster ARNs, topic mappings, etc.) — not a one-permission escalation,
+        but the iam:PassRole + CreateReplicator pair is the binding gate. The replicator
+        role reads from the source cluster (kafka-cluster:ReadData cross-account) and
+        writes to the destination; cross-cluster/cross-account data flow is driven by the
+        role's inherited permissions (source cluster policy + destination IAM policy).
+      narrative: >-
+        {principal.name} can create a new MSK Replicator bound to {role.name}
+        (iam:PassRole + kafka:CreateReplicator). Replication tasks running in the
+        replicator execute as {role.name}, reaching both source and destination clusters
+        with that role's permissions.
+
+  # --- B9) CanReadData via Replicator cross-cluster replication ----------------
+  # An MSK Replicator running as a role with kafka-cluster:ReadData on a source
+  # cluster (cross-account or same-account) reads messages from the source and
+  # replicates them to a destination cluster. This enables cross-cluster/
+  # cross-account message exfiltration when the replicator role has broad
+  # read permissions on the source.
+  - id: aws-msk-replication-can-read-data
+    emits: CanReadData
+    description: "An MSK Replicator reading from a source cluster with kafka-cluster:ReadData permission enables cross-cluster/cross-account data exfiltration of message contents."
+    match:
+      - [ ?replicator, ExecutesAs, ?role ]
+      - [ ?role, CanReadData, ?source_cluster ]
+    where:
+      - "node_type(?replicator) matches aws:kafka:Replicator OR generic_type == GenericCompute"
+      - "node_type(?source_cluster) == GenericMessaging"
+      - "?source_cluster.provider_type == 'AWS::MSK::Cluster'"
+    emit:
+      source_type: Identity
+      target_type: Queue
+      source: ?role
+      target: "<topic in ?source_cluster>"
+      permissions: ["kafka-cluster:ReadData"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?role has effective kafka-cluster:ReadData on topics in the source
+        cluster AND the replicator has been successfully created and is operational
+        (status != FAILED/STOPPED). When the replicator state is PAUSED or STOPPED, emit
+        CONDITIONAL(service_state). BLOCKED if the role's CanReadData is BLOCKED by an
+        explicit deny.
+      derived_from: ["?replicator ExecutesAs ?role (implicit from replicator config)", "?role CanReadData ?source_cluster"]
+      false_positive_note: >-
+        This edge is a data-exfiltration path for the role's inherited ReadData on the
+        source cluster. The attack value is cross-account or same-account replication
+        persistence: the replicator continuously replicates messages as it runs, making
+        it an automated data-flow vector vs. a one-shot read. If the source cluster and
+        destination are in separate accounts, the role must have cross-account CanReadData
+        on the source (granted by the source cluster resource policy). Downgrade to
+        CONDITIONAL(role_compatibility) when the cross-account resource policy is not
+        confirmed. When the replicator role is the only data access, cite this edge; when
+        the principal also has direct CanReadData on the source, the principal's edge is
+        preferred (lower hop count).
+      narrative: >-
+        MSK Replicator {replicator.name} running as {role.name} can consume messages
+        from source cluster {source_cluster.name} (kafka-cluster:ReadData). Replicated
+        messages are copied to the destination cluster, enabling cross-cluster/cross-account
+        data exfiltration via continuous replication.
+
+  # --- B10) CanReadSecret/ExposesCredential via DescribeConnector config ------
+  # kafkaconnect:DescribeConnector returns the full connector configuration,
+  # which may include embedded JDBC connection strings, database passwords, or
+  # API keys for downstream data stores (e.g. S3 sink connector S3 credentials,
+  # database credentials in a JDBC source connector config). The connector itself
+  # exposes these credentials to any caller who can DescribeConnector.
+  - id: aws-msk-connect-describe-exposes-credential
+    emits: ExposesCredential
+    description: "An MSK Connect connector's configuration (readable via kafkaconnect:DescribeConnector) may contain embedded credentials for downstream data stores (JDBC passwords, S3 keys, API credentials)."
+    match_record:
+      resource_type: "AWS::MSKConnect::Connector"
+      field: "connectorConfiguration"
+    where:
+      - "connector.connectorConfiguration contains non-empty sensitive fields (credential-like keys: password, credentials, secret, apiKey, connectionString, authToken, token)"
+    emit:
+      source_type: GenericCompute
+      target_type: Credential
+      source: "<MSK Connect Connector (GenericCompute)>"
+      target: "<embedded credential in connector config (JDBC connection string, S3 credentials, database password, API key, etc.)>"
+      permissions: []
+      state: CONDITIONAL(service_state)
+      conditions: [service_state]
+      derived_from: ["AWS::MSKConnect::Connector.connectorConfiguration field inspection (kafkaconnect:DescribeConnector evidence)"]
+      false_positive_note: >-
+        Only emit when the collector has positive evidence of credential-bearing config
+        fields (non-null, non-empty password/credentials/secret fields, or connection
+        string URIs with embedded credentials). Do not emit if the connector config is
+        empty or the credential fields are redacted by the API (AWS redacts sensitive
+        fields in the DescribeConnector response by default — verify that the raw
+        evidence includes unredacted credentials). The downstream target (JDBC database,
+        S3 bucket, API endpoint, etc.) is named in the config and should be modeled as a
+        separate node for the full credential-chains path. When the embedded credentials
+        authenticate to a specific downstream identity (database user, S3 bucket cross-account
+        role, etc.), cite credential-chains.read-secret-yields-identity for the
+        CanImpersonate roll-up (do not duplicate here). Any principal with
+        kafkaconnect:DescribeConnector can read this edge and harvest the credentials.
+      narrative: >-
+        MSK Connect connector {source.name} exposes embedded credentials in its
+        configuration (stored in connectorConfiguration fields such as password,
+        connectionString, apiKey, etc.). Any principal with kafkaconnect:DescribeConnector
+        permission can read these credentials and use them to authenticate to downstream
+        data stores (JDBC database, S3, third-party APIs), enabling lateral movement or
+        data exfiltration.
+
+  # ===========================================================================
+  # SECTION C — MSK CLUSTER CONTROL-PLANE FACTS (kafka:* actions)
+  # ===========================================================================
+
+  # --- C1) CanModifyConfiguration via kafka:UpdateClusterConfiguration ---------
+  - id: aws-msk-update-cluster-config
+    emits: CanModifyConfiguration
+    description: "kafka:UpdateClusterConfiguration applies a new Kafka broker configuration version to the MSK cluster, affecting settings such as auto.create.topics.enable, log retention, and replication factors."
+    match_effective_permission:
+      action: "kafka:UpdateClusterConfiguration"
+      resource_type: "AWS::MSK::Cluster"
+    emit:
+      source_type: Identity
+      target_type: GenericMessaging
+      source: "<principal>"
+      target: "<MSK Cluster (GenericMessaging)>"
+      permissions: ["kafka:UpdateClusterConfiguration"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective kafka:UpdateClusterConfiguration on the
+        cluster ARN. This modifies broker-level Kafka settings. Analyst note: enabling
+        auto.create.topics.enable is particularly significant — it allows producers to
+        create new topics implicitly, broadening the WriteData attack surface without
+        explicit kafka-cluster:CreateTopic permission. BLOCKED by SCP or boundary denial.
+      derived_from: ["effective kafka:UpdateClusterConfiguration on cluster ARN"]
+      false_positive_note: >-
+        Cluster configuration changes require a rolling broker restart (MSK handles this
+        automatically), which temporarily disrupts broker availability. The security
+        consequence of the configuration change (e.g. enabling auto topic creation) is
+        gradual — it takes effect after the rolling restart completes. Not a real-time
+        escalation but a persistent configuration modification.
+      narrative: >-
+        {principal.name} can apply a new Kafka broker configuration to cluster
+        {target.name} (kafka:UpdateClusterConfiguration), altering settings such as
+        auto.create.topics.enable, retention policies, and replication factors — changes
+        that can expand the cluster's data-plane attack surface.
+
+  # --- C2) CanModifyConfiguration via kafka:UpdateSecurity ---------------------
+  - id: aws-msk-update-security
+    emits: CanModifyConfiguration
+    description: "kafka:UpdateSecurity modifies cluster authentication and encryption settings, including potentially enabling unauthenticated client access, which removes the IAM and Kafka ACL authorization gates."
+    match_effective_permission:
+      action: "kafka:UpdateSecurity"
+      resource_type: "AWS::MSK::Cluster"
+    emit:
+      source_type: Identity
+      target_type: GenericMessaging
+      source: "<principal>"
+      target: "<MSK Cluster (GenericMessaging)>"
+      permissions: ["kafka:UpdateSecurity"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective kafka:UpdateSecurity on the cluster ARN.
+        CRITICAL: enabling UNAUTHENTICATED client access (setting
+        clientAuthentication.unauthenticated.enabled = true) removes all IAM and Kafka
+        ACL authorization gates from the cluster — any network-reachable client can then
+        produce and consume without credentials. This is a high-impact
+        CanModifyConfiguration edge. BLOCKED by SCP or boundary denial.
+      derived_from: ["effective kafka:UpdateSecurity on cluster ARN"]
+      false_positive_note: >-
+        The consequence of enabling unauthenticated access depends on network
+        reachability: the brokers must still be reachable (VPC-private by default;
+        requires PublicAccess or VPC peering/TGW for external reach). Do not emit
+        CanWriteData/CanReadData for unauthenticated principals directly from this rule —
+        instead flag the configuration change as a high-confidence CanModifyConfiguration
+        for analyst review. The actual broad data-plane access surface is derived
+        separately when the cluster's authentication config is observed as
+        unauthenticated=enabled.
+      narrative: >-
+        {principal.name} can modify cluster {target.name}'s security configuration
+        (kafka:UpdateSecurity), potentially enabling unauthenticated client access,
+        which removes all authorization gates and allows any network-reachable client
+        to produce and consume data.
+
+  # --- C3) CanModifyPolicy via kafka:PutClusterPolicy --------------------------
+  # kafka:PutClusterPolicy writes the MSK cluster resource-based policy, which
+  # can grant kafka-cluster:WriteData / ReadData to principals in other accounts.
+  # This is a policy-mutation capability that can broaden the publish-trigger
+  # attack surface to cross-account principals.
+  - id: aws-msk-put-cluster-policy
+    emits: CanModifyPolicy
+    description: "kafka:PutClusterPolicy allows writing the MSK cluster resource-based policy, enabling the attacker to grant kafka-cluster:WriteData (or ReadData) to arbitrary principals including cross-account ones."
+    match_effective_permission:
+      action: "kafka:PutClusterPolicy"
+      resource_type: "AWS::MSK::Cluster"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: "<principal>"
+      target: "<MSK Cluster ResourcePolicy>"
+      permissions: ["kafka:PutClusterPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has effective kafka:PutClusterPolicy on the cluster ARN.
+        Writing the policy can grant any kafka-cluster:* action to any principal
+        (including Principal: "*" for broad access, or a cross-account principal for
+        cross-account trust). The escalation consequence (the attacker grants themselves
+        kafka-cluster:WriteData and then triggers Lambda) is a second-order effect —
+        this rule emits the POLICY-MUTATION capability; CanWriteData on the cluster is
+        separately derived after the mutated policy is effective.
+        BLOCKED by SCP or permission boundary denying kafka:PutClusterPolicy.
+      derived_from: ["effective kafka:PutClusterPolicy on cluster ARN"]
+      false_positive_note: >-
+        This is a policy-write primitive, not a direct data-plane grant. The attacker
+        must call PutClusterPolicy with content that grants data-plane actions to a
+        controlled principal, then use that principal to produce to topics. The
+        two-step nature is intentional: this edge signals the mutation capability;
+        the downstream CanWriteData/CrossAccountTrust edges are emitted from the
+        resulting (modified) policy state. Do not collapse this into a direct
+        CanExecuteAs; let the linchpins handle the chain once CanWriteData is present.
+      narrative: >-
+        {principal.name} can write the resource-based policy for MSK cluster
+        {target.name} (kafka:PutClusterPolicy), granting kafka-cluster:WriteData or
+        ReadData to any principal (including cross-account or wildcard principals).
+
+  # ===========================================================================
+  # SECTION D — CLUSTER RESOURCE POLICY: CROSS-ACCOUNT TRUST
+  # ===========================================================================
+
+  # --- D1) CrossAccountTrust from cluster resource-based policy ----------------
+  # An MSK cluster resource policy that grants kafka-cluster:WriteData (or
+  # kafka-cluster:Connect + WriteData) to a principal in another account is
+  # cross-account publish trust. messaging-chains rule 4 (cited) picks this
+  # up and feeds can-control for CanEnterAccount when a bound Lambda consumer
+  # is also present.
+  - id: aws-msk-cluster-policy-cross-account
+    emits: CrossAccountTrust
+    description: "An MSK cluster resource-based policy granting kafka-cluster:WriteData or ReadData to a principal in another account is cross-account publish/consume trust; feeds messaging-chains rule 4 and can-control's CanEnterAccount derivation."
+    match:
+      - [ ?clusterpolicy, HasPolicy, ?cluster ]
+    where:
+      - "node_type(?clusterpolicy) == ResourcePolicy"
+      - "node_type(?cluster) == GenericMessaging"
+      - "?cluster is an AWS::MSK::Cluster"
+      - "?clusterpolicy grants kafka-cluster:WriteData OR kafka-cluster:ReadData OR kafka-cluster:Connect to a Principal whose account != owner_account(?cluster)"
+      - "the external Principal is not the AWS service principal kafka.amazonaws.com or kafkaconnect.amazonaws.com (exclude internal service grants)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: ?clusterpolicy
+      target: "<external account named in the cluster resource policy>"
+      permissions: []
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the cluster resource policy unconditionally grants a cross-account
+        kafka-cluster:WriteData or ReadData to a named external principal.
+        CONDITIONAL(condition_expression) when scoped by a condition the external
+        principal must satisfy (aws:PrincipalOrgID, aws:SourceAccount, or a principal
+        ARN condition narrowing the grant to a specific external role).
+        BLOCKED by an SCP or org-policy that neutralizes the cross-account grant.
+        On GCP this same pattern emits CrossProjectTrust — but this rule is AWS-only.
+      confidence: "min(contributing_confidences)"
+      derived_from: ["?clusterpolicy HasPolicy ?cluster (kafka:GetClusterPolicy evidence)", "cross-account Principal in policy statement"]
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE messaging-chains.messaging-resource-policy-cross-boundary-trust:
+        this rule is the MSK-specific adapter that emits the CrossAccountTrust fact;
+        the CanEnterAccount roll-up (cross-account produce → trigger Lambda consumer
+        in this account → CanEnterAccount) is messaging-chains rule 4 + can-control's
+        responsibility — never re-derived here. Honor the two-policy evaluation for
+        cross-account IAM: the external principal also needs kafka-cluster:WriteData in
+        their own identity-based policy (resource-based policy alone is necessary but
+        not sufficient for cross-account IAM access). Wildcard Principal ('*') in the
+        cluster policy is internet/tenant exposure (ExposedToInternet or ExposedToTenant),
+        not this cross-account trust edge.
+      narrative: >-
+        The resource policy on MSK cluster {cluster.name} grants kafka-cluster:WriteData
+        (or ReadData) to a principal in account {target.name}; this cross-account trust
+        lets external principals drive message production (and, via bound Lambda
+        consumers, execution inside {cluster.name}'s account — messaging-chains +
+        can-control roll that up to CanEnterAccount).
+
+  # ===========================================================================
+  # SECTION E — CLUSTER NETWORK EXPOSURE
+  # ===========================================================================
+
+  # --- E1) ExposedToInternet when publiclyAccessible + SG open ----------------
+  - id: aws-msk-public-access
+    emits: ExposedToInternet
+    description: "An MSK cluster with publiclyAccessible enabled and an open broker security group (port 9198 from 0.0.0.0/0) is internet-reachable; IAM or SASL/SCRAM authentication still required."
+    match_record:
+      resource_type: "AWS::MSK::Cluster"
+      field: "connectivityInfo.publicAccess.type"
+    where:
+      - "cluster.connectivityInfo.publicAccess.type in [SERVICE_PROVIDED_EIPS, MULTI_VPC]"
+      - "OR cluster.connectivityInfo.publicAccess.type != DISABLED (for ServerlessCluster)"
+      - "broker security groups allow inbound TCP port 9198 from 0.0.0.0/0 or ::/0 (confirmed by SecurityGroup rule evaluation)"
+    emit:
+      source_type: GenericMessaging
+      target_type: AnonymousIdentity
+      source: "<MSK Cluster (GenericMessaging)>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when public access is enabled (connectivityInfo.publicAccess.type !=
+        DISABLED) AND the broker ENI security groups allow port 9198 inbound from
+        0.0.0.0/0. CONDITIONAL(network_reachability) when public access is enabled but
+        the SG rule is not confirmed (collector could not evaluate the SG).
+        Note: even with public internet reachability, clients must still authenticate
+        (IAM, SASL/SCRAM, or mTLS) unless unauthenticated access is also enabled —
+        ExposedToInternet here means the BROKER ENDPOINT is internet-reachable, not
+        that it is anonymously accessible. Emit with a note about authentication
+        requirements in the narrative.
+      derived_from: ["AWS::MSK::Cluster.connectivityInfo.publicAccess.type (kafka:DescribeCluster)", "SecurityGroup inbound rules (ec2:DescribeSecurityGroups)"]
+      false_positive_note: >-
+        publiclyAccessible alone (without SG open) does NOT make the cluster reachable
+        from the internet — the default SG created by MSK restricts inbound to the VPC.
+        Require BOTH conditions: (1) publicAccess.type != DISABLED and (2) SG allows
+        port 9198 from 0.0.0.0/0. If SG evaluation is unavailable, downgrade to
+        CONDITIONAL(network_reachability). Also: public access assigns public IPs to
+        brokers at port 9198 (TLS) only; non-TLS endpoints are not publicly accessible.
+        MSK Serverless clusters are always private (PrivateLink); public access applies
+        only to provisioned clusters.
+      narrative: >-
+        MSK cluster {source.name} has public broker access enabled
+        (connectivityInfo.publicAccess.type) and a security group permitting inbound
+        on port 9198; the TLS broker endpoints are internet-reachable (authentication
+        still required for data-plane access).
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - SCP or permission boundary denying kafka-cluster:WriteData ->
+#    CanWriteData (A1) BLOCKED, and messaging-chains rule 1 CanTrigger
+#    derivation from this source BLOCKED.
+#  - SCP denying kafkaconnect:UpdateConnector ->
+#    CanModifyCode (B2) and CanModifyConfiguration (B3) BLOCKED.
+#  - iam:PassRole with iam:PassedToService NOT including kafkaconnect.amazonaws.com ->
+#    CanPassIdentity (B4) and CanCreateWorkloadAs (B5) BLOCKED.
+#  - Kafka ACL DENY on the topic (not collectible at IAM level) ->
+#    lower confidence on CanWriteData/CanReadData (0.8 max when dual-auth confirmed);
+#    flag as CONDITIONAL(condition_expression) when ACL authorization is active.
+#  - Disabled Lambda event-source mapping (state != ENABLED) ->
+#    CanTrigger(topic → Lambda) is CONDITIONAL(trigger_exists), not ACTIVE;
+#    messaging-chains rule 1 output inherits this state.
+#  - MSK Connect connector in FAILED or DEGRADED state ->
+#    ExecutesAs (B1) is CONDITIONAL(service_state), not ACTIVE.
+# ---------------------------------------------------------------------------
+
+# Linchpin citations (these rules produce the CanExecuteAs / CanEscalateTo /
+# CanEnter* roll-ups; do NOT re-derive them):
+#   messaging-chains.messaging-publish-triggers-consumer       (rule 1)
+#     CanWriteData(?p, ?topic) + CanTrigger(?topic, ?lambda)
+#     => CanTrigger(?p, ?lambda)  CONDITIONAL(trigger_exists)
+#   messaging-chains.messaging-trigger-executes-as             (rule 2)
+#     CanTrigger(?p, ?lambda) + ExecutesAs(?lambda, ?role)
+#     => CanExecuteAs(?p, ?role)  CONDITIONAL(trigger_exists)
+#   messaging-chains.messaging-resource-policy-cross-boundary-trust (rule 4)
+#     Consumes D1 CrossAccountTrust -> feeds can-control CanEnterAccount
+#   can-execute-as.execute-as-via-code-modify
+#     CanModifyCode(?p, ?connector) + ExecutesAs(?connector, ?role)
+#     => CanExecuteAs(?p, ?role)  (ACTIVE — run path is the connector's
+#        continuous execution; no separate invoke needed)
+#   can-execute-as.execute-as-via-new-workload
+#     CanCreateWorkloadAs(?p, ?role)
+#     => CanExecuteAs(?p, ?role)
+#   credential-chains.execute-then-read-secret
+#     CanExecuteAs(?p, ?role) + CanReadSecret(?role, ?secret)
+#     => CanReadSecret(?p, ?secret)
+#   credential-chains.read-secret-yields-identity
+#     CanReadSecret(?p, ?secret) + CredentialsFor(?secret, ?identity)
+#     => CanImpersonate(?p, ?identity)
+#   can-control.yaml
+#     CanExecuteAs(?p, ?role) + ?role Controls/CanAdminister boundary
+#     => CanEscalateTo or Controls (objective roll-up)
+
+explicit_rules:
+  # These belong in /rules/explicit/aws-msk.yaml if created.
+  # Listed here for collector reference.
+
+  - id: aws-msk-connect-executes-as-explicit
+    emits: ExecutesAs
+    applies_to: [aws]
+    from_field: "AWS::MSKConnect::Connector.serviceExecutionRoleArn"
+    note: >-
+      Emit ExecutesAs(MSKConnectConnector(GenericCompute) ->
+      serviceExecutionRole(MachineIdentity)) for every connector with a non-empty
+      serviceExecutionRoleArn (kafkaconnect:DescribeConnector).
+
+  - id: aws-msk-esm-trigger-explicit
+    emits: CanTrigger
+    applies_to: [aws]
+    from_field: "AWS::Lambda::EventSourceMapping.EventSourceArn + Topics[]"
+    note: >-
+      Emit CanTrigger(MSKTopic(Queue) -> LambdaFunction(ServerlessFunction)) for each
+      enabled Lambda event-source mapping where EventSourceArn is an MSK cluster ARN
+      and Topics[] names the specific Kafka topic. Source node: MSK topic Queue node
+      keyed by cluster-arn/topic-name. Target: Lambda function node.
+      State: ACTIVE when ESM state == ENABLED; CONDITIONAL(trigger_exists) when DISABLED.
+      Evidence: lambda:ListEventSourceMappings filtered by EventSourceArn.
+
+  - id: aws-msk-cluster-policy-explicit
+    emits: HasPolicy
+    applies_to: [aws]
+    from_field: "kafka:GetClusterPolicy -> Policy"
+    note: >-
+      Emit HasPolicy(MSKCluster(GenericMessaging) -> ClusterResourcePolicy(ResourcePolicy))
+      when GetClusterPolicy returns a non-empty policy document. The ResourcePolicy node
+      is then parsed for cross-account Principal statements to drive D1
+      (aws-msk-cluster-policy-cross-account) and for wildcard-Principal grants that
+      drive ExposedToInternet/ExposedToTenant.
+
+  - id: aws-msk-sasl-scram-secret-explicit
+    emits: ContainsSecret
+    applies_to: [aws]
+    from_field: "kafka:ListScramSecrets -> SecretArnList[]"
+    note: >-
+      Emit ContainsSecret(MSKCluster(GenericMessaging) -> Secret(Secret)) for each
+      SecretArn returned by ListScramSecrets. The secret (AmazonMSK_* prefix in
+      Secrets Manager) contains SASL/SCRAM credentials for broker authentication.
+      credential-chains will link ContainsSecret + CredentialsFor -> CanImpersonate
+      (CanImpersonate target here is the MSK cluster data-plane access — model as
+      CredentialsFor(secret -> cluster) if the cluster is modeled as a data Identity,
+      or as AuthenticatesTo(secret -> cluster brokers)).

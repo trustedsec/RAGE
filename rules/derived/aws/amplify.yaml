@@ -1,0 +1,670 @@
+# AWS Amplify Hosting — attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Permissions are the
+# EFFECTIVE actions the permission evaluator must confirm at the given resource
+# scope before an edge is produced. States: ACTIVE unless a condition is unmet
+# (CONDITIONAL/POTENTIAL) or an SCP/boundary denies (BLOCKED).
+#
+# Grounding: AWS Service Authorization Reference (service prefix `amplify`),
+# Amplify API Reference (UpdateApp, UpdateBranch, StartJob, CreateWebhook,
+# CreateApp), Amplify User Guide (build settings, service role, GitHub access).
+#
+# AMPLIFY CI/CD SECURITY MODEL:
+#   An Amplify App is a BuildWorker that executes the `buildSpec` (stored in
+#   the App or Branch config, or in an `amplify.yml` in the source repo) as the
+#   app's `iamServiceRoleArn` (trust principal: amplify.amazonaws.com). Every
+#   build Job inherits the service role's AWS credentials — injected into the
+#   build environment — so code running in the build can call any AWS API the
+#   role allows.
+#
+#   The primary build-spec injection surface:
+#     amplify:UpdateApp  (app-level buildSpec)  → poisons all future branch builds
+#     amplify:UpdateBranch (branch-level buildSpec) → poisons one branch
+#   Both require a run path: amplify:StartJob (MANUAL/RELEASE) or an existing
+#   auto-build trigger (git push → webhook, enableAutoBuild=true).
+#
+#   NOTE: amplify:StartJob does NOT accept a buildspecOverride; StartJob runs
+#   only the CURRENT stored buildSpec. The modify-then-trigger sequence is
+#   always required (unlike codebuild:StartBuild which offers buildspecOverride).
+#
+#   SSR Compute role (computeRoleArn): this is the serving-plane identity for
+#   SSR apps — distinct from the build service role and NOT acquired via build
+#   injection. Do not conflate it with iamServiceRoleArn.
+#
+# LINCHPIN CITATIONS (do not re-derive their roll-ups):
+#   cicd-chains.yaml — cicd-modify-buildspec-executes-as is the canonical
+#     collapse of CanModifyCode(runner) + ExecutesAs => CanExecuteAs. The rules
+#     below emit the service FACTS (CanModifyCode, ExecutesAs, CanTrigger,
+#     CanPassIdentity, CanAttachIdentity) and let cicd-chains + can-execute-as
+#     produce CanExecuteAs and CanEscalateTo. Service-specific CanExecuteAs
+#     rules are only added where Amplify's semantics differ materially from the
+#     generic collapse (role-swap via UpdateApp+PassRole; create-workload-as).
+#   can-execute-as.yaml — execute-as-via-code-modify collapses CanModifyCode +
+#     ExecutesAs for any Compute node; dedupes with cicd-modify-buildspec.
+#   credential-chains.yaml — ExposesCredential + CredentialsFor => CanImpersonate
+#     is credential-chains territory; not re-derived here.
+#
+# Scope discipline: every rule records the ARN scope the action applies at.
+# amplify:UpdateApp targets arn:aws:amplify:<region>:<acct>:apps/<appId>.
+# amplify:UpdateBranch targets arn:aws:amplify:<region>:<acct>:apps/<appId>/branches/<branchName>.
+# amplify:StartJob targets arn:aws:amplify:<region>:<acct>:apps/<appId>/branches/<branchName>/jobs/*.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-pipelines
+service: amplify
+applies_to: [aws]
+
+# ===========================================================================
+# EXPLICIT normalization rules (raw config -> explicit edges).
+# Match collected Amplify config fields, not other edges.
+# ===========================================================================
+explicit_rules:
+
+  - id: aws-amplify-executesas-service-role
+    emits: ExecutesAs
+    description: "Amplify App builds execute as the configured iamServiceRoleArn."
+    match_record:
+      resource_type: "AWS::Amplify::App"
+      field: "iamServiceRoleArn"
+    where:
+      - "iamServiceRoleArn is present and non-empty"
+    emit:
+      source_type: BuildWorker
+      target_type: MachineIdentity
+      source: "<AWS::Amplify::App>"
+      target: "<IAM role at iamServiceRoleArn>"
+      state: ACTIVE
+      permissions: []
+      api_source: "amplify:GetApp"
+      evidence_field: "iamServiceRoleArn"
+      false_positive_note: >-
+        Emit ONLY when iamServiceRoleArn is set and non-empty. An Amplify App
+        with no iamServiceRoleArn has no AWS identity — the build runs Amplify-
+        internal operations only and the attacker gains no AWS credentials from
+        buildSpec injection. Do NOT emit ExecutesAs for the SSR computeRoleArn
+        field — that role is used by the serving plane at request time, not by
+        the build runner.
+      narrative: >-
+        Amplify App {app.name} builds execute as {target.name}
+        (iamServiceRoleArn; trust principal amplify.amazonaws.com).
+
+  - id: aws-amplify-webhook-triggers-branch
+    emits: CanTrigger
+    description: "Amplify webhook is an HTTP endpoint that triggers a build job for its branch."
+    match_record:
+      resource_type: "AWS::Amplify::Webhook"
+      field: "webhookUrl"
+    where:
+      - "webhookUrl is present and non-empty"
+      - "branchName maps to an existing Branch node"
+    emit:
+      source_type: Webhook
+      target_type: BuildWorker
+      source: "<AWS::Amplify::Webhook>"
+      target: "<AWS::Amplify::Branch at branchName>"
+      state: ACTIVE
+      permissions: []
+      api_source: "amplify:GetWebhook"
+      evidence_field: "webhookUrl"
+      false_positive_note: >-
+        A webhook URL is unauthenticated — any HTTP client with the URL can POST
+        to trigger a build. However, the build runs only the CURRENT stored
+        buildSpec of the branch; triggering a webhook is ONLY an attack step
+        when combined with a prior buildSpec injection (CanModifyCode) or when
+        the current buildSpec already runs attacker-influenceable content. The
+        CanTrigger edge is ACTIVE (the trigger mechanism exists); the downstream
+        CanExecuteAs is CONDITIONAL(attacker_influenced_definition) per
+        cicd-chains cicd-trigger-runner-executes-as.
+      narrative: >-
+        Amplify webhook {webhook.name} can trigger a build of branch
+        {branch.name} via an HTTP POST to its unauthenticated URL.
+
+  - id: aws-amplify-autobild-trigger
+    emits: CanTrigger
+    description: "Branch with enableAutoBuild=true fires a build on every connected-repo push."
+    match_record:
+      resource_type: "AWS::Amplify::Branch"
+      field: "enableAutoBuild"
+    where:
+      - "enableAutoBuild == true"
+    emit:
+      source_type: ExternalIdentity
+      target_type: BuildWorker
+      source: "<ExternalIdentity representing principals with write access to the connected repository>"
+      target: "<AWS::Amplify::Branch>"
+      state: ACTIVE
+      permissions: []
+      api_source: "amplify:GetBranch"
+      evidence_field: "enableAutoBuild"
+      false_positive_note: >-
+        Emit with source as an ExternalIdentity representing push actors on the
+        connected Git repository. This CanTrigger is ACTIVE only while the branch
+        is connected to an active repo with push activity; if the repo is
+        disconnected or the branch is paused, downgrade to CONDITIONAL(service_state).
+        The push-to-trigger chain yields CanExecuteAs only if the buildSpec is also
+        attacker-influenced (repo amplify.yml, or a prior UpdateApp/UpdateBranch
+        buildSpec injection).
+      narrative: >-
+        Branch {branch.name} has auto-build enabled; any push to its connected
+        repository by an external principal (or internal via GitHub) triggers a
+        build running the current buildSpec as the app's service role.
+
+# ===========================================================================
+# DERIVED rules — match explicit/derived edges + effective permissions.
+# ===========================================================================
+rules:
+
+  # --- App-level buildSpec injection -> CanModifyCode -----------------------
+  - id: aws-amplify-modifycode-app
+    emits: CanModifyCode
+    description: "amplify:UpdateApp with buildSpec field rewrites the app-level build commands for all branches."
+    match_effective_permission:
+      action: "amplify:UpdateApp"
+      resource_type: "AWS::Amplify::App"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<AWS::Amplify::App in scope>"
+      permissions: ["amplify:UpdateApp"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if iam_permission is satisfied. A branch-level buildSpec override
+        on an individual branch takes precedence over the app-level buildSpec for
+        that branch (see aws-amplify-modifycode-branch); the app-level injection
+        still poisons all other branches. If the source repo contains an
+        amplify.yml, that file overrides the console-stored buildSpec for each
+        build — the app-level injection has no effect on those branches until the
+        amplify.yml is removed. Emit CONDITIONAL(service_state) if the app has no
+        connected branch with a run path.
+      confidence: 0.95
+      derived_from: [ "<HasPermission edge: ?principal amplify:UpdateApp on ?app>" ]
+      false_positive_note: >-
+        UpdateApp is the single Amplify action that touches both buildSpec AND
+        iamServiceRoleArn AND environmentVariables. This CanModifyCode rule is
+        scoped to the buildSpec field; aws-amplify-modifyconfig-app handles the
+        identity/config mutation. If the permission is scoped by a resource tag
+        condition, honor it. If the app has no iamServiceRoleArn (no ExecutesAs
+        edge), CanModifyCode is still emitted (the fact exists) but cicd-chains
+        cicd-modify-buildspec-executes-as will NOT fire (no ExecutesAs partner)
+        — the path dead-ends correctly. If the source repo contains an amplify.yml
+        that overrides the stored buildSpec, downgrade to
+        POTENTIAL(amplify.yml_overrides_stored_buildspec).
+      narrative: >-
+        {principal.name} can rewrite the app-level build commands of {app.name}
+        (amplify:UpdateApp buildSpec field), injecting arbitrary shell commands
+        that will run as the app's service role on the next build of any branch
+        that does not have its own branch-level buildSpec override.
+
+  # --- Branch-level buildSpec injection -> CanModifyCode --------------------
+  - id: aws-amplify-modifycode-branch
+    emits: CanModifyCode
+    description: "amplify:UpdateBranch with buildSpec field rewrites build commands for a specific branch."
+    match_effective_permission:
+      action: "amplify:UpdateBranch"
+      resource_type: "AWS::Amplify::Branch"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<AWS::Amplify::Branch in scope>"
+      permissions: ["amplify:UpdateBranch"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if iam_permission is satisfied. Scoped to the specific branch ARN;
+        amplify:UpdateBranch on Resource:"*" widens to all branches of all apps
+        in scope. A branch-level buildSpec takes precedence over the app-level
+        buildSpec for this branch. Same amplify.yml caveat as aws-amplify-modifycode-app:
+        if the repo contains amplify.yml for this branch, downgrade to
+        POTENTIAL(amplify.yml_overrides_stored_buildspec).
+      confidence: 0.95
+      derived_from: [ "<HasPermission edge: ?principal amplify:UpdateBranch on ?branch>" ]
+      false_positive_note: >-
+        UpdateBranch modifies a single branch; an app-wide IAM grant on the app
+        ARN does NOT automatically grant UpdateBranch on individual branch ARNs
+        (Amplify uses distinct resource ARN schemes for apps vs. branches). Confirm
+        the scope covers the branch ARN, not just the app ARN. The computeRoleArn
+        field of UpdateBranch is the SSR Compute role; see aws-amplify-modifyconfig-branch
+        for that mutation. StartJob does NOT accept a buildspecOverride — the attacker
+        must modify the stored buildSpec via UpdateApp or UpdateBranch BEFORE
+        triggering a job.
+      narrative: >-
+        {principal.name} can rewrite the build commands of branch {branch.name}
+        (amplify:UpdateBranch buildSpec field), injecting arbitrary shell commands
+        that will run as the app's service role on the next build of that branch.
+
+  # --- amplify:StartJob -> CanTrigger on a branch ---------------------------
+  - id: aws-amplify-startjob-trigger
+    emits: CanTrigger
+    description: "amplify:StartJob fires a build of the branch, running its current buildSpec as the service role."
+    match_effective_permission:
+      action: "amplify:StartJob"
+      resource_type: "AWS::Amplify::Branch"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<AWS::Amplify::Branch in scope>"
+      permissions: ["amplify:StartJob"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if iam_permission is satisfied. StartJob can fire RELEASE (latest
+        commit from repo), RETRY (re-run a prior job), or MANUAL jobs. ACTIVE for
+        all three types because the principal can cause the branch build to run.
+        Downstream CanExecuteAs via cicd-trigger-runner-executes-as is
+        CONDITIONAL(attacker_influenced_definition) unless the current buildSpec
+        is already attacker-controlled (prior UpdateApp/UpdateBranch injection).
+      confidence: 0.90
+      derived_from: [ "<HasPermission edge: ?principal amplify:StartJob on ?branch>" ]
+      false_positive_note: >-
+        StartJob does NOT accept a buildspecOverride. Triggering the job alone
+        yields no privilege unless the current buildSpec already runs
+        attacker-influenceable commands. This CanTrigger is the run path that
+        upgrades a prior buildSpec injection (aws-amplify-modifycode-app/branch)
+        from CONDITIONAL to ACTIVE per cicd-chains rule 1.
+      narrative: >-
+        {principal.name} can trigger a build of branch {branch.name}
+        (amplify:StartJob), running its current buildSpec as the app's service role.
+
+  # --- CreateWebhook -> CanTrigger on a branch (unauthenticated URL) ---------
+  - id: aws-amplify-create-webhook
+    emits: CanTrigger
+    description: "amplify:CreateWebHook creates an unauthenticated HTTP endpoint that triggers a branch build."
+    match_effective_permission:
+      action: "amplify:CreateWebHook"
+      resource_type: "AWS::Amplify::App"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<AWS::Amplify::Branch mapped by the new webhook>"
+      permissions: ["amplify:CreateWebHook"]
+      conditions: [iam_permission]
+      state_logic: >-
+        POTENTIAL(trigger_not_yet_created) until the webhook is created and its URL
+        is observed in collected data. A principal with amplify:CreateWebHook can
+        CREATE the webhook capability but has not yet realized it. Once the explicit
+        aws-amplify-webhook-triggers-branch rule observes the webhookUrl field (meaning
+        the webhook exists in collected data), that edge is ACTIVE. The downstream
+        CanExecuteAs from triggering is CONDITIONAL per cicd-chains
+        cicd-trigger-runner-executes-as (the current buildSpec must already be
+        attacker-influenced for the trigger to yield the role). Dedup:
+        aws-amplify-webhook-triggers-branch emits the ACTIVE trigger once the
+        webhook URL is confirmed.
+      derived_from: [ "<HasPermission edge: ?principal amplify:CreateWebHook on ?app>" ]
+      confidence: 0.70
+      false_positive_note: >-
+        The webhook URL returned by CreateWebhook is unauthenticated — any
+        client with the URL can trigger a build. However, the trigger only runs
+        the CURRENT buildSpec. Combined with a prior aws-amplify-modifycode-app/
+        branch injection (buildSpec rewritten), the sequence yields CanExecuteAs.
+        Without a prior injection, this is CONDITIONAL(attacker_influenced_definition).
+        Do not emit ExposedToInternet from the webhook — the webhook is a trigger
+        endpoint, not a data exposure surface.
+      narrative: >-
+        {principal.name} can create an Amplify webhook for a branch
+        (amplify:CreateWebHook), producing an unauthenticated HTTP URL that any
+        client can POST to trigger a build running the branch's current buildSpec
+        as the app's service role.
+
+  # --- UpdateApp passRole -> CanPassIdentity --------------------------------
+  - id: aws-amplify-pass-service-role
+    emits: CanPassIdentity
+    description: "iam:PassRole scoped to amplify.amazonaws.com lets a principal attach a service role to an Amplify App."
+    match_effective_permission:
+      action: "iam:PassRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "role trust policy allows amplify.amazonaws.com"
+      - "iam:PassedToService condition (if present) includes amplify.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: "<principal>"
+      target: "<IAM role passable to amplify.amazonaws.com>"
+      permissions: ["iam:PassRole"]
+      conditions: [iam_permission, role_compatibility, condition_expression]
+      state_logic: >-
+        ACTIVE if iam:PassRole is satisfied for the role AND the role trust
+        includes amplify.amazonaws.com. CONDITIONAL(role_compatibility) if the
+        role trust does not explicitly include amplify.amazonaws.com (Amplify
+        will reject the role assignment). BLOCKED if iam:PassedToService is
+        present and does not include amplify.amazonaws.com.
+      confidence: 0.95
+      derived_from: [ "<HasPermission edge: ?principal iam:PassRole on ?role>" ]
+      false_positive_note: >-
+        Honor iam:PassedToService rigorously: a role passable only to
+        ec2.amazonaws.com or lambda.amazonaws.com yields NO Amplify execution.
+        Also distinguish the build service role (trust: amplify.amazonaws.com)
+        from the SSR Compute role (trust: amplify-hosting-compute.amazonaws.com
+        or similar SSR principal). Only a role trusting amplify.amazonaws.com
+        produces an ExecutesAs edge and thus a CanExecuteAs path through the
+        build. Both role types require iam:PassRole but their downstream attack
+        value differs.
+      narrative: >-
+        {principal.name} can pass {role.name} to the Amplify service
+        (iam:PassRole; trust allows amplify.amazonaws.com), enabling it to be
+        set as an app's service role.
+
+  # --- UpdateApp + PassRole -> CanAttachIdentity ----------------------------
+  - id: aws-amplify-attach-service-role
+    emits: CanAttachIdentity
+    description: "UpdateApp + iam:PassRole can replace an Amplify App's iamServiceRoleArn, changing the build execution identity."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has effective amplify:UpdateApp on the target app ARN"
+      - "?role trust policy allows amplify.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<AWS::Amplify::App>"
+      permissions: ["amplify:UpdateApp", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE if both amplify:UpdateApp on the app ARN and iam:PassRole for a
+        role trusting amplify.amazonaws.com are satisfied. CONDITIONAL(role_compatibility)
+        if the role trust is unresolved. This edge sets up the retarget path:
+        after CanAttachIdentity the app's next build will ExecutesAs the newly
+        attached role, and cicd-chains cicd-modify-buildspec-executes-as fires
+        on (CanModifyCode, new_ExecutesAs) chain. The CanAttachIdentity by itself
+        does not grant execution; it becomes an attack step when combined with a
+        build trigger (amplify:StartJob or auto-build) that fires after the role swap.
+      derived_from: [ "<CanPassIdentity edge_id>" ]
+      false_positive_note: >-
+        UpdateApp is a single API that can simultaneously change buildSpec AND
+        iamServiceRoleArn; the attacker can inject build commands AND swap the
+        role in one call. The CanAttachIdentity edge models the identity-swap
+        half; CanModifyCode (aws-amplify-modifycode-app) models the buildSpec
+        half. Both may fire from a single UpdateApp call. iam:PassRole
+        PassedToService must include amplify.amazonaws.com; otherwise Amplify
+        rejects the new role ARN.
+      narrative: >-
+        {principal.name} can replace {app.name}'s IAM service role with
+        {role.name} (amplify:UpdateApp + iam:PassRole), changing the AWS identity
+        the next build executes as.
+
+  # --- Role-swap -> CanExecuteAs the new role --------------------------------
+  # Amplify-specific: UpdateApp can swap the service role and simultaneously
+  # trigger auto-build or next StartJob as the NEW role. The generic
+  # execute-as-via-config-identity-swap in can-execute-as.yaml already collapses
+  # CanModifyConfiguration + CanPassIdentity -> CanExecuteAs. This rule emits a
+  # first-class CanModifyConfiguration to feed that generic collapse instead of
+  # re-deriving CanExecuteAs directly.
+  - id: aws-amplify-modifyconfig-app
+    emits: CanModifyConfiguration
+    description: "amplify:UpdateApp can change iamServiceRoleArn, env vars, and auto-build config."
+    match_effective_permission:
+      action: "amplify:UpdateApp"
+      resource_type: "AWS::Amplify::App"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<AWS::Amplify::App in scope>"
+      permissions: ["amplify:UpdateApp"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE for env-var and enableAutoBuild facets if amplify:UpdateApp is
+        satisfied. CONDITIONAL(role_compatibility, iam_permission) for the
+        iamServiceRoleArn (identity-swap) facet: requires iam:PassRole for the
+        new role in addition to amplify:UpdateApp. Changing the service role requires
+        the new role to trust amplify.amazonaws.com and the principal to hold
+        iam:PassRole permission. The env-var / auto-build facet is ACTIVE on
+        amplify:UpdateApp alone. See aws-amplify-attach-service-role for the
+        combined CanAttachIdentity (UpdateApp + PassRole) path.
+      confidence: 0.95
+      derived_from: [ "<HasPermission edge: ?principal amplify:UpdateApp on ?app>" ]
+      false_positive_note: >-
+        UpdateApp is a superset: it can change buildSpec (CanModifyCode),
+        iamServiceRoleArn (CanAttachIdentity), AND env vars / auto-build config
+        (CanModifyConfiguration). All three edges may be emitted from the same
+        UpdateApp grant. The CanModifyConfiguration edge here feeds the generic
+        execute-as-via-config-identity-swap rule in can-execute-as.yaml (when
+        combined with CanPassIdentity) — do not re-derive CanExecuteAs directly
+        from this rule. The identity-swap facet (iamServiceRoleArn) is
+        CONDITIONAL(role_compatibility) and requires iam:PassRole; the env-var
+        facet is ACTIVE.
+      narrative: >-
+        {principal.name} can change the configuration of {app.name}
+        (amplify:UpdateApp), including the service role (requires iam:PassRole),
+        environment variables, and auto-build settings.
+
+  - id: aws-amplify-modifyconfig-branch
+    emits: CanModifyConfiguration
+    description: "amplify:UpdateBranch can change env vars, enableAutoBuild, computeRoleArn, and backend env."
+    match_effective_permission:
+      action: "amplify:UpdateBranch"
+      resource_type: "AWS::Amplify::Branch"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<AWS::Amplify::Branch in scope>"
+      permissions: ["amplify:UpdateBranch"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE for env-var and enableAutoBuild facets if amplify:UpdateBranch is
+        satisfied. CONDITIONAL(role_compatibility, iam_permission) for the
+        computeRoleArn (SSR Compute identity-swap) facet: requires iam:PassRole for
+        the new SSR compute role (trusting amplify-hosting-compute.amazonaws.com).
+        The computeRoleArn swap changes which identity serves SSR requests (at
+        request time, not build time), so an attacker with UpdateBranch + iam:PassRole
+        on a privileged SSR-compute-trusted role can escalate the serving-plane
+        identity. The env-var / enableAutoBuild facet is ACTIVE on amplify:UpdateBranch
+        alone.
+      confidence: 0.95
+      derived_from: [ "<HasPermission edge: ?principal amplify:UpdateBranch on ?branch>" ]
+      false_positive_note: >-
+        UpdateBranch is also a superset (buildSpec = CanModifyCode, env vars +
+        enableAutoBuild = CanModifyConfiguration). The computeRoleArn field of
+        UpdateBranch sets the SSR Compute role (distinct from the build service role);
+        changing it requires iam:PassRole for a role trusting the SSR compute principal
+        (amplify-hosting-compute.amazonaws.com). The SSR compute identity handles
+        server-side rendering requests at serving time (not build time); it is a distinct
+        attack path from the build-time service role. Do not conflate with the
+        iamServiceRoleArn path. The env-var / enableAutoBuild facet is ACTIVE;
+        the computeRoleArn facet is CONDITIONAL(role_compatibility).
+      narrative: >-
+        {principal.name} can change the configuration of branch {branch.name}
+        (amplify:UpdateBranch), including environment variables, auto-build,
+        and the SSR compute role (if iam:PassRole is also held).
+
+  # --- Create app + PassRole -> CanCreateWorkloadAs -------------------------
+  - id: aws-amplify-create-app-as
+    emits: CanCreateWorkloadAs
+    description: "amplify:CreateApp + iam:PassRole creates a new Amplify App bound to a chosen service role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has effective amplify:CreateApp"
+      - "?role trust policy allows amplify.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: "<principal>"
+      target: "<IAM service role>"
+      permissions: ["amplify:CreateApp", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE if amplify:CreateApp and iam:PassRole(?role) are both satisfied
+        and the role trust allows amplify.amazonaws.com. CONDITIONAL(role_compatibility)
+        if the role trust is unresolved. After CreateApp the attacker must also
+        set a buildSpec (inline or via a controlled repo amplify.yml) and trigger
+        a build (amplify:StartJob or enable auto-build + push) to run as the role.
+      derived_from: [ "<CanPassIdentity edge_id>" ]
+      false_positive_note: >-
+        CreateApp alone does not yield execution — the new app needs a buildSpec
+        with attacker-controlled commands AND a build trigger. Emit as ACTIVE
+        for the workload-creation capability; the execution step requires the
+        additional StartJob / auto-build trigger (a separate CanTrigger that the
+        attacker also controls). iam:PassRole PassedToService must include
+        amplify.amazonaws.com.
+      narrative: >-
+        {principal.name} can create a new Amplify App with {role.name} as its
+        service role (amplify:CreateApp + iam:PassRole), then deploy a buildSpec
+        that runs arbitrary code as {role.name}.
+
+  # --- SSR Compute role swap via UpdateBranch + PassRole ----------------------
+  # Amplify-specific: UpdateBranch can swap the SSR computeRoleArn (distinct from
+  # the build service role). An attacker with amplify:UpdateBranch + iam:PassRole
+  # on an SSR-compute-trusted role can swap to a more privileged identity that
+  # serves SSR requests at request time (not build time).
+  - id: aws-amplify-attach-ssr-compute-role
+    emits: CanAttachIdentity
+    description: "UpdateBranch + iam:PassRole can replace an Amplify Branch's computeRoleArn, changing the SSR request-serving identity."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has effective amplify:UpdateBranch on the target branch ARN"
+      - "?role trust policy allows amplify-hosting-compute.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<AWS::Amplify::Branch>"
+      permissions: ["amplify:UpdateBranch", "iam:PassRole"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE if both amplify:UpdateBranch on the branch ARN and iam:PassRole for
+        a role trusting amplify-hosting-compute.amazonaws.com are satisfied.
+        CONDITIONAL(role_compatibility) if the role trust is unresolved. After
+        UpdateBranch the app's NEXT SSR request will execute code running as the
+        newly-attached compute role. This is a distinct path from the build-time
+        service role (iamServiceRoleArn); the SSR Compute role is used by the
+        serving plane at request time. An attacker who swaps to a privileged SSR
+        role then triggers or waits for an SSR request (server-side rendering
+        traffic) runs code as the new role.
+      derived_from: [ "<CanPassIdentity edge_id>" ]
+      confidence: 0.90
+      false_positive_note: >-
+        UpdateBranch computeRoleArn is the SSR Compute role, not the build service
+        role. It requires iam:PassRole for a role trusting amplify-hosting-compute.
+        amazonaws.com (the SSR compute principal), not amplify.amazonaws.com.
+        After the role swap, the next SSR request runs as the new role. If the
+        branch does not serve SSR content (no Next.js SSR, no dynamic server-side
+        rendering), this edge is CONDITIONAL(ssr_enabled). CanAttachIdentity by
+        itself does not grant execution — it becomes an attack step when combined
+        with SSR traffic (a request or the attacker can trigger via a public URL).
+      narrative: >-
+        {principal.name} can replace {branch.name}'s SSR Compute role with
+        {role.name} (amplify:UpdateBranch + iam:PassRole), changing the AWS identity
+        that SSR requests execute as when served by that branch.
+
+  # --- vpcConfig modification enables private network reachability ---------
+  - id: aws-amplify-modifyconfig-vpcconfig
+    emits: CanModifyConfiguration
+    description: "amplify:UpdateApp vpcConfig change enables build access to private VPC resources."
+    match_effective_permission:
+      action: "amplify:UpdateApp"
+      resource_type: "AWS::Amplify::App"
+    where:
+      - "target app has a connected VPC (vpcConfig is modifiable)"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<AWS::Amplify::App in scope>"
+      permissions: ["amplify:UpdateApp"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        CONDITIONAL(network_reachability) — the principal CAN set vpcConfig via
+        amplify:UpdateApp, enabling the build worker to reach private resources
+        (RDS, ElastiCache, internal services) within the VPC. This is a network-
+        scoping escalation: with vpcConfig set, builds run inside the VPC subnet,
+        gaining network access to internal resources that were previously unreachable.
+        The edge is emitted CONDITIONAL on a VPC being configured; if no VPC is
+        configured, downgrade to POTENTIAL(vpc_attachment).
+      confidence: 0.85
+      derived_from: [ "<HasPermission edge: ?principal amplify:UpdateApp on ?app>" ]
+      false_positive_note: >-
+        UpdateApp's vpcConfig field is separate from the buildSpec/env-var fields
+        handled by aws-amplify-modifyconfig-app. Setting vpcConfig does NOT grant
+        execution by itself; it grants CanNetworkReach to private resources within
+        the VPC. The downstream escalation path is: CanModifyConfiguration(vpcConfig)
+        + CanNetworkReach(private_resource) -> exploit or exfiltrate the private
+        resource (e.g., read RDS data, reach an internal Lambda). This is a
+        CanNetworkReach-feeding rule, not a direct CanExecuteAs path.
+      narrative: >-
+        {principal.name} can configure the VPC network for builds of {app.name}
+        (amplify:UpdateApp vpcConfig field), enabling the build worker to reach
+        private resources (RDS, ElastiCache, internal services) within the VPC.
+
+  # --- Build exposes service-role credentials --------------------------------
+  - id: aws-amplify-exposes-service-role-cred
+    emits: ExposesCredential
+    description: "An Amplify App build exposes the service role's session credentials to code running in the build."
+    match:
+      - [ ?app, ExecutesAs, ?role ]
+    where:
+      - "node_type(?app) == BuildWorker"
+      - "?app.provider_type in ['AWS::Amplify::App', 'AWS::Amplify::Branch']"
+    emit:
+      source_type: BuildWorker
+      target_type: MachineIdentity
+      source: "<AWS::Amplify::App>"
+      target: "<iamServiceRoleArn role>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE — credentials are always present in the build environment when
+        ExecutesAs holds. The edge is a latent structural fact; it does not represent
+        an independent traversal step (traversal requires an inbound CanModifyCode or
+        CanTrigger that places attacker code in the build that can read the credentials).
+      confidence: 0.95
+      derived_from: [ "<ExecutesAs edge_id>" ]
+      false_positive_note: >-
+        This edge is a latent fact — credentials are only reachable from code
+        running inside the build. It must NOT be walked as a standalone attack
+        step; traversal requires an inbound CanModifyCode or CanTrigger edge
+        that places attacker code in the build. credential-chains handles the
+        ExposesCredential -> CredentialsFor -> CanImpersonate roll-up; do not
+        re-derive here.
+      narrative: >-
+        The Amplify build worker for {app.name} exposes the session credentials
+        of its service role {role.name} to any code running in the build
+        environment (injected as AWS session credentials).
+
+# ---------------------------------------------------------------------------
+# CANONICAL CanExecuteAs DERIVATIONS (cicd-chains handles these generically;
+# cite here for documentation clarity — do NOT add duplicate rules):
+#
+#   cicd-modify-buildspec-executes-as (cicd-chains):
+#     CanModifyCode(principal, ?app_or_branch) + ExecutesAs(?app_or_branch, ?role)
+#     [optional: CanTrigger(principal, ?app_or_branch)]
+#     => CanExecuteAs(principal -> ?role)
+#     ACTIVE when: buildSpec rewritten AND a run path exists (StartJob or auto-build
+#     trigger arms on the modification, e.g. push-to-branch webhook fires on the
+#     same push that plants the malicious amplify.yml).
+#
+#   cicd-trigger-runner-executes-as (cicd-chains):
+#     CanTrigger(principal, ?branch) + ExecutesAs(?branch, ?role)
+#     => CanExecuteAs(principal -> ?role)
+#     CONDITIONAL(attacker_influenced_definition) — triggering via StartJob or
+#     webhook POST yields the role ONLY if the current buildSpec is already
+#     attacker-controlled.
+#
+#   execute-as-via-config-identity-swap (can-execute-as):
+#     CanModifyConfiguration(principal, ?app) + CanPassIdentity(principal, ?new_role)
+#     => CanExecuteAs(principal -> ?new_role)
+#     ACTIVE — UpdateApp with a new iamServiceRoleArn + next build trigger.
+#
+#   execute-as-via-new-workload (can-execute-as):
+#     CanCreateWorkloadAs(principal, ?role)
+#     => CanExecuteAs(principal -> ?role)
+#     ACTIVE — new app with buildSpec + StartJob.
+#
+# BLOCKED-edge guidance:
+#   An SCP or permission boundary denying amplify:UpdateApp, amplify:UpdateBranch,
+#   amplify:StartJob, amplify:CreateApp, amplify:CreateWebHook, or iam:PassRole at
+#   the effective scope causes the evaluator to emit the edge with state: BLOCKED
+#   and denied_by=<SCP arn/statement>.
+#   A role with iam:PassedToService NOT including amplify.amazonaws.com blocks
+#   aws-amplify-pass-service-role and thus aws-amplify-create-app-as and
+#   aws-amplify-attach-service-role.
+#   If the source repo contains an amplify.yml overriding the console buildSpec,
+#   aws-amplify-modifycode-app/branch yields POTENTIAL(amplify.yml_overrides)
+#   unless the attacker also controls the repo.
+# ---------------------------------------------------------------------------

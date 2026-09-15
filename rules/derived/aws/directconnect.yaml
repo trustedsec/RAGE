@@ -1,0 +1,196 @@
+# AWS Direct Connect — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# Direct Connect is a LOW-relevance networking service in this corpus.
+# Its attack-path surface is restricted to:
+#
+#   (1) ROUTING FACTS: (MOVED TO /rules/explicit/aws-directconnect.yaml)
+#       Explicit RoutesTo edges are emitted by explicit rules for:
+#       - Private/transit VIF routes on-prem into VGW or DXGW
+#       - DXGW routes traffic to associated TGW
+#       - Cross-account DXGW associations establish network-layer trust
+#       These are structural network FACTS consumed by network-chains linchpin.
+#
+#   (2) CONTROL PLANE WEAKENING: an IAM principal with Direct Connect write
+#       permissions can create, modify, or accept VIF/DXGW associations,
+#       changing which networks have a routed path into AWS. Modeled as
+#       CanModifyConfiguration (constructive) or CanDelete (destructive).
+#
+# WHAT THESE RULES DO NOT EMIT:
+#   - CanExecuteAs / CanEscalateTo / CanEnterAccount — Direct Connect carries no
+#     IAM execution-identity surface; no workload runs as a role.
+#   - ExposedToInternet — DX is explicitly a private, non-internet path.
+#   - CanNetworkReach — transitive reachability is the network-chains linchpin;
+#     RoutesTo facts are consumed there, not emitted here.
+#   - CanReadSecret / ExposesCredential — BGP MD5 keys are not IAM credentials
+#     and are not Secret-class nodes in the current taxonomy.
+#
+# PERMISSIONS are exact action names from the AWS Service Authorization Reference:
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsdirectconnect.html
+#
+# CITED LINCHPINS (not duplicated here):
+#   /rules/derived/can-control.yaml — CanAdminister / CanGrantPermission → Controls.
+#   /rules/explicit/aws-directconnect.yaml — RoutesTo and CrossAccountTrust facts.
+#   Network-chains file (FUTURE) — composes RoutesTo + SecurityGroup + route-table
+#   facts into end-to-end CanNetworkReach edges.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 8-networking
+applies_to: [aws]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # 1. IAM principal can create/modify/accept Direct Connect routing (constructive)
+  # ---------------------------------------------------------------------------
+  # Principals with Direct Connect write permissions can expand the set of
+  # networks that have a routed path into AWS (by creating new VIFs or accepting
+  # cross-account DXGW association proposals). This is a CONTROL-PLANE weakening
+  # primitive that changes the network topology — modeled as CanModifyConfiguration
+  # on the target VIF or DXGW node. Destructive actions (Delete) are modeled
+  # separately as CanDelete.
+  #
+  # Note: This does NOT directly yield IAM privilege. The escalation path would
+  # be: create a new private VIF → route attacker-controlled on-prem host into
+  # VPC → reach unguarded internal service → steal credentials. That multi-hop
+  # chain runs through separate service-level edges and the network-chains linchpin.
+  #
+  # Key actions modeled:
+  #   directconnect:CreateVirtualInterface      — create a new routed VIF
+  #   directconnect:UpdateVirtualInterfaceAttributes — modify BGP/MTU params
+  #   directconnect:AcceptDirectConnectGatewayAssociationProposal — accept a
+  #       cross-account proposal, routing a remote on-prem network into this TGW
+  #   directconnect:CreateDirectConnectGatewayAssociation — create a new DXGW association
+  - id: aws-directconnect-modify-config
+    emits: CanModifyConfiguration
+    description: >-
+      IAM principal with Direct Connect write actions can create or modify virtual
+      interfaces and DXGW associations, altering which networks have a routed path
+      into AWS VPCs (network topology manipulation). Covers constructive/expansive actions
+      only (Create, Update, Accept); Delete actions are modeled separately as CanDelete.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?dxresource ]
+    where:
+      - "node_type(?principal) in [Identity]"
+      - "node_type(?dxresource) in [Route, TransitGateway]"
+      - "?dxresource.provider_type in ['AWS::DirectConnect::VirtualInterface', 'AWS::DirectConnect::DirectConnectGateway']"
+      - "effective_action_on(?principal, ?dxresource) intersects ['directconnect:UpdateVirtualInterfaceAttributes', 'directconnect:AcceptDirectConnectGatewayAssociationProposal', 'directconnect:CreateDirectConnectGatewayAssociation']"
+      - "service_state: at_least_one_connection_available"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: ?principal
+      target: ?dxresource
+      permissions:
+        - "directconnect:UpdateVirtualInterfaceAttributes"
+        - "directconnect:AcceptDirectConnectGatewayAssociationProposal"
+        - "directconnect:CreateDirectConnectGatewayAssociation"
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        ACTIVE when the effective-permission evaluator confirms at least one of the
+        listed directconnect write actions (Create/Update/Accept, excluding Delete) on the VIF or
+        DXGW ARN (or a wildcard resource scope) AND at least one Connection or LAG
+        in state 'available' or 'down' exists that the principal can reference
+        (from DescribeConnections). BLOCKED if an SCP or permission boundary
+        explicitly denies the matching action(s). No resource-based policy or network
+        gate applies to the Direct Connect control plane — IAM is the sole authorization layer.
+      confidence: 0.85
+      derived_from:
+        - "?principal HasPermission ?dxresource (directconnect write actions: Create/Update/Accept)"
+        - "DescribeConnections service_state: connection in available or down state"
+      false_positive_note: >-
+        (1) Direct Connect control-plane actions are IAM-only — no resource-based
+        policy, VPC endpoint policy, or network gate applies. IAM effective permissions
+        are the sole condition to evaluate.
+        (2) This edge is a NETWORK-TOPOLOGY manipulation primitive, not an IAM
+        privilege escalation. Do NOT chain directly to CanEnterAccount or CanExecuteAs
+        without intermediate network-reachability + exploitation edges.
+        (3) AcceptDirectConnectGatewayAssociationProposal is the higher-risk action:
+        it allows the principal to accept an inbound proposal from a remote account's
+        DXGW, which would route an external on-prem network into this account's TGW.
+        Analysts should flag this action with elevated concern when the DXGW owner
+        account is external.
+        (4) CreateVirtualInterface requires a provisioned physical connection (Connection
+        or LAG) in state 'available' or 'down' as the resource target. Without at least
+        one such connection, the action is latent. Service state is evaluated by
+        DescribeConnections to confirm availability in the account.
+      narrative: >-
+        {principal.name} can create, modify, or accept Direct Connect configuration
+        (create/update VIFs or accept DXGW associations). For VIFs, this allows
+        creating a new private or transit interface to route an attacker-controlled
+        on-prem segment into this account's VPCs. For DXGWs, this allows accepting
+        cross-account association proposals, routing a remote on-prem network into
+        this account's Transit Gateway. Both capabilities alter network topology
+        and enable lateral movement from on-premises into AWS.
+
+  # ---------------------------------------------------------------------------
+  # 2b. IAM principal can DELETE Direct Connect routing (disruption only)
+  # ---------------------------------------------------------------------------
+  # A principal with only directconnect:DeleteVirtualInterface permission can
+  # disrupt existing connectivity but cannot create new paths. This is modeled
+  # separately as CanDelete (non-walkable, destructive threat model) rather than
+  # CanModifyConfiguration (walkable, escalation).
+  - id: aws-directconnect-delete-vif
+    emits: CanDelete
+    description: >-
+      IAM principal with directconnect:DeleteVirtualInterface can disrupt existing
+      Direct Connect routing (availability impact, not escalation).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?dxresource ]
+    where:
+      - "node_type(?principal) in [Identity]"
+      - "node_type(?dxresource) in [Route]"
+      - "?dxresource.provider_type == 'AWS::DirectConnect::VirtualInterface'"
+      - "effective_action_on(?principal, ?dxresource) intersects ['directconnect:DeleteVirtualInterface']"
+    emit:
+      source_type: Identity
+      target_type: Network
+      source: ?principal
+      target: ?dxresource
+      permissions:
+        - "directconnect:DeleteVirtualInterface"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the effective-permission evaluator confirms directconnect:DeleteVirtualInterface
+        on the VIF ARN. BLOCKED if an SCP or permission boundary explicitly denies
+        the action.
+      confidence: 0.85
+      derived_from:
+        - "?principal HasPermission ?dxresource (directconnect:DeleteVirtualInterface)"
+      false_positive_note: >-
+        (1) This is a destructive action (disruption/availability impact), not
+        escalation or lateral movement. CanDelete is non-walkable in path queries by
+        default. Include only if the threat model explicitly includes denial-of-service
+        or persistence through disruption-and-recreation.
+      narrative: >-
+        {principal.name} can delete Direct Connect virtual interfaces targeting
+        {dxresource.name}, disrupting existing on-premises network connectivity into AWS.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying directconnect:CreateVirtualInterface or
+#     directconnect:AcceptDirectConnectGatewayAssociationProposal at account/OU
+#     scope -> emit aws-directconnect-modify-config with state: BLOCKED and
+#     denied_by=<SCP ARN>.
+#   - A permission boundary capping the principal below the relevant write
+#     actions -> BLOCKED similarly.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service:
+#   /rules/explicit/aws-directconnect.yaml contains the structural RoutesTo facts:
+#   - aws-directconnect-vif-routes-to-gateway: VIF→VGW/DXGW RoutesTo
+#   - aws-directconnect-dxgw-routes-to-tgw: DXGW→TGW RoutesTo
+#   - aws-directconnect-dxgw-cross-account-trust: DXGW→Account CrossAccountTrust
+#
+#   These rules normalize DescribeVirtualInterfaces and
+#   DescribeDirectConnectGatewayAssociations raw data into FACT edges consumed
+#   by the network-chains linchpin.
+#
+# Linchpin citations:
+#   /rules/derived/can-control.yaml — CanAdminister/CanGrantPermission → Controls.
+#     Direct Connect does not yield Controls over any boundary directly; N/A.
+#   Network-chains (FUTURE) — composes RoutesTo (from explicit rules above) +
+#     SecurityGroup ingress facts + route-table propagation into CanNetworkReach.
+#     This is the key consumer of the RoutesTo edges. Do NOT pre-empt it here.

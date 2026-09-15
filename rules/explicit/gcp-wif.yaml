@@ -1,0 +1,146 @@
+# Normalizing GCP Workload Identity Federation (WIF) into explicit edges.
+# ===========================================================================
+# The adapter collects raw WIF records:
+#   * iam.workloadIdentityPools.list / .get           -> pool (state, displayName)
+#   * iam.workloadIdentityPoolProviders.list / .get   -> provider (oidc.issuerUri,
+#       oidc.allowedAudiences | saml.idpMetadataXml | aws.accountId, attributeMapping,
+#       attributeCondition, state)
+#   * iam.serviceAccounts.getIamPolicy                -> bindings with
+#       role=roles/iam.workloadIdentityUser (or roles/iam.serviceAccountTokenCreator)
+#       and members principal://... / principalSet://...
+# These rules translate ONE observed fact into ONE explicit edge (schema/edges.yaml);
+# they do NOT combine edges — the derived combination lives in
+# /rules/derived/gcp/wif.yaml and the provider-agnostic collapse in
+# /rules/derived/federation-chains.yaml.
+#
+# The normalized trust PAIR (federation-chains contract) is:
+#   TrustsExternalIdentity(SA|provider -> ExternalIdentity)   the provider trust config
+#   ExternalIdentityMapsTo(ExternalIdentity -> ServiceAccount) the workloadIdentityUser binding
+#   CredentialValidFor(federated STS token -> ServiceAccount)  the no-static-key token exchange
+# The trust CONDITION (issuer / allowedAudiences / attributeCondition / subject-pin
+# breadth of the principalSet:// member) is recorded as edge PROPERTIES that
+# /rules/derived/gcp/wif.yaml rule 1 reads to decide ACTIVE vs CONDITIONAL(trust_condition).
+#
+# Permission/field names verbatim from
+# cloud.google.com/iam/docs/workload-identity-federation and the IAM permissions
+# reference. Key facts encoded:
+#   * The pool CONTAINS its providers; the provider holds the issuer/audience/condition.
+#   * Empty allowedAudiences still requires aud == the provider resource URL (a PIN),
+#     NOT a wildcard — recorded as audience_pinned=true.
+#   * A principalSet://.../attribute.<x>/<v> or .../subject/* member that is NOT a
+#     specific google.subject => subject_pinned=false (BROAD) -> derived rule ACTIVE.
+# ===========================================================================
+
+rules:
+
+  # --- Pool contains Provider (structural) ----------------------------------
+  # NODE MODELING: the pool is a FederatedIdentity namespace/container; it CONTAINS
+  # its providers. Contains.source == [AdministrativeBoundary], so class the pool as
+  # AdministrativeBoundary (GenericBoundary fallback) for THIS structural edge — it
+  # is a namespace boundary for external identities, not a Secret/Policy.
+  - id: gcp-wif-pool-contains-provider
+    emits: Contains
+    applies_to: [gcp]
+    match_record: {resource_type: "iam.WorkloadIdentityPool", field: "providers"}
+    emit:
+      source_type: AdministrativeBoundary
+      target_type: "*"
+      source: "<WorkloadIdentityPool (AdministrativeBoundary / GenericBoundary) node>"
+      target: "<WorkloadIdentityPoolProvider node>"
+      api_source: "iam.workloadIdentityPoolProviders.list"
+      evidence_field: "name (workloadIdentityPools/*/providers/*)"
+      narrative: "{pool.name} contains workload identity pool provider {provider.name}."
+
+  # --- Provider trust config -> TrustsExternalIdentity ----------------------
+  # The provider (issuer/audience/attributeCondition) declares that identities from
+  # an external IdP are accepted. Emit the trust with the ServiceAccount as the
+  # normalized source where a workloadIdentityUser binding exists (source set is
+  # [Role, ServiceAccount, ApplicationIdentity, ResourcePolicy]); the provider's
+  # condition fields are carried as edge properties. When no SA binding is known yet,
+  # the pool/provider acts as the ResourcePolicy-class anchor.
+  - id: gcp-wif-provider-trusts-external
+    emits: TrustsExternalIdentity
+    applies_to: [gcp]
+    match_record: {resource_type: "iam.WorkloadIdentityPoolProvider", field: "oidc.issuerUri | saml.idpMetadataXml | aws.accountId"}
+    emit:
+      source_type: ServiceAccount
+      target_type: ExternalIdentity
+      source: "<impersonated ServiceAccount (or the pool provider as ResourcePolicy anchor if no SA binding)>"
+      target: "<ExternalIdentity: subjects from the pinned issuer>"
+      api_source: "iam.workloadIdentityPoolProviders.get"
+      evidence_field: "oidc.issuerUri / oidc.allowedAudiences / attributeMapping / attributeCondition / saml.idpMetadataXml / aws.accountId"
+      properties:
+        issuer: "<oidc.issuerUri | SAML entityID | aws.accountId>"
+        allowed_audiences: "<oidc.allowedAudiences (empty => aud must == provider resource URL)>"
+        audience_pinned: "<true unless allowedAudiences accepts an attacker-mintable value>"
+        attribute_mapping: "<google.subject / attribute.* CEL expressions>"
+        attribute_condition: "<attributeCondition CEL, or null>"
+        subject_pinned: "<true if attributeCondition/mapping bind a specific subject; false if broad/absent>"
+      false_positive_note: >-
+        Empty allowedAudiences is a PIN (aud == provider resource URL), not a wildcard
+        — set audience_pinned=true. A provider in state DISABLED/DELETED trusts nothing
+        — do not emit (or emit BLOCKED). The subject_pinned property must reflect BOTH
+        the attributeCondition AND the breadth of the workloadIdentityUser member
+        (see the ExternalIdentityMapsTo rule) — a broad mapping re-pinned by a strict
+        attributeCondition is subject_pinned=true.
+      narrative: "{sa.name} (via WIF provider {provider.name}) trusts external identities from issuer {issuer} under condition {attribute_condition}."
+
+  # --- workloadIdentityUser binding -> ExternalIdentityMapsTo ---------------
+  # The roles/iam.workloadIdentityUser binding on the SA resolves an external
+  # subject (principal://.../subject/<s> or principalSet://.../attribute.<x>/<v>) to
+  # the concrete ServiceAccount. The BREADTH of the member expression is the subject
+  # pin: a specific subject => pinned; an attribute-only or /subject/* / /* member
+  # => broad (any workload from the issuer) => the derived rule fires ACTIVE.
+  - id: gcp-wif-binding-maps-to-sa
+    emits: ExternalIdentityMapsTo
+    applies_to: [gcp]
+    match_record: {resource_type: "google.iam.ServiceAccount", field: "iamPolicy.bindings[role=roles/iam.workloadIdentityUser].members"}
+    where:
+      - "member is principal://iam.googleapis.com/<POOL>/subject/<s> OR principalSet://iam.googleapis.com/<POOL>/attribute.<x>/<v> (or group/*)"
+    emit:
+      source_type: ExternalIdentity
+      target_type: ServiceAccount
+      source: "<ExternalIdentity: the principal:// / principalSet:// member of the WIF pool>"
+      target: "<impersonated ServiceAccount>"
+      api_source: "iam.serviceAccounts.getIamPolicy"
+      evidence_field: "bindings[role=roles/iam.workloadIdentityUser].members"
+      properties:
+        member: "<principal:// or principalSet:// member expression>"
+        subject_pinned: "<true if principal://.../subject/<exact>; false if principalSet://.../attribute.*/ , .../subject/* , or .../* (BROAD)>"
+        attribute_scope: "<the attribute the principalSet is keyed on (subject/aud/repository/...)>"
+      false_positive_note: >-
+        The subject_pinned property is THE gate for the derived takeover: a
+        principalSet:// member keyed on an attribute (attribute.aud, attribute.repository/*)
+        or on subject/* accepts ANY workload from the issuer => subject_pinned=false =>
+        derived rule ACTIVE. A principal://.../subject/<exact-subject> is subject_pinned=true
+        => CONDITIONAL(trust_condition). Also honor roles/iam.serviceAccountTokenCreator
+        granted to a principalSet:// member (same effect). Do not emit for bindings whose
+        member is a normal Google user/SA (not a WIF principal:// / principalSet://).
+      narrative: "External WIF principal {member} maps to service account {sa.name} via roles/iam.workloadIdentityUser (subject_pinned={subject_pinned})."
+
+  # --- Federated STS token authenticates as the SA -> CredentialValidFor ----
+  # Records the no-static-key nature: the STS-exchanged federated token, combined
+  # with generateAccessToken/getAccessToken, is valid for the impersonated SA. This
+  # is a doc-level fact (no per-instance secret), emitted so credential-centric
+  # queries see the federation yields a usable SA credential.
+  - id: gcp-wif-token-valid-for-sa
+    emits: CredentialValidFor
+    applies_to: [gcp]
+    match_record: {resource_type: "google.iam.ServiceAccount", field: "iamPolicy.bindings[role=roles/iam.workloadIdentityUser]"}
+    emit:
+      source_type: Token
+      target_type: ServiceIdentity
+      source: "<federated STS access token minted for the WIF principal>"
+      target: "<impersonated ServiceAccount>"
+      api_source: "sts.googleapis.com token-exchange + iamcredentials generateAccessToken"
+      evidence_field: "presence of a roles/iam.workloadIdentityUser binding for a WIF principal"
+      properties:
+        static_key: false
+        mechanism: "sts.googleapis.com token-exchange -> iam.serviceAccounts.getAccessToken"
+      false_positive_note: >-
+        This is not a harvestable long-lived credential (no iam.serviceAccountKeys.create):
+        the federated token is short-lived and only mintable by an external identity that
+        satisfies the provider trust AND the workloadIdentityUser binding. Path value comes
+        from the derived CanFederateAs, not from this fact alone. Do not emit if no
+        workloadIdentityUser binding maps a WIF principal to the SA.
+      narrative: "A federated STS token for the WIF principal is valid for {sa.name} (short-lived, no static key), obtained via the token exchange + getAccessToken."

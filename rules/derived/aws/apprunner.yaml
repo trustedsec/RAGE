@@ -1,0 +1,383 @@
+# AWS App Runner — attack-path rules (Phase 4 compute / ApplicationPlatform)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml. Permissions are the
+# EFFECTIVE apprunner:/iam: actions the evaluator must confirm at the given
+# resource scope before an edge is produced. States: ACTIVE unless a listed
+# condition is unmet (CONDITIONAL/POTENTIAL) or an SCP/boundary denies (BLOCKED).
+#
+# Grounding: AWS Service Authorization Reference (service prefix `apprunner`)
+# and the App Runner API/Developer Guide. Runtime identity = the instance role
+# (trust principal tasks.apprunner.amazonaws.com); the access role
+# (build.apprunner.amazonaws.com) is BUILD-TIME ONLY and is not ExecutesAs.
+#
+# Scope discipline: every rule records the ARN scope the action applies at. A
+# wildcard grant widens the target set; a scoped grant restricts it. iam:PassRole
+# is honored ONLY when its iam:PassedToService condition includes an App Runner
+# service principal.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 4-compute-serverless
+service: apprunner
+applies_to: [aws]
+
+# ===========================================================================
+# EXPLICIT normalization rules (raw config -> explicit edges).
+# These belong conceptually in rules/explicit/ ; kept here co-located for the
+# service. They match collected App Runner config, not other edges.
+# ===========================================================================
+explicit_rules:
+
+  - id: aws-apprunner-executesas-instance-role
+    emits: ExecutesAs
+    description: "App Runner service runs application code as its configured instance role."
+    match_record: {resource_type: "AWS::AppRunner::Service", field: "InstanceConfiguration.InstanceRoleArn"}
+    where:
+      - "InstanceRoleArn is present and non-empty"
+    emit:
+      source: "<AppRunner::Service>"
+      target: "<instance role (arn from InstanceRoleArn)>"
+      state: ACTIVE
+      permissions: []
+      false_positive_note: >
+        Emit ONLY when InstanceRoleArn is set. A service with no instance role has
+        no AWS runtime identity (outbound HTTP only) — do NOT emit ExecutesAs. The
+        AccessRoleArn (build.apprunner.amazonaws.com, ECR pull) is build-time and is
+        NOT the runtime identity; never emit ExecutesAs to the access role.
+      narrative: "App Runner service {service.name} runs as instance role {target.name} (tasks.apprunner.amazonaws.com)."
+
+  - id: aws-apprunner-exposed-internet
+    emits: ExposedToInternet
+    description: "Publicly accessible App Runner service is reachable from the internet."
+    match_record: {resource_type: "AWS::AppRunner::Service", field: "NetworkConfiguration.IngressConfiguration.IsPubliclyAccessible"}
+    where:
+      - "IsPubliclyAccessible == true"
+    emit:
+      source: "<AppRunner::Service (public URL)>"
+      target: "<AnonymousIdentity>"
+      state: ACTIVE
+      false_positive_note: >
+        Network reachability only. The hosted application may enforce its own authn;
+        ExposedToInternet does not assert app-level access. If a VpcIngressConnection
+        is used (private), emit PrivateReachability instead, not ExposedToInternet.
+      narrative: "{service.name} is publicly reachable at its awsapprunner.com URL."
+
+  - id: aws-apprunner-readsecret-runtime-secrets
+    emits: CanReadSecret
+    description: "Service instance role reads RuntimeEnvironmentSecrets (Secrets Manager / SSM) injected as env vars."
+    match_record: {resource_type: "AWS::AppRunner::Service", field: "SourceConfiguration.*.RuntimeEnvironmentSecrets"}
+    where:
+      - "RuntimeEnvironmentSecrets contains one or more secret/parameter ARNs"
+      - "instance role has secretsmanager:GetSecretValue OR ssm:GetParameters/GetParameter (+ kms:Decrypt if CMK) on the referenced ARN"
+    emit:
+      source: "<AppRunner::Service>"
+      target: "<referenced Secret / SSM parameter>"
+      permissions: ["secretsmanager:GetSecretValue", "ssm:GetParameters", "ssm:GetParameter", "kms:Decrypt"]
+      conditions: [iam_permission, key_permission]
+      false_positive_note: >
+        Only the ARNs actually listed in RuntimeEnvironmentSecrets are read, and only
+        if the instance role's policy grants read on them. Do not over-claim from the
+        mere presence of the feature.
+      narrative: "{service.name} injects {target.name} as an env var at deploy (instance role reads it)."
+
+  - id: aws-apprunner-vpc-egress-reach
+    emits: CanNetworkReach
+    description: "Service with a VPC connector inherits network reach into the customer VPC."
+    match_record: {resource_type: "AWS::AppRunner::Service", field: "NetworkConfiguration.EgressConfiguration.VpcConnectorArn"}
+    where:
+      - "VpcConnectorArn is present"
+      - "target reachable per the VpcConnector's subnets/security groups"
+    emit:
+      source: "<AppRunner::Service>"
+      target: "<private resource reachable via connector SGs>"
+      conditions: [network_reachability]
+      false_positive_note: "Reachability is gated by the VPC connector's subnets and security-group rules; evaluate them, do not assume full-VPC reach."
+      narrative: "{service.name} can reach {target.name} via its VPC connector."
+
+# ===========================================================================
+# DERIVED rules (this format). Match explicit/derived edges + effective perms.
+# ===========================================================================
+rules:
+
+  # --- Modify the code/image an existing service runs -> execute as its role -
+  - id: aws-apprunner-modifycode
+    emits: CanModifyCode
+    description: "UpdateService can rewrite the code (build/start command) or image an App Runner service runs."
+    match_effective_permission: {action: "apprunner:UpdateService", resource_type: "AWS::AppRunner::Service"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<AppRunner::Service in scope>"
+      permissions: ["apprunner:UpdateService"]
+      conditions: [iam_permission]
+      false_positive_note: >
+        For a code-repository service, code injection is via BuildCommand/StartCommand;
+        for an image service those are ignored — the attacker must instead point
+        ImageIdentifier at a controllable image (or poison the referenced ECR repo).
+        Scope to the specific service ARN; apprunner:UpdateService on Resource:"*" widens targets.
+      narrative: "{principal.name} can change the code/image {service.name} runs (apprunner:UpdateService)."
+
+  - id: aws-apprunner-modifyconfig
+    emits: CanModifyConfiguration
+    description: "UpdateService can change instance role, start command, env vars, secrets, and egress."
+    match_effective_permission: {action: "apprunner:UpdateService", resource_type: "AWS::AppRunner::Service"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<AppRunner::Service in scope>"
+      permissions: ["apprunner:UpdateService"]
+      conditions: [iam_permission]
+      narrative: "{principal.name} can change {service.name} configuration (instance role, start command, env/secrets, egress) via apprunner:UpdateService."
+
+  - id: aws-apprunner-startdeployment
+    emits: CanDeploy
+    description: "StartDeployment redeploys latest source/image (realizes poisoned code / auto-deploy)."
+    match_effective_permission: {action: "apprunner:StartDeployment", resource_type: "AWS::AppRunner::Service"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<AppRunner::Service in scope>"
+      permissions: ["apprunner:StartDeployment"]
+      conditions: [iam_permission]
+      narrative: "{principal.name} can trigger a redeploy of {service.name} (apprunner:StartDeployment)."
+
+  - id: aws-apprunner-create-service
+    emits: CanDeploy
+    description: "CreateService deploys a new App Runner workload (attacker code/image)."
+    match_effective_permission: {action: "apprunner:CreateService", resource_type: "AWS::AppRunner::Service"}
+    optional_permission: "iam:PassRole"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<App Runner platform (account/region)>"
+      permissions: ["apprunner:CreateService", "iam:PassRole?"]
+      conditions: [iam_permission]
+      note: "Pairs with CanPassIdentity to bind a chosen instance role (see aws-apprunner-create-workload-as)."
+      narrative: "{principal.name} can create a new App Runner service running attacker-controlled code (apprunner:CreateService)."
+
+  # --- PassRole -> App Runner (instance role attach) -------------------------
+  - id: aws-apprunner-pass-instance-role
+    emits: CanPassIdentity
+    description: "iam:PassRole scoped to App Runner lets a principal attach an instance/access role."
+    match_effective_permission: {action: "iam:PassRole", resource_type: "AWS::IAM::Role"}
+    where:
+      - "role trust policy allows tasks.apprunner.amazonaws.com (instance role) or build.apprunner.amazonaws.com (access role)"
+      - "iam:PassedToService condition (if present) includes tasks.apprunner.amazonaws.com / build.apprunner.amazonaws.com / apprunner.amazonaws.com"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<IAM role passable to App Runner>"
+      permissions: ["iam:PassRole"]
+      conditions: [iam_permission, role_compatibility, condition_expression]
+      false_positive_note: >
+        Honor iam:PassedToService. A role passable only to a non-App-Runner service
+        (e.g. ec2.amazonaws.com) yields NO App Runner execution. Also honor any
+        apprunner:ServiceArn / aws:ResourceTag conditions on the grant.
+        DISTINGUISH the two App Runner role trusts: only a role whose trust allows
+        tasks.apprunner.amazonaws.com (the INSTANCE role / ExecutesAs identity) can yield
+        CanExecuteAs downstream. A CanPassIdentity emitted for a role trusting ONLY
+        build.apprunner.amazonaws.com (the ACCESS role) is BUILD-TIME image-pull only: it
+        satisfies CanPassIdentity but can NEVER satisfy the tasks.apprunner where-clause in any
+        executeas/create-workload rule, so it must not be treated as an execution path. Where
+        possible, tag/split the emitted CanPassIdentity by trust principal (instance vs access)
+        so downstream rules only consume the instance-role variant. This mirrors the ExecutesAs
+        false_positive_note that already excludes the access role.
+      narrative: "{principal.name} can pass {role.name} to App Runner (iam:PassRole; PassedToService tasks.apprunner.amazonaws.com)."
+
+  - id: aws-apprunner-attach-identity
+    emits: CanAttachIdentity
+    description: "Update/CreateService + PassRole can attach/replace the identity the service runs as."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has effective apprunner:UpdateService OR apprunner:CreateService on the service ARN scope"
+      - "?role trust allows tasks.apprunner.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<AppRunner::Service (existing or new)>"
+      permissions: ["apprunner:UpdateService | apprunner:CreateService", "iam:PassRole"]
+      note: "Consumed by aws-apprunner-config-retarget-executeas as the intermediate CanAttachIdentity + ExecutesAs-retarget => CanExecuteAs; not a dead edge."
+      narrative: "{principal.name} can set {role.name} as the instance role of {service.name} (apprunner:UpdateService/CreateService + iam:PassRole)."
+
+  # --- Canonical CanExecuteAs derivations -----------------------------------
+  - id: aws-apprunner-modifycode-executeas
+    emits: CanExecuteAs
+    description: "Modify code/image of a service that already has an instance role -> run as that role."
+    match:
+      - [ ?principal, CanModifyCode, ?service ]
+      - [ ?service,   ExecutesAs,    ?role ]
+    where:
+      - "node_type(?service) == ApplicationPlatform"
+    optional:
+      - [ ?principal, CanDeploy, ?service ]   # StartDeployment/UpdateService applies immediately -> ACTIVE
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<instance role>"
+      state_logic: "ACTIVE (UpdateService triggers an automatic deployment); CONDITIONAL(service_state) only if the service is PAUSED and principal lacks apprunner:ResumeService"
+      permissions: ["apprunner:UpdateService", "apprunner:StartDeployment?"]
+      conditions_from: [ ?service, ?role ]
+      derived_from: [ "<CanModifyCode edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: >
+        Requires an existing instance role (ExecutesAs must be present). No instance
+        role -> no privilege gain, do not emit. If the service is PAUSED, gate on
+        apprunner:ResumeService (service_state).
+      narrative: >
+        {principal.name} can execute as {role.name} by changing the code/image of
+        {service.name} (apprunner:UpdateService), which runs as {role.name}; UpdateService
+        auto-deploys the change.
+
+  - id: aws-apprunner-config-retarget-executeas
+    emits: CanExecuteAs
+    description: "Retarget InstanceRoleArn to a more-privileged role via UpdateService + PassRole."
+    match:
+      - [ ?principal, CanAttachIdentity,      ?service ]
+      - [ ?principal, CanModifyConfiguration, ?service ]
+      - [ ?principal, CanPassIdentity,        ?role ]
+    where:
+      - "node_type(?service) == ApplicationPlatform"
+      - "?role trust allows tasks.apprunner.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<chosen more-privileged instance role>"
+      state_logic: "ACTIVE if apprunner:UpdateService + iam:PassRole(?role) both satisfied; else CONDITIONAL(iam_permission)"
+      permissions: ["apprunner:UpdateService", "iam:PassRole"]
+      conditions_from: [ ?service, ?role ]
+      derived_from: [ "<CanAttachIdentity edge_id>", "<CanModifyConfiguration edge_id>", "<CanPassIdentity edge_id>" ]
+      false_positive_note: "iam:PassRole PassedToService must include tasks.apprunner.amazonaws.com; otherwise the role cannot be set as the instance role. Consumes the CanAttachIdentity edge (aws-apprunner-attach-identity) as the intermediate that binds ?role onto ?service, so that edge is no longer dead in the graph."
+      narrative: >
+        {principal.name} can execute as {role.name} by setting it as {service.name}'s
+        instance role (apprunner:UpdateService + iam:PassRole) and redeploying.
+
+  - id: aws-apprunner-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new App Runner service bound to a passed instance role -> execute as it."
+    match:
+      - [ ?principal, CanDeploy,        ?platform ]
+      - [ ?principal, CanPassIdentity,  ?role ]
+    where:
+      - "?principal has effective apprunner:CreateService"
+      - "?role trust allows tasks.apprunner.amazonaws.com"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<instance role>"
+      state_logic: "ACTIVE if apprunner:CreateService + iam:PassRole(?role) satisfied; else CONDITIONAL(iam_permission)"
+      permissions: ["apprunner:CreateService", "iam:PassRole"]
+      derived_from: [ "<CanDeploy edge_id>", "<CanPassIdentity edge_id>" ]
+      false_positive_note: "Requires PassedToService to include tasks.apprunner.amazonaws.com and the role trust to allow it; otherwise CreateService rejects the role."
+      narrative: >
+        {principal.name} can create an App Runner service running attacker code with
+        {role.name} as its instance role (apprunner:CreateService + iam:PassRole), executing as {role.name}.
+
+  # --- Supply-chain trigger (auto deploy) -----------------------------------
+  - id: aws-apprunner-autodeploy-trigger
+    emits: CanTrigger
+    description: "Auto-deploy service redeploys on upstream ECR push / source commit."
+    match_record: {resource_type: "AWS::AppRunner::Service", field: "SourceConfiguration.AutoDeploymentsEnabled"}
+    where:
+      - "AutoDeploymentsEnabled == true"
+      - "principal can write the source: ecr:PutImage on the referenced ECR repo, OR push to the connected source repo"
+    emit:
+      target_type: Compute
+      source: "<upstream ECR repo / source repo (or principal that can write it)>"
+      target: "<AppRunner::Service>"
+      state: CONDITIONAL
+      permissions: ["ecr:PutImage"]
+      conditions: [trigger_exists, iam_permission]
+      false_positive_note: "Only when AutoDeploymentsEnabled=true AND the principal can write the referenced image/source; otherwise no trigger. Manual services require apprunner:StartDeployment instead."
+      narrative: "A push to the source referenced by {service.name} auto-deploys it (AutoDeploymentsEnabled), running the new code as its instance role."
+
+  - id: aws-apprunner-autodeploy-executeas
+    emits: CanExecuteAs
+    description: "Supply-chain: poison the auto-deployed source -> run as the instance role."
+    match:
+      - [ ?principal, CanWriteData, ?upstream ]
+      - [ ?upstream,  CanTrigger,   ?service ]
+      - [ ?service,   ExecutesAs,   ?role ]
+    where:
+      - "?principal can write ?upstream (ecr:PutImage on the referenced ECR repo, or a push to the connected source repo)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<instance role>"
+      state: CONDITIONAL
+      conditions: [trigger_exists, service_state]
+      derived_from: [ "<CanTrigger edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Depends on AutoDeploymentsEnabled and write access to the referenced image/source. Requires an instance role to yield privilege."
+      narrative: "{principal.name} can execute as {role.name} by pushing a poisoned image/commit that {service.name} auto-deploys."
+
+  # --- Credential exposure from the running service -------------------------
+  - id: aws-apprunner-instance-metadata
+    emits: ExposesCredential
+    description: "Running service exposes instance-role credentials via the container credential endpoint."
+    match:
+      - [ ?service, ExecutesAs, ?role ]
+    emit:
+      source: "<AppRunner::Service>"
+      target: "<instance role>"
+      state: CONDITIONAL
+      conditions: [trigger_exists]
+      derived_from: [ "<ExecutesAs edge_id>" ]
+      false_positive_note: >
+        Only meaningful once an attacker has code/exec on the service (see CanExecuteAs chains)
+        or reads the injected env vars. This edge is a latent fact and MUST NOT be walked
+        unconditionally: traversal requires an inbound execution foothold into the service
+        (CanExecuteAs / CanModifyCode / ExposedToInternet + app-RCE). Without such an inbound
+        edge it does not represent attacker-reachable credential exposure — do not surface it
+        ACTIVE across every service that merely has an instance role.
+      narrative: "{service.name} exposes {role.name}'s credentials to any code running in the container (container credential endpoint)."
+
+  - id: aws-apprunner-retrieve-token
+    emits: CanRetrieveToken
+    description: "Code executing on the service can fetch the instance role's session token."
+    match:
+      - [ ?principal, CanExecuteAs, ?role ]
+    emit:
+      source: "<principal>"
+      target: "<instance role>"
+      state: ACTIVE
+      derived_from: [ "<CanExecuteAs edge_id>" ]
+      narrative: "{principal.name}, running as {role.name} on App Runner, can retrieve {role.name}'s credentials from the container credential endpoint."
+
+  # --- Full control ----------------------------------------------------------
+  - id: aws-apprunner-admin
+    emits: CanAdminister
+    description: "apprunner:* grants full control of the service."
+    match_effective_permission: {action: "apprunner:*", resource_type: "AWS::AppRunner::Service"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<AppRunner::Service in scope>"
+      permissions: ["apprunner:*"]
+      note: >
+        The evaluator MUST expand apprunner:* to its member actions before rule matching so
+        that a holder of apprunner:* also satisfies aws-apprunner-modifycode
+        (apprunner:UpdateService), aws-apprunner-modifyconfig (apprunner:UpdateService),
+        aws-apprunner-startdeployment (apprunner:StartDeployment) and aws-apprunner-create-service
+        (apprunner:CreateService), and therefore still drives the CanModifyCode/
+        CanModifyConfiguration/CanDeploy -> CanExecuteAs chains. If wildcard expansion is NOT
+        guaranteed, treat CanAdminister as implying CanModifyCode/CanModifyConfiguration/CanDeploy
+        on the same service so those derivations still fire for apprunner:* holders.
+      narrative: "{principal.name} has full control of {service.name} (apprunner:* / AWSAppRunnerFullAccess)."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: if an SCP or permission boundary denies any action
+# above at the effective scope (e.g. deny apprunner:UpdateService or iam:PassRole
+# with PassedToService apprunner.amazonaws.com), the evaluator emits the edge with
+# state: BLOCKED and denied_by=<SCP arn/statement> so the UI can explain why the
+# otherwise-present App Runner execution path does not work.
+#
+# NOTE: App Runner has NO resource-based policy (no apprunner:*Policy actions);
+# all access is identity-based. Do not emit ResourcePolicy or cross-account
+# resource-grant edges from the App Runner service itself.
+# ---------------------------------------------------------------------------

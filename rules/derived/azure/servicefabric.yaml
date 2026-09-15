@@ -1,0 +1,344 @@
+# Azure — Service Fabric (Microsoft.ServiceFabric) execution rules (Phase 4)
+# ---------------------------------------------------------------------------
+# Service Fabric has TWO distinct execution/identity planes; keep them separate:
+#
+#   1. NODE plane  — the cluster runs on a VM Scale Set. Code on a node inherits
+#      the NODE managed identity via IMDS (169.254.169.254). This is identical to
+#      azure:vmss and is handled by the Microsoft.Compute VMSS rules (reused,
+#      referenced at the bottom). On MANAGED clusters the backing VMSS is
+#      SF-owned and direct Compute writes are usually denied -> prefer the app
+#      path or emit BLOCKED.
+#
+#   2. APPLICATION plane — an SF application deployed as an Azure resource can be
+#      assigned its OWN managed identity (system- or up to 32 user-assigned).
+#      A per-node localhost "Managed Identity Token Service"
+#      (fabric:/System/ManagedIdentityTokenService) issues each service code
+#      package a token via IDENTITY_ENDPOINT (e.g. https://localhost:2377/
+#      metadata/identity/oauth2/token?api-version=2019-07-01-preview&resource=...)
+#      authenticated by the per-activation IDENTITY_HEADER (sent as "Secret").
+#      Attacker code deployed into an app inherits the APP MI (NOT the node MI).
+#
+# There is also a DATA plane: an admin client X.509 certificate / Entra admin
+# role lets a client connect to gateway 19000/19080 and provision applications,
+# independent of Microsoft.ServiceFabric ARM RBAC. Model it separately.
+#
+# All operation strings verified against the Microsoft.ServiceFabric provider
+# operations, the SF managed-identity concepts + app-code REST token API, the
+# managed-cluster application managed-identity guide, and the cluster client-roles
+# doc (learn.microsoft.com, 2026-03 snapshot). Every rule records the effective
+# operation the evaluator must confirm at the given scope. Deny assignments
+# override -> BLOCKED. Escalation edges require the MI to out-privilege the caller.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 4-compute-serverless
+applies_to: [azure]
+
+rules:
+
+  # === Administrative control over the cluster object =======================
+  - id: azure-sf-cluster-contributor
+    emits: CanAdminister
+    match_effective_permission: {action: "Microsoft.ServiceFabric/managedclusters/write", scope_type: "resource|resourceGroup|subscription"}
+    where: ["principal effectively holds Service Fabric Cluster Contributor / Contributor / Owner (or custom role granting Microsoft.ServiceFabric/managedclusters/* or .../clusters/*) at the scope"]
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<serviceFabric cluster in scope>"
+      permissions: ["Microsoft.ServiceFabric/managedclusters/write", "Microsoft.ServiceFabric/clusters/write"]
+      false_positive_note: "Service Fabric Cluster Contributor grants full control of the cluster/app/nodeType objects but NOT Microsoft.Authorization/*/write and NOT the DATA-plane FabricClient (which needs an admin client cert/Entra admin role). It is still sufficient for code execution via applications/write."
+      narrative: "{principal.name} has full control of Service Fabric cluster {target.name} (Microsoft.ServiceFabric/managedclusters/*)."
+
+  # === Application code deployment (control-plane 'run code') ================
+  - id: azure-sf-app-deploy-code
+    emits: CanModifyCode
+    description: "Register an attacker application-type version and create/upgrade an app pointing at it -> attacker code runs in the cluster."
+    match_effective_permission: {action: "Microsoft.ServiceFabric/managedclusters/applications/write", scope_type: "resource|resourceGroup|subscription"}
+    where:
+      - "principal ALSO has EFFECTIVE Microsoft.ServiceFabric/managedclusters/applicationTypes/write AND .../applicationTypes/versions/write (or .../clusters/* equivalents) to register the code package"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<serviceFabric application type/version + image store (ArtifactRepository)>"
+      permissions: ["Microsoft.ServiceFabric/managedclusters/applications/write", "Microsoft.ServiceFabric/managedclusters/applicationTypes/versions/write"]
+      escalation: "Deploy or upgrade an SF application whose code package is attacker-controlled; the service runs as the app's managed identity."
+      false_positive_note: "applications/write ALONE (without applicationTypes/versions/write to register a code package) can still re-point an existing app to a new version but cannot introduce arbitrary NEW code; require both for the 'arbitrary code' claim. On classic .../clusters/* use the clusters/applications/* strings. Target is the ArtifactRepository (application type/version + image store, the executable-content plane), NOT the ApplicationPlatform/ContainerCluster object which CanModifyCode's schema target set (Compute, ContainerRegistry, ArtifactRepository, KubernetesWorkload) excludes."
+      narrative: "{principal.name} can register an attacker code package into the application type/version image store {target.name} and deploy/upgrade the app (applications/write + applicationTypes/versions/write)."
+
+  - id: azure-sf-admin-client-provision
+    emits: CanModifyCode
+    description: "Data-plane: an admin client cert/Entra admin can provision an app type and create an application, running attacker code."
+    where:
+      - "principal possesses a cluster ADMIN client certificate (thumbprint in fabric settings) OR an Entra admin client role"
+      - "network path to FabricGateway 19000 (or FabricHttpGateway 19080) exists"
+      - "?artifactRepo is the application type/version + image store (ArtifactRepository) AttachedTo/Contains ?cluster"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<serviceFabric application type/version + image store (ArtifactRepository) on the cluster>"
+      permissions: ["FabricClient:ProvisionApplicationType", "FabricClient:Upload(imagestore)", "FabricClient:CreateApplication", "FabricClient:CodePackageControl"]
+      conditions: [network_reachability, service_state]
+      false_positive_note: "This is DATA-plane authz via the admin client cert, INDEPENDENT of Microsoft.ServiceFabric ARM RBAC. Do NOT emit from mere ARM Reader/Contributor without evidence of an admin client cert. A USER (read-only) client role cannot provision. Requires network reach to 19000/19080. Target is the ArtifactRepository (application type/version + image store), NOT the ContainerCluster object which CanModifyCode's schema target set excludes; the ArtifactRepository is AttachedTo the cluster."
+      narrative: "{principal.name} holds a cluster admin client certificate and can reach gateway 19000 on the cluster; can provision an application type into image store {target.name} and create an application (CreateApplication), running attacker code."
+
+  # === Configuration modification ==========================================
+  - id: azure-sf-app-write-config
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "Microsoft.ServiceFabric/managedclusters/applications/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<serviceFabric application>"
+      permissions: ["Microsoft.ServiceFabric/managedclusters/applications/write"]
+      note: "Can change the app's identity block (attach/select an MI) and the app version; realizes execution as the chosen MI at next deploy/upgrade."
+      narrative: "{principal.name} can rewrite the configuration of application {target.name} (applications/write) including its version and managed-identity binding."
+
+  - id: azure-sf-cluster-write-config
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "Microsoft.ServiceFabric/managedclusters/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<serviceFabric cluster>"
+      permissions: ["Microsoft.ServiceFabric/managedclusters/write", "Microsoft.ServiceFabric/clusters/write"]
+      escalation: "Add an attacker admin client-cert thumbprint to fabric settings -> self-grant data-plane admin; enable ManagedIdentityTokenService; add node types."
+      false_positive_note: "clusters/write changes cluster config but does not itself run code; the escalation is realized only by then using the added admin client cert on the data plane (see azure-sf-admin-client-provision)."
+      narrative: "{principal.name} can rewrite cluster config on {target.name} (clusters/write), e.g. adding an admin client-cert thumbprint to grant itself data-plane admin."
+
+  # === Identity attachment (Azure PassRole analog, application plane) ========
+  - id: azure-sf-app-pass-user-mi
+    emits: CanPassIdentity
+    description: "Azure PassRole analog for the SF application plane: assign/action on a user-assigned MI lets the principal pass that MI to a workload."
+    match_effective_permission: {action: "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", scope_type: "resource"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"]
+      conditions: [iam_permission, role_compatibility]
+      false_positive_note: "assign/action alone only grants the ability to PASS the MI; it does not attach it to any resource without a resource write (e.g. applications/write). Honor the assign/action resource scope."
+      narrative: "{principal.name} can pass user-assigned MI {target.name} to an SF workload (userAssignedIdentities/assign/action)."
+
+  - id: azure-sf-app-attach-user-mi
+    emits: CanAttachIdentity
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.ServiceFabric/managedclusters/applications/write on the target application (existing or new)"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<serviceFabric application (existing or new)>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.ServiceFabric/managedclusters/applications/write"]
+      conditions: [role_compatibility]
+      false_positive_note: "BOTH permissions are required: the CanPassIdentity edge (produced by azure-sf-app-pass-user-mi from assign/action on the MI) AND applications/write on the app. Neither alone attaches the MI. Honor the assign/action resource scope. This attaches to the APPLICATION MI plane, not the node/VMSS MI."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to SF application {target.name} (assign/action + applications/write)."
+
+  # === App managed-identity token service exposure ==========================
+  - id: azure-sf-app-token-service
+    emits: CanRetrieveToken
+    description: "Code in a managed-identity-enabled SF service can mint a bearer token for the app's MI from the per-node localhost token service."
+    match:
+      - [ ?app, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?app) == ApplicationPlatform   # SF application resource"
+    emit:
+      source: "<serviceFabric application>"
+      target: "<managed identity assigned to the app>"
+      permissions: []
+      conditions: [service_state]
+      note: "Service env carries IDENTITY_ENDPOINT (e.g. https://localhost:2377/metadata/identity/oauth2/token), IDENTITY_HEADER (per-activation secret sent as 'Secret' header), IDENTITY_SERVER_THUMBPRINT. GET <endpoint>?api-version=2019-07-01-preview&resource=<aud>. The companion ExposesCredential(app -> mi) edge is produced by azure-sf-app-exposes-mi-credential."
+      false_positive_note: "Only fires when the application actually has a managed identity (identity.type != None) AND the cluster ManagedIdentityTokenService is enabled (auto-enabled on first MI-app deploy). No MI or service without ManagedIdentityTokenService => no token; do NOT emit. This is the APP MI, distinct from any node/VMSS MI."
+      narrative: "Code in a service of {app.name} can request a bearer token for {mi.name} from the localhost Managed Identity Token Service (IDENTITY_ENDPOINT + IDENTITY_HEADER)."
+
+  - id: azure-sf-app-exposes-mi-credential
+    emits: ExposesCredential
+    description: "An MI-enabled SF application leaks a usable credential for its managed identity via the per-node localhost token service environment."
+    match:
+      - [ ?app, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?app) == ApplicationPlatform   # SF application resource"
+    emit:
+      source: "<serviceFabric application>"
+      target: "<managed identity assigned to the app>"
+      permissions: []
+      conditions: [service_state]
+      note: "Companion fact-edge to azure-sf-app-token-service: the application env (IDENTITY_ENDPOINT + per-activation IDENTITY_HEADER) exposes credential material for the app MI to any code running in a bound service."
+      false_positive_note: "Only fires when the application actually has a managed identity (identity.type != None) AND the cluster ManagedIdentityTokenService is enabled. This is the APP MI, distinct from any node/VMSS MI."
+      narrative: "SF application {app.name} exposes a credential for its managed identity {mi.name} via the localhost Managed Identity Token Service environment."
+
+  # === Reading the admin client certificate -> data-plane admin =============
+  - id: azure-sf-read-client-cert
+    emits: CanReadSecret
+    description: "The cluster admin client certificate stored in Key Vault yields data-plane admin over the cluster."
+    match_effective_permission: {action: "Key Vault secret/certificate get (data-plane or RBAC)", scope_type: "resource"}
+    where:
+      - "the KV secret/certificate is the cluster ADMIN client certificate (thumbprint present in cluster fabric settings clientCertificateThumbprints/admin)"
+    emit:
+      source: "<principal>"
+      target: "<admin client certificate secret>"
+      permissions: ["Microsoft.KeyVault/vaults/secrets/getSecret/action | secret get data action"]
+      note: "Feeds CredentialsFor(cert -> cluster admin data-plane) and enables azure-sf-admin-client-provision."
+      false_positive_note: "Only escalates if the certificate is an ADMIN client cert (not a user/read-only client cert, not the server/cluster cert). Confirm the thumbprint maps to the admin client role in cluster config."
+      narrative: "{principal.name} can read the cluster admin client certificate from Key Vault, obtaining data-plane admin over {cluster.name}."
+
+  # === Network exposure of the management gateway ===========================
+  - id: azure-sf-gateway-exposed
+    emits: ExposedToInternet
+    description: "SF cluster gateway (19000 FabricGateway / 19080 FabricHttpGateway+SFX) fronted by a public LB with a permissive NSG."
+    where:
+      - "cluster LB/publicIPAddresses front gateway ports 19000 and/or 19080"
+      - "effective NSG allows inbound on those ports"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<serviceFabric cluster>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      false_positive_note: "Exposure of the gateway does NOT grant control: the data plane still requires an admin/user client certificate or Entra token. Emit as reachability/entry-surface, not as authenticated control. Do not emit if the NSG denies 19000/19080 or no public IP fronts them."
+      narrative: "{cluster.name} exposes its management gateway (19000/19080) to the internet (public LB + permissive NSG); data-plane auth still required."
+
+  # === Derived: attacker code -> execute as the app's managed identity =======
+  - id: azure-sf-execute-as-via-app-deploy
+    emits: CanExecuteAs
+    description: "Deploy/upgrade an SF app with attacker code + the app runs as an MI => execute as that MI via the localhost token service."
+    match:
+      - [ ?principal, CanModifyCode, ?artifactRepo ]
+      - [ ?artifactRepo, AttachedTo, ?cluster ]
+      - [ ?app, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?app) == ApplicationPlatform"
+      - "?artifactRepo is the application type/version + image store (ArtifactRepository) of ?cluster; ?app deploys on ?cluster"
+      - "?mi.privilege_level >= ?principal.privilege_level   # escalation only"
+    optional:
+      - [ ?principal, CanAttachIdentity, ?app ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      state_logic: |
+        if ?app has an MI and ManagedIdentityTokenService enabled: ACTIVE
+        elif matched(optional[0]): ACTIVE   # attacker can attach a privileged MI
+        else: CONDITIONAL(service_state)
+      conditions_from: [ ?app, ?mi ]
+      permissions: ["Microsoft.ServiceFabric/managedclusters/applications/write", "applicationTypes/versions/write | FabricClient admin"]
+      derived_from: [ "<CanModifyCode(artifactRepo) edge_id>", "<AttachedTo edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Emit only when the APP has a managed identity that out-privileges the caller and the token service is enabled. Target the APP MI, never the node/VMSS MI. If the app has no MI, deploying code yields only cluster/data access, not an ARM token."
+      narrative: "{principal.name} can deploy/upgrade {app.name} with attacker code and mint the token of its identity {mi.name} from the localhost token service, executing as {mi.name}."
+
+  - id: azure-sf-execute-as-via-admin-client
+    emits: CanExecuteAs
+    description: "Admin client cert -> provision app + the app runs as an MI => execute as that MI."
+    match:
+      - [ ?principal, CanModifyCode, ?artifactRepo ]
+      - [ ?artifactRepo, AttachedTo, ?cluster ]
+      - [ ?app, ExecutesAs, ?mi ]
+    where:
+      - "?app is (or can be created) on ?cluster"
+      - "?artifactRepo is the application type/version + image store (ArtifactRepository) of ?cluster"
+      - "?principal's CanModifyCode(?artifactRepo) is via the admin client cert (data plane)"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      conditions: [network_reachability, service_state]
+      permissions: ["FabricClient:CreateApplication", "FabricClient:ProvisionApplicationType"]
+      derived_from: [ "<CanModifyCode(artifactRepo) edge_id>", "<AttachedTo edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Data-plane path: requires the admin client cert AND network reach to 19000/19080. The app must bind an MI that out-privileges the caller. Do not emit from ARM RBAC alone. The CanModifyCode edge targets the ArtifactRepository (image store) AttachedTo the cluster, matching azure-sf-admin-client-provision's schema-conformant target."
+      narrative: "{principal.name} can provision an application on the cluster via the admin client cert, binding MI {mi.name}, executing as {mi.name}."
+
+  - id: azure-sf-createworkload-via-attach-mi
+    emits: CanCreateWorkloadAs
+    description: "Attach a privileged user-assigned MI to a new/controlled SF app and deploy attacker code -> execute as the MI."
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+      - [ ?principal, CanAttachIdentity, ?app ]
+      - [ ?principal, CanModifyCode, ?artifactRepo ]
+      - [ ?artifactRepo, AttachedTo, ?cluster ]
+    where:
+      - "?app deploys on ?cluster; ?artifactRepo is the ArtifactRepository (image store) of ?cluster"
+      - "?userMI is the MI the CanAttachIdentity chain attaches to ?app (bound via CanPassIdentity)"
+      - "?userMI.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.ServiceFabric/managedclusters/applications/write", "applicationTypes/versions/write"]
+      conditions: [role_compatibility, service_state]
+      derived_from: [ "<CanPassIdentity edge_id>", "<CanAttachIdentity edge_id>", "<CanModifyCode(artifactRepo) edge_id>" ]
+      false_positive_note: "Requires the pass/attach chain (assign/action + applications/write, i.e. CanPassIdentity(?userMI) + CanAttachIdentity(?app)) AND a code-deploy primitive (CanModifyCode on the app's ArtifactRepository). Escalation only if the attached MI out-privileges the caller. Targets the APP MI plane."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to an SF app it can deploy code into, executing as {userMI.name}."
+
+# ---------------------------------------------------------------------------
+# NODE / VMSS plane reuse:
+# Execution on the underlying node VM Scale Set (classic clusters) is IDENTICAL
+# to azure:vmss. Reuse rules azure-vmss-run-command / azure-vmss-extension-write
+# / azure-vmss-imds-token / azure-vmss-execute-as-* against the backing
+# Microsoft.Compute/virtualMachineScaleSets, emitting CanExecuteAs to the NODE
+# MI (distinct from the app MI above). On MANAGED clusters the VMSS is SF-owned;
+# direct Microsoft.Compute/virtualMachineScaleSets/* writes are typically
+# denied -> emit BLOCKED and prefer the application-plane rules here.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: any action above covered by an applicable DENY
+# ASSIGNMENT (Azure Blueprint / Managed Application) or an explicit deny in a
+# custom role is emitted with state: BLOCKED and denied_by=<deny assignment>,
+# so the UI can explain why an otherwise-present execution path does not work.
+# On managed clusters, SF-owned deny assignments over the backing VMSS also
+# produce BLOCKED node-plane edges.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization (raw config -> explicit edges). These belong in
+# /rules/explicit/azure/ but are noted here for completeness; they emit the
+# ExecutesAs / AttachedTo / CredentialsFor facts the derived rules consume.
+# ---------------------------------------------------------------------------
+explicit_rules:
+  - id: azure-sf-app-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Microsoft.ServiceFabric/managedclusters/applications", field: "identity"}
+    where: ["identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned']"]
+    emit:
+      source: "<serviceFabric application>"
+      target: "<each MI: system-assigned SP (principalId) and every userAssignedIdentities / properties.managedIdentities principalId>"
+      state: CONDITIONAL
+      conditions: [service_state]
+      note: "System-assigned principalId is the app's Entra SP (…/applications/{app}/providers/Microsoft.ManagedIdentity/Identities/default); user-assigned keys are Microsoft.ManagedIdentity/userAssignedIdentities resource ids. A service must be bound via IdentityBindingPolicy (in the app/service manifest package) to actually use the identity; the ARM identity block alone does NOT confirm a binding, so the ExecutesAs fact is CONDITIONAL until manifest evidence of IdentityBindingPolicy is collected."
+      false_positive_note: "An MI present on the application resource but NOT bound to any service via IdentityBindingPolicy yields no usable token: no service can mint or use it. IdentityBindingPolicy lives in the app/service manifest package, not ARM, so it is not collectable from the ARM identity block alone. Emit CONDITIONAL(service_state); downstream CanExecuteAs must NOT assert ACTIVE purely from the ARM identity block without manifest evidence."
+      narrative: "SF application {app.name} runs as managed identity {mi.name} (CONDITIONAL until an IdentityBindingPolicy binding is confirmed in the service manifest)."
+
+  - id: azure-sf-vmss-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Microsoft.Compute/virtualMachineScaleSets", field: "identity"}
+    where: ["backing VMSS of the SF cluster/node type", "identity.type != None"]
+    emit:
+      source: "<backing VMSS (node)>"
+      target: "<each node MI>"
+      note: "Node-plane MI, reachable from node OS code via IMDS 169.254.169.254. Distinct from the app MI."
+      narrative: "SF node VMSS {vmss.name} runs as node managed identity {mi.name}."
+
+  - id: azure-sf-app-attached-to-cluster
+    emits: AttachedTo
+    source_config: {resource_type: "Microsoft.ServiceFabric/managedclusters/applications", field: "id"}
+    emit:
+      source: "<serviceFabric application>"
+      target: "<serviceFabric cluster>"
+      narrative: "Application {app.name} is deployed on cluster {cluster.name}."
+
+  - id: azure-sf-admin-cert-credentials-for
+    emits: CredentialsFor
+    source_config: {resource_type: "Microsoft.ServiceFabric/managedclusters", field: "clusterCertificateThumbprints / clientConnectionPort admin client thumbprints"}
+    where: ["certificate thumbprint is registered as an ADMIN client cert in cluster fabric settings"]
+    emit:
+      source: "<admin client certificate>"
+      target: "<cluster admin data-plane identity>"
+      note: "Possession of the admin client cert authenticates as a cluster admin on gateway 19000/19080 (data plane), independent of ARM RBAC."
+      narrative: "Admin client certificate {cert.name} authenticates as a Service Fabric cluster admin on {cluster.name}."

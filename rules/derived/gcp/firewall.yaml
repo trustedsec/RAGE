@@ -1,0 +1,428 @@
+# GCP VPC Firewall — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:firewall. Emits ONLY common edge types from schema/edges.yaml.
+#
+# TWO attack-path themes:
+#
+#   (1) EXPOSURE: an ingress ALLOW firewall rule with sourceRanges 0.0.0.0/0 (or
+#       ::/0) means any internet host can reach the matched VM(s) on the opened
+#       port -> CanReachPort(Internet → VirtualMachine). When the VM also carries
+#       an external IP -> ExposedToInternet(VirtualMachine → AnonymousIdentity).
+#       These are FACTS (explicit/derived from the firewall rule config); net-chain
+#       composition (peering + route + SG → end-to-end reach) is a FUTURE linchpin
+#       and is NOT emitted here.
+#
+#   (2) CONTROL-PLANE WEAKENING: compute.firewalls.create / .update or
+#       compute.firewallPolicies.update lets an attacker INSERT a new ALLOW rule,
+#       opening a port that was previously closed -> CanModifyConfiguration on the
+#       Firewall node. This is a prerequisite for lateral network movement and
+#       internet exposure escalation but is NOT exploitation by itself.
+#
+# PRIORITY EVALUATION REQUIREMENT:
+#   GCP evaluates firewall rules in ascending priority-number order (lower number =
+#   higher priority). An ALLOW at priority 1000 is shadowed by a DENY at priority
+#   900 for the same (target, port, source). Rules that emit CanReachPort or
+#   ExposedToInternet MUST check there is no lower-priority-number DENY that covers
+#   the same (target-tag/SA, protocol+port, source-range) tuple.
+#
+# TARGET-SCOPE REQUIREMENT:
+#   A firewall rule's target is either:
+#     * All instances in the network (no targetTags + no targetServiceAccounts), OR
+#     * Instances with a specific network tag (targetTags[]), OR
+#     * Instances running as a specific service account (targetServiceAccounts[]).
+#   Do NOT emit CanReachPort for a VM that does not match the rule's target scope.
+#
+# EXTERNAL-IP REQUIREMENT for ExposedToInternet:
+#   An ingress ALLOW from 0.0.0.0/0 on a VM with no external IP makes the VM
+#   reachable from within the VPC / peered networks only — NOT from the internet.
+#   ExposedToInternet requires BOTH the ALLOW rule AND an external IP on the VM.
+#
+# HIERARCHICAL POLICY PRECEDENCE:
+#   Hierarchical firewall policies (org/folder-level) are evaluated before VPC
+#   rules. A DENY in a higher-priority hierarchical policy overrides a VPC ALLOW.
+#   Collectors must fold hierarchical policy evaluation when determining effective
+#   allow/deny for a given (target, port, source).
+#
+# CITED LINCHPINS (do NOT re-derive here):
+#   can-control.yaml  — CanControl / CanEscalateTo rollups from CanModifyConfiguration.
+#   gce.yaml          — CanExecuteAs derivations that feed on CanReachPort/ExposedToInternet
+#                       + CanExecuteCommand paths. This file emits FACTS; gce.yaml consumes.
+#
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 8-networking
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # (1) CONTROL-PLANE: compute.firewalls.create -> CanModifyConfiguration
+  # ---------------------------------------------------------------------------
+  # compute.firewalls.create is sufficient to add a NEW allow rule to any VPC
+  # in the project — even if the existing rules are restrictive. With default
+  # priority (1000), a new ALLOW rule does not override an existing higher-
+  # priority DENY at priority < 1000, but in most environments the only rules
+  # are ALLOWs at priority 1000, so a new ALLOW at 500 beats everything.
+  # ---------------------------------------------------------------------------
+
+  - id: gcp-firewall-create-rule
+    emits: CanModifyConfiguration
+    description: "compute.firewalls.create lets an attacker insert an ALLOW rule, opening ports on any VMs matching a chosen tag or service account."
+    applies_to: [gcp]
+    # NOTE: This rule uses match_effective_permission, identical to the explicit rule
+    # gcp-firewall-can-modify-config-create in /rules/explicit/gcp-firewall.yaml.
+    # A derived rule should CONSUME edges produced by explicit normalization, not
+    # re-implement the effective-permission match. This implementation is a workaround
+    # pending refactoring to use explicit edges as input to derived rules (e.g.,
+    # match: [ ?identity, HasPermission, ?firewall ] where action=compute.firewalls.create).
+    match_effective_permission:
+      action: "compute.firewalls.create"
+      resource_type: "compute.googleapis.com/Firewall"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal (Identity)>"
+      target: "<Firewall rule node (Firewall class)>"
+      permissions:
+        - "compute.firewalls.create"
+      conditions: [iam_permission]
+      state_logic: "ACTIVE if compute.firewalls.create effective on the project; BLOCKED if constrained by an org policy deny."
+      false_positive_note: >-
+        compute.firewalls.create alone opens a port only if the new rule wins the
+        priority evaluation over any existing DENY. If compute.firewalls.create is
+        constrained to specific VPCs or tags via IAM conditions, scope accordingly.
+        Creating a rule with a low priority number (e.g. 500) beats most defaults.
+        This is not exploitation by itself — downstream CanReachPort / CanReachPort
+        → CanExecuteCommand requires the VM to also have an external IP or the
+        attacker to be in-network.
+      narrative: >-
+        {principal.name} can create new VPC firewall rules (compute.firewalls.create),
+        allowing insertion of an ingress ALLOW rule from 0.0.0.0/0 on any port for
+        any target tag, opening network access to matched VMs.
+      derived_from: ["<iam_permission: compute.firewalls.create on project>"]
+      evidence:
+        narrative_template: >-
+          IAM effective permission compute.firewalls.create on project {project.id}
+          grants {principal.name} the ability to insert an inbound allow rule on
+          any VPC firewall in the project.
+
+  # ---------------------------------------------------------------------------
+  # (2) CONTROL-PLANE: compute.firewalls.update -> CanModifyConfiguration
+  # ---------------------------------------------------------------------------
+  # compute.firewalls.update modifies an EXISTING rule (widen source ranges,
+  # add protocols/ports, change target tags). This is the most common "weaken
+  # controls" primitive because it does not create a new rule ID and may not
+  # trigger certain change-detection controls.
+  # ---------------------------------------------------------------------------
+
+  - id: gcp-firewall-update-rule
+    emits: CanModifyConfiguration
+    description: "compute.firewalls.update lets an attacker widen an existing rule to 0.0.0.0/0 source or add new ports."
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "compute.firewalls.update"
+      resource_type: "compute.googleapis.com/Firewall"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal (Identity)>"
+      target: "<Firewall rule node (Firewall class)>"
+      permissions:
+        - "compute.firewalls.update"
+      conditions: [iam_permission]
+      state_logic: "ACTIVE if compute.firewalls.update effective on the specific firewall rule or the project; BLOCKED if IAM condition restricts to a label/tag that does not match."
+      false_positive_note: >-
+        compute.firewalls.update on a DENY rule widening source ranges is unusual
+        but possible. The target rule must be an ALLOW rule for port-opening abuse;
+        updating a DENY rule's source to 0.0.0.0/0 is destructive (blocks everyone)
+        not an opening. Emit for ALLOW-direction rules.
+      narrative: >-
+        {principal.name} can update existing VPC firewall rules (compute.firewalls.update),
+        including widening the source range to 0.0.0.0/0 or adding new allowed protocols
+        and ports, weakening network isolation for targeted VMs.
+      derived_from: ["<iam_permission: compute.firewalls.update on Firewall node>"]
+      evidence:
+        narrative_template: >-
+          IAM effective permission compute.firewalls.update on {target.name} grants
+          {principal.name} the ability to modify the rule's source ranges and allowed
+          protocol/port combinations.
+
+  # ---------------------------------------------------------------------------
+  # (2b) CONTROL-PLANE: compute.firewalls.delete on DENY rule -> CanModifyConfiguration
+  # ---------------------------------------------------------------------------
+  # Deleting an existing DENY rule that was blocking traffic is functionally
+  # equivalent to inserting an ALLOW rule: it unblocks previously denied traffic
+  # to the targeted VMs. compute.firewalls.delete on a DENY-direction Firewall
+  # is a network-exposure escalation path (effective security posture change).
+  # The edge is CanModifyConfiguration because it changes network security, not
+  # CanDelete (which is destructive/impact only).
+  # ---------------------------------------------------------------------------
+
+  - id: gcp-firewall-delete-deny-rule
+    emits: CanModifyConfiguration
+    description: "compute.firewalls.delete on a DENY rule lets an attacker unblock previously denied traffic, opening network access to matched VMs."
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "compute.firewalls.delete"
+      resource_type: "compute.googleapis.com/Firewall"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal (Identity)>"
+      target: "<Firewall rule node (Firewall class), specifically a DENY rule>"
+      permissions:
+        - "compute.firewalls.delete"
+      conditions: [iam_permission]
+      state_logic: "ACTIVE if compute.firewalls.delete effective on the DENY firewall rule and the rule is the effective blocking rule for the target (target-tag/SA, protocol+port, source-range) tuple. CONDITIONAL(resource_configuration) if the DENY is not the highest-priority rule blocking that tuple (a lower-priority-number DENY would still block even after deletion). BLOCKED if a lower-priority-number DENY overrides this deletion."
+      false_positive_note: >-
+        Deleting an ALLOW rule is destructive but not an escalation — omit CanModifyConfiguration
+        for ALLOW deletion. Only emit for DENY rules. The rule must be the effective
+        blocking rule for the (target, port, source) tuple. If a higher-priority DENY
+        (lower priority number) would still block traffic even after this DENY is deleted,
+        reduce confidence and mark CONDITIONAL(resource_configuration) — the impact is
+        mitigated. Verify the firewall rule's direction=DENY and action=DENY before emitting.
+      narrative: >-
+        {principal.name} can delete VPC firewall rule {target.name} (compute.firewalls.delete).
+        Since this is a DENY rule blocking ingress from {source_range} on {protocol}/{port},
+        deletion unblocks traffic that was previously denied, weakening network isolation
+        for the matched VMs.
+      derived_from: ["<iam_permission: compute.firewalls.delete on Firewall node>"]
+      evidence:
+        narrative_template: >-
+          IAM effective permission compute.firewalls.delete on {target.name} grants
+          {principal.name} the ability to delete this DENY firewall rule. The rule
+          has direction=DENY, action=DENY, and blocks ingress from {source_range} on
+          {protocol}/{port}. Deletion would unblock that traffic.
+
+  # ---------------------------------------------------------------------------
+  # (3) CONTROL-PLANE: compute.firewallPolicies.update -> CanModifyConfiguration
+  # ---------------------------------------------------------------------------
+  # compute.firewallPolicies.update modifies a hierarchical or network firewall
+  # policy. A hierarchical policy bound at the folder/org level affects ALL
+  # projects under that node — high blast-radius primitive. The permission is
+  # checked on the policy resource, not on individual projects.
+  # ---------------------------------------------------------------------------
+
+  - id: gcp-firewall-policy-update
+    emits: CanModifyConfiguration
+    description: "compute.firewallPolicies.update on a hierarchical/network policy lets an attacker insert ALLOW rules affecting all projects in the policy scope."
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "compute.firewallPolicies.update"
+      resource_type: "compute.googleapis.com/FirewallPolicy"
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal (Identity)>"
+      target: "<Firewall policy node (Firewall class)>"
+      permissions:
+        - "compute.firewallPolicies.update"
+      conditions: [iam_permission]
+      state_logic: "ACTIVE if compute.firewallPolicies.update effective on the policy resource; CONDITIONAL(scp_or_org_policy) if an org policy restricts firewall policy modification."
+      false_positive_note: >-
+        compute.firewallPolicies.update modifies the policy rules but the policy
+        must be ASSOCIATED (attached) to a folder/org/network to have effect.
+        If the policy is not attached to any node, this is POTENTIAL rather than
+        ACTIVE for any specific VM exposure. Check the FirewallPolicy resource's
+        associations field (policy.associations[].attachmentTarget) to determine
+        whether the policy is bound to org/folder/network nodes. Hierarchical policies
+        at higher priority override VPC rules — honor the priority / GOTO-NEXT
+        evaluation semantics; an ALLOW in a hierarchical policy does not
+        override a lower-priority-number DENY in the same policy.
+      narrative: >-
+        {principal.name} can modify hierarchical or network firewall policy
+        {target.name} (compute.firewallPolicies.update), inserting ALLOW rules
+        that apply to all networks / projects the policy is associated with,
+        potentially opening ports across the entire folder or organization scope.
+      derived_from: ["<iam_permission: compute.firewallPolicies.update on policy>"]
+      evidence:
+        narrative_template: >-
+          IAM effective permission compute.firewallPolicies.update on policy
+          {target.name} grants {principal.name} the ability to insert or modify
+          rules in a policy that may govern network access across multiple projects.
+
+  # ---------------------------------------------------------------------------
+  # (3b) CONTROL-PLANE: compute.organizations.setFirewallPolicy -> CanModifyConfiguration
+  # ---------------------------------------------------------------------------
+  # compute.organizations.setFirewallPolicy lets an attacker replace the firewall
+  # policy at the organization or folder level with an attacker-controlled policy,
+  # opening ports across every project under that scope — highest blast-radius
+  # primitive. Requires the attacker to also control or be able to create the
+  # replacement policy.
+  # ---------------------------------------------------------------------------
+
+  - id: gcp-firewall-org-policy-replace
+    emits: CanModifyConfiguration
+    description: "compute.organizations.setFirewallPolicy lets an attacker replace org/folder-level firewall policy, opening ports across all projects in scope."
+    applies_to: [gcp]
+    match_effective_permission:
+      action: "compute.organizations.setFirewallPolicy"
+      resource_type: ["compute.googleapis.com/Organization", "compute.googleapis.com/Folder"]
+    emit:
+      source_type: Identity
+      target_type: Firewall
+      source: "<principal (Identity)>"
+      target: "<Firewall policy node (Firewall class) bound to the organization or folder>"
+      permissions:
+        - "compute.organizations.setFirewallPolicy"
+      conditions: [iam_permission]
+      state_logic: "ACTIVE if compute.organizations.setFirewallPolicy effective on the org/folder resource and attacker controls a replacement policy; CONDITIONAL(scp_or_org_policy) if org policy restricts setFirewallPolicy; POTENTIAL if attacker can create a new policy but has not yet created one."
+      false_positive_note: >-
+        compute.organizations.setFirewallPolicy is a high-severity primitive because
+        it replaces protection at organization or folder scope (affecting all projects
+        under that node). The attacker must either control an existing FirewallPolicy
+        resource (CanModifyConfiguration on that policy) or be able to create one
+        (compute.firewallPolicies.create). Verify that the replacement policy is
+        attacker-controlled or creatable before rating this as ACTIVE. The blast
+        radius is all projects and networks under the org/folder scope.
+      narrative: >-
+        {principal.name} can replace the firewall policy at the organization/folder
+        level (compute.organizations.setFirewallPolicy), allowing substitution of a
+        restrictive policy with an attacker-controlled one that opens ports to all
+        networks and projects under that administrative boundary.
+      derived_from: ["<iam_permission: compute.organizations.setFirewallPolicy on org/folder>"]
+      evidence:
+        narrative_template: >-
+          IAM effective permission compute.organizations.setFirewallPolicy on
+          org/folder {scope.name} grants {principal.name} the ability to replace
+          the firewall policy that governs all projects and networks under that
+          administrative boundary.
+
+  # ---------------------------------------------------------------------------
+  # (4) EXPOSURE: ingress ALLOW 0.0.0.0/0 -> CanReachPort (internet -> VM)
+  # ---------------------------------------------------------------------------
+  # A firewall rule with direction=INGRESS, sourceRanges=["0.0.0.0/0"] (or
+  # "::/0"), action=ALLOW on a specific protocol+port, and a target that applies
+  # to the VM means any internet host can reach that port on the matched VM.
+  # This is a FACT about the current firewall state, not a control-plane action.
+  # State: CONDITIONAL(network_reachability) by default — the VM must be in the
+  # rule's target scope (tag/SA match) and have an accessible network path.
+  # ---------------------------------------------------------------------------
+
+  - id: gcp-firewall-inbound-open
+    emits: CanReachPort
+    description: "Ingress ALLOW from 0.0.0.0/0 on a port means any internet source can reach that port on matched VMs — a per-firewall-rule network FACT."
+    applies_to: [gcp]
+    match:
+      - [ ?firewall_rule, LocatedIn, ?network ]
+    where:
+      - "?firewall_rule.direction == INGRESS"
+      - "?firewall_rule.action == ALLOW"
+      - "0.0.0.0/0 or ::/0 in ?firewall_rule.sourceRanges"
+      - "?firewall_rule.allowed[].ports is non-empty (protocol + ports specified)"
+      - "?vm is a VirtualMachine in ?network matching ?firewall_rule.targetTags OR ?firewall_rule.targetServiceAccounts (or rule has no target restriction)"
+      - "no lower-priority-number DENY rule covers the same (target, protocol+port, 0.0.0.0/0) tuple"
+    emit:
+      source_type: Network
+      target_type: Compute
+      source: "<synthetic PublicEndpoint / VirtualNetwork node representing the internet ingress>"
+      target: "<VirtualMachine node matching rule target scope>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when the VM has a confirmed external IP and no higher-priority DENY
+        shadows this ALLOW for the (target, port, 0.0.0.0/0) tuple. CONDITIONAL(network_reachability)
+        when the VM's external IP cannot be confirmed at collection time or when the VM has
+        no external IP but may be reachable via a public load balancer. BLOCKED when a
+        lower-priority-number DENY covers the same tuple.
+      false_positive_note: >-
+        Priority evaluation is mandatory: a DENY at priority number lower than this
+        ALLOW (e.g. DENY at 900, ALLOW at 1000) defeats the ALLOW for those
+        (target, port, source) combinations. Do not emit when shadowed.
+        Target-scope: the VM must carry the targetTag (if set) or run as the
+        targetServiceAccount (if set). VMs that do not match the target are not
+        affected. A VM with no external IP is not internet-reachable despite the
+        rule — downgrade to CONDITIONAL(network_reachability) for those.
+      narrative: >-
+        Firewall rule {firewall_rule.name} allows ingress from 0.0.0.0/0 on
+        {protocol}/{port}; any internet source can reach this port on {vm.name},
+        subject to the VM having an accessible external IP address.
+      derived_from: ["<LocatedIn(firewall_rule → network) edge_id>", "<VM-tag-match evidence>"]
+      evidence:
+        narrative_template: >-
+          Firewall rule {firewall_rule.name} in VPC {network.name} has direction=INGRESS,
+          action=ALLOW, sourceRanges=[0.0.0.0/0], protocols={protocols}, ports={ports},
+          and targets VM {vm.name} (via tag {tag} or SA {sa}). No higher-priority DENY
+          overrides this allow for the matched (target, port, source) tuple.
+
+  # ---------------------------------------------------------------------------
+  # (5) EXPOSURE: inbound open + external IP -> ExposedToInternet
+  # ---------------------------------------------------------------------------
+  # When a VM has BOTH an ingress ALLOW from 0.0.0.0/0 (from rule above) AND
+  # an external IP address, it is genuinely internet-accessible — an unauthenticated
+  # internet actor can attempt to connect. This is the terminal internet-exposure fact.
+  # ---------------------------------------------------------------------------
+
+  - id: gcp-firewall-internet-exposed
+    emits: ExposedToInternet
+    description: "VM with an ingress ALLOW from 0.0.0.0/0 AND an external IP is internet-exposed on that port — any unauthenticated actor can attempt to connect."
+    applies_to: [gcp]
+    match:
+      - [ ?internet, CanReachPort, ?vm ]
+    # NOTE: The where clause checks that "the CanReachPort edge was derived by
+    # gcp-firewall-inbound-open (source is 0.0.0.0/0)" but the match clause above
+    # only checks CanReachPort without binding it to the specific source. The
+    # derived_from anchor (CanReachPort from gcp-firewall-inbound-open) is insufficiently
+    # precise as a machine-readable constraint at the engine level — any CanReachPort
+    # edge into the VM (including internal-range rules) could satisfy the match if
+    # the rule_id check is not enforced. This should be strengthened to explicitly
+    # check the CanReachPort's source_range attribute or rule_id before emitting.
+    where:
+      - "?vm is a VirtualMachine with networkInterfaces[*].accessConfigs[*].natIP non-empty (external IP present)"
+      - "the CanReachPort edge was derived by gcp-firewall-inbound-open (source is 0.0.0.0/0)"
+    emit:
+      source_type: Compute
+      target_type: AnonymousIdentity
+      source: "<VirtualMachine node (?vm)>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the VM has a confirmed external IP and no higher-priority DENY
+        shadows the ingress ALLOW rule; CONDITIONAL(network_reachability) if the
+        external IP presence cannot be confirmed at collection time.
+      false_positive_note: >-
+        A VM behind a NAT gateway that does not have its own external IP is NOT
+        directly internet-exposed even if the firewall allows inbound from 0.0.0.0/0;
+        omit ExposedToInternet for NAT-only egress VMs. Cloud Load Balancers present
+        a separate public IP — the LB exposure is captured by the load balancer service
+        rules, not here. Only emit when natIP (external IP on the NIC itself) is
+        confirmed present.
+      narrative: >-
+        {vm.name} is directly internet-exposed: firewall rule {firewall_rule.name}
+        allows ingress from 0.0.0.0/0 on {protocol}/{port} and the VM has external
+        IP {external_ip}. Any unauthenticated internet actor can attempt to reach the
+        service on that port.
+      derived_from: ["<CanReachPort(Internet → ?vm) edge_id from gcp-firewall-inbound-open>"]
+      evidence:
+        narrative_template: >-
+          VM {vm.name} has external IP {external_ip} (networkInterfaces[].accessConfigs[].natIP)
+          and firewall rule {firewall_rule.name} allows inbound from 0.0.0.0/0 on {protocol}/{port}.
+          No higher-priority DENY overrides this allow. The VM is directly internet-reachable.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An org policy constraint/compute.restrictCloudSQLInstances or similar
+#     preventing external IPs (constraints/compute.vmExternalIpAccess) -> BLOCKED
+#     for ExposedToInternet (VMs cannot have external IPs -> no internet exposure).
+#   - An IAM deny policy on compute.firewalls.create/update for the project ->
+#     BLOCKED for gcp-firewall-create-rule / gcp-firewall-update-rule.
+#   - A higher-priority DENY firewall rule covering the same target/port/source ->
+#     BLOCKED for gcp-firewall-inbound-open on the specific (target, port) tuple.
+#   - constraints/compute.restrictFirewallPolicyModification -> BLOCKED for
+#     gcp-firewall-policy-update.
+#
+# EXPLICIT NORMALIZATION needed in /rules/explicit/gcp-firewall.yaml:
+#   - LocatedIn(Firewall → VirtualNetwork)  from firewall.network field
+#   - CanModifyConfiguration(Identity → Firewall)  from effective perm evaluation
+#     for compute.firewalls.create, compute.firewalls.update,
+#     compute.firewallPolicies.update
+#
+# NETWORK-CHAINS LINCHPIN (FUTURE — do NOT emit here):
+#   Transitive network reachability: VPC peering + firewall allow on destination +
+#   route → end-to-end CanNetworkReach from VM in VPC-A to VM in VPC-B. This
+#   multi-hop composition is reserved for a future network-chains derivation file
+#   and is NOT emitted in per-service rules. This file emits ONLY the
+#   single-hop firewall-rule FACTS (port open to 0.0.0.0/0 on the VM).
+# ---------------------------------------------------------------------------

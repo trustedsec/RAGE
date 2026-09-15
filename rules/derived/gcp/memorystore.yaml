@@ -1,0 +1,373 @@
+# GCP Memorystore for Redis — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:memorystore. Emits ONLY common edge types from schema/edges.yaml.
+# All permissions are exact names from the Memorystore IAM reference:
+#   cloud.google.com/memorystore/docs/redis/access-control
+# AUTH behavior documented at:
+#   cloud.google.com/memorystore/docs/redis/about-redis-auth
+#   cloud.google.com/memorystore/docs/redis/managing-auth
+#
+# KEY ARCHITECTURAL FACTS that discipline every rule here:
+#
+#   1. IAM CONTROLS ONLY THE CONTROL PLANE. redis.instances.*, redis.locations.*,
+#      redis.operations.* govern create/update/delete/auth API calls. They do NOT
+#      control Redis protocol (data-plane) access. There is no per-key IAM check
+#      at read/write time.
+#
+#   2. DATA PLANE IS NETWORK + AUTH GATED ONLY. Any in-VPC client that can reach
+#      port 6379 (plaintext) or port 6380 (TLS) AND supplies the AUTH string
+#      (if AUTH is enabled) gets full Redis access to all keys. Without AUTH, any
+#      in-VPC client with network reach has full access — no credential required.
+#
+#   3. AUTH STRING IS THE MASTER CREDENTIAL. redis.instances.getAuthString
+#      retrieves the instance's AUTH UUID (36 characters). Possession of this string
+#      combined with in-VPC network reach = full Redis data-plane access (read,
+#      write, delete, flush, admin commands). This is the Phase 6 "credential grab"
+#      primitive for Memorystore.
+#
+#   4. AUTH DOES NOT PROTECT AGAINST IN-VPC ATTACKERS (per Google docs). The AUTH
+#      string is a shared secret; it is not per-identity. Any entity that retrieves
+#      it via the control-plane API can authenticate from any in-VPC position.
+#
+#   5. NO PUBLIC IP SURFACE. Memorystore instances are VPC-private only (VPC
+#      peering: direct or private services access). ExposedToInternet MUST NOT be
+#      emitted for any Memorystore resource.
+#
+#   6. NO CMEK KEY_PERMISSION GATE. Memorystore for Redis does not support
+#      customer-managed encryption keys (CMEK). Data at rest is encrypted by
+#      Google-managed keys transparently. The key_permission condition MUST NOT be
+#      applied to CanReadData edges.
+#
+#   7. LOW-RELEVANCE SERVICE. Per Phase 6 theme guidance: 1-3 conservative rules.
+#      Rules below cover only the highest-value paths for this tier.
+#
+# Linchpins cited (not duplicated):
+#   /rules/derived/credential-chains.yaml — ContainsSecret->CredentialsFor->CanImpersonate;
+#                                            execute-then-read-secret; decrypt-gates-secret-read
+#   /rules/derived/can-control.yaml       — CanAdminister->Controls roll-up
+#   /rules/derived/can-execute-as.yaml    — CanModifyCode/Config+ExecutesAs->CanExecuteAs
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 6-storage-databases
+service: memorystore
+applies_to: [gcp]
+
+rules:
+
+  # --- redis.instances.getAuthString -> AUTH credential exposed ---------------
+  # PRIMARY ATTACK PRIMITIVE: The control-plane permission redis.instances.getAuthString
+  # lets a caller retrieve the Redis AUTH string (a 36-character UUID) via:
+  #   GET /v1/projects/{project}/locations/{location}/instances/{instance}/authString
+  #   (or: gcloud redis instances get-auth-string)
+  #
+  # The AUTH string is the only shared credential for Redis protocol authentication.
+  # Retrieving it grants the caller the ability to authenticate to the Redis instance
+  # from any in-VPC client, regardless of IAM identity at connection time.
+  #
+  # This rule emits ExposesCredential from the Cache node (the Redis instance) to a
+  # Credential node (the AUTH string). The instance is the source because the credential
+  # is an instance-bound artifact revealed by a control-plane API call on that instance.
+  # The downstream CanReadData edge requires in-VPC network reach (separate condition).
+  #
+  # NOTE: Cache is listed directly in ExposesCredential source set (edges.yaml).
+  # No class-mapping inference needed.
+  - id: gcp-memorystore-get-auth-string-exposes-credential
+    emits: ExposesCredential
+    description: >-
+      redis.instances.getAuthString retrieves the Redis AUTH string (UUID), which is
+      the shared credential granting full Redis data-plane access to any in-VPC client
+      that possesses it. This is the Memorystore "master key" credential grab.
+    match:
+      - [ ?instance, Contains, ?auth_string ]
+    where:
+      - "node_type(?instance) == Cache"
+      - "node_type(?auth_string) == Credential"
+      - "?instance.authEnabled == true"
+    emit:
+      source_type: Cache
+      target_type: Credential
+      source: ?instance
+      target: ?auth_string
+      permissions: ["redis.instances.getAuthString"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when: the CanReadCredential input is ACTIVE (redis.instances.getAuthString
+        permission held) AND instance.authEnabled is true (the AUTH string is meaningful
+        only when AUTH is enabled).
+        CONDITIONAL(iam_permission) when the CanReadCredential input is CONDITIONAL.
+        BLOCKED if the CanReadCredential input is BLOCKED (IAM deny on getAuthString).
+        Do NOT emit if instance.authEnabled is false — the AUTH string is not the
+        access control mechanism when AUTH is disabled (use gcp-memorystore-no-auth-
+        data-access instead).
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<Contains edge: instance -> AUTH string Credential>", "<instance.authEnabled == true>" ]
+      false_positive_note: >-
+        Only emit when AUTH is enabled on the instance (authEnabled=true). When AUTH
+        is disabled, the AUTH string is irrelevant — any in-VPC client already has
+        full access without credentials. The ExposesCredential edge here documents the
+        control-plane credential-grab path; it does NOT by itself yield data access —
+        the attacker must also have network reach to port 6379/6380, which is modeled
+        separately by gcp-memorystore-auth-string-grants-data-read and
+        gcp-memorystore-auth-string-grants-data-write. Do NOT apply a
+        key_permission gate: Memorystore does not use CMEK. Never emit ExposedToInternet.
+      narrative: >-
+        {instance.name} exposes the Redis AUTH string (UUID) credential. Any principal
+        holding redis.instances.getAuthString can retrieve it via the Memorystore API;
+        any in-VPC client that possesses this string can authenticate to {instance.name}
+        and access all Redis keys.
+
+  # --- AUTH string possession + in-VPC reach -> CanReadData & CanWriteData -----
+  # Once the AUTH string is obtained (via gcp-memorystore-get-auth-string-exposes-
+  # credential above), the attacker can connect from any in-VPC client to port 6379
+  # (or 6380 for TLS), send AUTH <string>, and issue arbitrary Redis commands.
+  # This includes full write access (SET, DEL, FLUSHALL, CONFIG, etc.) for cache
+  # poisoning and supply-chain injection attacks.
+  #
+  # This rule collapses ExposesCredential (the credential-grab step) with the
+  # network_reachability precondition into CanReadData and CanWriteData.
+  # State is ACTIVE only when BOTH the ExposesCredential is ACTIVE AND the caller
+  # has confirmed in-VPC reach to the Redis port; otherwise CONDITIONAL(network_reachability).
+  #
+  # NOTE: CanReadData/CanWriteData source set is [Identity, Compute]; target set is
+  # [Storage, Data, Messaging]. Cache is a generic_type under the Data class.
+  # The where clause ensures ?principal is Identity or Compute, and source_type is
+  # derived from the actual node class of ?principal.
+  - id: gcp-memorystore-auth-string-grants-data-read
+    emits: CanReadData
+    description: >-
+      Possession of the Redis AUTH string (retrieved via redis.instances.getAuthString)
+      combined with in-VPC network reach to the Redis port grants full data-plane read access
+      to all keys on the Memorystore instance.
+    match:
+      - [ ?principal, CanReadCredential, ?auth_string ]
+      - [ ?instance, ExposesCredential, ?auth_string ]
+    where:
+      - "node_type(?auth_string) == Credential"
+      - "node_type(?instance) == Cache"
+      - "node_class(?principal) in [Identity, Compute]"
+      - "?principal has in-VPC network reachability to ?instance.host on port 6379 or 6380"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?instance
+      permissions: ["redis.instances.getAuthString"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        ACTIVE when: (1) CanReadCredential input is ACTIVE (getAuthString permission held)
+        (2) ExposesCredential input is ACTIVE (AUTH enabled on instance) AND (3) in-VPC
+        network reachability to the Redis port is confirmed (VPC peering/Shared VPC, no
+        blocking firewall rule on port 6379/6380).
+        CONDITIONAL(network_reachability) when VPC topology is unresolved (e.g., peering
+        unconfirmed, firewall rules not collected).
+        CONDITIONAL(iam_permission) when CanReadCredential input is CONDITIONAL.
+        BLOCKED if CanReadCredential is BLOCKED (IAM deny on getAuthString) or if a VPC
+        firewall rule explicitly blocks port 6379/6380 from attacker's position to instance IP.
+        NOTE: Do NOT apply key_permission gating. Memorystore does not support CMEK;
+        data-at-rest encryption is Google-managed and transparent.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanReadCredential: principal -> AUTH string Credential>", "<ExposesCredential: instance -> AUTH string Credential>", "<network_reachability confirmation: principal IP -> instance.host:6379/6380>" ]
+      false_positive_note: >-
+        BOTH conditions must be satisfied for ACTIVE: (1) the principal holds
+        redis.instances.getAuthString AND the instance has authEnabled=true (confirmed
+        by the ExposesCredential input), AND (2) in-VPC network reach to port 6379
+        (plaintext) or 6380 (TLS) is confirmed by VPC topology analysis — peering
+        route exists, no VPC firewall rule blocks the traffic. When network reach is
+        unresolved, emit as CONDITIONAL(network_reachability), not ACTIVE.
+        AUTH does not protect against in-VPC malicious principals (per Google docs) —
+        once the string is obtained, any in-VPC position can authenticate. This CanReadData
+        edge implies full Redis read command access: reads (GET, SCAN, KEYS). Do NOT emit
+        ExposedToInternet. Do NOT gate on key_permission.
+      narrative: >-
+        {principal.name} can retrieve the AUTH string for {instance.name}
+        (redis.instances.getAuthString) and has network reach to the Redis port; it can
+        authenticate via Redis AUTH and read all keys — including cached sessions, OAuth
+        tokens, API keys, and connection strings stored in the cache.
+
+  # --- AUTH string possession + in-VPC reach -> CanWriteData (cache poisoning) ---
+  # Full write access to Redis (SET, DEL, FLUSHALL, CONFIG) via AUTH string enables
+  # cache poisoning attacks: injecting malicious data into the cache for downstream
+  # applications to consume, leading to supply-chain injection and lateral movement.
+  - id: gcp-memorystore-auth-string-grants-data-write
+    emits: CanWriteData
+    description: >-
+      Possession of the Redis AUTH string combined with in-VPC network reach grants
+      full data-plane write access (SET, DEL, FLUSHALL, etc.), enabling cache poisoning
+      and supply-chain injection attacks against dependent applications.
+    match:
+      - [ ?principal, CanReadCredential, ?auth_string ]
+      - [ ?instance, ExposesCredential, ?auth_string ]
+    where:
+      - "node_type(?auth_string) == Credential"
+      - "node_type(?instance) == Cache"
+      - "node_class(?principal) in [Identity, Compute]"
+      - "?principal has in-VPC network reachability to ?instance.host on port 6379 or 6380"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?instance
+      permissions: ["redis.instances.getAuthString"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        ACTIVE when: (1) CanReadCredential input is ACTIVE (getAuthString permission held)
+        (2) ExposesCredential input is ACTIVE (AUTH enabled on instance) AND (3) in-VPC
+        network reachability to the Redis port is confirmed (VPC peering/Shared VPC, no
+        blocking firewall rule on port 6379/6380).
+        CONDITIONAL(network_reachability) when VPC topology is unresolved.
+        CONDITIONAL(iam_permission) when CanReadCredential input is CONDITIONAL.
+        BLOCKED if CanReadCredential is BLOCKED or if a VPC firewall rule blocks port 6379/6380.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanReadCredential: principal -> AUTH string Credential>", "<ExposesCredential: instance -> AUTH string Credential>", "<network_reachability confirmation: principal IP -> instance.host:6379/6380>" ]
+      false_positive_note: >-
+        Write access to Redis enables cache poisoning: an attacker can inject malicious
+        data (SET key value) that downstream applications trust and consume, leading to
+        RCE, privilege escalation, or data corruption. Cite credential-chains.yaml for
+        the ContainsSecret->CanImpersonate roll-up when poisoned cached credentials flow
+        back to downstream identity consumption. When network reach is unresolved, emit
+        CONDITIONAL(network_reachability).
+      narrative: >-
+        {principal.name} can retrieve the AUTH string for {instance.name} and has network
+        reach to the Redis port; it can authenticate via Redis AUTH and write to all keys
+        (SET, DEL, FLUSHALL, CONFIG, etc.), enabling cache poisoning attacks against
+        dependent applications.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An IAM deny policy or org policy denying redis.instances.getAuthString at the
+#    project/folder/org scope -> emit gcp-memorystore-get-auth-string-exposes-credential
+#    with state: BLOCKED (denied_by=<deny policy>).
+#  - A VPC firewall rule blocking TCP 6379/6380 from the attacker's network position
+#    to the Redis instance IP -> gcp-memorystore-auth-string-grants-data-read/write
+#    and gcp-memorystore-no-auth-data-read/write are CONDITIONAL(network_reachability)
+#    or BLOCKED.
+#  - instance.authEnabled == false: do NOT fire gcp-memorystore-get-auth-string-exposes-
+#    credential (AUTH string is not the access control). Any in-VPC principal with network
+#    reach already has full unauthenticated access — CanReadData and CanWriteData edges
+#    with CONDITIONAL(network_reachability) and no iam_permission condition apply for
+#    those principals (gcp-memorystore-no-auth-data-read/write).
+#  - ExposedToInternet: NEVER emit. Memorystore instances are VPC-private only.
+#  - key_permission: NEVER gate CanReadData/CanWriteData. Memorystore does not support CMEK.
+#
+# CACHE POISONING & SUPPLY-CHAIN INJECTION:
+#  Both AUTH-enabled and no-AUTH paths include CanWriteData edges modeling the cache
+#  poisoning attack surface. When a Redis instance stores credentials or keys
+#  (ContainsSecret -> Credential), the credential-chains.yaml linchpin synthesizes:
+#    CanWriteData(principal -> instance) + ContainsSecret(instance -> secret)
+#    => supply-chain injection risk (downstream app consumes poisoned data)
+#  Cite credential-chains.yaml for the CanReadData + ContainsSecret -> CanImpersonate
+#  roll-up when cached credentials are exfiltrated and re-used.
+#
+# DATA CONTAINING SECRETS (cite, do not re-derive):
+#  When a Redis instance stores session tokens, OAuth tokens, API keys, database
+#  connection strings, or other credential material (ContainsSecret -> Credential),
+#  the credential-chains.yaml linchpin collapses:
+#    CanReadData(principal -> instance) + ContainsSecret(instance -> secret)
+#    + CredentialsFor(secret -> identity)
+#    => CanImpersonate(principal -> identity)  [read-secret-yields-identity]
+#  This roll-up is handled by credential-chains.yaml; do NOT re-derive it here.
+# ---------------------------------------------------------------------------
+
+  # --- No AUTH + in-VPC reach -> unauthenticated CanReadData --------------------
+  # When AUTH is disabled (the GCP default), any in-VPC client (compute node or
+  # identity-bearing workload) with network reachability to port 6379/6380 has full
+  # Redis access WITHOUT any credential. This is the most common real-world attack
+  # surface for Memorystore. Unlike the AUTH string case, there is no control-plane
+  # credential to grab; the data-plane network reach alone is sufficient.
+  #
+  # State is ACTIVE only when topology confirms in-VPC reach AND authEnabled is false;
+  # otherwise CONDITIONAL(network_reachability). No iam_permission condition.
+  # Source can be any in-VPC Identity or Compute node.
+  - id: gcp-memorystore-no-auth-data-read
+    emits: CanReadData
+    description: >-
+      When AUTH is disabled (the GCP default), any in-VPC client (Identity, Compute,
+      Container, KubernetesWorkload) with network reachability to port 6379/6380 gains
+      full unauthenticated Redis data-plane read access. No credential retrieval is needed.
+    match:
+      - [ ?principal, LocatedIn, ?vpc ]
+      - [ ?instance, LocatedIn, ?vpc ]
+    where:
+      - "node_class(?principal) in [Identity, Compute]"
+      - "node_type(?instance) == Cache"
+      - "?instance.authEnabled == false"
+      - "?principal has network reachability to ?instance.host on port 6379 or 6380"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?instance
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when: both ?principal and ?instance are LocatedIn the same VPC, AUTH is
+        disabled (authEnabled == false) on the instance, and VPC topology confirms port
+        6379/6380 reachability (no blocking firewall rule).
+        CONDITIONAL(network_reachability) when VPC topology is unresolved (e.g., peering
+        or firewall rules not fully collected).
+        Do NOT emit if instance.authEnabled == true (use gcp-memorystore-auth-string-
+        grants-data-read instead).
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<LocatedIn edge: principal -> vpc>", "<LocatedIn edge: instance -> vpc>", "<instance.authEnabled == false>" ]
+      false_positive_note: >-
+        Emit ONLY when instance.authEnabled is false (the condition for unauthenticated
+        access). Do NOT conflate with the AUTH-string path. There is no control-plane
+        IAM permission required — network reach alone is sufficient. If the VPC topology
+        does not confirm reachability, emit CONDITIONAL(network_reachability), not ACTIVE.
+        This CanReadData edge implies full Redis read command access (GET, SCAN, KEYS)
+        from the in-VPC position. Do NOT gate on key_permission (Memorystore does not
+        support CMEK).
+      narrative: >-
+        {principal.name} is in VPC {vpc.name}, where {instance.name} is also located.
+        AUTH is disabled on {instance.name}; any in-VPC client with network reach to
+        port 6379/6380 can connect without credentials and read all keys.
+
+  # --- No AUTH + in-VPC reach -> unauthenticated CanWriteData (cache poisoning) ---
+  # When AUTH is disabled, in-VPC clients also have full write access (SET, DEL,
+  # FLUSHALL, CONFIG, etc.), enabling cache poisoning attacks: injecting malicious
+  # data for downstream applications to consume, leading to supply-chain injection.
+  - id: gcp-memorystore-no-auth-data-write
+    emits: CanWriteData
+    description: >-
+      When AUTH is disabled (the GCP default), any in-VPC client (Identity, Compute,
+      Container, KubernetesWorkload) with network reachability to port 6379/6380 gains
+      full unauthenticated Redis data-plane write access (SET, DEL, FLUSHALL, CONFIG),
+      enabling cache poisoning and supply-chain injection attacks.
+    match:
+      - [ ?principal, LocatedIn, ?vpc ]
+      - [ ?instance, LocatedIn, ?vpc ]
+    where:
+      - "node_class(?principal) in [Identity, Compute]"
+      - "node_type(?instance) == Cache"
+      - "?instance.authEnabled == false"
+      - "?principal has network reachability to ?instance.host on port 6379 or 6380"
+    emit:
+      source_type: Identity
+      target_type: Cache
+      source: ?principal
+      target: ?instance
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when: both ?principal and ?instance are LocatedIn the same VPC, AUTH is
+        disabled (authEnabled == false) on the instance, and VPC topology confirms port
+        6379/6380 reachability (no blocking firewall rule).
+        CONDITIONAL(network_reachability) when VPC topology is unresolved.
+        Do NOT emit if instance.authEnabled == true (use gcp-memorystore-auth-string-
+        grants-data-write instead).
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<LocatedIn edge: principal -> vpc>", "<LocatedIn edge: instance -> vpc>", "<instance.authEnabled == false>" ]
+      false_positive_note: >-
+        Write access to Redis without AUTH enables cache poisoning: an attacker can
+        inject malicious data (SET key value) that downstream applications trust and
+        consume, leading to RCE, privilege escalation, or data corruption. Cite
+        credential-chains.yaml for the ContainsSecret->CanImpersonate roll-up when
+        poisoned cached credentials flow back to downstream identity consumption.
+        When network reach is unresolved, emit CONDITIONAL(network_reachability).
+      narrative: >-
+        {principal.name} is in VPC {vpc.name}, where {instance.name} is also located.
+        AUTH is disabled on {instance.name}; any in-VPC client with network reach to
+        port 6379/6380 can connect without credentials and write to all keys (SET, DEL,
+        FLUSHALL, CONFIG, etc.), enabling cache poisoning attacks.
+

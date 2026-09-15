@@ -1,0 +1,426 @@
+# GCP Cloud Spanner — Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Catalog key: gcp:spanner. Emits ONLY common edge types from schema/edges.yaml.
+# All permissions are exact names from the Cloud Spanner IAM reference:
+#   cloud.google.com/spanner/docs/iam
+#   cloud.google.com/spanner/docs/access-control
+#   cloud.google.com/spanner/docs/import-export
+#   cloud.google.com/spanner/docs/cmek
+#
+# KEY ARCHITECTURAL FACTS that discipline every rule here:
+#
+#   1. NO CREDENTIAL-GRAB PRIMITIVE. Spanner has no listKeys, HMAC-key,
+#      master-password, or token-export API. ExposesCredential is NOT emitted
+#      from any Spanner control-plane action. Credential paths arise only from
+#      user-table data (ContainsSecret, analyst-tagged) and feed into
+#      credential-chains.yaml roll-ups (cited, not duplicated).
+#
+#   2. NO EXECUTION IDENTITY. Spanner does not run user-supplied code as a
+#      service account. ExecutesAs, CanModifyCode, CanExecuteAs are NOT
+#      applicable. The Spanner service agent is Google-managed and not a
+#      user-accessible token surface.
+#
+#   3. CMEK TRANSPARENCY. A database encrypted with Cloud KMS CMEK is transparent
+#      to the caller's IAM evaluation. The Spanner SERVICE AGENT (not the caller)
+#      holds cloudkms.cryptoKeyVersions.useToDecrypt on the wrapping key. The caller's
+#      CanReadData is ACTIVE when their IAM permissions are satisfied and the CMEK key
+#      is operational; BLOCKED if the key is DISABLED/DESTROYED. The credential-chains.yaml
+#      linchpin `decrypt-gates-secret-read` does NOT apply to Spanner (it assumes the
+#      caller holds decrypt, which is not the Spanner model).
+#
+#   4. DATA-PLANE READ REQUIRES BOTH IAM + SESSION. spanner.databases.read
+#      (or spanner.databases.select) + spanner.sessions.create are both required
+#      for an effective data API call. Neither alone is sufficient.
+#
+#   5. BACKUP EXFILTRATION. A backup with a cross-project IAM binding (granting
+#      spanner.backups.restoreDatabase to an external principal) is the primary
+#      exfiltration channel. Backup creation requires THREE permissions: spanner.backups.create
+#      (instance scope) + spanner.databases.get (source database) + spanner.backups.setIamPolicy
+#      (project scope, which applies to backups in that project). Note: roles/spanner.backupAdmin
+#      grants backups.create + setIamPolicy but NOT databases.get; only roles/spanner.admin
+#      or roles/spanner.databaseAdmin grant databases.get.
+#
+#   6. NO PUBLIC SPANNER DATABASE. IAM does not natively allow allUsers /
+#      allAuthenticatedUsers on Spanner resources (org policy typically blocks
+#      it). ExposedToInternet is not emitted unless a confirmed misconfigured
+#      allUsers binding is observed.
+#
+#   7. VPC SERVICE CONTROLS. A VPC-SC perimeter restricting the Spanner API
+#      blocks IAM-authorized principals outside the perimeter. Emit affected
+#      edges as BLOCKED(resource_policy) with denied_by = <perimeter name>.
+#      See /rules/derived/gcp/accesscontextmanager.yaml for perimeter modeling.
+#
+# LINCHPIN CITATIONS (do NOT re-derive the roll-ups listed here):
+#   * /rules/derived/credential-chains.yaml
+#       - read-secret-yields-identity: ONLY applies when CanReadSecret (not CanReadData)
+#         is held. For Spanner, emit CanReadData only; the downstream credential-chains
+#         rule requires an intermediate edge CanReadSecret(principal -> Secret) which is
+#         not emitted by Spanner rules. Credential exposure from Spanner tables is modeled
+#         via analyst-tagged ContainsSecret edges on the database, not from Spanner
+#         control-plane actions.
+#       - impersonate-is-escalation: CanImpersonate => CanEscalateTo roll-up (applies if
+#         CanReadData feeds into read-secret-yields-identity via explicit ContainsSecret edge)
+#   * /rules/derived/can-control.yaml
+#       - control-via-admin: CanAdminister => Controls roll-up. MISSING: gcp-spanner-database-admin
+#         rule that emits CanAdminister from effective permissions (not yet implemented).
+#   * /rules/derived/can-execute-as.yaml — NOT cited; no ExecutesAs in Spanner.
+#   NOTE: CMEK gates on CanReadData — The Spanner SERVICE AGENT
+#         (service-PROJECT_NUMBER@gcp-sa-spanner.iam.gserviceaccount.com), not the caller,
+#         holds cloudkms.cryptoKeyVersions.useToDecrypt. The caller's CanReadData is ACTIVE
+#         when their IAM permissions are satisfied and the CMEK key is operational. If the
+#         CMEK key is DISABLED/DESTROYED, emit BLOCKED(key_permission) with denied_by = key.
+#         The decrypt-gates-secret-read linchpin does NOT apply to Spanner.
+#
+# PERMISSIONS ARE EFFECTIVE: the permission evaluator has already resolved
+# project, instance, and database-level IAM role bindings (Google Cloud Spanner
+# evaluates policies hierarchically: project > instance > database). State
+# defaults to ACTIVE; an unmet condition yields CONDITIONAL/POTENTIAL; an
+# explicit deny policy or VPC-SC perimeter yields BLOCKED.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 6-storage-databases
+service: spanner
+applies_to: [gcp]
+
+rules:
+
+  # =====================================================================
+  # SECTION 1 — DATA PLANE ACCESS
+  # =====================================================================
+
+  # --- CanReadData: effective data-plane read via sessions API ---------------
+  # spanner.databases.read (broad DML+read) OR spanner.databases.select
+  # (read-only SQL) combined with spanner.sessions.create is the minimum pair
+  # for an effective ExecuteSql / ExecuteStreamingSql API call.
+  # Reference: cloud.google.com/spanner/docs/iam#spanner.databases.read
+  - id: gcp-spanner-read-data
+    emits: CanReadData
+    description: >-
+      spanner.databases.read (or spanner.databases.select) + spanner.sessions.create
+      together constitute effective data-plane read access: the caller can open a
+      session and execute SQL to read arbitrary rows from any table in the database.
+    match_effective_permission:
+      action: "spanner.databases.read"
+      resource_type: "google.spanner.admin.database.v1.Database"
+    where:
+      - "?principal ALSO has EFFECTIVE spanner.sessions.create on the same database or instance scope"
+      - "database.state == READY"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: "<principal>"
+      target: "<Spanner Database node>"
+      permissions: ["spanner.databases.read", "spanner.sessions.create"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when both spanner.databases.read (or spanner.databases.select) and
+        spanner.sessions.create are confirmed ACTIVE effective permissions on the
+        database or enclosing instance/project scope AND the database state is READY
+        AND no VPC-SC perimeter blocks the Spanner API for the caller's network context.
+        CONDITIONAL(iam_permission) when sessions.create is uncertain or held only at a
+        broader scope that may be capped by an IAM deny policy;
+        BLOCKED when a VPC-SC perimeter enforces and the caller is outside the perimeter.
+        NOTE: If a database is encrypted with Cloud KMS CMEK and the CMEK key is DISABLED
+        or DESTROYED (not just inaccessible to the caller), the database becomes unavailable
+        and should emit BLOCKED(key_permission) with denied_by = <KMS key resource name>.
+        If the CMEK key is ENABLED and operational, the Spanner SERVICE AGENT (not the caller)
+        holds the KMS decrypt rights — the caller's CanReadData is ACTIVE if their IAM
+        permissions are satisfied. The credential-chains.yaml decrypt-gates-secret-read
+        linchpin does NOT apply to this rule.
+      false_positive_note: >-
+        BOTH permissions are required: spanner.databases.read alone does not allow
+        executing queries without a session (sessions.create), and spanner.sessions.create
+        alone does not grant data access without read permissions. The permission evaluator
+        must resolve BOTH at the effective (post-hierarchy) level: a project-level binding
+        of roles/spanner.databaseReader grants spanner.databases.select + spanner.sessions.create
+        (NOT spanner.databases.read). A project-level binding of roles/spanner.databaseUser
+        (or higher) grants spanner.databases.read + spanner.sessions.create.
+        Do NOT conflate spanner.databases.read (in roles/spanner.databaseUser and above)
+        with spanner.databases.select (read-only; in roles/spanner.databaseReader).
+        Both grant data read; the effective evaluator should emit CanReadData for either
+        when combined with sessions.create.
+        For CMEK-encrypted databases: it is the Spanner SERVICE AGENT
+        (service-PROJECT_NUMBER@gcp-sa-spanner.iam.gserviceaccount.com) that must hold
+        cloudkms.cryptoKeyVersions.useToDecrypt on the CMEK key, not the caller.
+        The caller's IAM permissions determine their own data-plane access. If the CMEK key
+        is disabled or destroyed, the database becomes inaccessible — emit BLOCKED
+        with denied_by set to the key resource. If the CMEK key is operational, emit
+        CanReadData as ACTIVE (the service agent's decrypt is transparent to the caller).
+        VPC-SC perimeters (from accesscontextmanager.yaml) that include the Spanner API
+        block callers outside the perimeter regardless of IAM — emit BLOCKED in that case.
+      narrative: >-
+        {principal.name} holds spanner.databases.read + spanner.sessions.create on
+        database {database.name}; it can open a Spanner session and execute SQL to read
+        arbitrary rows from any table in the database.
+      derived_from:
+        - "spanner.databases.read (or spanner.databases.select) effective permission on Database"
+        - "spanner.sessions.create effective permission on same scope"
+
+  # --- CanWriteData: effective data-plane write (DML mutations) ----------------
+  # spanner.databases.write + spanner.sessions.create together enable the caller to
+  # execute INSERT, UPDATE, DELETE DML statements on any table in the database.
+  # This is a high-value data-integrity and supply-chain attack path (poisoning
+  # application data, deleting audit records, corrupting critical tables).
+  # Reference: cloud.google.com/spanner/docs/iam#spanner.databases.write
+  - id: gcp-spanner-write-data
+    emits: CanWriteData
+    description: >-
+      spanner.databases.write + spanner.sessions.create together constitute effective
+      data-plane write access: the caller can open a session and execute DML (INSERT,
+      UPDATE, DELETE) statements to modify arbitrary rows in any table in the database.
+    match_effective_permission:
+      action: "spanner.databases.write"
+      resource_type: "google.spanner.admin.database.v1.Database"
+    where:
+      - "?principal ALSO has EFFECTIVE spanner.sessions.create on the same database or instance scope"
+      - "database.state == READY"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: "<principal>"
+      target: "<Spanner Database node>"
+      permissions: ["spanner.databases.write", "spanner.sessions.create"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when both spanner.databases.write and spanner.sessions.create are
+        confirmed ACTIVE effective permissions on the database or enclosing instance/project
+        scope AND the database state is READY AND no VPC-SC perimeter blocks the Spanner API
+        for the caller's network context;
+        CONDITIONAL(iam_permission) when sessions.create is uncertain or held only at a
+        broader scope that may be capped by an IAM deny policy;
+        BLOCKED when a VPC-SC perimeter enforces and the caller is outside the perimeter.
+      false_positive_note: >-
+        BOTH permissions are required: spanner.databases.write alone does not allow
+        executing DML without a session (sessions.create), and spanner.sessions.create
+        alone does not grant data write access. The permission evaluator must resolve
+        BOTH at the effective (post-hierarchy) level. spanner.databases.write is present
+        in roles/spanner.admin, roles/spanner.databaseAdmin, and roles/spanner.databaseUser
+        (and above). It enables INSERT, UPDATE, DELETE DML operations and is not available
+        in read-only roles like roles/spanner.databaseReader.
+        A principal with CanWriteData can corrupt database integrity, modify sensitive
+        application data, delete audit logs, or inject malicious data for downstream
+        consumption — this is a high-value attack path for supply-chain or data-integrity
+        attacks. VPC-SC perimeters that include the Spanner API block callers outside
+        the perimeter regardless of IAM — emit BLOCKED in that case.
+      narrative: >-
+        {principal.name} holds spanner.databases.write + spanner.sessions.create on
+        database {database.name}; it can open a Spanner session and execute DML
+        (INSERT/UPDATE/DELETE) to modify arbitrary rows in any table in the database.
+      derived_from:
+        - "spanner.databases.write effective permission on Database"
+        - "spanner.sessions.create effective permission on same scope"
+
+  # =====================================================================
+  # SECTION 2 — EXFILTRATION
+  # =====================================================================
+
+  # --- CanExfiltrate: backup creation + cross-project IAM share ---------------
+  # The standard full-database exfiltration path: create a managed backup and
+  # set its IAM policy to grant an attacker-controlled principal restore rights.
+  # spanner.backups.create (requires spanner.databases.get on the source database)
+  # + spanner.backups.setIamPolicy (available at project scope or on the backup
+  # itself) enables sharing the backup cross-project.
+  # Reference: cloud.google.com/spanner/docs/import-export
+  #            cloud.google.com/spanner/docs/reference/rest/v1/projects.instances.databases.backups
+  - id: gcp-spanner-exfiltrate-via-backup
+    emits: CanExfiltrate
+    description: >-
+      Creating a Spanner backup (spanner.backups.create) then setting the backup's
+      IAM policy (spanner.backups.setIamPolicy) to grant a cross-project principal
+      spanner.backups.restoreDatabase copies the full database contents across the
+      project boundary — effective exfiltration.
+    match_effective_permission:
+      action: "spanner.backups.create"
+      resource_type: "google.spanner.admin.instance.v1.Instance"
+    where:
+      - "?principal has EFFECTIVE spanner.databases.get on the source database (required to read the database for backup creation)"
+      - "?principal has EFFECTIVE spanner.backups.setIamPolicy on the instance or project scope (applies to backups created within that scope)"
+      - "?principal (or an identity they control in another project) can call spanner.databases.create and spanner.backups.restoreDatabase to restore the backup"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: "<principal>"
+      target: "<Spanner Database node>"
+      permissions: ["spanner.backups.create", "spanner.backups.setIamPolicy"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when spanner.backups.create on the source database and
+        spanner.backups.setIamPolicy on the instance or project scope are both
+        confirmed ACTIVE and the attacker controls a restore target (another project with
+        a database + spanner.backups.restoreDatabase grant). CONDITIONAL(iam_permission)
+        when setIamPolicy on backups is uncertain (e.g., granted only at database scope
+        but not instance/project scope, which may not propagate to a newly created backup).
+        CONDITIONAL(resource_policy) when the cross-project restore principal is unknown
+        or cannot be confirmed. POTENTIAL when the attacker is assumed to control an
+        external project but it is not modeled. BLOCKED when VPC-SC perimeter blocks the
+        Spanner API or when an org policy (e.g. constraints/gcp.resourceLocations)
+        disallows backup creation in the required region.
+      false_positive_note: >-
+        CRITICAL: spanner.backups.create requires BOTH spanner.backups.create
+        (on instance scope) AND spanner.databases.get (on the source database).
+        Without spanner.databases.get on the source database, the CreateBackup API call
+        fails with PERMISSION_DENIED. Roles are critical here: roles/spanner.backupAdmin
+        grants backups.create + backups.setIamPolicy but NOT databases.get. Only
+        roles/spanner.admin or roles/spanner.databaseAdmin grant databases.get. A
+        principal with only backupAdmin cannot create backups. Confirm the attacker
+        holds ALL THREE permissions: spanner.backups.create (instance), spanner.databases.get
+        (database), and spanner.backups.setIamPolicy (instance or project).
+        spanner.backups.create also requires the source database is in state READY and
+        the backup expiration is within the database's version retention period.
+        Without setIamPolicy on the backup, the attacker can create the backup but cannot
+        share it cross-project — downgrade to POTENTIAL(resource_policy) in that case.
+        The alternative exfiltration path (Dataflow export to GCS) is modeled in
+        /rules/derived/gcp/dataflow.yaml and cited there; do not duplicate it here.
+        For CMEK-encrypted databases, the backup inherits CMEK encryption — the restore
+        target project must have access to the same CMEK key to decrypt the restored database.
+      narrative: >-
+        {principal.name} can create a backup of database {database.name}
+        (spanner.backups.create) and set the backup's IAM policy
+        (spanner.backups.setIamPolicy) to grant a cross-project principal restore access,
+        copying the full database contents across the project boundary.
+      derived_from:
+        - "spanner.backups.create effective permission on Instance scope"
+        - "spanner.backups.setIamPolicy effective permission on Instance or Project scope"
+        - "spanner.databases.get effective permission on the source Database"
+
+  # =====================================================================
+  # SECTION 3 — IAM GRANT ESCALATION
+  # =====================================================================
+
+  # --- CanGrantPermission: setIamPolicy on a database (database-scope only) -------
+  # spanner.databases.setIamPolicy is the primary IAM escalation primitive at the
+  # database scope. It allows the attacker to grant roles/spanner.databaseAdmin (which
+  # includes full data read/write + further setIamPolicy) to themselves or any other
+  # principal on that specific database.
+  # Reference: cloud.google.com/spanner/docs/iam#roles
+  - id: gcp-spanner-set-iam-policy
+    emits: CanGrantPermission
+    description: >-
+      spanner.databases.setIamPolicy lets a principal grant any role on a specific
+      database to any principal, including itself — self-granting roles/spanner.databaseAdmin
+      yields full data-plane access plus further IAM mutation rights on that database.
+    match_effective_permission:
+      action: "spanner.databases.setIamPolicy"
+      resource_type: "google.spanner.admin.database.v1.Database"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<any principal (self-grant or other)>"
+      permissions: ["spanner.databases.setIamPolicy"]
+      conditions: [iam_permission, deny_assignment, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when spanner.databases.setIamPolicy is confirmed as an ACTIVE effective
+        permission on the database scope and no org policy or IAM deny policy blocks
+        IAM mutations;
+        CONDITIONAL(scp_or_org_policy) if an org policy restricts IAM policy modifications;
+        BLOCKED when an IAM deny policy (resourcemanager.projects.setIamPolicy deny or
+        spanner.databases.setIamPolicy deny) explicitly denies the action. Reference
+        /rules/derived/gcp/iam-deny.yaml for deny-policy modeling.
+      false_positive_note: >-
+        spanner.databases.setIamPolicy is present in roles/spanner.admin (project scope)
+        and roles/spanner.databaseAdmin (instance or database scope). It allows modifying
+        the Cloud IAM policy of the database resource. This is a self-escalation path:
+        the attacker self-grants roles/spanner.databaseAdmin, which itself includes
+        spanner.databases.setIamPolicy, spanner.databases.read, spanner.databases.select,
+        spanner.databases.write, and spanner.sessions.create — yielding full data-plane
+        access plus further IAM mutations.
+        spanner.instances.setIamPolicy is a separate, broader permission modeled in a
+        separate rule (gcp-spanner-set-iam-policy-instance). Do NOT conflate the two —
+        database-scope setIamPolicy does not grant instance-level IAM mutation.
+        VPC-SC perimeters do not block IAM mutations (IAM is not part of the Spanner
+        service perimeter scope); only Spanner DATA API calls are blocked.
+      narrative: >-
+        {principal.name} holds spanner.databases.setIamPolicy on database {database.name}
+        and can grant itself or any principal roles/spanner.databaseAdmin, gaining full
+        read/write data access and further IAM mutation rights on that database.
+      derived_from:
+        - "spanner.databases.setIamPolicy effective permission on Database"
+
+  # --- CanGrantPermission: setIamPolicy on an instance (instance-scope) -----------
+  # spanner.instances.setIamPolicy is broader than database-scope setIamPolicy: it
+  # grants IAM mutation rights at the INSTANCE scope, affecting ALL databases within
+  # that instance simultaneously. This is a higher-value escalation primitive.
+  # Reference: cloud.google.com/spanner/docs/iam#roles
+  - id: gcp-spanner-set-iam-policy-instance
+    emits: CanGrantPermission
+    description: >-
+      spanner.instances.setIamPolicy lets a principal grant any instance-level role
+      to any principal, including itself. This affects ALL databases within the instance
+      — a broader blast radius than database-scope setIamPolicy.
+    match_effective_permission:
+      action: "spanner.instances.setIamPolicy"
+      resource_type: "google.spanner.admin.instance.v1.Instance"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<any principal (self-grant or other)>"
+      permissions: ["spanner.instances.setIamPolicy"]
+      conditions: [iam_permission, deny_assignment, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when spanner.instances.setIamPolicy is confirmed as an ACTIVE effective
+        permission on the instance scope and no org policy or IAM deny policy blocks
+        IAM mutations;
+        CONDITIONAL(scp_or_org_policy) if an org policy restricts IAM policy modifications;
+        BLOCKED when an IAM deny policy (resourcemanager.projects.setIamPolicy deny or
+        spanner.instances.setIamPolicy deny) explicitly denies the action. Reference
+        /rules/derived/gcp/iam-deny.yaml for deny-policy modeling.
+      false_positive_note: >-
+        spanner.instances.setIamPolicy is present in roles/spanner.admin and
+        roles/spanner.instanceAdmin. Unlike database-scope setIamPolicy, this permission
+        applies to the entire instance and grants IAM mutation rights over ALL databases
+        in the instance simultaneously. Self-granting roles/spanner.admin at the instance
+        scope yields maximum privilege for all databases in the instance.
+        This is a higher-value escalation than database-scope setIamPolicy.
+      narrative: >-
+        {principal.name} holds spanner.instances.setIamPolicy on instance {instance.name}
+        and can grant itself or any principal instance-level roles (e.g., roles/spanner.instanceAdmin,
+        roles/spanner.databaseAdmin at instance scope), affecting all {count} databases in
+        the instance. Note: only roles grantable at instance scope are accessible;
+        project-level roles like roles/spanner.admin cannot be granted at instance scope IAM.
+      derived_from:
+        - "spanner.instances.setIamPolicy effective permission on Instance"
+
+# ---------------------------------------------------------------------------
+# BLOCKED-EDGE GUIDANCE:
+#   - A VPC-SC perimeter that includes the Spanner API enforces source-IP /
+#     VPN / service-account membership checks for DATA API calls; callers outside
+#     the perimeter receive 403 PERMISSION_DENIED -> emit CanReadData and
+#     CanExfiltrate edges as BLOCKED(resource_policy) with
+#     denied_by = <perimeter resource name>.
+#     Note: IAM setIamPolicy calls are NOT blocked by VPC-SC (IAM is not a
+#     Spanner API call); CanGrantPermission edges are NOT BLOCKED by VPC-SC.
+#   - An IAM deny policy explicitly denying spanner.databases.setIamPolicy ->
+#     CanGrantPermission BLOCKED(denied_by = <deny-policy resource name>).
+#   - A CMEK key in DISABLED or DESTROYED state -> the database becomes
+#     inaccessible even with valid IAM; emit CanReadData BLOCKED(key_permission)
+#     with denied_by = <KMS key resource name> when confirmed.
+#   - Org policy constraints/gcp.resourceLocations restricting Spanner regions
+#     may block backup creation in certain regions -> CanExfiltrate
+#     BLOCKED(scp_or_org_policy) if the backup target region is disallowed.
+#
+# LINCHPIN CROSS-REFERENCES (edges this file emits feed into):
+#   * gcp-spanner-read-data (CanReadData) — Does NOT directly feed credential-chains.yaml
+#     read-secret-yields-identity (which matches CanReadSecret, not CanReadData). Analyst-
+#     tagged ContainsSecret(database -> Secret) edges must be combined with CanReadData at
+#     graph query time to infer credential exposure. If credential-chains rules are extended
+#     to support CanReadData as a trigger, this comment should be updated.
+#   * gcp-spanner-set-iam-policy (CanGrantPermission on database) ->
+#     Self-grant escalation: CanGrantPermission(principal, ?database) enables the caller
+#     to grant themselves roles/spanner.databaseAdmin. A separate rule (gcp-spanner-database-admin,
+#     NOT YET IMPLEMENTED) should detect the effective databaseAdmin role and emit
+#     CanAdminister(principal, database). The can-control.yaml control-via-admin rule would
+#     then fire to emit Controls. Until that rule exists, the CanGrantPermission edge is
+#     present but the Controls derivation is incomplete.
+#   * gcp-spanner-set-iam-policy-instance (CanGrantPermission on instance) ->
+#     Higher-value self-grant escalation: CanGrantPermission(principal, ?instance)
+#     affects all databases. Instance scope is NOT an AdministrativeBoundary in the
+#     taxonomy (only Project/Folder/Org are), so control-boundary-via-iam-admin does not
+#     apply. Same CanAdminister gap: no rule currently emits CanAdminister from instance-scope
+#     role effectiveness.
+#   * gcp-spanner-exfiltrate-via-backup (CanExfiltrate) — terminal data exfil
+#     path; no further linchpin derivation required.
+# ---------------------------------------------------------------------------
+

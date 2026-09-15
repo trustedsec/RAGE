@@ -1,0 +1,328 @@
+# Azure VM Scale Sets (VMSS) — Compute execution rules (Phase 4)
+# ---------------------------------------------------------------------------
+# Catalog key: azure:vmss. Generic type: VirtualMachine.
+# A VMSS runs as a managed identity (system- and/or user-assigned). Every
+# code-execution primitive on the fleet or an instance yields that MI's token
+# via IMDS -> CanExecuteAs(MI). Permissions are exact Microsoft.Compute /
+# Microsoft.ManagedIdentity resource-provider operations verified against
+# learn.microsoft.com.
+#
+# Scope discipline: every effective-permission match records the ARM scope the
+# action must apply at (scale set resource, or MG/sub/RG inheriting down). A
+# CONDITIONAL input can never yield an ACTIVE output. Deny assignments -> BLOCKED.
+# Only edge type names from schema/edges.yaml are used.
+#
+# State model: per schema/edges.yaml an edge instance carries a `state` enum plus
+# a machine-readable `conditions: [condition_types]` list; there is no schema
+# `state_logic` field. The ACTIVE-vs-CONDITIONAL determination is therefore
+# encoded via conditions:[service_state] (etc.) on the derived edges so the engine
+# can compute state. Any `state_logic:` string that remains is a human annotation
+# only and must NOT be the sole carrier of the state determination.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 4-compute-serverless
+applies_to: [azure]
+
+rules:
+
+  # === Execution identity (explicit fact from the model) ====================
+  - id: azure-vmss-executes-as
+    emits: ExecutesAs
+    match_record: {resource_type: "Microsoft.Compute/virtualMachineScaleSets", field: "identity"}
+    where: ["identity.type includes SystemAssigned OR identity.userAssignedIdentities is non-empty"]
+    emit:
+      source_type: Compute
+      source: "<vmss instance / scale set compute node>"
+      target: "<managed identity from identity block>"
+      api_source: "Microsoft.Compute/virtualMachineScaleSets/read"
+      evidence_field: "identity.type / identity.userAssignedIdentities"
+      false_positive_note: "If identity.type is None (no MI), emit nothing; code execution then yields only host access, not CanExecuteAs."
+      narrative: "{compute.name} executes as managed identity {identity.name} (scale-set identity block)."
+
+  # === Code modification via model extension ================================
+  - id: azure-vmss-extension-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachineScaleSets/extensions/write", scope_type: "resource|resourceGroup|subscription|mg"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<scale set>"
+      permissions: ["Microsoft.Compute/virtualMachineScaleSets/extensions/write"]
+      escalation: "Add/replace a CustomScript or RunCommand model extension that runs attacker code on every instance as the scale-set MI."
+      false_positive_note: "Auto-detonation depends on the upgrade policy: on a fleet with upgradePolicy.mode=Automatic or extension enableAutomaticUpgrade the extension applies to existing instances without any further attacker action (strongest primitive); otherwise it requires a reimage / rolling-upgrade / new-instance lever to apply on existing instances (new instances get it automatically). Azure Policy may deny specific extension types (e.g. CustomScript); if a matching deny policy applies, emit BLOCKED."
+      narrative: "{principal.name} can write a model extension on {vmss.name} (virtualMachineScaleSets/extensions/write), running code on every instance."
+
+  # === Code / config modification via model write ==========================
+  - id: azure-vmss-model-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachineScaleSets/write", scope_type: "resource|resourceGroup|subscription|mg"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<scale set>"
+      permissions: ["Microsoft.Compute/virtualMachineScaleSets/write"]
+      conditions: [service_state]
+      escalation: "Rewrite the model extensionProfile / osProfile.customData (cloud-init) / userData, then reimage or roll upgrade to detonate as the MI."
+      false_positive_note: "Model write is NOT self-detonating: the CanModifyCode edge is CONDITIONAL(service_state) until an upgrade/reimage/new-instance applies the changed model. Without a reimage/osRollingUpgrade/start/capacity lever (or upgradePolicy.mode=Automatic) it does not run on existing instances. Weaker than extensions/write on an auto-upgrade fleet."
+      narrative: "{principal.name} can rewrite the model of {vmss.name} (virtualMachineScaleSets/write) to run attacker code on instances."
+
+  - id: azure-vmss-model-write-config
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachineScaleSets/write", scope_type: "resource|resourceGroup|subscription|mg"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<scale set>"
+      permissions: ["Microsoft.Compute/virtualMachineScaleSets/write"]
+      note: "Same permission also changes the identity binding (enable system-assigned / attach user-assigned) and upgrade policy."
+      narrative: "{principal.name} can change the configuration of {vmss.name} (virtualMachineScaleSets/write), including its identity binding."
+
+  # === Command execution on an instance ====================================
+  - id: azure-vmss-run-command
+    emits: CanExecuteCommand
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachineScaleSets/virtualMachines/runCommand/action", scope_type: "resource|resourceGroup|subscription|mg"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<scale set instance>"
+      permissions: ["Microsoft.Compute/virtualMachineScaleSets/virtualMachines/runCommand/action"]
+      conditions: [service_state]
+      escalation: "Run an arbitrary script on an instance as the scale-set MI (SYSTEM/root), then read its IMDS token."
+      false_positive_note: "Execution requires the target instance to be running with a healthy/provisioned VM agent; on a stopped or deallocated instance (or one without a responsive agent) the edge is CONDITIONAL(service_state) and only realizes once the instance is started (see azure-vmss-start / azure-vmss-execute-as-via-command state gating). Azure Policy can restrict run-command; deny -> BLOCKED. Only meaningful for escalation if the fleet has an MI (see IMDS rule)."
+      narrative: "{principal.name} can run commands on instance {instance.name} of {vmss.name} (virtualMachineScaleSets/virtualMachines/runCommand/action)."
+
+  # === Instance-level write (single instance model override) ===============
+  - id: azure-vmss-instance-write
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachineScaleSets/virtualMachines/write", scope_type: "resource|resourceGroup|subscription|mg"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<scale set instance>"
+      permissions: ["Microsoft.Compute/virtualMachineScaleSets/virtualMachines/write"]
+      false_positive_note: "Per-instance write does not add an extension by itself; pair with extension/runCommand for execution. Primarily meaningful in Flexible orchestration mode; under Uniform orchestration per-instance model overrides are limited."
+      narrative: "{principal.name} can modify instance {instance.name} of {vmss.name} (virtualMachineScaleSets/virtualMachines/write)."
+
+  # === Identity attachment (PassRole analog: two permissions) ==============
+  - id: azure-vmss-assign-user-mi
+    emits: CanPassIdentity
+    match_effective_permission: {action: "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", scope_type: "resource (the target MI)"}
+    where: ["principal also has Microsoft.Compute/virtualMachineScaleSets/write on the scale set (or create) to bind the MI"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Compute/virtualMachineScaleSets/write"]
+      conditions: [role_compatibility, iam_permission]
+      note: "Pairs with VMSS write -> CanAttachIdentity -> CanExecuteAs(MI). This is the Azure PassRole analog."
+      false_positive_note: "Contributor / Virtual Machine (Scale Set) Contributor do NOT include the assign/action; only Managed Identity Operator (or a custom role) grants it. Without it, VMSS write cannot attach a user-assigned MI."
+      narrative: "{principal.name} can assign user-assigned MI {mi.name} (userAssignedIdentities/assign/action) and bind it to a scale set it can write."
+
+  - id: azure-vmss-attach-identity
+    emits: CanAttachIdentity
+    description: "assign/action on an MI + VMSS write => can attach/replace the identity the fleet runs as."
+    match:
+      - [ ?principal, CanPassIdentity, ?mi ]
+    where:
+      - "?principal has effective Microsoft.Compute/virtualMachineScaleSets/write on ?vmss"
+      - "?mi is a user-assigned managed identity assignable to compute"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<scale set>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Compute/virtualMachineScaleSets/write"]
+      note: "Chains to CanExecuteAs(mi) once instances refresh (see azure-vmss-execute-as-via-attach-identity)."
+      narrative: "{principal.name} can attach managed identity {mi.name} to {vmss.name} and thereby run code as it."
+
+  # === Credential / token exposure via IMDS ================================
+  - id: azure-vmss-imds-token
+    emits: CanRetrieveToken
+    description: "Any code-exec primitive on a fleet that has an MI yields that MI's token from IMDS."
+    match:
+      - [ ?vmss_instance, ExecutesAs, ?mi ]
+    optional:
+      - [ ?principal, CanExecuteCommand, ?vmss_instance ]
+      - [ ?principal, CanModifyCode, ?vmss ]
+    where:
+      - "?principal has code execution on the instance/fleet (CanExecuteCommand OR CanModifyCode)"
+    emit:
+      source: "<principal / instance>"
+      target: "<managed identity>"
+      permissions: ["(in-guest) GET http://169.254.169.254/metadata/identity/oauth2/token"]
+      conditions: [service_state]
+      note: "IMDS is link-local, credential-free, reachable from any running instance."
+      false_positive_note: "Only emit when the fleet actually has a managed identity (ExecutesAs present) AND the principal has an execution primitive; no MI => no token payoff."
+      narrative: "{principal.name} can retrieve a token for managed identity {mi.name} from IMDS on {vmss.name} instances."
+
+  - id: azure-vmss-exposes-credential
+    emits: ExposesCredential
+    match:
+      - [ ?vmss, ExecutesAs, ?mi ]
+    emit:
+      source: "<scale set>"
+      target: "<managed identity>"
+      note: "The fleet exposes the MI credential to any code running on its instances (via IMDS)."
+      narrative: "{vmss.name} exposes managed-identity {mi.name} credentials to code on its instances."
+
+  # === Derived execution-as (the canonical escalation edge) ================
+  - id: azure-vmss-execute-as-via-code
+    emits: CanExecuteAs
+    description: "Modify the fleet's code/config + it executes as an MI => execute as that MI."
+    match:
+      - [ ?principal, CanModifyCode, ?vmss ]
+      - [ ?vmss_instance, ExecutesAs, ?mi ]
+    optional:
+      - [ ?principal, CanModifyConfiguration, ?vmss ]
+    where:
+      - "?vmss_instance is an instance of ?vmss"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      permissions: ["Microsoft.Compute/virtualMachineScaleSets/extensions/write | virtualMachineScaleSets/write"]
+      conditions: [service_state]
+      state_logic: "ACTIVE if attacker also holds reimage/osRollingUpgrade/start/capacity (new or refreshed instances run the code) else CONDITIONAL(service_state). Encoded via conditions:[service_state] so the engine computes state from the schema-defined condition rather than this prose field; state_logic is retained only as an annotation and should not be relied on if the engine ignores non-schema fields."
+      conditions_from: [ ?vmss, ?mi ]
+      false_positive_note: "Model/extension change is inert until an instance runs it; extension write on a running fleet with auto-upgrade applies sooner than plain model write. Require an MI to exist."
+      narrative: "{principal.name} can modify the code/model of {vmss.name}, which executes as {mi.name}, thereby executing as {mi.name}."
+
+  - id: azure-vmss-execute-as-via-command
+    emits: CanExecuteAs
+    description: "Run-command on an instance that executes as an MI => execute as that MI."
+    match:
+      - [ ?principal, CanExecuteCommand, ?vmss_instance ]
+      - [ ?vmss_instance, ExecutesAs, ?mi ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      permissions: ["Microsoft.Compute/virtualMachineScaleSets/virtualMachines/runCommand/action"]
+      conditions: [service_state]
+      state_logic: "ACTIVE if the target instance is running else CONDITIONAL(service_state). Encoded via conditions:[service_state] so the engine computes state from the schema-defined condition; state_logic is retained only as an annotation."
+      conditions_from: [ ?vmss_instance, ?mi ]
+      narrative: "{principal.name} can run commands on {instance.name}, which executes as {mi.name}, thereby executing as {mi.name}."
+
+  - id: azure-vmss-execute-as-via-attach-identity
+    emits: CanExecuteAs
+    description: "Attach a chosen MI to the fleet + drive instance refresh => execute as the attached MI."
+    match:
+      - [ ?principal, CanAttachIdentity, ?vmss ]
+    where:
+      - "?principal can cause an instance to (re)boot the model: reimage/osRollingUpgrade/start/action OR capacity increase via virtualMachineScaleSets/write"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<attached managed identity>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Compute/virtualMachineScaleSets/write"]
+      conditions: [service_state, role_compatibility]
+      state_logic: "ACTIVE if attacker holds reimage/upgrade/start/capacity else CONDITIONAL(service_state). Encoded via conditions:[service_state] so the engine computes state from the schema-defined condition; state_logic is retained only as an annotation."
+      escalation: "Bind an arbitrary user-assigned MI to the fleet, refresh instances, then read its token."
+      narrative: "{principal.name} can attach MI {mi.name} to {vmss.name} and refresh instances, executing as {mi.name}."
+
+  # === Trigger / instance creation ==========================================
+  - id: azure-vmss-capacity-trigger
+    emits: CanTrigger
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachineScaleSets/write", scope_type: "resource|resourceGroup|subscription|mg"}
+    emit:
+      target_type: Compute
+      source: "<principal>"
+      target: "<scale set>"
+      permissions: ["Microsoft.Compute/virtualMachineScaleSets/write"]
+      note: "Increasing capacity (or setting an autoscale profile) creates new instances that boot the model and assume the MI - detonates poisoned config."
+      narrative: "{principal.name} can raise capacity of {vmss.name} (virtualMachineScaleSets/write), forcing new instances to boot the model as its MI."
+
+  - id: azure-vmss-start
+    emits: CanStart
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachineScaleSets/start/action", scope_type: "resource|resourceGroup|subscription|mg"}
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<scale set>"
+      permissions: ["Microsoft.Compute/virtualMachineScaleSets/start/action"]
+      note: "Realizes CONDITIONAL(service_state) execution edges by bringing stopped instances online."
+      narrative: "{principal.name} can start {vmss.name} (virtualMachineScaleSets/start/action)."
+
+  - id: azure-vmss-reimage
+    emits: CanTrigger
+    match_effective_permission: {action: "Microsoft.Compute/virtualMachineScaleSets/reimage/action", scope_type: "resource|resourceGroup|subscription|mg"}
+    emit:
+      target_type: Compute
+      source: "<principal>"
+      target: "<scale set>"
+      permissions: ["Microsoft.Compute/virtualMachineScaleSets/reimage/action"]
+      note: "Reimage/osRollingUpgrade re-applies the (poisoned) model to already-running instances - it causes the target to (re)execute the model, so this is a CanTrigger (detonation) semantic, NOT a power-on-a-stopped-fleet CanStart. Modeled as CanTrigger so path scoring does not conflate reimage with starting a deallocated fleet; it realizes CONDITIONAL(service_state) execution edges (azure-vmss-execute-as-via-code) by re-applying poisoned model/extension writes."
+      narrative: "{principal.name} can reimage {vmss.name} (virtualMachineScaleSets/reimage/action), re-applying the model to running instances and detonating poisoned model/extension writes."
+
+  # === Cross-boundary roll-up ==============================================
+  - id: azure-vmss-mi-enter-subscription
+    emits: CanEnterSubscription
+    description: "Executing as the fleet MI grants whatever RBAC that MI holds."
+    match:
+      - [ ?principal, CanExecuteAs, ?mi ]
+    where:
+      - "?mi has an effective role assignment (e.g. Contributor/Owner) at subscription or RG scope"
+    emit:
+      source_type: Identity
+      target_type: Subscription
+      source: "<principal>"
+      target: "<subscription>"
+      permissions: ["(inherited from MI's role assignments)"]
+      note: "If the fleet MI holds Owner or User Access Administrator, executing as it also yields CanGrantPermission/CanModifyPolicy (Microsoft.Authorization/roleAssignments/write) - self-grant to any role at that scope, the highest-impact continuation. If the MI holds Entra directory roles or Graph app roles it can further reach CanEnterTenant. Those onward edges are produced by the identity ruleset (cross-reference it) rather than here, so this chain is not silently truncated at subscription scope."
+      false_positive_note: "Only emit if the MI actually holds RBAC at sub/RG scope; a scoped MI with only data-plane access does not grant subscription entry."
+      narrative: "{principal.name}, by executing as {mi.name}, inherits its subscription-scoped RBAC and gains control-plane access to {subscription.name}."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: any action above covered by an applicable deny
+# assignment, or an extension/run-command type denied by Azure Policy, is
+# emitted with state: BLOCKED and denied_by=<deny assignment / policy>, so the
+# UI can explain why an otherwise-present execution path does not work.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw config -> explicit edges) belong in
+# /rules/explicit/ alongside aws-lambda.yaml. The ExecutesAs / AttachedTo /
+# ContainsSecret facts for VMSS are listed here for reference; a dedicated
+# rules/explicit/azure-vmss.yaml should carry them if the collector emits raw
+# records rather than pre-normalized edges.
+explicit_rules:
+
+  - id: azure-vmss-executes-as-explicit
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record: {resource_type: "Microsoft.Compute/virtualMachineScaleSets", field: "identity"}
+    emit:
+      source: "<scale set / instance node>"
+      target: "<managed identity from identity.userAssignedIdentities or system-assigned principalId>"
+      api_source: "Microsoft.Compute/virtualMachineScaleSets/read"
+      evidence_field: "identity"
+      narrative: "{vmss.name} executes as {identity.name}."
+
+  - id: azure-vmss-mi-attached-explicit
+    emits: AttachedTo
+    applies_to: [azure]
+    match_record: {resource_type: "Microsoft.Compute/virtualMachineScaleSets", field: "identity.userAssignedIdentities"}
+    emit:
+      source: "<managed identity>"
+      target: "<scale set>"
+      api_source: "Microsoft.Compute/virtualMachineScaleSets/read"
+      evidence_field: "identity.userAssignedIdentities"
+      narrative: "{mi.name} is attached to scale set {vmss.name}."
+
+  - id: azure-vmss-customdata-secret-explicit
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record: {resource_type: "Microsoft.Compute/virtualMachineScaleSets", field: "virtualMachineProfile.osProfile.customData"}
+    where: ["customData / userData / extension protectedSettings contain credential-like material"]
+    emit:
+      source: "<scale set>"
+      target: "<embedded secret>"
+      api_source: "Microsoft.Compute/virtualMachineScaleSets/read"
+      false_positive_note: "protectedSettings are write-only in most API responses; treat as POTENTIAL unless customData/userData is readable and contains a credential."
+      narrative: "{vmss.name} model embeds a secret in customData/userData/protectedSettings."

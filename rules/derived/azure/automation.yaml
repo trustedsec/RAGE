@@ -1,0 +1,1088 @@
+# Azure — Automation (Microsoft.Automation) derived attack-path rules (Phase 9)
+# ---------------------------------------------------------------------------
+# PHASE-9 SERVICE ADAPTER: Azure Automation is a CI/CD-style orchestration service.
+# Runbooks are the "build definitions" (PowerShell / Python scripts); jobs are the
+# execution instances; the Automation Account's managed identity is the "service
+# identity" the runner executes as. This file emits the NORMALIZED FACTS that
+# cicd-chains.yaml, can-execute-as.yaml, and can-control.yaml consume to produce
+# the full escalation and cross-boundary roll-ups. Do NOT re-derive those roll-ups
+# here — CITE the linchpins.
+#
+# KEY ATTACK SURFACE (verified against Microsoft.Automation ops ref, 2026-09):
+#   (a) RUNBOOK WRITE + JOB WRITE  (the headline path):
+#       Microsoft.Automation/automationAccounts/runbooks/write  — overwrite runbook code
+#       Microsoft.Automation/automationAccounts/runbooks/publish/action — publish draft
+#       Microsoft.Automation/automationAccounts/jobs/write       — start a job
+#       Together = import arbitrary PowerShell/Python, publish, run as the MI.
+#       cicd-chains cicd-modify-buildspec-executes-as collapses
+#         CanModifyCode(runbook) + ExecutesAs(account, MI) => CanExecuteAs.
+#
+#   (b) MODULE SUPPLY-CHAIN:
+#       Microsoft.Automation/automationAccounts/modules/write — upload a malicious
+#       PowerShell module that existing runbooks Import-Module at runtime.
+#       CanModifyCode on the runbook (via the module path) + ExecutesAs => CanExecuteAs
+#       — cicd-chains fires, CONDITIONAL on an existing runbook importing the module.
+#
+#   (c) HYBRID RUNBOOK WORKER RCE:
+#       jobs/write with runOn=<HybridWorkerGroup> sends the runbook to an on-prem/Azure
+#       VM and executes it as LOCAL SYSTEM (or a stored credential). This is DIRECT
+#       CanExecuteCommand on the VirtualMachine node, NOT a sandbox MI-token path.
+#       can-execute-as execute-as-via-command then collapses:
+#         CanExecuteCommand(principal, worker-VM) + ExecutesAs(worker-VM, MI) => CanExecuteAs.
+#
+#   (d) LEGACY RunAs:
+#       Automation Account may store a RunAs Service Principal connection (certificate).
+#       Running any runbook in the sandbox exposes Get-AutomationConnection, which
+#       returns the SP cert → authenticate as the RunAs SP. ExposesCredential.
+#
+# LINCHPINS CITED (not re-derived here):
+#   cicd-chains     cicd-modify-buildspec-executes-as (rule 1): CanModifyCode(runner) +
+#                   ExecutesAs => CanExecuteAs.
+#   cicd-chains     cicd-trigger-runner-executes-as (rule 2): CanTrigger(runner) +
+#                   ExecutesAs => CanExecuteAs (CONDITIONAL, weaker).
+#   can-execute-as  execute-as-via-code-modify (provider-agnostic fallback, dedupes).
+#   can-execute-as  execute-as-via-command: CanExecuteCommand + ExecutesAs => CanExecuteAs.
+#   can-control     escalate-via-execute-as: CanExecuteAs => CanEscalateTo.
+#   credential-chains read-secret-yields-identity: CanReadSecret(cred) + CredentialsFor
+#                   => CanImpersonate.
+#
+# STATE DEFAULTS:
+#   ACTIVE when all required operations are held AND a run path exists (job-start or
+#     a trigger/schedule the code modification arms).
+#   CONDITIONAL(trigger_exists) when code can be modified but no job-start or
+#     established trigger is confirmed (a schedule/webhook may fire later).
+#   CONDITIONAL(service_state) when the Hybrid Worker Group has no registered workers.
+#   BLOCKED when a deny assignment covers the critical action at effective scope.
+#   POTENTIAL when the runbook-write + job-write combination is possible but the
+#     principal's effective permissions are not confirmed (e.g., custom role unknown).
+#
+# All operation strings from the official Microsoft.Automation resource-provider
+# operations reference. No hallucinated permissions.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 9-cicd-pipelines
+applies_to: [azure]
+
+rules:
+
+  # ===========================================================================
+  # 1. Administrative control over the Automation Account
+  # ===========================================================================
+
+  - id: azure-auto-account-contributor
+    emits: CanAdminister
+    description: "Full control of an Automation Account (Automation Contributor / Contributor / Owner)."
+    match_effective_permission:
+      action: "Microsoft.Automation/automationAccounts/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Automation Contributor, Contributor, Owner, or a custom role granting Microsoft.Automation/automationAccounts/* at the scope"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<automationAccount in scope>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/write"
+      conditions: []
+      state_logic: "ACTIVE when the effective permission is confirmed; BLOCKED if a deny assignment covers automationAccounts/write at the scope. CanAdminister(account) does NOT imply CanGrantPermission — escalation is via the account's managed identity (or RunAs SP), not via self role-assignment or Microsoft.Authorization/*/write."
+      confidence: 0.98
+      derived_from: ["effective permission: Microsoft.Automation/automationAccounts/write"]
+      false_positive_note: >-
+        automationAccounts/* grants control of the account, runbooks, jobs, modules, credentials,
+        variables, and the identity block, but NOT Microsoft.Authorization/*/write. Escalation
+        is via the account's managed identity (or RunAs SP), not via self role-assignment.
+        Automation Operator and Automation Job Operator do NOT grant runbooks/write; they are
+        narrower and do not qualify for CanAdminister.
+      narrative: >-
+        {principal.name} has full control of Automation Account {target.name}
+        (Microsoft.Automation/automationAccounts/*) including runbooks, jobs, credentials, and
+        the managed-identity block.
+
+  # ===========================================================================
+  # 2. Code modification primitives (→ CanModifyCode, consumed by cicd-chains rule 1)
+  # ===========================================================================
+
+  # --- 2a. Runbook write: the primary code-injection primitive ---------------
+  - id: azure-auto-runbook-write
+    emits: CanModifyCode
+    description: "Overwrite or create a runbook (PowerShell/Python) in an Automation Account; content executes as the account MI on next job."
+    match_effective_permission:
+      any_of:
+        - action: "Microsoft.Automation/automationAccounts/runbooks/write"
+          scope_type: "resource|resourceGroup|subscription"
+        - action: "Microsoft.Automation/automationAccounts/runbooks/draft/write"
+          scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds the runbook write action at the automationAccount scope"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<runbook (BuildWorker) in the automationAccount>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/runbooks/write"
+        - "Microsoft.Automation/automationAccounts/runbooks/draft/write"
+      conditions: [service_state, trigger_exists]
+      state_logic: >-
+        ACTIVE when principal also holds automationAccounts/jobs/write (confirmed run path)
+        AND the account is not suspended. CONDITIONAL(trigger_exists) when runbook-write is
+        confirmed but jobs/write is absent — code is planted but requires an existing schedule,
+        webhook, or a different principal to start a job. CONDITIONAL(service_state) if the
+        account is suspended. Publishing a draft requires automationAccounts/runbooks/publish/action
+        in addition to draft/write (full runbooks/write includes publish implicitly).
+        BLOCKED if a deny assignment covers runbooks/write at the scope.
+      confidence: 0.97
+      derived_from:
+        - "effective permission: Microsoft.Automation/automationAccounts/runbooks/write OR runbooks/draft/write"
+        - "cicd-chains.yaml: cicd-modify-buildspec-executes-as"
+      false_positive_note: >-
+        runbooks/write alone does NOT start a job; publishing (runbooks/publish/action) and
+        job creation (jobs/write) are separate operations. Draft/write requires publish/action
+        as an additional step before the draft becomes the active runbook version. Without
+        jobs/write or an existing trigger/schedule that fires the modified runbook, this is
+        CONDITIONAL(trigger_exists), not ACTIVE. Automation Operator holds jobs/write but NOT
+        runbooks/write; Automation Job Operator holds jobs/write but NOT runbooks/write.
+        The full code-execution chain requires both runbooks/write AND jobs/write (or an
+        existing automated trigger); confirm both before marking ACTIVE.
+      narrative: >-
+        {principal.name} can overwrite or create runbook code in Automation Account
+        {target.name} (automationAccounts/runbooks/write); the content is arbitrary
+        PowerShell/Python that executes as the account's managed identity on the next job.
+        cicd-chains cicd-modify-buildspec-executes-as collapses this with ExecutesAs to
+        CanExecuteAs(managed identity) when a run path exists.
+
+  # --- 2b. Module write: supply-chain code injection -------------------------
+  - id: azure-auto-module-write
+    emits: CanModifyCode
+    description: "Upload a malicious PowerShell module or Python package to an Automation Account; existing runbooks that Import-Module/import it execute the injected code as the account MI."
+    match_effective_permission:
+      any_of:
+        - action: "Microsoft.Automation/automationAccounts/modules/write"
+          scope_type: "resource|resourceGroup|subscription"
+        - action: "Microsoft.Automation/automationAccounts/python2Packages/write"
+          scope_type: "resource|resourceGroup|subscription"
+        - action: "Microsoft.Automation/automationAccounts/python3Packages/write"
+          scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "at least one existing runbook in the account imports the module by name (or imports all modules from the gallery implicitly)"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<runbook (BuildWorker) that imports the module>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/modules/write"
+        - "Microsoft.Automation/automationAccounts/python2Packages/write"
+        - "Microsoft.Automation/automationAccounts/python3Packages/write"
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) when a runbook is known to Import-Module the poisoned
+        module but no current trigger/schedule fires it for the attacker; ACTIVE when an
+        existing schedule or webhook already runs the consuming runbook without attacker
+        action. If no runbook in the account imports the affected module, do not emit —
+        the supply-chain injection has no consumer. BLOCKED if deny assignment covers
+        modules/write.
+      confidence: 0.80
+      derived_from:
+        - "effective permission: Microsoft.Automation/automationAccounts/modules/write (or python2/3Packages/write)"
+        - "cicd-chains.yaml: cicd-modify-buildspec-executes-as (module is the definition the runner executes)"
+      false_positive_note: >-
+        Only emit when a runbook in the account actually imports the module name being
+        poisoned. A module upload with no consuming runbook is not a CanModifyCode edge.
+        The attacker must be able to shadow or replace an existing module (matching the
+        name the runbook imports); uploading a completely new, unimported module has no
+        execution path. Confidence 0.80 (lower than direct runbook-write) because the
+        supply-chain path requires an existing consumer and an established trigger.
+      narrative: >-
+        {principal.name} can upload a malicious PowerShell/Python module to Automation
+        Account {target.name} (automationAccounts/modules/write); if an existing runbook
+        imports this module by name, the injected code executes as the account's managed
+        identity on the next job trigger.
+
+  # --- 2c. Source control write: repo repoint injection ----------------------
+  - id: azure-auto-sourcecontrol-write
+    emits: CanModifyCode
+    description: "Repoint the Automation Account's source control sync to an attacker-controlled repository; runbook code is replaced at next sync."
+    match_effective_permission:
+      action: "Microsoft.Automation/automationAccounts/sourceControls/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "account has source control sync enabled (sourceControls collection is non-empty, or attacker creates a new sourceControl entry)"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<runbook(s) (BuildWorker) synced from the source control>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/sourceControls/write"
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) — code is injected at the NEXT sync event (manually
+        triggered or on a sync schedule), not immediately. ACTIVE only when the sync is
+        configured to run automatically (syncType=AutoSync with a schedule) and the source
+        control repo accepts attacker pushes. BLOCKED if deny assignment covers
+        sourceControls/write.
+      confidence: 0.75
+      derived_from:
+        - "effective permission: Microsoft.Automation/automationAccounts/sourceControls/write"
+        - "cicd-chains.yaml: cicd-modify-buildspec-executes-as"
+      false_positive_note: >-
+        Source control sync is NOT immediate; actual code import happens at the next
+        configured sync event. If syncType=Manual (operator-initiated sync), the attacker
+        cannot self-trigger the sync — keep CONDITIONAL(trigger_exists). AutoSync with a
+        schedule is the ACTIVE case only if the attacker also controls the target repo.
+        Do not emit if source control is not configured or if the attacker cannot push
+        to the configured repository branch.
+      narrative: >-
+        {principal.name} can repoint or create a source-control sync (sourceControls/write)
+        for Automation Account {target.name}; attacker-controlled repo content replaces
+        runbook code at the next sync, executing as the account's managed identity.
+
+  # ===========================================================================
+  # 3. Job-start primitive (→ CanTrigger, consumed by cicd-chains rule 2)
+  # ===========================================================================
+
+  - id: azure-auto-jobs-write
+    emits: CanTrigger
+    description: "Start a runbook job in an Automation Account (cloud sandbox or hybrid worker)."
+    match_effective_permission:
+      action: "Microsoft.Automation/automationAccounts/jobs/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Automation Operator, Automation Job Operator, Automation Contributor, Contributor, Owner, or a custom role granting jobs/write"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<runbook (BuildWorker) in the automationAccount>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/jobs/write"
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the effective permission is confirmed and the account is not suspended.
+        CONDITIONAL(service_state) if the account is suspended or the target runbook is not
+        in Published state. For hybrid worker paths, also CONDITIONAL(service_state) if the
+        targeted HybridRunbookWorkerGroup has no registered workers. BLOCKED if a deny
+        assignment covers jobs/write.
+      confidence: 0.97
+      derived_from:
+        - "effective permission: Microsoft.Automation/automationAccounts/jobs/write"
+        - "cicd-chains.yaml: cicd-trigger-runner-executes-as (rule 2, CONDITIONAL unless definition is attacker-influenced)"
+      false_positive_note: >-
+        jobs/write alone triggers the CURRENT runbook definition. cicd-chains rule 2
+        keeps this CONDITIONAL(attacker_influenced_definition) unless the current runbook
+        definition already contains attacker-influenced code. When combined with
+        runbooks/write (azure-auto-runbook-write), the CanModifyCode + CanTrigger pair
+        makes the MODIFY path (rule 1) ACTIVE. A principal with jobs/write but NOT
+        runbooks/write can only trigger existing (trusted) runbooks — this is the weaker
+        trigger-only path.
+      narrative: >-
+        {principal.name} can start runbook jobs in Automation Account {target.name}
+        (automationAccounts/jobs/write); cicd-chains rule 2 derives CanExecuteAs(MI)
+        CONDITIONAL on the current runbook definition running attacker-influenced code
+        (ACTIVE when combined with CanModifyCode via azure-auto-runbook-write).
+
+  # ===========================================================================
+  # 4. Webhook trigger (→ CanTrigger, external / data-plane access)
+  # ===========================================================================
+
+  - id: azure-auto-webhook-trigger
+    emits: CanTrigger
+    description: "Holder of a webhook URI (secret token in URL) can trigger a specific runbook job via HTTP POST without ARM RBAC."
+    match:
+      - [ ?account, Contains, ?webhook ]
+    where:
+      - "node_type(?webhook) == Webhook"
+      - "?webhook.isEnabled == true"
+      - "principal holds the webhook URI secret (obtained at creation or from a code/config leak)"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal holding the webhook URI>"
+      target: "<runbook (BuildWorker) the webhook targets>"
+      permissions: []
+      conditions: [service_state, uri_possession]
+      state_logic: >-
+        ACTIVE when the principal holds the webhook URI (uri_possession confirmed via creation
+        event, code/config leak, or attacker creation via webhooks/write) and the webhook is
+        enabled (isEnabled=true). CONDITIONAL(service_state) if the account is suspended.
+        BLOCKED if the webhook is disabled (isEnabled=false). Note: the URI secret
+        is returned ONCE at webhook creation and cannot be re-read via ARM read;
+        evidence of URI possession must come from collection of creation events,
+        code/config leaks, or an attacker creating a new webhook (webhooks/write).
+      confidence: 0.90
+      derived_from:
+        - "webhook exists (isEnabled=true) in Automation Account"
+        - "cicd-chains.yaml: cicd-trigger-runner-executes-as"
+      false_positive_note: >-
+        The webhook URI secret is NOT readable via ARM `webhooks/read`; standard ARM
+        enumeration reveals only webhook existence (name, enabled, expiry, runbook
+        target). Only emit ACTIVE if there is positive evidence the principal holds the
+        URI (creation event, code leak, or the attacker holds automationAccounts/webhooks/write
+        and created a new one). A principal who can read webhook metadata but not the URI
+        cannot trigger it. `webhooks/write` lets an attacker create a NEW webhook (returning
+        the URI once) for any runbook — this is a separate CanTrigger primitive gated on
+        webhooks/write permission.
+      narrative: >-
+        {principal.name} holds the webhook URI for runbook {target.name} in Automation
+        Account {account.name}; a POST to that URI starts a job as the account's managed
+        identity without ARM RBAC on jobs/write.
+
+  # ===========================================================================
+  # 5. Scheduled / recurring execution (→ CanSchedule)
+  # ===========================================================================
+
+  - id: azure-auto-jobschedule-write
+    emits: CanSchedule
+    description: "Create or modify a recurring job schedule that starts a runbook in an Automation Account."
+    match_effective_permission:
+      any_of:
+        - action: "Microsoft.Automation/automationAccounts/jobSchedules/write"
+          scope_type: "resource|resourceGroup|subscription"
+        - action: "Microsoft.Automation/automationAccounts/schedules/write"
+          scope_type: "resource|resourceGroup|subscription"
+    emit:
+      source_type: Identity
+      target_type: Scheduler
+      source: "<principal>"
+      target: "<schedule (Scheduler) for the runbook>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/jobSchedules/write"
+        - "Microsoft.Automation/automationAccounts/schedules/write"
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the permission is confirmed. Creates a time-based trigger that
+        repeatedly starts the targeted runbook — useful for persistence (code executes
+        without further attacker interaction). BLOCKED if deny assignment covers
+        jobSchedules/write.
+      confidence: 0.95
+      derived_from:
+        - "effective permission: Microsoft.Automation/automationAccounts/jobSchedules/write OR schedules/write"
+        - "cicd-chains.yaml: cicd-trigger-runner-executes-as (scheduled trigger upgrades the run path to ACTIVE for CONDITIONAL edges)"
+      false_positive_note: >-
+        CanSchedule creates a RECURRING trigger — the attacker can establish persistent
+        code execution as the MI without holding further permissions after schedule creation.
+        Pair with azure-auto-runbook-write (CanModifyCode) to confirm full attack path ACTIVE.
+      narrative: >-
+        {principal.name} can create a recurring schedule (automationAccounts/jobSchedules/write)
+        to repeatedly start a runbook in Automation Account {target.name}, enabling persistent
+        code execution as the account's managed identity.
+
+  # ===========================================================================
+  # 6. Hybrid Runbook Worker RCE (→ CanExecuteCommand on the worker VM)
+  # ===========================================================================
+
+  - id: azure-auto-hybrid-worker-rce
+    emits: CanExecuteCommand
+    description: "Submit a runbook job targeting a Hybrid Runbook Worker Group; the runbook runs as LOCAL SYSTEM (or a stored credential) on the designated VM/on-prem host."
+    match:
+      - [ ?principal, CanTrigger, ?runbook ]
+      - [ ?runbook, LocatedIn, ?workerGroup ]
+    where:
+      - "node_type(?runbook) == GenericCompute"
+      - "node_type(?workerGroup) == RemoteManagementService"
+      - "?workerGroup has at least one registered HybridRunbookWorker (worker node)"
+      - "job is submitted with runOn = ?workerGroup.name"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: ?principal
+      target: "<worker VM(s) registered in ?workerGroup>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/jobs/write"
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the principal holds jobs/write AND the targeted HybridRunbookWorkerGroup
+        has registered workers AND the account is not suspended. CONDITIONAL(service_state)
+        when the worker group has no currently registered workers (workers may register later).
+        Inherit from CanTrigger edge: BLOCKED if jobs/write is covered by a deny assignment.
+      confidence: 0.93
+      derived_from:
+        - "azure-auto-jobs-write: ?principal CanTrigger ?runbook"
+        - "can-execute-as.yaml: execute-as-via-command (CanExecuteCommand + ExecutesAs => CanExecuteAs on worker VM's identity)"
+        - "cicd-chains.yaml: cicd-modify-buildspec-executes-as (if principal also CanModifyCode the runbook)"
+      false_positive_note: >-
+        Hybrid Worker RCE targets the PHYSICAL WORKER VM, not the cloud sandbox.
+        The runbook executes as LOCAL SYSTEM (Windows) or the configured user (Linux) on
+        the worker host — this is OS-level command execution, not just MI token access.
+        Only emit when the job includes runOn=<HybridWorkerGroup> and at least one
+        registered worker exists in that group. Cloud-only jobs (no runOn) route to the
+        managed sandbox and do NOT produce CanExecuteCommand. If the worker VM has its
+        own managed identity, can-execute-as execute-as-via-command then fires:
+        CanExecuteCommand(principal, worker-VM) + ExecutesAs(worker-VM, MI) => CanExecuteAs.
+      narrative: >-
+        {principal.name} can submit a runbook job to Hybrid Runbook Worker Group
+        {workerGroup.name} (automationAccounts/jobs/write with runOn={workerGroup.name});
+        the runbook executes arbitrary PowerShell/Python as LOCAL SYSTEM on worker VM
+        {target.name}, yielding RCE on the host and any identity the VM runs as.
+
+  # ===========================================================================
+  # 7. ExecutesAs fact (cloud sandbox → MI)
+  # ===========================================================================
+
+  - id: azure-auto-executes-as-mi
+    emits: ExecutesAs
+    description: "An Automation Account sandbox job executes as the bound managed identity; any code running in the sandbox can mint MI tokens from IMDS."
+    match:
+      - [ ?account, HasPolicy, ?identity ]
+    where:
+      - "node_type(?account) == AutomationService"
+      - "node_type(?identity) in [ManagedIdentity, ServiceIdentity]"
+      - "identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned']"
+    emit:
+      source_type: GenericCompute
+      target_type: ManagedIdentity
+      source: "<runbook (BuildWorker) in ?account>"
+      target: ?identity
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the account identity block confirms the MI binding (principalId or
+        userAssignedIdentities map is non-empty). Zero-cost structural fact.
+        cicd-chains cicd-modify-buildspec-executes-as consumes this edge with CanModifyCode
+        to produce CanExecuteAs. No permissions required to assert this fact — it is an
+        inventory observation.
+      confidence: 1.0
+      derived_from:
+        - "Microsoft.Automation/automationAccounts identity.principalId or userAssignedIdentities"
+        - "cicd-chains.yaml: ExecutesAs is the linchpin input for cicd-modify-buildspec-executes-as"
+        - "can-execute-as.yaml: execute-as-via-code-modify dedupes with cicd-chains on (CanExecuteAs, ?p, ?identity)"
+      false_positive_note: >-
+        Only emit when the account identity block is non-empty (identity.type != None).
+        The account's system-assigned MI has principalId in the identity block; user-assigned
+        MIs appear in userAssignedIdentities. If both types are configured, emit one
+        ExecutesAs per bound MI. Do NOT emit if the account has no identity configured —
+        sandbox jobs have no ARM token access and CanRetrieveToken/CanExecuteAs to an MI
+        must not follow.
+      narrative: >-
+        Automation Account {account.name} sandbox jobs execute as managed identity
+        {target.name}; any code running in the sandbox can call IMDS
+        (http://169.254.169.254/metadata/identity/oauth2/token) to mint a bearer token
+        for {target.name} with no further credentials. cicd-chains collapses this with
+        CanModifyCode to CanExecuteAs.
+
+  # ===========================================================================
+  # 8. IMDS token exposure (→ ExposesCredential + CanRetrieveToken)
+  # ===========================================================================
+
+  - id: azure-auto-exposes-mi-token
+    emits: ExposesCredential
+    description: "An Automation Account sandbox job exposes its bound MI's token to any code it runs via the IMDS endpoint."
+    match:
+      - [ ?runbook, ExecutesAs, ?identity ]
+    where:
+      - "node_type(?runbook) == GenericCompute"
+      - "node_type(?identity) in [ManagedIdentity, ServiceIdentity]"
+      - "?runbook is a runbook (BuildWorker) in an Automation Account (AutomationService)"
+    emit:
+      source_type: GenericCompute
+      target_type: ManagedIdentity
+      source: ?runbook
+      target: ?identity
+      permissions: []
+      conditions: []
+      state_logic: "ACTIVE when the account has a bound MI (ExecutesAs confirmed) and a runbook can execute in the sandbox. CONDITIONAL(service_state) if the account is suspended."
+      confidence: 1.0
+      derived_from:
+        - "azure-auto-executes-as-mi: ?runbook ExecutesAs ?identity"
+        - "credential-chains.yaml: ExposesCredential feeds CanImpersonate via CredentialsFor"
+      false_positive_note: >-
+        This edge expresses the fact that code-execution in the sandbox equals holding the
+        MI's credentials. It is not an escalation by itself; it becomes an attack step when
+        combined with a CanModifyCode or CanTrigger edge. The IMDS endpoint is only reachable
+        from within the sandbox; a principal who can only read ARM config cannot reach it
+        without code execution.
+      narrative: >-
+        Automation Account sandbox jobs expose the credentials of managed identity {target.name}
+        to any code running in them via IMDS (http://169.254.169.254/metadata/identity/
+        oauth2/token); code execution in the sandbox = token access for {target.name}.
+
+  - id: azure-auto-imds-token
+    emits: CanRetrieveToken
+    description: "Code executing in an Automation Account sandbox can retrieve a bearer token for the bound MI from IMDS."
+    match:
+      - [ ?principal, CanExecuteAs, ?identity ]
+    where:
+      - "?identity is a ManagedIdentity bound to an Automation Account (AutomationService)"
+      - "?principal reached ?identity via an azure-auto-* derivation (code runs in the Automation sandbox)"
+    emit:
+      source_type: Identity
+      target_type: ManagedIdentity
+      source: ?principal
+      target: ?identity
+      permissions: []
+      derived_from:
+        - "<CanExecuteAs edge for ?principal -> ?identity via Automation sandbox>"
+        - "cicd-chains.yaml: cicd-modify-buildspec-executes-as or cicd-trigger-runner-executes-as"
+      false_positive_note: >-
+        Redundant with CanExecuteAs for path-finding; emitted so credential-centric queries
+        surface the token-retrieval step explicitly. State inherits from the contributing
+        CanExecuteAs edge. Only emit when CanExecuteAs was derived via an Automation sandbox
+        (not a hybrid worker — hybrid worker RCE yields CanExecuteCommand/CanExecuteAs via
+        can-execute-as execute-as-via-command, with IMDS on the worker VM's own identity).
+      narrative: >-
+        {principal.name}, executing code in an Automation Account sandbox as {identity.name},
+        can retrieve the MI's bearer token from IMDS (http://169.254.169.254/metadata/identity/
+        oauth2/token) without any further credential.
+
+  # ===========================================================================
+  # 9. Legacy RunAs credential exposure
+  # ===========================================================================
+
+  - id: azure-auto-exposes-runas-cred
+    emits: ExposesCredential
+    description: "An Automation Account with a legacy RunAs account exposes the RunAs service principal certificate to any runbook via Get-AutomationConnection."
+    match:
+      - [ ?account, ContainsSecret, ?runasConn ]
+    where:
+      - "node_type(?account) == AutomationService"
+      - "node_type(?runasConn) == Certificate"
+      - "?runasConn is of connection type AzureServicePrincipal with CertificateThumbprint field (RunAs account)"
+    emit:
+      source_type: GenericCompute
+      target_type: ApplicationIdentity
+      source: "<runbook (BuildWorker) in ?account>"
+      target: "<RunAs service principal (ApplicationIdentity)>"
+      permissions: []
+      conditions: [trigger_exists]
+      state_logic: "ACTIVE when the account contains a RunAs Connection of type AzureServicePrincipal with CertificateThumbprint (ContainsSecret confirmed) and a runbook can execute in the sandbox. CONDITIONAL(trigger_exists) if no confirmed run path exists. BLOCKED if the RunAs account has been removed."
+      confidence: 0.95
+      derived_from:
+        - "ContainsSecret: ?account stores RunAs Connection (Certificate)"
+        - "credential-chains.yaml: ExposesCredential + CredentialsFor(RunAs cert -> SP) => CanImpersonate"
+      false_positive_note: >-
+        The RunAs certificate private key is NOT returned via ARM `connections/read`; it is
+        only accessible from within a runbook via `Get-AutomationConnection`. This edge
+        therefore only materializes when an attacker can execute code in the sandbox
+        (combined with a CanModifyCode or CanTrigger edge). Do not emit as a standalone
+        credential read from ARM. Verify the connection type is AzureServicePrincipal with
+        a CertificateThumbprint field (the RunAs pattern); a non-RunAs connection is not
+        this threat. RunAs accounts are deprecated; check for their presence explicitly.
+      narrative: >-
+        Automation Account {account.name} has a legacy RunAs connection; any runbook
+        can call Get-AutomationConnection to retrieve the RunAs SP certificate and
+        authenticate as the RunAs service principal {target.name} without holding the SP's
+        client secret in ARM RBAC.
+
+  # ===========================================================================
+  # 10. Plaintext variable read (→ CanReadSecret)
+  # ===========================================================================
+
+  - id: azure-auto-variable-read
+    emits: CanReadSecret
+    description: "Read a plaintext (non-encrypted) Automation Variable directly from ARM; encrypted variables require runbook execution."
+    match_effective_permission:
+      action: "Microsoft.Automation/automationAccounts/variables/read"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "at least one variable in the account has isEncrypted=false"
+    emit:
+      source_type: Identity
+      target_type: Secret
+      source: "<principal>"
+      target: "<plaintext variable (Secret)>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/variables/read"
+      conditions: []
+      state_logic: >-
+        POTENTIAL when plaintext variables (isEncrypted=false) exist but their credential
+        status cannot be confirmed from ARM metadata alone. ACTIVE when heuristic naming
+        (contains 'password', 'key', 'token', 'secret', 'credential') or content inspection
+        confirms credential material. BLOCKED for encrypted variables (isEncrypted=true)
+        — the value is masked in ARM and requires runbook execution to decrypt. BLOCKED if
+        a deny assignment covers variables/read.
+      confidence: 0.70
+      derived_from:
+        - "effective permission: Microsoft.Automation/automationAccounts/variables/read"
+        - "credential-chains.yaml: CanReadSecret + CredentialsFor => CanImpersonate"
+      false_positive_note: >-
+        Emit for plaintext variables (isEncrypted=false) with moderate confidence (0.70).
+        Encrypted variables (isEncrypted=true) have their value masked in ARM responses;
+        only code running inside a runbook (via Get-AutomationVariable) can read encrypted
+        values. Do not emit CanReadSecret for encrypted variables based on ARM read alone.
+        Use heuristic naming (password, key, token, secret, credential in the variable name)
+        or confirmed content inspection to upgrade to ACTIVE; otherwise keep POTENTIAL to
+        surface the capability while allowing analysts to triage.
+      narrative: >-
+        {principal.name} can read plaintext Automation Variables in {source.name}
+        (automationAccounts/variables/read); plaintext variables may contain credential
+        material directly accessible from the ARM API without code execution.
+
+  # ===========================================================================
+  # 11. Identity attachment (→ CanAttachIdentity, Azure PassRole analog)
+  # ===========================================================================
+
+  - id: azure-auto-attach-user-mi
+    emits: CanAttachIdentity
+    description: "Attach a user-assigned managed identity to an Automation Account (Azure PassRole analog); subsequent runbooks execute as that MI."
+    match:
+      - [ ?principal, CanPassIdentity, ?mi ]
+    where:
+      - "?principal also has EFFECTIVE Microsoft.Automation/automationAccounts/write on the target account"
+      - "node_type(?mi) == ManagedIdentity"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: ?principal
+      target: "<Automation Account (AutomationService)>"
+      permissions:
+        - "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
+        - "Microsoft.Automation/automationAccounts/write"
+      conditions: [role_compatibility]
+      state_logic: >-
+        ACTIVE when BOTH permissions are confirmed: assign/action on the MI AND
+        automationAccounts/write on the account. CONDITIONAL(role_compatibility) when
+        only one permission is confirmed. A new or existing account with automationAccounts/write
+        alone cannot attach a user-assigned MI without assign/action on that specific MI.
+        BLOCKED if a deny assignment covers either permission.
+      confidence: 0.95
+      derived_from:
+        - "azure identity-escalation.yaml: azure-assign-user-assigned-mi (CanPassIdentity)"
+        - "azure-auto-account-contributor: Microsoft.Automation/automationAccounts/write"
+        - "can-execute-as.yaml: execute-as-via-config-identity-swap (CanModifyConfiguration + CanPassIdentity => CanExecuteAs via new/modified account)"
+      false_positive_note: >-
+        BOTH permissions are required: assign/action on the MI scope AND automationAccounts/write
+        on the account. A Contributor at resource-group scope inherits both for resources in
+        that RG; a narrower Automation Contributor does NOT include assign/action on MIs in
+        other resource groups. Honor the assign/action scope: if the MI is in a different
+        subscription, the attacker needs assign/action at that subscription/MI scope.
+      narrative: >-
+        {principal.name} can attach user-assigned managed identity {mi.name} to an Automation
+        Account (assign/action + automationAccounts/write); subsequent runbooks in the account
+        execute as {mi.name} and can mint its ARM token from IMDS.
+
+  # ===========================================================================
+  # 12. Webhook public exposure (→ ExposedToInternet)
+  # ===========================================================================
+
+  - id: azure-auto-webhook-public
+    emits: ExposedToInternet
+    description: "An enabled Automation Account webhook with a public URI is internet-triggerable; any holder of the URI can start a runbook job."
+    match:
+      - [ ?account, Contains, ?webhook ]
+    where:
+      - "node_type(?account) == AutomationService"
+      - "node_type(?webhook) == Webhook"
+      - "?webhook.isEnabled == true"
+      - "?account.publicNetworkAccess != Disabled"
+    emit:
+      source_type: GenericCompute
+      target_type: AnonymousIdentity
+      source: ?account
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the webhook is enabled AND the account's public network access is not
+        Disabled. CONDITIONAL(service_state) if the account is suspended. BLOCKED if
+        publicNetworkAccess=Disabled or the webhook is disabled.
+      confidence: 0.88
+      derived_from:
+        - "webhook.isEnabled=true in account"
+        - "account.publicNetworkAccess != Disabled"
+      false_positive_note: >-
+        The URI secret is NOT recoverable from ARM after creation; actual exploitation
+        requires the attacker to hold the URI. This edge models that the webhook
+        SURFACE IS INTERNET-EXPOSED (a potential entry point), not that every internet
+        user holds the URI. Combine with URI leakage evidence (code, logs, config) for
+        ACTIVE exploitation assessment. If publicNetworkAccess=Disabled, no internet
+        reachability exists — BLOCKED.
+      narrative: >-
+        Automation Account {account.name} has an enabled webhook with a public
+        URI; any internet party holding the URI secret can trigger runbook jobs as the account's
+        managed identity without ARM RBAC.
+
+  # ===========================================================================
+  # 13. Hybrid Worker execute-as (→ CanExecuteAs via can-execute-as linchpin)
+  # ===========================================================================
+  # NOTE: The headline execute-as capability (CanModifyCode + CanTrigger => CanExecuteAs)
+  # is derived by cicd-chains.yaml cicd-modify-buildspec-executes-as and
+  # can-execute-as.yaml execute-as-via-code-modify. Do not re-derive here; cite
+  # instead.
+
+
+  # ===========================================================================
+  # 14. Webhook write → CanTrigger (data-plane creation without ARM RBAC)
+  # ===========================================================================
+
+  - id: azure-auto-webhook-write-trigger
+    emits: CanTrigger
+    description: "Create a new webhook for any runbook via automationAccounts/webhooks/write; the attacker receives the webhook URI once and can trigger the runbook."
+    match_effective_permission:
+      action: "Microsoft.Automation/automationAccounts/webhooks/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds automationAccounts/webhooks/write at the automationAccount scope"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<runbook (BuildWorker) targeted by the new webhook>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/webhooks/write"
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the principal holds webhooks/write — the attacker can create a new
+        webhook URI for any runbook, receive the URI once at creation, and use it to
+        trigger jobs. CONDITIONAL(service_state) if the account is suspended. BLOCKED if
+        a deny assignment covers webhooks/write.
+      confidence: 0.95
+      derived_from:
+        - "effective permission: Microsoft.Automation/automationAccounts/webhooks/write"
+        - "cicd-chains.yaml: cicd-trigger-runner-executes-as (webhook URI creation = CanTrigger primitive without ARM RBAC)"
+      false_positive_note: >-
+        webhooks/write grants the attacker FULL CONTROL to create new webhooks for ANY
+        runbook in the account. Each webhook creation returns a URI (secrets) once — the
+        attacker uses the URI to trigger runbooks via HTTP POST without ARM roles/RBAC.
+        This is distinct from webhooks/read (metadata read) and from CanTrigger via
+        jobs/write (ARM RBAC trigger). A principal with webhooks/write can trigger any
+        runbook via this data-plane HTTP surface, independent of jobs/write permission.
+      narrative: >-
+        {principal.name} can create new webhook URIs for runbooks in Automation Account
+        (automationAccounts/webhooks/write); each webhook creation yields a secret URI
+        that can be used to trigger the runbook via HTTP POST as the account's managed
+        identity, bypassing ARM RBAC.
+
+  # ===========================================================================
+  # 15. Configuration mutation: identity attachment (→ CanModifyConfiguration on account)
+  # ===========================================================================
+
+  - id: azure-auto-account-write-identity
+    emits: CanModifyConfiguration
+    description: "Modify the identity block of an Automation Account via automationAccounts/write; enables identity swap (CanAttachIdentity-like escalation)."
+    match_effective_permission:
+      action: "Microsoft.Automation/automationAccounts/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal has EFFECTIVE automationAccounts/write (identity block modification is included in full write)"
+      - "account has no existing managed identity OR principal can also change the identity binding"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<Automation Account (AutomationService)>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/write"
+      conditions: [role_compatibility]
+      state_logic: >-
+        ACTIVE when the principal holds automationAccounts/write and can modify the
+        identity block (full write includes identity mutation). CONDITIONAL(role_compatibility)
+        if a specific MI assignment is checked (requires CanPassIdentity on that MI).
+        BLOCKED if a deny assignment covers automationAccounts/write.
+      confidence: 0.92
+      derived_from:
+        - "effective permission: Microsoft.Automation/automationAccounts/write"
+        - "can-execute-as.yaml: execute-as-via-config-identity-swap (CanModifyConfiguration + CanPassIdentity => CanExecuteAs)"
+      false_positive_note: >-
+        automationAccounts/write includes identity block changes (systemAssignedIdentity,
+        userAssignedIdentities). Confirm the principal holds the full write action, not
+        a narrower delegated MI-assignment-only permission. Pairing with CanPassIdentity
+        on a target MI yields CanExecuteAs via can-execute-as execute-as-via-config-identity-swap.
+      narrative: >-
+        {principal.name} can modify the identity configuration of Automation Account
+        (automationAccounts/write); combined with CanPassIdentity on a target managed
+        identity, this yields CanExecuteAs on the target identity.
+
+  # ===========================================================================
+  # 16. Variable write → CanModifyConfiguration (behavior change or credential injection)
+  # ===========================================================================
+
+  - id: azure-auto-variable-write
+    emits: CanModifyConfiguration
+    description: "Write plaintext Automation Variables that runbooks read; enables behavior modification or credential injection into the execution sandbox."
+    match_effective_permission:
+      action: "Microsoft.Automation/automationAccounts/variables/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds automationAccounts/variables/write at the automationAccount scope"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<Automation Account (AutomationService)>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/variables/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal holds variables/write — plaintext variables can be
+        injected or modified to alter runbook behavior at runtime or inject credentials
+        that runbooks read via Get-AutomationVariable. Encrypted variables require
+        additional runbook execution to decrypt and re-inject. BLOCKED if a deny
+        assignment covers variables/write.
+      confidence: 0.88
+      derived_from:
+        - "effective permission: Microsoft.Automation/automationAccounts/variables/write"
+        - "can-execute-as.yaml: execute-as-via-config-identity-swap (CanModifyConfiguration => configuration escalation when paired with other edges)"
+      false_positive_note: >-
+        variables/write allows the attacker to inject or modify any plaintext variable
+        read by runbooks. This is CanModifyConfiguration on the account's runtime state,
+        not code modification (runbooks/write). The threat depends on runbooks reading
+        the poisoned variable (recon needed) and a trigger path to run the runbook.
+        Downgrade to CONDITIONAL if no runbooks consume the variable or no run path exists.
+      narrative: >-
+        {principal.name} can create or modify plaintext Automation Variables
+        (automationAccounts/variables/write); runbooks that read these variables execute
+        with attacker-injected values at runtime, enabling behavior modification or
+        credential injection.
+
+  # ===========================================================================
+  # 17. Connection write → CanModifyConfiguration (RunAs credential hijack)
+  # ===========================================================================
+
+  - id: azure-auto-connection-write
+    emits: CanModifyConfiguration
+    description: "Modify or replace Automation Account connections, including legacy RunAs service principal credentials."
+    match_effective_permission:
+      action: "Microsoft.Automation/automationAccounts/connections/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds automationAccounts/connections/write at the automationAccount scope"
+    emit:
+      source_type: Identity
+      target_type: GenericCompute
+      source: "<principal>"
+      target: "<Automation Account (AutomationService)>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/connections/write"
+      conditions: []
+      state_logic: >-
+        ACTIVE when the principal holds connections/write — the attacker can create,
+        modify, or replace connections including the legacy RunAs SP connection (certificate).
+        Runbooks calling Get-AutomationConnection retrieve the attacker-injected or
+        hijacked connection, yielding access to the RunAs SP or any other service the
+        connection targets. BLOCKED if a deny assignment covers connections/write.
+      confidence: 0.90
+      derived_from:
+        - "effective permission: Microsoft.Automation/automationAccounts/connections/write"
+        - "can-execute-as.yaml: execute-as-via-config-identity-swap (CanModifyConfiguration reaching connection/credential)"
+        - "credential-chains.yaml: ExposesCredential (runbook retrieves poisoned connection)"
+      false_positive_note: >-
+        connections/write includes full CRUD on connections. The RunAs connection (type
+        AzureServicePrincipal with CertificateThumbprint) is the high-value target, but
+        other connection types (AWS, SQL, GitHub, etc.) also yield their target-service
+        credentials when retrieved by a runbook. Confirm the target connection type to
+        prioritize RunAs (SP credential escalation) vs. other cloud/external service
+        credentials. Downgrade to CONDITIONAL if no runbooks retrieve connections or no
+        run path exists.
+      narrative: >-
+        {principal.name} can create or modify connections in Automation Account
+        (automationAccounts/connections/write); any runbook that calls Get-AutomationConnection
+        retrieves attacker-injected or hijacked connection credentials (including legacy
+        RunAs SP certificates), yielding cross-service escalation.
+
+  # ===========================================================================
+  # 18. Create workload as via identity attachment (→ CanCreateWorkloadAs)
+  # ===========================================================================
+
+  - id: azure-auto-create-workload-as-via-attach-mi
+    emits: CanCreateWorkloadAs
+    description: "Attach a privileged managed identity to a new or existing Automation Account and trigger a runbook — equivalent to creating a new workload bound to that identity."
+    match:
+      - [ ?principal, CanAttachIdentity, ?account ]
+      - [ ?principal, CanTrigger,        ?runbook ]
+    where:
+      - "node_type(?account) == AutomationService"
+      - "node_type(?runbook) == GenericCompute"
+      - "?runbook is in ?account"
+      - "?principal also has EFFECTIVE CanModifyCode on ?account (or can create a new account with automationAccounts/write)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: "<managed identity attached to ?account>"
+      permissions:
+        - "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
+        - "Microsoft.Automation/automationAccounts/write"
+        - "Microsoft.Automation/automationAccounts/jobs/write"
+      conditions: [role_compatibility]
+      state_logic: >-
+        ACTIVE when the principal can attach a privileged MI to an account (CanAttachIdentity)
+        AND can trigger a runbook in that account (CanTrigger) AND either the account already
+        has executable code or the principal can also modify/create code (CanModifyCode).
+        CONDITIONAL(role_compatibility) if MI attachment is unconfirmed or the MI is not
+        compatible with the account. This is the CanCreateWorkloadAs primitive: create/modify
+        a workload (Automation Account) and bind a privileged identity to it.
+      confidence: "min(contributing_confidences) * 0.88"
+      derived_from:
+        - "azure-auto-attach-user-mi: ?principal CanAttachIdentity ?account"
+        - "azure-auto-jobs-write: ?principal CanTrigger ?runbook (or CanModifyCode via azure-auto-runbook-write)"
+        - "can-execute-as.yaml: execute-as-via-new-workload (CanCreateWorkloadAs => CanExecuteAs)"
+      false_positive_note: >-
+        Requires both CanAttachIdentity (assign/action + automationAccounts/write) and a
+        run path (CanTrigger or CanModifyCode). CanAttachIdentity alone is not sufficient
+        without a confirmed way to run code as the attached MI. Only emit when all three
+        edges are verified: MI assignment permission, account write, and run path.
+      narrative: >-
+        {principal.name} can attach a privileged managed identity to Automation Account
+        {account.name} and trigger a runbook in that account; this yields CanExecuteAs the
+        attached identity (via can-execute-as execute-as-via-new-workload).
+
+  # ===========================================================================
+  # 19. Credential read (→ CanReadSecret via data-plane gate)
+  # ===========================================================================
+
+  - id: azure-auto-credential-read
+    emits: CanReadSecret
+    description: "Read Automation Credentials (username/password pairs) via automationAccounts/credentials/read; values require data-plane getProperties/action or runbook execution."
+    match_effective_permission:
+      action: "Microsoft.Automation/automationAccounts/credentials/read"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds automationAccounts/credentials/read at the automationAccount scope"
+    emit:
+      source_type: Identity
+      target_type: Secret
+      source: "<principal>"
+      target: "<Automation Credential (Secret)>"
+      permissions:
+        - "Microsoft.Automation/automationAccounts/credentials/read"
+      conditions: [key_permission]
+      state_logic: >-
+        CONDITIONAL(key_permission) — ARM read (credentials/read) returns credential names
+        but NOT values. The values require either (a) the additional data-plane permission
+        automationAccounts/credentials/getProperties/action (uncommon; requires explicit
+        data-plane RBAC) OR (b) code execution in a runbook (Get-AutomationCredential returns
+        the value). Confidence 0.70 reflects the data-plane gate. Only ACTIVE if the principal
+        also holds getProperties/action OR can execute code in the sandbox (CanModifyCode or
+        CanTrigger with attacker code). BLOCKED if a deny assignment covers credentials/read.
+      confidence: 0.70
+      derived_from:
+        - "effective permission: Microsoft.Automation/automationAccounts/credentials/read"
+        - "credential-chains.yaml: read-secret-yields-identity (CanReadSecret + CredentialsFor => CanImpersonate)"
+      false_positive_note: >-
+        Emit at CONDITIONAL(key_permission) because ARM credentials/read alone does NOT
+        return the credential value — it only enumerates credential names. To retrieve the
+        password, the principal needs EITHER (a) the separate data-plane action
+        automationAccounts/credentials/getProperties/action (not implied by credentials/read)
+        OR (b) code execution in the sandbox to call Get-AutomationCredential. Credentials
+        are commonly database credentials, AD passwords, or third-party API keys stored in
+        the Automation Credential store — high-value targets. Do not mark ACTIVE unless the
+        attacker also holds getProperties/action or can execute code.
+      narrative: >-
+        {principal.name} can read Automation Credentials in the account
+        (automationAccounts/credentials/read); credential names are visible in ARM, but
+        values require either data-plane getProperties/action or runbook code execution.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A deny assignment covering automationAccounts/runbooks/write or /jobs/write at
+#    the effective scope -> emit the CanModifyCode or CanTrigger edge with state: BLOCKED
+#    and denied_by=<deny assignment>.
+#  - publicNetworkAccess=Disabled blocks azure-auto-webhook-public (BLOCKED, not CONDITIONAL).
+#  - A HybridRunbookWorkerGroup with no registered workers -> azure-auto-hybrid-worker-rce
+#    CONDITIONAL(service_state), NOT ACTIVE.
+#  - An account with identity=None -> do NOT emit azure-auto-executes-as-mi,
+#    azure-auto-exposes-mi-token, azure-auto-imds-token targeting a MI; the sandbox
+#    has no ARM token access.
+#  - RunAs account absent (no AzureServicePrincipal connection) -> do NOT emit
+#    azure-auto-exposes-runas-cred.
+#  - Encrypted variables (isEncrypted=true) -> CONDITIONAL for azure-auto-variable-read from ARM.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in
+# /rules/explicit/azure-automation.yaml (ExecutesAs, ContainsCredential,
+# ContainsSecret, CanTrigger webhook/schedule, LocatedIn worker->VM).
+explicit_rules:
+
+  - id: azure-auto-executes-as-system-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Automation/automationAccounts"
+      field: "identity"
+    where:
+      - "identity.type in [SystemAssigned, 'SystemAssigned, UserAssigned']"
+    emit:
+      source_type: GenericCompute
+      target_type: ManagedIdentity
+      source: "<automationAccount runbook (BuildWorker)>"
+      target: "<system-assigned MI (identity.principalId)>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Automation/automationAccounts/{account}"
+      evidence_field: "identity.principalId"
+      narrative: "Automation Account {account.name} runs as its system-assigned MI {target.name} (identity.principalId)."
+
+  - id: azure-auto-executes-as-user-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Automation/automationAccounts"
+      field: "identity.userAssignedIdentities"
+    where:
+      - "identity.userAssignedIdentities is non-empty"
+    emit:
+      source_type: GenericCompute
+      target_type: ManagedIdentity
+      source: "<automationAccount runbook (BuildWorker)>"
+      target: "<each user-assigned MI (key in userAssignedIdentities map)>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Automation/automationAccounts/{account}"
+      evidence_field: "identity.userAssignedIdentities"
+      narrative: "Automation Account {account.name} runs as user-assigned MI {target.name} (userAssignedIdentities entry)."
+
+  - id: azure-auto-runas-connection
+    emits: ContainsSecret
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Automation/automationAccounts/connections"
+      field: "properties.connectionType.name"
+    where:
+      - "properties.connectionType.name == AzureServicePrincipal"
+      - "properties.fieldDefinitionValues.CertificateThumbprint is non-empty"
+    emit:
+      source_type: AutomationService
+      target_type: Certificate
+      source: "<automationAccount>"
+      target: "<RunAs SP certificate (Certificate node)>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Automation/automationAccounts/{account}/connections"
+      evidence_field: "properties.fieldDefinitionValues.CertificateThumbprint"
+      narrative: "Automation Account {account.name} has a legacy RunAs connection with certificate thumbprint {value}; runbooks can call Get-AutomationConnection to extract the SP cert."
+
+  - id: azure-auto-webhook-contains
+    emits: CanTrigger
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Automation/automationAccounts/webhooks"
+      field: "properties.isEnabled"
+    where:
+      - "properties.isEnabled == true"
+    emit:
+      source_type: Webhook
+      target_type: GenericCompute
+      source: "<webhook>"
+      target: "<runbook (BuildWorker) the webhook targets (properties.runbook.name)>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Automation/automationAccounts/{account}/webhooks"
+      evidence_field: "properties.runbook.name"
+      narrative: "Webhook {source.name} in Automation Account {account.name} triggers runbook {target.name} on HTTP POST with the URI secret."
+
+  - id: azure-auto-schedule-triggers-runbook
+    emits: CanTrigger
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Automation/automationAccounts/jobSchedules"
+      field: "properties.schedule.name"
+    emit:
+      source_type: Scheduler
+      target_type: GenericCompute
+      source: "<schedule (Scheduler) referenced by the jobSchedule>"
+      target: "<runbook (BuildWorker) properties.runbook.name>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Automation/automationAccounts/{account}/jobSchedules"
+      evidence_field: "properties.runbook.name"
+      narrative: "Schedule {source.name} triggers runbook {target.name} in Automation Account {account.name} on a time-based recurring basis."
+
+  - id: azure-auto-hybrid-worker-attachedto
+    emits: AttachedTo
+    applies_to: [azure]
+    match_record:
+      resource_type: "Microsoft.Automation/automationAccounts/hybridRunbookWorkerGroups/hybridRunbookWorkers"
+      field: "properties.vmResourceId"
+    where:
+      - "properties.vmResourceId is non-empty"
+    emit:
+      source_type: GenericCompute
+      target_type: VirtualMachine
+      source: "<hybridRunbookWorker node>"
+      target: "<VirtualMachine (properties.vmResourceId)>"
+      api_source: "GET /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Automation/automationAccounts/{account}/hybridRunbookWorkerGroups/{group}/hybridRunbookWorkers"
+      evidence_field: "properties.vmResourceId"
+      narrative: "Hybrid Runbook Worker {source.name} is registered on VM {target.name}; runbooks routed to its group execute on this VM as CanExecuteCommand on the VM."

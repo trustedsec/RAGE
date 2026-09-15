@@ -1,0 +1,402 @@
+# GCP Security Command Center (SCC) — Derived attack-path rules (Phase 12 — security & logging)
+# ---------------------------------------------------------------------------
+# SCC is GCP's native cloud-security posture management (CSPM) and threat-
+# detection service (SecurityService node). It has NO execution identity,
+# NO credential material, and NO code the attacker can modify. The entire
+# attack surface is:
+#   (1) DEFENSE EVASION / COVER TRACKS (dominant):
+#       Disabling SCC services, creating mute configs, inactivating/muting
+#       individual findings, or deleting notification configs ->
+#       CanModifyConfiguration on the SecurityService node.
+#   (2) RECON (1 conservative rule):
+#       Reading findings + asset inventory reveals org-wide resource
+#       misconfigurations and attack paths -> CanRead on the SecurityService node.
+#
+# THEME CONTRACT (Phase 12, mode 1):
+#   - All edges target the SCC SecurityService node.
+#   - Do NOT chain to CanExecuteAs / CanEnterProject / CanEnterOrganization /
+#     CanEscalateTo. SCC tampering is cover-tracks, not access escalation.
+#   - Detective controls do NOT set BLOCKED state on capability edges. BLOCKED
+#     is reserved for preventive guardrails (org policy, deny policy, VPC-SC).
+#   - Muting a finding reduces detection probability; it does NOT grant access.
+#
+# LINCHPINS CITED (not duplicated):
+#   can-execute-as.yaml     — not applicable; SCC has no ExecutesAs
+#   cicd-chains.yaml        — not applicable; SCC triggers no workloads
+#   credential-chains.yaml  — not applicable; SCC contains no credentials
+#   can-control.yaml        — not applicable; no CanExecuteAs chain to collapse
+#
+# PERMISSIONS (verbatim from cloud.google.com/iam/docs/permissions-reference):
+#   securitycenter.settings.update        — disable/modify SCC org or project settings
+#   securitycenter.muteconfigs.create     — create a mute config (rule-based suppression)
+#   securitycenter.muteconfigs.update     — modify an existing mute config
+#   securitycenter.muteconfigs.delete     — delete a mute config
+#   securitycenter.findings.setState      — set finding state (ACTIVE/INACTIVE)
+#   securitycenter.findings.setMute       — mute/unmute individual findings
+#   securitycenter.notificationconfigs.delete — delete a notification config (Pub/Sub route)
+#   securitycenter.notificationconfigs.update — modify notification routing
+#   securitycenter.findings.list          — list findings (read / recon)
+#   securitycenter.assets.list            — list asset inventory (read / recon)
+#
+# SCOPE: bindings at org, folder, or project; org-scoped actions affect all
+#   descendant projects simultaneously. Scope specificity is critical — see
+#   false_positive_note in each rule.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 12-security-logging
+service: scc
+applies_to: [gcp]
+
+rules:
+
+  # --- 1) Disable SCC services — org-wide detection blind spot ---------------
+  # securitycenter.settings.update on the Organization (or Project) allows
+  # calling UpdateOrganizationSettings / UpdateProjectSettings to set
+  # enableAssetDiscovery=false or to disable individual detection services
+  # (Event Threat Detection, VM Threat Detection, Container Threat Detection).
+  # Disabling a service permanently stops it from generating findings at that
+  # scope until explicitly re-enabled — the highest-impact SCC evasion action.
+  - id: gcp-scc-disable-service
+    emits: CanModifyConfiguration
+    description: "Principal with securitycenter.settings.update can disable SCC detection services at org or project scope, permanently stopping finding generation for the disabled services."
+    match:
+      - [ ?principal, HasPermission, ?scc ]
+    where:
+      - "node_type(?scc) == SecurityService"
+      - "?scc.provider_type in ['google.securitycenter.OrganizationSettings', 'google.securitycenter.ProjectSettings']"
+      - "?principal has EFFECTIVE securitycenter.settings.update at the scope of ?scc (via IAM allow policy at org, folder, or project)"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?scc
+      permissions: ["securitycenter.settings.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal holds effective securitycenter.settings.update at
+        ?scc.scope (via roles/securitycenter.admin, roles/securitycenter.adminEditor,
+        or a custom role containing the permission). BLOCKED if an IAM deny policy
+        or org policy explicitly denies securitycenter.settings.update at ?scc.scope.
+        Org-scoped SCC settings (OrganizationSettings) require the binding at the
+        org node; project-scoped settings (ProjectSettings) require the binding at or
+        above the project. Do not emit BLOCKED merely because SCC services are
+        currently ENABLED — BLOCKED is for IAM/policy guardrails, not the current
+        service state.
+      confidence: 0.95
+      derived_from:
+        - "HasPermission(?principal, securitycenter.settings.update, ?scc)"
+      false_positive_note: >-
+        This is DEFENSE EVASION only — disabling SCC services stops detection but
+        does NOT grant access to any resource, credential, or identity. Do NOT chain
+        to CanExecuteAs, CanEnterProject, CanEnterOrganization, or CanEscalateTo.
+        Detective controls do not set BLOCKED state on capability edges.
+        securitycenter.settings.update can disable individual services (ETD, VMTD,
+        CTD) without disabling SCC globally; the narrative should not claim "SCC is
+        disabled" unless the API call sets the top-level enable flag. Scope the edge
+        to the SCC node the effective permission actually reaches: an org-scoped
+        binding creates CanModifyConfiguration on the OrganizationSettings node; a
+        project-scoped binding creates it on that ProjectSettings node only. A
+        VPC Service Controls perimeter denying securitycenter.googleapis.com is
+        a BLOCKED guardrail.
+      narrative: >-
+        {principal.name} holds securitycenter.settings.update at {scc.scope} and can
+        call UpdateOrganizationSettings / UpdateProjectSettings to disable SCC detection
+        services (Event Threat Detection, VM Threat Detection, Container Threat Detection)
+        for {scc.scope}. Disabling a service permanently stops finding generation for
+        that service until explicitly re-enabled, creating a persistent detection blind
+        spot. This is a cover-tracks primitive — it reduces detection probability; it
+        does not grant access to resources or credentials.
+
+  # --- 2) Create or update mute configs — rule-based finding suppression ------
+  # securitycenter.muteconfigs.create allows creating a MuteConfig with a CEL
+  # filter expression that auto-mutes all matching findings. Muted findings are
+  # excluded from active finding lists and dashboards. An attacker can create a
+  # broad config targeting specific finding categories (e.g.,
+  # category="ACCOUNT_COMPROMISED" or category="CREDENTIAL_ACCESS") or specific
+  # resources/environments to silence the relevant detection signals while the
+  # SCC service continues to appear operational. This is the stealthiest SCC
+  # evasion primitive: the service is ENABLED and generating findings — they are
+  # simply auto-muted before analysts see them.
+  - id: gcp-scc-mute-config-create
+    emits: CanModifyConfiguration
+    description: "Principal with securitycenter.muteconfigs.create or .update can create or modify a mute config that auto-suppresses matching SCC findings, silencing targeted detection signals while SCC appears operational."
+    match:
+      - [ ?principal, HasPermission, ?scc ]
+    where:
+      - "node_type(?scc) == SecurityService"
+      - "?scc.provider_type in ['google.securitycenter.OrganizationSettings', 'google.securitycenter.ProjectSettings']"
+      - "?principal has EFFECTIVE securitycenter.muteconfigs.create OR securitycenter.muteconfigs.update at the scope of ?scc"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?scc
+      permissions: ["securitycenter.muteconfigs.create", "securitycenter.muteconfigs.update"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when ?principal holds effective securitycenter.muteconfigs.create or
+        securitycenter.muteconfigs.update at ?scc.scope AND SCC Premium tier is enabled
+        at ?scc.scope. The mute config does not need to pre-exist for a .create operation.
+        CONDITIONAL(service_state) if the org or project is on Standard tier (mute configs
+        are unavailable in Standard tier; the permission has no effect). BLOCKED if an IAM
+        deny policy or VPC-SC perimeter explicitly denies both create and update at the
+        effective scope.
+      confidence: 0.90
+      derived_from:
+        - "HasPermission(?principal, securitycenter.muteconfigs.create|securitycenter.muteconfigs.update, ?scc)"
+      false_positive_note: >-
+        Mute configs suppress findings matching their CEL filter expression; they do NOT
+        stop the SCC service from generating findings or disable any detection service.
+        The narrative must NOT claim "SCC is disabled" — it is "matching findings are
+        auto-muted." SCC remains enabled and its dashboard shows findings in other
+        categories. This is stealthier than gcp-scc-disable-service because SCC appears
+        fully operational to casual inspection.
+        securitycenter.muteconfigs.create is required for new mute configs; .update is
+        required to modify an existing one — both permissions grant the evasion
+        capability (use OR logic). This is DEFENSE EVASION only; do NOT chain to any
+        access/escalation edge. Mute config scope: org-scoped configs suppress findings
+        org-wide; project-scoped configs suppress only that project's findings. Emit
+        for the SCC node at the scope the permission actually resolves at.
+        IMPORTANT: SCC Premium tier is required for mute configs. If the organization or
+        project is on Standard tier, the API will reject create/update attempts. Analysts
+        should verify SCC tier to distinguish real mute-config capability (Premium) from
+        false positives (Standard tier with permission).
+      narrative: >-
+        {principal.name} holds securitycenter.muteconfigs.create or .update at
+        {scc.scope} and can create a mute configuration with a CEL filter that
+        auto-suppresses all matching SCC findings (e.g., category="ACCOUNT_COMPROMISED"
+        or targeting specific resource types). The SCC service continues operating and
+        appears healthy — targeted finding categories are silently muted before analysts
+        see them. This capability requires SCC Premium tier; Standard tier orgs cannot
+        create mute configs. This is a stealthy cover-tracks primitive analogous to a
+        GuardDuty auto-archive filter.
+
+  # --- 3) Mute or inactivate individual findings — per-finding suppression ----
+  # securitycenter.findings.setState allows marking a finding INACTIVE (resolved),
+  # removing it from the active finding queue. securitycenter.findings.setMute
+  # allows muting individual findings. Both are lower-impact than a mute config
+  # (per-finding, requires manual action per finding) but require only project-scoped
+  # findingEditor permission — accessible to principals without org-level rights.
+  - id: gcp-scc-mute-finding
+    emits: CanModifyConfiguration
+    description: "Principal with securitycenter.findings.setState or findings.setMute can individually mark findings as INACTIVE or MUTED, removing them from the active queue without a rule-based mute config."
+    match:
+      - [ ?principal, HasPermission, ?scc ]
+    where:
+      - "node_type(?scc) == SecurityService"
+      - "?scc.provider_type in ['google.securitycenter.OrganizationSettings', 'google.securitycenter.ProjectSettings']"
+      - "?principal has EFFECTIVE securitycenter.findings.setState OR securitycenter.findings.setMute at the scope of ?scc"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?scc
+      permissions: ["securitycenter.findings.setState", "securitycenter.findings.setMute"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal holds effective securitycenter.findings.setState or
+        securitycenter.findings.setMute at ?scc.scope (via roles/securitycenter.findingEditor,
+        roles/securitycenter.adminEditor, or roles/securitycenter.admin). BLOCKED if an
+        IAM deny policy explicitly denies both setState and setMute at the effective scope.
+        Confidence is lower than gcp-scc-mute-config-create (0.80) because this path
+        requires per-finding manual action rather than a persistent rule.
+      confidence: 0.80
+      derived_from:
+        - "HasPermission(?principal, securitycenter.findings.setState|securitycenter.findings.setMute, ?scc)"
+      false_positive_note: >-
+        Per-finding muting/inactivating is lower-impact than rule-based mute configs
+        and requires the attacker to manually target each finding they wish to suppress.
+        It is most relevant when the attacker generates a small number of high-fidelity
+        findings (e.g., a single ACCOUNT_COMPROMISED finding for their own activity)
+        and wants to suppress only those. The setState(INACTIVE) operation appears as
+        "resolved" in the SCC UI, which may be operationally plausible and less
+        suspicious than a broad mute config. This is DEFENSE EVASION only; do NOT chain
+        to access/escalation. Scope: project-scoped findingEditor can only setState on
+        findings within that project; org-scoped permission covers all projects.
+      narrative: >-
+        {principal.name} holds securitycenter.findings.setState or findings.setMute at
+        {scc.scope} and can individually mark SCC findings as INACTIVE (resolved) or
+        MUTED, removing them from the active finding queue. Unlike a mute config, this
+        requires targeting each finding manually, but project-scoped findingEditor
+        permission suffices — making it accessible to principals without org-level
+        rights. This is a per-finding cover-tracks primitive.
+
+  # --- 4) Delete or modify notification configs — evasion (disrupt alerting pipeline) -------
+  # securitycenter.notificationconfigs.delete and .update are evasion primitives that
+  # silently disrupt the downstream SIEM/SOAR detection pipeline without touching SCC
+  # findings themselves. Deleting a config stops all notifications to external systems;
+  # updating can redirect the route or disable delivery. This is distinct from and
+  # complementary to disabling SCC services (gcp-scc-disable-service) — the SCC service
+  # continues running and generating findings, but external teams never see them.
+  - id: gcp-scc-notification-config-modify
+    emits: CanModifyConfiguration
+    description: "Principal with securitycenter.notificationconfigs.delete or .update can delete or modify notification configs that route SCC findings to external systems (SIEM, SOAR, ticketing), disrupting the downstream alerting pipeline."
+    match:
+      - [ ?principal, HasPermission, ?scc ]
+    where:
+      - "node_type(?scc) == SecurityService"
+      - "?scc.provider_type in ['google.securitycenter.OrganizationSettings', 'google.securitycenter.ProjectSettings']"
+      - "?principal has EFFECTIVE securitycenter.notificationconfigs.delete OR securitycenter.notificationconfigs.update at the scope of ?scc"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?scc
+      permissions: ["securitycenter.notificationconfigs.delete", "securitycenter.notificationconfigs.update"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal holds effective securitycenter.notificationconfigs.delete
+        or securitycenter.notificationconfigs.update at ?scc.scope. BLOCKED if an IAM
+        deny policy or VPC-SC perimeter denies both delete and update at the effective
+        scope. This is distinct from gcp-scc-disable-service: SCC findings continue to be
+        generated, but external systems are silenced.
+      confidence: 0.85
+      derived_from:
+        - "HasPermission(?principal, securitycenter.notificationconfigs.delete|securitycenter.notificationconfigs.update, ?scc)"
+      false_positive_note: >-
+        Notification config modification/deletion disrupts the downstream alerting pipeline
+        (SIEM, SOAR, ticketing integrations) WITHOUT disabling SCC services or stopping
+        finding generation. The SCC service continues operating at its current state —
+        findings are still generated but external teams never receive them. This is DEFENSE
+        EVASION only; do NOT chain to access/escalation edges. Deletion is destructive but
+        required to realize the evasion primitive (deletion creates a gap in alerting).
+        The deletion is both a capability and an impact: once deleted, the config must be
+        manually recreated by an administrator. Scope: org-scoped notification configs route
+        findings org-wide; project-scoped configs route only that project's findings.
+      narrative: >-
+        {principal.name} holds securitycenter.notificationconfigs.delete or .update at
+        {scc.scope} and can delete or modify notification configurations that route SCC
+        findings to external systems (e.g., Pub/Sub topics, Cloud Logging destinations, or
+        third-party SIEM connectors). Deletion or disabling a config silences downstream
+        alerting without affecting SCC finding generation — the attack surface remains
+        exposed to the attacker, but external teams and automated response systems never
+        see the findings. This is a high-impact cover-tracks primitive that persists until
+        an administrator manually restores the config.
+
+  # --- 4) Read findings only — org-wide recon (partial capability) -------
+  # securitycenter.findings.list alone (without assets.list) is a recon primitive:
+  # findings for ACCOUNT_COMPROMISED, OPEN_FIREWALL, SERVICE_ACCOUNT_KEY_CREATED,
+  # and other attack categories reveal exploitable misconfigurations without requiring
+  # direct read access to those resources. This rule captures the partial-permission
+  # principal who has findings-read but not asset-inventory-read.
+  - id: gcp-scc-read-findings-only
+    emits: CanRead
+    description: "Principal with securitycenter.findings.list can enumerate all SCC findings across their scope, revealing exploitable misconfigurations."
+    match:
+      - [ ?principal, HasPermission, ?scc ]
+    where:
+      - "node_type(?scc) == SecurityService"
+      - "?scc.provider_type in ['google.securitycenter.OrganizationSettings', 'google.securitycenter.ProjectSettings']"
+      - "?principal has EFFECTIVE securitycenter.findings.list at the scope of ?scc"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?scc
+      permissions: ["securitycenter.findings.list"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal holds effective securitycenter.findings.list at ?scc.scope.
+        BLOCKED if an IAM deny policy or VPC-SC perimeter denies securitycenter.findings.list.
+        Confidence 0.70 reflects that read access is low direct attack value without a
+        subsequent exploitation step.
+      confidence: 0.70
+      derived_from:
+        - "HasPermission(?principal, securitycenter.findings.list, ?scc)"
+      false_positive_note: >-
+        Read access to SCC findings alone provides reconnaissance of finding categories
+        (ACCOUNT_COMPROMISED, OPEN_FIREWALL, SERVICE_ACCOUNT_KEY_CREATED, etc.) but
+        does not include asset inventory and does not suppress findings or grant access.
+        Many legitimate roles (SOC analysts, security engineers, audit accounts) hold
+        this permission. Confidence is 0.70. SCC findings do NOT contain credentials or
+        secret material. This is RECON-only; do NOT chain to CanExecuteAs, CanEnterProject,
+        or CanEscalateTo.
+      narrative: >-
+        {principal.name} can list SCC findings at {scc.scope} (securitycenter.findings.list).
+        This reveals finding categories and resource misconfigurations across all projects
+        in scope (e.g., ACCOUNT_COMPROMISED, OPEN_FIREWALL, SERVICE_ACCOUNT_KEY_CREATED
+        findings) without requiring direct read access to those resources. This reconnaissance
+        capability accelerates identification of lateral movement targets and exploitable
+        misconfigurations.
+
+  # --- 4b) Read findings AND assets — fuller org-wide recon -------
+  # securitycenter.findings.list + securitycenter.assets.list exposes both SCC
+  # findings and the complete GCP asset inventory (every resource across all
+  # projects in scope) to the principal. This is a more powerful recon primitive
+  # than findings-only because the asset inventory provides the full resource graph.
+  # Per Phase-12 guidance: 1 conservative recon rule for each capability level.
+  - id: gcp-scc-read-findings-and-assets
+    emits: CanRead
+    description: "Principal with both securitycenter.findings.list and securitycenter.assets.list can enumerate all SCC findings and the full GCP asset inventory, providing complete org-wide resource reconnaissance."
+    match:
+      - [ ?principal, HasPermission, ?scc ]
+    where:
+      - "node_type(?scc) == SecurityService"
+      - "?scc.provider_type in ['google.securitycenter.OrganizationSettings', 'google.securitycenter.ProjectSettings']"
+      - "?principal has EFFECTIVE securitycenter.findings.list AND securitycenter.assets.list at the scope of ?scc"
+    emit:
+      source_type: Identity
+      target_type: SecurityService
+      source: ?principal
+      target: ?scc
+      permissions: ["securitycenter.findings.list", "securitycenter.assets.list"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal holds both securitycenter.findings.list and
+        securitycenter.assets.list at ?scc.scope (both are required for full recon).
+        BLOCKED if an IAM deny policy or VPC-SC perimeter denies either action.
+        Confidence 0.75 reflects that combined read access is low direct attack value
+        without a subsequent exploitation step, but higher than findings-only.
+      confidence: 0.75
+      derived_from:
+        - "HasPermission(?principal, securitycenter.findings.list, ?scc)"
+        - "HasPermission(?principal, securitycenter.assets.list, ?scc)"
+      false_positive_note: >-
+        Read access to SCC findings and full asset inventory is low direct attack value
+        on its own — it provides complete reconnaissance but does not suppress findings
+        or grant access. Many legitimate roles (SOC analysts, security engineers, audit
+        accounts) hold this permission. Confidence is 0.75. SCC findings do NOT contain
+        credentials or secret material; do NOT emit ContainsSecret or CanReadSecret for
+        SCC finding content. Findings may point to a misconfigured resource (e.g., a public
+        GCS bucket), but that is a recon pointer, not a credential in the SCC payload itself.
+        This is RECON-only; do NOT chain to CanExecuteAs, CanEnterProject, or CanEscalateTo.
+      narrative: >-
+        {principal.name} can list SCC findings and the full GCP asset inventory at
+        {scc.scope} (securitycenter.findings.list + securitycenter.assets.list). This
+        reveals the complete asset graph and all misconfigured resources across all
+        projects in scope (e.g., PUBLIC_BUCKET_ACL, OPEN_FIREWALL, SERVICE_ACCOUNT_KEY_CREATED
+        findings) without requiring direct read access to those resources. This reconnaissance
+        capability provides a complete attack surface map for lateral movement planning.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An IAM deny policy denying securitycenter.settings.update at org scope
+#     blocks gcp-scc-disable-service for org-scoped SCC. A project-scoped deny
+#     blocks it only for that project's SCC settings.
+#   - An IAM deny policy denying securitycenter.muteconfigs.create AND
+#     securitycenter.muteconfigs.update blocks gcp-scc-mute-config-create.
+#   - An IAM deny policy denying securitycenter.findings.setState AND
+#     securitycenter.findings.setMute blocks gcp-scc-mute-finding.
+#   - A VPC Service Controls perimeter restricting securitycenter.googleapis.com
+#     blocks all SCC API calls for principals outside the perimeter.
+#   - Org policy `constraints/gcp.disableCloudServices` does NOT apply to SCC
+#     (SCC is not a disableable service via that constraint).
+#   - SCC Premium tier is required for some features (muteconfigs, some finding
+#     types); if the org is on Standard tier, emit CONDITIONAL(service_state)
+#     for mute-config rules rather than ACTIVE.
+#
+# CHAINS THIS FILE DOES NOT PRODUCE (by design):
+#   - CanExecuteAs: SCC has no execution identity.
+#   - CanEnterProject / CanEnterOrganization: SCC tampering is evasion, not access.
+#   - CanEscalateTo: SCC edges are cover-tracks and recon, not escalation.
+#   - ContainsSecret / CanReadSecret: SCC findings contain no credential material.
+#   - ExecutesAs: SCC is a managed detection service with no attacker-influenceable
+#     execution runtime.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw config -> explicit edges) have been moved
+# to /rules/explicit/gcp-scc.yaml to produce the HasPermission edges this
+# derived file consumes. The explicit-rule pipeline will materialize the
+# required HasPermission edges from IAM/RBAC assignments using effective-
+# permission evaluation, and this file's derived rules will consume them.

@@ -1,0 +1,491 @@
+# AWS CloudTrail — Derived attack-path rules (Phase 12 — security & logging)
+# ---------------------------------------------------------------------------
+# CloudTrail is AWS's API-audit service. The dominant attacker use-case is
+# DEFENSE EVASION / TAMPERING: stopping, deleting, or narrowing a trail removes
+# the audit record of subsequent attacker operations. This is a cover-tracks /
+# weaken-detective-controls primitive. It does NOT grant resource access and MUST
+# NOT be chained to CanExecuteAs, CanEnterAccount, or any access escalation edge.
+#
+# Three surface areas modeled here:
+#   (1) STOP LOGGING  — cloudtrail:StopLogging disables recording on an ACTIVE
+#       trail (reversible). -> CanModifyConfiguration on the trail (LoggingService).
+#   (2) DELETE TRAIL  — cloudtrail:DeleteTrail permanently destroys a trail.
+#       -> CanDelete on the trail (LoggingService).
+#   (3) NARROW SELECTORS — cloudtrail:UpdateTrail + cloudtrail:PutEventSelectors
+#       can exclude attacker-controlled API principals or event categories from
+#       capture, creating selective blindness without fully stopping logging.
+#       -> CanModifyConfiguration on the trail (LoggingService).
+#   (4) LOOKUP EVENTS — cloudtrail:LookupEvents searches recent management-event
+#       history (last 90 days, no S3 access required) revealing IAM principal names,
+#       access-key IDs, resource names, and error codes — recon primitive.
+#       -> CanRead on the trail (LoggingService).
+#
+# COMPOSITION NOTE: CloudTrail has no execution-identity model. None of these rules
+# chain to CanExecuteAs / CanEscalateTo / CanEnterAccount — cite this explicitly in
+# false_positive_note. The linchpin files (can-execute-as.yaml, cicd-chains.yaml,
+# credential-chains.yaml, can-control.yaml) are not relevant for CloudTrail.
+#
+# STATE NOTE: detective controls do NOT set BLOCKED state on capability edges.
+# BLOCKED is reserved for preventive guardrails (SCPs, permission boundaries, deny
+# assignments) that neutralize an access action. A stopped trail reduces detection
+# of other actions but does not block any access capability edge.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 12-security-logging
+applies_to: [aws]
+
+rules:
+
+  # --- (1) Stop an active trail — reversible logging suppression --------------
+  - id: aws-cloudtrail-stop-logging
+    emits: CanModify
+    description: >-
+      Principal with cloudtrail:StopLogging can pause event recording on a trail,
+      suppressing the audit record of all subsequent API activity until logging is
+      resumed — a defense-evasion / cover-tracks primitive.
+    match:
+      - [ ?principal, HasPermission, ?trail ]
+    where:
+      - "node_type(?trail) == LoggingService"
+      - "?trail.provider_type == 'AWS::CloudTrail::Trail'"
+      - "effective_action(?principal, ?trail) includes 'cloudtrail:StopLogging'"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?trail
+      permissions: ["cloudtrail:StopLogging"]
+      conditions: [iam_permission, scp_or_org_policy, region_or_boundary]
+      state_logic: >-
+        ACTIVE when the principal holds cloudtrail:StopLogging with no effective deny
+        (SCP or permission boundary) on the trail ARN scope AND the caller is in the
+        same region as the trail's HomeRegion (for org trails) or any region (for
+        regional trails); BLOCKED when an SCP or permission boundary explicitly denies
+        cloudtrail:StopLogging or cloudtrail:*. Organization trails (IsOrganizationTrail=true)
+        are only manageable from the management account in the trail's home region — if
+        the principal is in a member account or different region, set state BLOCKED
+        (API returns AccessDenied). Regional trails can be stopped from any region by
+        the management account (or any account-local principal with the permission).
+      confidence: 0.95
+      derived_from:
+        - HasPermission(?principal, cloudtrail:StopLogging, ?trail)
+      false_positive_note: >-
+        This is DEFENSE EVASION only — stopping a trail suppresses detection but does
+        NOT grant access to any resource or identity. Do NOT chain this edge to
+        CanExecuteAs, CanEscalateTo, or CanEnterAccount. Organization trails are
+        manageable only from the management account's home region; a member-account
+        principal cannot stop an org trail even with cloudtrail:StopLogging — emit
+        BLOCKED or suppress for member-account callers. Check for SCPs implementing
+        detective-control guardrails (common pattern: deny cloudtrail:StopLogging on
+        all accounts except the security tooling account) — these produce a BLOCKED
+        edge. Note: CanModify (resource_control/CONTROL) correctly describes the
+        operational tamper capability without EXECUTION category semantics.
+      narrative: >-
+        {principal.name} can call cloudtrail:StopLogging on {trail.name}, pausing
+        event recording for this trail. While stopped, all API calls in the trail's
+        scope go unrecorded, allowing subsequent attacker activity to avoid the
+        CloudTrail audit log. This is a cover-tracks primitive and does not grant
+        resource access.
+
+  # --- (2) Delete a trail — permanent audit blind spot -----------------------
+  - id: aws-cloudtrail-delete-trail
+    emits: CanDelete
+    description: >-
+      Principal with cloudtrail:DeleteTrail can permanently destroy a trail,
+      creating an irreversible audit blind spot. Existing S3 log objects are
+      unaffected; only future event capture is eliminated.
+    match:
+      - [ ?principal, HasPermission, ?trail ]
+    where:
+      - "node_type(?trail) == LoggingService"
+      - "?trail.provider_type == 'AWS::CloudTrail::Trail'"
+      - "effective_action(?principal, ?trail) includes 'cloudtrail:DeleteTrail'"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?trail
+      permissions: ["cloudtrail:DeleteTrail"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal holds cloudtrail:DeleteTrail with no effective deny
+        on the trail ARN scope. BLOCKED when an SCP or permission boundary denies
+        cloudtrail:DeleteTrail or cloudtrail:*. Organization trails: manageable only
+        from the management account in the trail's home region; emit BLOCKED for
+        member-account principals or when the caller's region differs from the trail's
+        HomeRegion. Note: deletion of an org trail silences the entire organization
+        simultaneously — annotate IsOrganizationTrail=true trails with elevated impact
+        (analyst note, not a separate edge type).
+      confidence: 0.97
+      derived_from:
+        - HasPermission(?principal, cloudtrail:DeleteTrail, ?trail)
+      false_positive_note: >-
+        DEFENSE EVASION ONLY. DeleteTrail is permanent and higher-impact than
+        StopLogging, but equally does not grant access to any resource. Do NOT emit
+        CanEnterAccount or any escalation edge from this capability. Log objects
+        already written to S3 survive trail deletion — the attacker must separately
+        target the S3 bucket to destroy historical evidence. SCP deny on
+        cloudtrail:DeleteTrail is common in security-baseline accounts and renders
+        this edge BLOCKED. NOTE: CanDelete edges have traversal: {walkable: false}
+        in edges.yaml, so this edge will not appear in default attack paths; this is
+        correct for destructive-only operations.
+      narrative: >-
+        {principal.name} can permanently delete {trail.name} (cloudtrail:DeleteTrail),
+        eliminating future audit capture for the trail's scope. This is an anti-forensic
+        / cover-tracks primitive with no accompanying access gain.
+
+  # --- (3a) Narrow event selectors — selective logging evasion ----------------
+  - id: aws-cloudtrail-narrow-selectors
+    emits: CanModify
+    description: >-
+      Principal with cloudtrail:PutEventSelectors can exclude attacker-used API
+      principals, actions, or data-event prefixes from capture, creating selective
+      audit blindness while leaving the trail apparently running.
+    match:
+      - [ ?principal, HasPermission, ?trail ]
+    where:
+      - "node_type(?trail) == LoggingService"
+      - "?trail.provider_type == 'AWS::CloudTrail::Trail'"
+      - "effective_action(?principal, ?trail) includes 'cloudtrail:PutEventSelectors'"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?trail
+      permissions: ["cloudtrail:PutEventSelectors"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal holds cloudtrail:PutEventSelectors with no effective
+        deny on the trail ARN scope; BLOCKED on SCP/boundary deny or member-account
+        access to org trail.
+      confidence: 0.90
+      derived_from:
+        - HasPermission(?principal, cloudtrail:PutEventSelectors, ?trail)
+      false_positive_note: >-
+        DEFENSE EVASION, NOT privilege escalation. Narrowing selectors via the
+        PutEventSelectors API is the clean selector-exclusion surface. The trail
+        remains in IsLogging=true state; monitoring that only checks trail status
+        misses this. However, it grants zero resource access. Do NOT chain to any
+        access edge. CanModify (resource_control/CONTROL) correctly describes the
+        operational tamper capability.
+      narrative: >-
+        {principal.name} can call cloudtrail:PutEventSelectors on {trail.name} to
+        exclude specific API principals, resource types, or management event categories
+        from capture. The trail remains apparently active (IsLogging=true), but targeted
+        attacker actions avoid the audit record — a stealth evasion primitive.
+
+  # --- (3b) UpdateTrail for benign parameters (low-risk) -----
+  - id: aws-cloudtrail-update-trail-benign
+    emits: null
+    description: >-
+      Principal with cloudtrail:UpdateTrail but no PutEventSelectors can update
+      trail metadata (description, tags) without impactful defense-evasion capability.
+      This rule is a SUPPRESS-IF-ONLY-UPDATETRAIL gate — do not emit an edge when
+      UpdateTrail is the only action AND the effective policy scope does not include
+      S3 bucket redirection or IncludeManagementEvents disable.
+    match:
+      - [ ?principal, HasPermission, ?trail ]
+    where:
+      - "node_type(?trail) == LoggingService"
+      - "?trail.provider_type == 'AWS::CloudTrail::Trail'"
+      - "effective_action(?principal, ?trail) includes 'cloudtrail:UpdateTrail'"
+      - "NOT effective_action(?principal, ?trail) includes 'cloudtrail:PutEventSelectors'"
+    emit: null
+    state_logic: >-
+      NULL (no edge emitted). This gate suppresses UpdateTrail-only edges when the
+      effective policy cannot reach impactful parameters. If UpdateTrail is granted
+      alongside PutEventSelectors, the combined rule aws-cloudtrail-narrow-selectors
+      fires instead. Analysts should manually review UpdateTrail-only grants with
+      broad resource scopes or condition keys that allow S3BucketName / IsMultiRegionTrail
+      changes.
+    confidence: 0
+    derived_from: []
+    false_positive_note: >-
+      This is a SUPPRESS rule, not an emit rule. UpdateTrail has many benign uses
+      (tag changes, description updates). Emitting CanModify for every UpdateTrail
+      grant risks false positives. If analysts see UpdateTrail in an effective policy,
+      they should manually check whether the policy constrains it to safe parameters.
+      If S3BucketName or EnableLogFileValidation=false are reachable, a threat analyst
+      should flag for manual edge creation with state ACTIVE.
+    narrative: null
+
+  # --- (3c) Redirect delivery bucket — log exfiltration ------
+  - id: aws-cloudtrail-redirect-delivery
+    emits: CanWrite
+    description: >-
+      Principal with cloudtrail:UpdateTrail can redirect S3 log delivery to an
+      attacker-controlled bucket, enabling silent log exfiltration while the trail
+      remains IsLogging=true. This is a log-redirect-to-attacker-bucket exfiltration
+      capability, distinct from selector narrowing.
+    match:
+      - [ ?principal, HasPermission, ?trail ]
+    where:
+      - "node_type(?trail) == LoggingService"
+      - "?trail.provider_type == 'AWS::CloudTrail::Trail'"
+      - "effective_action(?principal, ?trail) includes 'cloudtrail:UpdateTrail'"
+      - "policy_allows_parameter_modification(?principal, 'S3BucketName') OR policy_allows_parameter_modification(?principal, 'S3KeyPrefix')"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?trail
+      permissions: ["cloudtrail:UpdateTrail"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal holds cloudtrail:UpdateTrail with no effective deny
+        AND the IAM policy permits changes to S3BucketName or S3KeyPrefix (detected via
+        policy analysis or confirmation from analyst annotation). This capability allows
+        silent redirection of CloudTrail logs to an attacker-controlled bucket; logs
+        continue to be generated (IsLogging=true) but flow to the attacker. BLOCKED on
+        SCP/boundary deny or policy condition keys that restrict bucket changes.
+      confidence: 0.85
+      derived_from:
+        - HasPermission(?principal, cloudtrail:UpdateTrail, ?trail)
+      false_positive_note: >-
+        This rule fires on UpdateTrail when the policy permits S3 bucket/prefix changes.
+        If UpdateTrail is locked to safe parameters only (e.g., via IAM condition keys
+        limiting resource scope), this rule should not emit. Analysts should verify
+        that the target bucket redirection is actually exploitable before promoting
+        the edge to ACTIVE. This is distinct from selector narrowing (evasion) and is
+        an exfiltration primitive — do NOT chain to CanExecuteAs.
+      narrative: >-
+        {principal.name} can call cloudtrail:UpdateTrail on {trail.name} to redirect
+        log delivery to a different S3 bucket (via S3BucketName parameter), potentially
+        an attacker-controlled bucket. Logs continue to be recorded (IsLogging=true
+        remains), but flow to the attacker, enabling silent exfiltration of the audit
+        trail. This is an anti-forensic / cover-tracks + data-exfiltration primitive.
+
+  # --- (4) Lookup events — recon of account-wide event history --------
+  - id: aws-cloudtrail-lookup-events
+    emits: CanRead
+    description: >-
+      Principal with cloudtrail:LookupEvents can query 90 days of account-wide
+      management-event history without S3 access, exposing IAM principal names,
+      access-key IDs, resource ARNs, and error codes — useful for recon and lateral
+      movement planning.
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_type(?account) == Account"
+      - "effective_action(?principal, ?account) includes 'cloudtrail:LookupEvents'"
+    emit:
+      source_type: Identity
+      target_type: Account
+      source: ?principal
+      target: ?account
+      permissions: ["cloudtrail:LookupEvents"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal holds cloudtrail:LookupEvents with no effective deny.
+        LookupEvents operates account-wide and is not scoped to a specific trail in IAM
+        (the IAM resource is always *). BLOCKED only when an SCP or boundary explicitly
+        denies the action. This edge is emitted once per account (per principal-account
+        pair), not once per trail.
+      confidence: 0.90
+      derived_from:
+        - HasPermission(?principal, cloudtrail:LookupEvents, ?account)
+      false_positive_note: >-
+        RECON primitive only — LookupEvents surfaces metadata about past API calls
+        (who called what, when, from where, with which access key) but does NOT expose
+        raw credentials or session tokens. It cannot be used to access other resources.
+        Do NOT chain CanRead(account) to CanAssume, CanImpersonate, or any access edge
+        without a separate, evidenced permission grant. Note: LookupEvents returns
+        management events from the CURRENT account's event history; it does NOT reach
+        org-level data or other accounts' trails. Analysts should note that error-code
+        fields (AccessDenied) in returned events expose which actions the caller does
+        NOT have, giving attackers negative-space recon. This edge targets the Account
+        boundary node (not a specific trail) because LookupEvents queries the entire
+        account's audit history regardless of trail configuration.
+      narrative: >-
+        {principal.name} can call cloudtrail:LookupEvents to search 90 days of
+        management-event history in {account.name} — revealing IAM principal names,
+        access-key IDs used for API calls, resource ARNs, source IPs, and error codes.
+        This is a recon capability for lateral movement planning; it grants no resource
+        access.
+
+  # --- (5) Delete CloudTrail Lake Event Data Store -----
+  - id: aws-cloudtrail-delete-event-data-store
+    emits: CanDelete
+    description: >-
+      Principal with cloudtrail:DeleteEventDataStore can permanently destroy a
+      CloudTrail Lake event data store, eliminating the long-term audit retention
+      store for the organization. This is a high-impact anti-forensic primitive.
+    match:
+      - [ ?principal, HasPermission, ?datastore ]
+    where:
+      - "node_type(?datastore) == LoggingService"
+      - "?datastore.provider_type == 'AWS::CloudTrail::EventDataStore'"
+      - "effective_action(?principal, ?datastore) includes 'cloudtrail:DeleteEventDataStore'"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?datastore
+      permissions: ["cloudtrail:DeleteEventDataStore"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal holds cloudtrail:DeleteEventDataStore with no
+        effective deny on the data store ARN. BLOCKED when an SCP or permission
+        boundary denies cloudtrail:DeleteEventDataStore or cloudtrail:*. Organization
+        data stores are managed at org level; member-account principals cannot delete
+        org data stores — emit BLOCKED for member-account access attempts.
+      confidence: 0.97
+      derived_from:
+        - HasPermission(?principal, cloudtrail:DeleteEventDataStore, ?datastore)
+      false_positive_note: >-
+        DEFENSE EVASION ONLY. Deleting a Lake event data store is permanent and
+        destroys long-term audit retention (typically the organization's sole
+        persistent audit store). However, it does not grant access to other resources.
+        Do NOT emit CanEnterAccount or escalation edges. SCP deny on
+        cloudtrail:DeleteEventDataStore is a strong security baseline. An org-scoped
+        data store deletion requires management account privileges — emit BLOCKED for
+        member-account callers.
+      narrative: >-
+        {principal.name} can permanently delete {datastore.name} (cloudtrail:DeleteEventDataStore),
+        destroying the CloudTrail Lake event data store and eliminating long-term audit
+        retention. This is a high-impact anti-forensic primitive with no accompanying
+        resource access gain.
+
+  # --- (6) Disable Lake ingestion via UpdateEventDataStore -----
+  - id: aws-cloudtrail-disable-lake-ingestion
+    emits: CanModify
+    description: >-
+      Principal with cloudtrail:UpdateEventDataStore can disable ingestion
+      (IngestionEnabled: false) on a CloudTrail Lake event data store, halting
+      new audit-event collection while the store remains accessible — a reversible
+      detection-suppression primitive.
+    match:
+      - [ ?principal, HasPermission, ?datastore ]
+    where:
+      - "node_type(?datastore) == LoggingService"
+      - "?datastore.provider_type == 'AWS::CloudTrail::EventDataStore'"
+      - "effective_action(?principal, ?datastore) includes 'cloudtrail:UpdateEventDataStore'"
+      - "policy_allows_parameter_modification(?principal, 'IngestionEnabled')"
+    emit:
+      source_type: Identity
+      target_type: LoggingService
+      source: ?principal
+      target: ?datastore
+      permissions: ["cloudtrail:UpdateEventDataStore"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when the principal holds cloudtrail:UpdateEventDataStore with no
+        effective deny AND the IAM policy permits IngestionEnabled parameter changes
+        (detected via policy analysis or analyst annotation). BLOCKED on SCP/boundary
+        deny or policy conditions that restrict this capability.
+      confidence: 0.88
+      derived_from:
+        - HasPermission(?principal, cloudtrail:UpdateEventDataStore, ?datastore)
+      false_positive_note: >-
+        DEFENSE EVASION ONLY. Disabling ingestion is reversible (StartIngestion
+        re-enables it) and stops new event collection without deleting stored events.
+        cloudtrail:UpdateEventDataStore can also change benign parameters (retention
+        period, tags). Only emit this edge when the effective policy permits
+        IngestionEnabled modification. Do NOT chain to escalation edges.
+      narrative: >-
+        {principal.name} can call cloudtrail:UpdateEventDataStore on {datastore.name}
+        to disable ingestion (IngestionEnabled: false), halting new audit-event
+        collection. Stored events remain accessible, but future API activity goes
+        unrecorded — a reversible detection-suppression primitive.
+
+  # --- (7) Deregister Organization Delegated Admin -----
+  - id: aws-cloudtrail-deregister-delegated-admin
+    emits: CanModify
+    description: >-
+      Principal with cloudtrail:DeregisterOrganizationDelegatedAdmin can remove the
+      delegated admin role from an account, preventing it from managing organization
+      trails and reducing the security team's ability to respond to and restore logging.
+      This is a persistence / evasion amplifier in multi-account environments.
+    match:
+      - [ ?principal, HasPermission, ?org ]
+    where:
+      - "node_type(?org) == Organization"
+      - "effective_action(?principal, ?org) includes 'cloudtrail:DeregisterOrganizationDelegatedAdmin'"
+    emit:
+      source_type: Identity
+      target_type: Organization
+      source: ?principal
+      target: ?org
+      permissions: ["cloudtrail:DeregisterOrganizationDelegatedAdmin"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal (must be in the management account) holds
+        cloudtrail:DeregisterOrganizationDelegatedAdmin. This action is management-account-only;
+        member-account principals cannot call it (API returns AccessDenied). BLOCKED
+        only when an org-level SCP denies the action.
+      confidence: 0.92
+      derived_from:
+        - HasPermission(?principal, cloudtrail:DeregisterOrganizationDelegatedAdmin, ?org)
+      false_positive_note: >-
+        This is an ORG-LEVEL TAMPERING action, not resource access. Removing the
+        delegated admin prevents the security team's dedicated account from managing
+        CloudTrail across the organization. This is a persistence/response-impairment
+        primitive — do NOT chain to resource access edges. Only the management account
+        can call this action; member-account access attempts fail with AccessDenied.
+      narrative: >-
+        {principal.name} can call cloudtrail:DeregisterOrganizationDelegatedAdmin to remove
+        the delegated admin role from an organization, preventing the security team's
+        dedicated account from managing organization trails. This reduces the organization's
+        ability to respond to and restore logging, acting as a persistence and detection-evasion
+        amplifier.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying cloudtrail:StopLogging, cloudtrail:DeleteTrail,
+#     cloudtrail:PutEventSelectors, cloudtrail:UpdateTrail, cloudtrail:LookupEvents,
+#     or cloudtrail:* -> corresponding rules produce BLOCKED edges with
+#     denied_by=<SCP statement>.
+#   - A permission boundary capping cloudtrail:StopLogging or cloudtrail:DeleteTrail
+#     -> BLOCKED for those specific rules.
+#   - An organization trail (IsOrganizationTrail=true) is manageable ONLY from the
+#     management account in the trail's home region. Member-account principals ->
+#     StopLogging / DeleteTrail / PutEventSelectors BLOCKED (API returns AccessDenied).
+#     Regional trail management requires the caller to be in the same region (for org
+#     trails) or any region (for regional trails in the owning account).
+#   - Organization-scoped Lake data stores (EventDataStore with IsOrganizationDataStore=true)
+#     are manageable ONLY from the management account. Member-account principals ->
+#     DeleteEventDataStore / UpdateEventDataStore BLOCKED.
+#   - cloudtrail:DeregisterOrganizationDelegatedAdmin is management-account-only;
+#     member-account calls return AccessDenied (BLOCKED state).
+#   - No ACTIVE escalation path exists from ANY CloudTrail action. Never emit
+#     CanExecuteAs, CanEscalateTo, CanEnterAccount, or CanAssume from CloudTrail
+#     permissions — see providers/aws/cloudtrail.md section 3 and 14.
+#
+# RULE SUMMARY:
+#   (1) aws-cloudtrail-stop-logging        — CanModify (reversible logging suppression)
+#   (2) aws-cloudtrail-delete-trail        — CanDelete (permanent audit blind spot)
+#   (3a) aws-cloudtrail-narrow-selectors   — CanModify (PutEventSelectors selective evasion)
+#   (3b) aws-cloudtrail-update-trail-benign — NULL (suppress UpdateTrail-only edges)
+#   (3c) aws-cloudtrail-redirect-delivery  — CanWrite (S3 bucket redirect exfiltration)
+#   (4) aws-cloudtrail-lookup-events       — CanRead (account-wide recon, target: Account)
+#   (5) aws-cloudtrail-delete-event-data-store — CanDelete (Lake data store destruction)
+#   (6) aws-cloudtrail-disable-lake-ingestion — CanModify (Lake ingestion disable)
+#   (7) aws-cloudtrail-deregister-delegated-admin — CanModify (org delegated admin removal)
+#
+# LINCHPIN CITATIONS (rules not applicable here but cited for completeness):
+#   - rules/derived/can-execute-as.yaml   — CloudTrail has NO ExecutesAs surface
+#   - rules/derived/cicd-chains.yaml      — CloudTrail is not a CI/CD runner
+#   - rules/derived/credential-chains.yaml — CloudTrail does NOT expose credentials
+#   - rules/derived/can-control.yaml      — No admin/control path from CloudTrail perms
+#
+# EXPLICIT NORMALIZATION:
+#   No separate /rules/explicit/aws-cloudtrail.yaml is needed. HasPermission edges
+#   feeding the rules above are produced by the standard effective-permission evaluator
+#   running cloudtrail:StopLogging / DeleteTrail / PutEventSelectors / UpdateTrail /
+#   LookupEvents / DeleteEventDataStore / UpdateEventDataStore / DeregisterOrganizationDelegatedAdmin
+#   against the appropriate resource scope (trail ARN, data store ARN, account, or org).
+#   Collection APIs and evidence fields are documented in providers/aws/cloudtrail.md
+#   sections 19-21.
+#
+# EDGE TYPE SELECTION RATIONALE:
+#   - CanModify: describes operational tamper on trail/data-store properties without
+#     EXECUTION category semantics. Used for StopLogging, UpdateTrail (redirect +
+#     selector narrowing gate), UpdateEventDataStore (ingestion disable), and
+#     DeregisterOrganizationDelegatedAdmin.
+#   - CanWrite: used for redirect-delivery (exfiltration of logs to attacker bucket).
+#   - CanDelete: used for trail deletion and data store deletion (destructive, permanent).
+#   - CanRead: used for LookupEvents (account-wide recon), targeting Account boundary node.
+#   - NULL: aws-cloudtrail-update-trail-benign suppresses UpdateTrail-only edges that
+#     lack impactful scope.
+# ---------------------------------------------------------------------------

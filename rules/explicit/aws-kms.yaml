@@ -1,0 +1,168 @@
+# Normalizing AWS KMS into explicit edges.
+# The adapter emits raw KMS records (DescribeKey, GetKeyPolicy, ListGrants) and the
+# effective-permission evaluator emits permission-derived edges. KMS is doubly-gated:
+# a cryptographic capability requires the action in the caller's effective IAM policy
+# AND the key policy (or a grant) to permit the principal. The match_effective_permission
+# rules below assume the evaluator has ALREADY intersected identity policy + key policy
+# + grants; where it cannot, the derived rules downgrade to CONDITIONAL(resource_policy).
+
+rules:
+
+  # --- Key policy is the key's resource policy -------------------------------
+  - id: aws-kms-has-key-policy
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::KMS::Key", field: "Policy"}
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<key node>"
+      target: "<key-policy ResourcePolicy node>"
+      api_source: "kms:GetKeyPolicy"
+      evidence_field: "Policy"
+      narrative: "{key.name} has a key policy (resource policy) governing who may use it."
+
+  # --- Effective kms:Decrypt (identity policy AND key policy/grant) ----------
+  - id: aws-kms-can-decrypt
+    emits: CanDecrypt
+    applies_to: [aws]
+    match_effective_permission:
+      action: "kms:Decrypt"
+      resource_type: "AWS::KMS::Key"
+    where:
+      - "key policy or a grant permits the principal (directly, via account-root IAM delegation, or grant)"
+      - "any kms:ViaService / kms:EncryptionContext condition on the grant is recorded as a condition"
+    emit:
+      target_type: EncryptionKey
+      source: "<principal>"
+      target: "<key node>"
+      api_source: "iam:SimulatePrincipalPolicy | policy evaluation (intersect identity + key policy + grants)"
+      permissions: ["kms:Decrypt"]
+      narrative: "{principal.name} can decrypt with {key.name} (kms:Decrypt, permitted by identity + key policy)."
+
+  # --- Effective kms:Sign on an asymmetric SIGN_VERIFY key ------------------
+  - id: aws-kms-can-sign
+    emits: CanSignAs
+    applies_to: [aws]
+    match_effective_permission:
+      action: "kms:Sign"
+      resource_type: "AWS::KMS::Key"
+    where:
+      - "DescribeKey.KeyUsage == SIGN_VERIFY (asymmetric)"
+      - "node_type(key) == SigningKey (SIGN_VERIFY keys carry the SigningKey subtype; required so the CanSignAs target conforms to edges.yaml target set [SigningKey, ServiceAccount, ApplicationIdentity])"
+      - "key policy or a grant permits the principal"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<key node (SigningKey subtype)>"
+      api_source: "kms:DescribeKey (KeyUsage) + policy evaluation"
+      permissions: ["kms:Sign"]
+      narrative: "{principal.name} can sign as {key.name} (kms:Sign on a SIGN_VERIFY key) — forge signatures anchored on its public key."
+
+  # --- Effective kms:GenerateMac on an HMAC (GENERATE_VERIFY_MAC) key --------
+  - id: aws-kms-can-sign-hmac
+    emits: CanSignAs
+    applies_to: [aws]
+    match_effective_permission:
+      action: "kms:GenerateMac"
+      resource_type: "AWS::KMS::Key"
+    where:
+      - "DescribeKey.KeyUsage == GENERATE_VERIFY_MAC (HMAC)"
+      - "node_type(key) == SigningKey (HMAC keys carry the SigningKey subtype — conforms to CanSignAs target set)"
+      - "key policy or a grant permits the principal"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<key node (SigningKey subtype)>"
+      api_source: "kms:DescribeKey (KeyUsage) + policy evaluation"
+      permissions: ["kms:GenerateMac"]
+      false_positive_note: >-
+        This is symmetric-MAC forgery (kms:GenerateMac on a GENERATE_VERIFY_MAC key),
+        NOT public-key signing. It lets the attacker forge a valid MAC for any message,
+        but because verification requires the same secret KMS key (kms:VerifyMac), it
+        does NOT forge public-key-verified identities the way a SIGN_VERIFY key does —
+        the derived rule aws-kms-sign-forges-identity therefore excludes HMAC keys.
+      narrative: "{principal.name} can forge MACs with {key.name} (kms:GenerateMac on an HMAC key) — symmetric-MAC forgery, not public-key signing."
+
+  # --- Key administration = self-grant of any crypto op ---------------------
+  - id: aws-kms-can-administer-via-putkeypolicy
+    emits: CanAdminister
+    applies_to: [aws]
+    match_effective_permission:
+      action: "kms:PutKeyPolicy"
+      resource_type: "AWS::KMS::Key"
+    where:
+      - "DescribeKey.KeyManager == CUSTOMER (AWS-managed keys have immutable policies)"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<key node>"
+      permissions: ["kms:PutKeyPolicy"]
+      narrative: "{principal.name} can rewrite the key policy of {key.name} (kms:PutKeyPolicy) — self-grant Decrypt/Sign."
+
+  - id: aws-kms-can-administer-via-creategrant
+    emits: CanAdminister
+    applies_to: [aws]
+    match_effective_permission:
+      action: "kms:CreateGrant"
+      resource_type: "AWS::KMS::Key"
+    where:
+      - "DescribeKey.KeyManager == CUSTOMER"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<key node>"
+      permissions: ["kms:CreateGrant"]
+      narrative: "{principal.name} can create grants on {key.name} (kms:CreateGrant) — delegate Decrypt/Sign to any grantee."
+
+  # --- Cross-account use via key policy / grant -----------------------------
+  - id: aws-kms-key-policy-cross-account
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::KMS::Key", field: "Policy"}
+    where: ["a key-policy statement names a principal / account root in a different account"]
+    emit:
+      source: "<key-policy ResourcePolicy node>"
+      target: "<external principal / account>"
+      api_source: "kms:GetKeyPolicy"
+      evidence_field: "Policy.Statement[].Principal"
+      narrative: "{key.name} key policy grants use to {external.name} in account {account}."
+
+  - id: aws-kms-grant-cross-account
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::KMS::Grant", field: "GranteePrincipal"}
+    where: ["GranteePrincipal is in a different account"]
+    emit:
+      source: "<key-policy ResourcePolicy node>"
+      target: "<external grantee principal / account>"
+      api_source: "kms:ListGrants"
+      evidence_field: "GranteePrincipal"
+      narrative: "{key.name} has a grant delegating {operations} to {external.name} in account {account}."
+
+  # --- Alias re-point (poisoning / substitution) via kms:UpdateAlias --------
+  - id: aws-kms-can-write-alias
+    emits: CanWrite
+    applies_to: [aws]
+    match_effective_permission:
+      action: "kms:UpdateAlias"
+      resource_type: "AWS::KMS::Alias"
+    where:
+      - "the principal also holds kms:UpdateAlias on (or covering) the TARGET key it re-points to"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<alias node (AWS::KMS::Alias; CanWrite target set is '*')>"
+      api_source: "policy evaluation (kms:UpdateAlias)"
+      permissions: ["kms:UpdateAlias"]
+      false_positive_note: >-
+        This is a substitution/poisoning primitive, not escalation: re-pointing an
+        alias to an attacker-controlled key affects only callers that reference the key
+        BY ALIAS (not by key ID/ARN), and encrypt/decrypt with the substituted key still
+        requires those callers' own key permissions on it. Model as CanWrite on the
+        alias (per providers/aws/kms.md §6), NOT a crypto/execution edge; do not roll it
+        up to CanDecrypt/CanSignAs.
+      narrative: "{principal.name} can re-point alias {alias.name} to another key (kms:UpdateAlias) — a substitution/poisoning risk for callers referencing the key by alias."

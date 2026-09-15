@@ -1,0 +1,599 @@
+# Azure — Container Registry (Microsoft.ContainerRegistry) rules (Phase 7)
+# ---------------------------------------------------------------------------
+# Azure Container Registry is the Phase-7 SUPPLY-CHAIN entry point for Azure.
+# This file emits only service-specific FACTS (CanModifyCode, CanTrigger,
+# ExposesCredential, ExposedToInternet, ExecutesAs, CanModifyConfiguration,
+# CanAdminister) and defers ALL roll-ups to the linchpins:
+#
+#   container-chains (image-push-poisons-consumers + poisoned-image-executes-as)
+#     <- consumes CanModifyCode(principal → registry) and
+#        ContainsResourceReference(consumer → registry, runs_image, mutable)
+#     -> produces CanModifyCode(principal → consumer) and CanExecuteAs(principal → identity)
+#
+#   cicd-chains (buildspec-execute-as)
+#     <- consumes CanModifyCode(principal → task_BuildWorker) + ExecutesAs(task → MI)
+#     -> produces CanExecuteAs(principal → MI)
+#
+#   cicd-chains (pipeline-trigger-execute-as)
+#     <- consumes CanTrigger(principal → task_BuildWorker) + ExecutesAs(task → MI)
+#     -> produces CanExecuteAs (CONDITIONAL) when definition already attacker-influenced
+#
+#   can-control (escalate-via-execute-as)
+#     <- consumes CanExecuteAs(principal → MI)
+#     -> produces CanEscalateTo when MI outranks caller
+#
+#   credential-chains (read-secret-yields-identity / CredentialsFor)
+#     <- consumes ExposesCredential / CredentialsFor edges emitted here
+#     -> produces CanImpersonate / CanEnter* where admin creds authenticate cross-boundary
+#
+#   federation-chains (workload-identity-federates)
+#     <- consumes TrustsExternalIdentity / ExternalIdentityMapsTo for ACR Tasks using WIF
+#     -> produces CanFederateAs
+#
+# Permissions are EXACT Azure resource-provider operation strings from the
+# Microsoft.ContainerRegistry RBAC reference (learn.microsoft.com, 2026-09).
+# Deny assignments override all positive grants -> BLOCKED.
+#
+# Resource types:
+#   ContainerRegistry  <- Microsoft.ContainerRegistry/registries (and /repositories)
+#   BuildWorker        <- Microsoft.ContainerRegistry/registries/tasks and /taskRuns
+#   Credential         <- admin account credential; repository-scoped token passwords
+#   ResourcePolicy     <- Microsoft.ContainerRegistry/registries/scopeMaps
+#   Webhook            <- Microsoft.ContainerRegistry/registries/webhooks
+#   ManagedIdentity    <- system-assigned or user-assigned MI on a task
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 7-containers-k8s
+applies_to: [azure]
+
+rules:
+
+  # === 1. Administrative control over the registry ===========================
+  - id: azure-acr-contributor
+    emits: CanAdminister
+    description: "Full control of the registry (write + all sub-resource management)."
+    match_effective_permission:
+      action: "Microsoft.ContainerRegistry/registries/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor, Owner, or a custom role that includes Microsoft.ContainerRegistry/registries/* at the scope"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<registry>"
+      permissions:
+        - "Microsoft.ContainerRegistry/registries/write"
+        - "Microsoft.ContainerRegistry/registries/delete"
+        - "Microsoft.ContainerRegistry/registries/listCredentials/action"
+        - "Microsoft.ContainerRegistry/registries/tokens/write"
+        - "Microsoft.ContainerRegistry/registries/tasks/write"
+        - "Microsoft.ContainerRegistry/registries/webhooks/write"
+      state_logic: >-
+        ACTIVE when the principal has the effective permission and no deny assignments block
+        write/delete actions. BLOCKED when a deny assignment covers
+        Microsoft.ContainerRegistry/registries/write or registries/delete at this scope
+        (denied_by=<deny assignment id>).
+      confidence: 0.97
+      false_positive_note: >-
+        AcrPush role does NOT grant CanAdminister — it only includes push/write and
+        pull/read plus listCredentials/action (which is sufficient for ExposesCredential
+        but not full admin). Only Contributor / Owner / custom wildcard (* on registries)
+        qualifies. Deny assignments over write yield BLOCKED. When CanAdminister is
+        ACTIVE, the CanModifyConfiguration edge (azure-acr-registry-write-config) is
+        subsumed to prevent double-counting.
+      narrative: >-
+        {principal.name} has full administrative control of registry {target.name}
+        (Microsoft.ContainerRegistry/registries/*) including the ability to push images,
+        manage tasks, enable the admin account, and modify network/trust policy.
+
+  # === 2. Image push (supply-chain primitive) =================================
+  - id: azure-acr-push
+    emits: CanModifyCode
+    description: "AcrPush (registries/push/write) over the registry — supply-chain primitive consumed by container-chains."
+    match_effective_permission:
+      action: "Microsoft.ContainerRegistry/registries/push/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds AcrPush, Contributor, Owner, or a custom role including Microsoft.ContainerRegistry/registries/push/write"
+    emit:
+      source_type: Identity
+      target_type: ContainerRegistry
+      source: "<principal>"
+      target: "<registry>"
+      permissions:
+        - "Microsoft.ContainerRegistry/registries/push/write"
+      state_logic: >-
+        ACTIVE when the principal can push to the registry and the push write action is
+        not blocked by a deny assignment or scope-map restriction. CONDITIONAL(resource_policy)
+        when a repository-scoped token scope map limits push to specific repositories —
+        in that case emit only for the in-scope repositories. BLOCKED when a deny
+        assignment covers push/write or the registry is in a locked state.
+      confidence: 0.97
+      derived_from:
+        - "container-chains image-push-poisons-consumers (CITED — rolls CanModifyCode(registry) + ContainsResourceReference(consumer) into CanModifyCode(consumer))"
+        - "container-chains poisoned-image-executes-as (CITED — rolls CanModifyCode(consumer) + ExecutesAs into CanExecuteAs)"
+      false_positive_note: >-
+        This edge targets the ContainerRegistry node. container-chains
+        `image-push-poisons-consumers` fans this out to each consuming workload —
+        do NOT duplicate that derivation here. Digest-pinned consumers
+        (ContainsResourceReference.image_mutable == false) are guarded in container-chains
+        (those fan-outs are BLOCKED). If the principal holds only a repository-scoped token
+        with push limited to specific repos, scope this emit to those repository nodes
+        rather than the entire registry. Trust-policy gate: if trustPolicy.status==enabled
+        and consumers verify signatures, the push may not reach consumers without a valid
+        signature — emit as CONDITIONAL(resource_policy) rather than ACTIVE.
+      narrative: >-
+        {principal.name} can push images to registry {target.name}
+        (Microsoft.ContainerRegistry/registries/push/write / AcrPush); every workload
+        that pulls a mutable tag from this registry will execute the attacker-injected
+        layers on its next pull or restart (container-chains rolls the supply-chain fan-out
+        to each consumer and their execution identities).
+
+  # === 3. importImage — functionally equivalent to AcrPush ====================
+  - id: azure-acr-import-image
+    emits: CanModifyCode
+    description: "importImage/action copies an external image into a registry tag — supply-chain write equivalent to AcrPush."
+    match_effective_permission:
+      action: "Microsoft.ContainerRegistry/registries/importImage/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor, Owner, or a custom role including Microsoft.ContainerRegistry/registries/importImage/action"
+    emit:
+      source_type: Identity
+      target_type: ContainerRegistry
+      source: "<principal>"
+      target: "<registry>"
+      permissions:
+        - "Microsoft.ContainerRegistry/registries/importImage/action"
+      state_logic: >-
+        ACTIVE when the principal can import an image into the registry. CONDITIONAL if
+        the source registry requires additional auth (the import API accepts source
+        registry credentials in the request body — an attacker can supply their own source
+        registry). BLOCKED by deny assignment over importImage/action.
+      confidence: 0.92
+      derived_from:
+        - "container-chains image-push-poisons-consumers (CITED)"
+        - "container-chains poisoned-image-executes-as (CITED)"
+      false_positive_note: >-
+        importImage is a REST API call (POST to management.azure.com) that writes an image
+        from a source registry (Docker Hub, another ACR, MCR, public ECR) into a tag in
+        this registry. The attacker can nominate any source registry they control. Effect
+        on consumers is identical to AcrPush — do NOT duplicate the container-chains
+        fan-out. Slightly lower confidence (0.92) because the import requires constructing
+        an API call with a source specification, vs. a native docker push.
+      narrative: >-
+        {principal.name} can import images from an external registry into {target.name}
+        (registries/importImage/action); by importing from an attacker-controlled source
+        registry, arbitrary image content is written to a chosen tag — equivalent to AcrPush
+        for supply-chain purposes. container-chains propagates the fan-out to consumers.
+
+  # === 4. ACR Task definition write (CI build step injection) =================
+  - id: azure-acr-task-write
+    emits: CanModifyCode
+    description: "tasks/write over an ACR Task — modifies build steps (the BuildWorker's code) that run as the task's MI."
+    match_effective_permission:
+      action: "Microsoft.ContainerRegistry/registries/tasks/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor, Owner, or a custom role including Microsoft.ContainerRegistry/registries/tasks/write at the scope"
+      - "the target task has an ExecutesAs managed identity (system-assigned or user-assigned)"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<task (BuildWorker)>"
+      permissions:
+        - "Microsoft.ContainerRegistry/registries/tasks/write"
+      state_logic: >-
+        ACTIVE when the principal can update the task definition and a task run will
+        subsequently occur (existing timer/base-image trigger, or the attacker can also
+        trigger runs via tasks/runs/write). CONDITIONAL(trigger_exists) when no scheduled
+        trigger exists and the attacker lacks tasks/runs/write to trigger manually.
+      confidence: 0.93
+      derived_from:
+        - "cicd-chains buildspec-execute-as (CITED — rolls CanModifyCode(task) + ExecutesAs(task→MI) into CanExecuteAs)"
+      false_positive_note: >-
+        Only security-relevant when the task has an ExecutesAs MI — if no identity is
+        bound (identity.type None and no userAssignedIdentities), the task runs without an
+        ARM credential and code injection yields only build-environment access (lower value;
+        still emit but lower confidence). cicd-chains handles the CanExecuteAs derivation;
+        do NOT duplicate it here. The trigger gate matters: tasks/write alone doesn't run
+        the task — a trigger or tasks/runs/write is needed to realize execution.
+      narrative: >-
+        {principal.name} can overwrite the build steps of ACR Task {target.name}
+        (registries/tasks/write); the next run will execute the modified steps as the
+        task's managed identity (cicd-chains rolls this into CanExecuteAs of the task MI).
+
+  # === 7b. ACR Task write — Pass task identity (requires MI assignment action) ===
+  - id: azure-acr-task-pass-identity
+    emits: CanPassIdentity
+    description: "Assigning a user-assigned MI to an ACR Task requires both tasks/write AND MI assign/action."
+    match_effective_permission:
+      action: "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor, Owner, or a custom role including Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
+      - "target is a user-assigned managed identity (ManagedIdentity node)"
+    emit:
+      source_type: Identity
+      target_type: ManagedIdentity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      permissions:
+        - "Microsoft.ManagedIdentity/userAssignedIdentities/assign/action"
+      state_logic: >-
+        ACTIVE when the principal can assign the UAMI. This edge combines with
+        CanModifyConfiguration on an ACR Task via can-execute-as execute-as-via-config-identity-swap
+        to produce CanExecuteAs when the principal can both swap the task's MI AND modify its config.
+      confidence: 0.92
+      derived_from: []
+      false_positive_note: >-
+        CanPassIdentity targets the MI resource, not the task. The escalation
+        consequence is produced by execute-as-via-config-identity-swap (CanModifyConfiguration +
+        CanPassIdentity + role_compatible => CanExecuteAs) when both the task write and MI
+        assignment actions are held. Do not double-emit CanExecuteAs here.
+      narrative: >-
+        {principal.name} can assign {target.name} (user-assigned managed identity) to a resource,
+        enabling identity swapping on any task that supports MI binding when combined with
+        CanModifyConfiguration on that task.
+
+  # === 5. Registry configuration write ========================================
+  - id: azure-acr-registry-write-config
+    emits: CanModifyConfiguration
+    description: "registries/write changes admin account state, trust policy, anonymous pull, network rules — alters the security posture of the entire registry."
+    match_effective_permission:
+      action: "Microsoft.ContainerRegistry/registries/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor, Owner, or a custom role including Microsoft.ContainerRegistry/registries/write"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<registry>"
+      permissions:
+        - "Microsoft.ContainerRegistry/registries/write"
+      state_logic: >-
+        ACTIVE when the principal holds effective registries/write and no deny assignment covers it.
+        BLOCKED when a deny assignment at this scope covers Microsoft.ContainerRegistry/registries/write
+        (denied_by=<deny assignment id>). CONDITIONAL(service_state) when registry is locked (resource lock
+        prevents writes even if RBAC allows).
+      confidence: 0.95
+      false_positive_note: >-
+        The high-impact configuration changes are: (a) adminUserEnabled false→true (enables
+        credential exposure — link to azure-acr-list-credentials becoming ACTIVE); (b)
+        anonymousPullEnabled false→true (enables anonymous pull — link to
+        azure-acr-anonymous-pull-internet becoming ACTIVE); (c) trustPolicy disable
+        (removes signature gate — mutable-tag push succeeds without signing). Model each
+        as a CONDITIONAL upgrade of the corresponding dependent edge when the write
+        capability is ACTIVE. A Contributor who already has push can skip the admin-enable
+        step; the admin-account path is most useful when push is not directly available.
+        When azure-acr-contributor emits ACTIVE CanAdminister, this CanModifyConfiguration
+        edge is subsumed (lower traversal weight) to prevent double-counting on the same
+        principal + registry pair. Deny assignments over write yield BLOCKED.
+      narrative: >-
+        {principal.name} can update the configuration of registry {target.name}
+        (registries/write) including enabling the admin account, disabling the trust
+        policy, enabling anonymous pull, and modifying network access rules.
+
+  # === 5b. Scope map modification (policy escalation) ==========================
+  - id: azure-acr-scope-map-write
+    emits: CanModifyPolicy
+    description: "scopeMaps/write allows a principal to modify repository-scoped token access policies, upgrading restricted tokens to include push/write capability."
+    match_effective_permission:
+      action: "Microsoft.ContainerRegistry/registries/scopeMaps/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor, Owner, or a custom role including Microsoft.ContainerRegistry/registries/scopeMaps/write"
+    emit:
+      source_type: Identity
+      target_type: ResourcePolicy
+      source: "<principal>"
+      target: "<scope map (ResourcePolicy)>"
+      permissions:
+        - "Microsoft.ContainerRegistry/registries/scopeMaps/write"
+      state_logic: >-
+        ACTIVE when the principal can modify a scope map and no deny assignment blocks
+        the action. BLOCKED when a deny assignment at this scope covers
+        Microsoft.ContainerRegistry/registries/scopeMaps/write (denied_by=<deny assignment id>).
+      confidence: 0.90
+      derived_from: []
+      false_positive_note: >-
+        Modifying a scope map changes the actions and repositories a bound token can access.
+        A principal who modifies a scope map attached to a pull-only token can add push/write
+        actions, converting that token into a supply-chain primitive. This edge models the
+        policy-mutation capability. The escalation consequence (token upgraded to push-capable
+        then used for CanModifyCode) is rolled up by container-chains and credential-chains,
+        which consume this CanModifyPolicy. Scope maps are ResourcePolicy nodes
+        (not ServiceControlPolicy / OrganizationPolicy guardrails), so this is a direct
+        policy write, not a guardrail removal.
+      narrative: >-
+        {principal.name} can modify the scope map {target.name}
+        (Microsoft.ContainerRegistry/registries/scopeMaps/write); by adding push/write
+        actions or repository scopes to a scope map that restricts a token, the token's
+        capabilities are expanded — potentially converting a pull-only token into a
+        supply-chain credential (container-chains propagates the CanModifyCode upgrade).
+
+  # === 6. ACR Task manual run trigger =========================================
+  - id: azure-acr-task-run-write
+    emits: CanTrigger
+    description: "registries/taskRuns/write queues a manual run of an existing ACR Task — triggers execution of whatever the current task definition specifies as the task's MI."
+    match_effective_permission:
+      action: "Microsoft.ContainerRegistry/registries/taskRuns/write"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor, Owner, or a custom role including Microsoft.ContainerRegistry/registries/taskRuns/write"
+      - "target task exists and has an ExecutesAs managed identity"
+    emit:
+      source_type: Identity
+      target_type: BuildWorker
+      source: "<principal>"
+      target: "<task (BuildWorker)>"
+      permissions:
+        - "Microsoft.ContainerRegistry/registries/taskRuns/write"
+      conditions:
+        - trigger_exists
+      state_logic: >-
+        CONDITIONAL(trigger_exists) — triggering a run with an unmodified definition only
+        becomes a meaningful attack step if the definition already contains attacker-
+        influenced code (a poisoned dependency, a tampered base image, an attacker-authored
+        branch). Without that precondition, triggering the current definition yields at
+        most legitimate task output and does not give the attacker code execution. Upgrade
+        to ACTIVE only if the contributing CanModifyCode(principal → task) edge is also
+        ACTIVE (definition is already under attacker control). cicd-chains
+        cicd-trigger-runner-executes-as handles the conditional derivation.
+      confidence: 0.75
+      derived_from:
+        - "cicd-chains cicd-trigger-runner-executes-as (CITED — rolls CanTrigger(task) + ExecutesAs(task→MI) into conditional CanExecuteAs)"
+      false_positive_note: >-
+        Do NOT emit ACTIVE for trigger-only (no CanModifyCode). Triggering a legitimate,
+        unmodified task definition does not give the attacker code execution — it runs
+        authorized build steps as the MI. The edge is CONDITIONAL because it only matters
+        when combined with another path that compromised the definition. The confidence
+        penalty (0.75) reflects the precondition on the definition state. The canonical
+        ARM operation is Microsoft.ContainerRegistry/registries/taskRuns/write. There is
+        no registries/tasks/runs/write operation — verify the effective action name.
+      narrative: >-
+        {principal.name} can trigger a manual run of ACR Task {target.name}
+        (registries/taskRuns/write); if the task definition is already under attacker
+        control (poisoned step, tampered base image), triggering it executes attacker code
+        as the task's managed identity (cicd-chains derives CanExecuteAs CONDITIONAL).
+
+  # === 7. Admin account credential exposure ===================================
+  - id: azure-acr-list-credentials
+    emits: CanReadCredential
+    description: "registries/listCredentials/action allows a principal to retrieve the admin account's long-lived passwords."
+    match_effective_permission:
+      action: "Microsoft.ContainerRegistry/registries/listCredentials/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds AcrPush, Contributor, Owner, or a custom role including Microsoft.ContainerRegistry/registries/listCredentials/action"
+      - "registry.adminUserEnabled == true"
+    emit:
+      source_type: Identity
+      target_type: Credential
+      source: "<principal holding listCredentials/action>"
+      target: "<admin account password Credential>"
+      permissions:
+        - "Microsoft.ContainerRegistry/registries/listCredentials/action"
+      state_logic: >-
+        ACTIVE when adminUserEnabled == true and the principal holds listCredentials/action.
+        CONDITIONAL(service_state) when adminUserEnabled == false — the action succeeds
+        but the returned passwords are disabled and cannot authenticate. If a principal
+        holds CanModifyConfiguration on the registry (registries/write), they can upgrade
+        adminUserEnabled false → true, converting CONDITIONAL to ACTIVE.
+      confidence: 0.95
+      derived_from:
+        - "azure-acr-admin-credential-present (explicit rule — emits ContainsCredential(registry → admin credential))"
+        - "credential-chains read-secret-yields-identity (CITED — consumes CanReadCredential + CredentialsFor to produce CanImpersonate)"
+      false_positive_note: >-
+        Admin account disabled (adminUserEnabled == false) => passwords are returned by
+        the API but cannot be used for authentication — emit CONDITIONAL(service_state), never ACTIVE.
+        Only emit ACTIVE when adminUserEnabled == true is confirmed in the registry properties.
+        The admin account is a SINGLE account (username is the registry name); both passwords
+        are long-lived and are rotated by regenerating them via regenerateCredential/action
+        — rotating one does NOT invalidate the other. Long-lived credential = persistent
+        exfiltration risk with no session TTL.
+      narrative: >-
+        {source.name} can retrieve {target.name} (the admin account passwords) via
+        registries/listCredentials/action; when adminUserEnabled == true, this retrieval
+        enables persistent HTTP Basic authentication to push, pull, or delete any image
+        in {registry.name} from any network location without an Entra token.
+        credential-chains will derive CanImpersonate when the credential CredentialsFor
+        an identity.
+
+  # === 8. Repository-scoped token password exposure ===========================
+  - id: azure-acr-token-list-passwords
+    emits: CanReadCredential
+    description: "tokens/listPasswords/action returns long-lived passwords for a repository-scoped token — principal can retrieve static credential valid for the actions in the token's scope map."
+    match_effective_permission:
+      action: "Microsoft.ContainerRegistry/registries/tokens/listPasswords/action"
+      scope_type: "resource|resourceGroup|subscription"
+    where:
+      - "principal effectively holds Contributor, Owner, or a custom role including Microsoft.ContainerRegistry/registries/tokens/listPasswords/action"
+      - "target token status == enabled"
+    emit:
+      source_type: Identity
+      target_type: Credential
+      source: "<principal holding tokens/listPasswords/action>"
+      target: "<token password Credential>"
+      permissions:
+        - "Microsoft.ContainerRegistry/registries/tokens/listPasswords/action"
+      state_logic: >-
+        ACTIVE when the token status == enabled and the principal holds
+        tokens/listPasswords/action. CONDITIONAL(service_state) when the token is
+        disabled. The scope map restricts what the token password can do (push, pull,
+        delete, per repository) — record the scope map's actions as conditions on any
+        downstream CanModifyCode edge derived from this credential.
+      confidence: 0.92
+      derived_from:
+        - "credential-chains read-secret-yields-identity (CITED — consumes CanReadCredential + CredentialsFor to produce CanImpersonate)"
+      false_positive_note: >-
+        Token scope maps may restrict this to pull-only (no push) — in that case the
+        credential does not enable supply-chain poisoning and should NOT feed a
+        CanModifyCode derivation. Verify the scopeMap.actions to determine push capability.
+        Token passwords are long-lived (no session TTL) and persist until regenerated or
+        the token is deleted. Two passwords exist per token (password and password2);
+        rotating one does not invalidate the other. The separate explicit rule
+        (azure-acr-token-credential-present) models the structural ContainsCredential(token→password)
+        fact; this derived rule models the principal's retrieval capability.
+      narrative: >-
+        {source.name} can retrieve {target.name} (repository-scoped token password) via
+        tokens/listPasswords/action; when the token is enabled, the principal gains
+        HTTP Basic authentication scoped to the actions and repositories in the
+        token's scope map — which may include push/write and thus supply-chain access.
+        credential-chains will derive CanImpersonate when the credential CredentialsFor an identity.
+
+  # === 9. Anonymous pull exposure (read-only data plane open to internet) ======
+  - id: azure-acr-anonymous-pull-internet
+    emits: ExposedToInternet
+    description: "anonymousPullEnabled == true on a registry makes image pull accessible to any unauthenticated client from the internet."
+    where:
+      - "registry.anonymousPullEnabled == true"
+      - "registry SKU is Standard or Premium (Basic does not support anonymousPullEnabled)"
+    emit:
+      source_type: ContainerRegistry
+      target_type: AnonymousIdentity
+      source: "<registry>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      state_logic: >-
+        ACTIVE when anonymousPullEnabled == true and publicNetworkAccess != Disabled.
+        CONDITIONAL(network_reachability) when network rules limit ingress to specific CIDRs
+        but anonymous pull is still enabled for those sources. BLOCKED when
+        publicNetworkAccess == Disabled (private endpoint only) or a deny assignment covers
+        the data-plane read action.
+      confidence: 0.85
+      derived_from:
+        - "registry property anonymousPullEnabled == true (evidence source: Microsoft.ContainerRegistry/registries/read)"
+      false_positive_note: >-
+        Anonymous pull is read-only (no push, no delete, no list of all repos — only
+        known-name pulls). This is LOW escalation value on its own but HIGH recon value:
+        any proprietary image can be pulled without credentials. publicNetworkAccess:
+        Disabled suppresses this even if the flag is true. The confidence penalty (0.85)
+        reflects that the flag may be set intentionally for public images (a legitimate
+        pattern). Flag for analyst review rather than treating as a defect by default.
+        Only Standard and Premium SKUs support this; do not emit for Basic registries.
+      narrative: >-
+        Registry {source.name} has anonymousPullEnabled == true; any unauthenticated
+        client can pull images by name without presenting any credential, from any internet
+        location (subject to network rules). This exposes proprietary image content and
+        configuration to public enumeration.
+
+  # === 10. ACR Task execute-as via code modification ===========================
+  # CITED: cicd-chains cicd-modify-buildspec-executes-as + can-execute-as
+  # execute-as-via-code-modify produce CanExecuteAs(principal→MI) when
+  # CanModifyCode(principal→task_BuildWorker) + ExecutesAs(task→MI) are present.
+  # ACR Tasks (BuildWorker) are already in cicd-chains node_type filter. No
+  # re-derivation needed here. The narrative text explaining the escalation path
+  # is preserved in the acr.md analyst section (Phase 7 docs).
+
+  # === 11. ACR Task execute-as via trigger (conditional) =======================
+  # CITED: cicd-chains cicd-trigger-runner-executes-as produces
+  # CanExecuteAs(principal→MI) CONDITIONAL(attacker_influenced_definition) when
+  # CanTrigger(principal→task_BuildWorker) + ExecutesAs(task→MI). No re-derivation
+  # needed. The narrative text explaining the conditional gate is preserved in the
+  # acr.md analyst section (Phase 7 docs).
+
+  # === 11. Escalation roll-up (CanEscalateTo from CanExecuteAs) ===============
+  # NOTE: This is produced by can-control escalate-via-execute-as and is CITED here
+  # for completeness; do not re-derive it. The comment below is for analyst context.
+  # can-control:
+  #   [?principal, CanExecuteAs, ?mi]
+  #   where privilege(?mi) > privilege(?principal)
+  #   => CanEscalateTo(?principal, ?mi)
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - A deny assignment over Microsoft.ContainerRegistry/registries/push/write,
+#     registries/tasks/write, or registries/listCredentials/action -> BLOCKED on the
+#     respective emitted edge, denied_by=<deny assignment id>.
+#   - publicNetworkAccess == Disabled + private endpoint + no matching VNET access ->
+#     azure-acr-anonymous-pull-internet is BLOCKED / does not fire.
+#   - adminUserEnabled == false -> azure-acr-list-credentials is CONDITIONAL(service_state),
+#     never ACTIVE — admin passwords are returned by the API but are disabled.
+#   - Token status == disabled -> azure-acr-token-list-passwords is CONDITIONAL(service_state).
+#   - Content Trust (trustPolicy.status == enabled) -> supply-chain edges from azure-acr-push
+#     are CONDITIONAL(resource_policy) for consumers that enforce image signature verification.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization rules (raw config -> explicit edges).
+# These belong in /rules/explicit/azure-acr.yaml but are declared here for
+# completeness; they produce the ExecutesAs / ContainsCredential facts the
+# derived rules above consume.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: azure-acr-task-executes-as-system-mi
+    emits: ExecutesAs
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.ContainerRegistry/registries/tasks"
+      field: "identity"
+    where:
+      - "identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned']"
+    emit:
+      source: "<task (BuildWorker)>"
+      target: "<each MI: system-assigned SP (identity.principalId) and each userAssignedIdentities key>"
+      api_source: "Microsoft.ContainerRegistry/registries/tasks/read"
+      evidence_field: "identity.type + identity.principalId + identity.userAssignedIdentities"
+      narrative: "ACR Task {task.name} runs as managed identity {mi.name} ({identity.type})."
+
+  - id: azure-acr-admin-credential-present
+    emits: ContainsCredential
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.ContainerRegistry/registries"
+      field: "properties.adminUserEnabled"
+    where:
+      - "properties.adminUserEnabled == true"
+    emit:
+      source: "<registry (ContainerRegistry)>"
+      target: "<admin account Credential node>"
+      api_source: "Microsoft.ContainerRegistry/registries/read"
+      evidence_field: "properties.adminUserEnabled"
+      narrative: "Registry {registry.name} has adminUserEnabled == true; the admin credential is present and retrievable via listCredentials/action."
+
+  - id: azure-acr-token-credential-present
+    emits: ContainsCredential
+    applies_to: [azure]
+    source_config:
+      resource_type: "Microsoft.ContainerRegistry/registries/tokens"
+      field: "properties.status"
+    where:
+      - "properties.status == enabled"
+    emit:
+      source: "<token resource (Credential node)>"
+      target: "<token password Credential>"
+      api_source: "Microsoft.ContainerRegistry/registries/tokens/read"
+      evidence_field: "properties.status + properties.scopeMapId"
+      narrative: "ACR token {token.name} is enabled; its long-lived passwords are retrievable via tokens/listPasswords/action (scoped to {scopeMap.name})."
+
+  - id: azure-acr-workload-pulls-image
+    emits: ContainsResourceReference
+    applies_to: [azure]
+    description: "A consuming workload (AKS pod, ACI group, Container App, App Service, ACR Task) references an image in this registry — the run-image relation container-chains consumes."
+    source_config:
+      resource_types:
+        - "Microsoft.ContainerService/managedClusters (pod spec image)"
+        - "Microsoft.ContainerInstance/containerGroups (containers[].image)"
+        - "Microsoft.App/containerApps (template.containers[].image)"
+        - "Microsoft.Web/sites (siteConfig.linuxFxVersion / windowsFxVersion)"
+        - "Microsoft.ContainerRegistry/registries/tasks (step.dockerfilePath base image / FROM)"
+      field: "image reference matching <registry>.azurecr.io/<repo>:<tag_or_digest>"
+    where:
+      - "image reference hostname matches <registry>.azurecr.io"
+    emit:
+      source: "<consuming workload (Compute/KubernetesWorkload/ContainerService/BuildWorker)>"
+      target: "<registry (ContainerRegistry)>"
+      api_source: "workload config read"
+      evidence_field: "image: <registry>.azurecr.io/<repo>:<tag>"
+      properties:
+        reference_kind: "runs_image"
+        image_tag: "<tag>"
+        image_digest: "<digest if @sha256: present>"
+        image_mutable: "<true if tag reference (no digest pin) and registry tags are not immutable; false if @sha256: digest>"
+      narrative: "{workload.name} pulls and runs the image {image_ref} from registry {registry.name} ({reference_kind}; mutable={image_mutable})."

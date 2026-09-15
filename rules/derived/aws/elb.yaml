@@ -1,0 +1,480 @@
+# AWS ELB (ALB / NLB / CLB) — Derived attack-path rules (Phase 8 — networking)
+# ---------------------------------------------------------------------------
+# Central theme: Elastic Load Balancers are ENTRY-POINT / EXPOSURE primitives.
+# An internet-facing LB (scheme=internet-facing) is by definition reachable from
+# the public internet (ExposedToInternet). Its listeners route traffic to backend
+# compute (RoutesTo). An attacker who can modify the LB's security groups or
+# listener authentication actions weakens the network control gate
+# (CanModifyConfiguration). An ALB with a Lambda target group is a trigger
+# for that function (CanTrigger -> CanExecuteAs via messaging-chains.yaml rule 2).
+#
+# WHAT THESE RULES EMIT:
+#   ExposedToInternet    — internet-facing LB with active listener
+#   RoutesTo             — LB listener forwards to target group / backend targets
+#   CanModifyConfiguration — SetSecurityGroups on ALB (gate weakening)
+#                          — ModifyListener / ModifyRule removes OIDC/Cognito auth
+#   CanTrigger           — ALB Lambda target group
+#   ExposedToInternet    — principal creates an internet-facing LB + listener
+#
+# WHAT THESE RULES DO NOT EMIT:
+#   CanExecuteAs — ELB has no execution identity; no code runs as an IAM role.
+#                  CanExecuteAs from LB→Lambda is derived by messaging-chains.yaml
+#                  (rule 2: CanTrigger + ExecutesAs -> CanExecuteAs). CITE; do not
+#                  duplicate here.
+#   CanNetworkReach (end-to-end) — transitive network reachability (LB SG allows
+#                  internet + backend SG allows LB SG + route → backend reachable)
+#                  is a FUTURE network-chains linchpin. DO NOT emit it here. Emit
+#                  the per-hop FACTS (ExposedToInternet on the LB, RoutesTo to the
+#                  target group, CanReachPort on the backend once SG rules are
+#                  evaluated). The network-chains file will compose the chain.
+#   CanReadSecret  — ALB OIDC client secret in Secrets Manager is modeled by
+#                  secretsmanager.yaml. Cite it; do not duplicate.
+#   CrossAccountTrust — NLB cross-account target registration is an explicit
+#                  structural fact, not a derived attack edge from ELB alone.
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE:
+#   messaging-chains.yaml rule 2  (CanTrigger + ExecutesAs => CanExecuteAs)
+#   lambda.yaml           rule 1  (CanModifyCode + ExecutesAs => CanExecuteAs)
+#   can-control.yaml              (CanAdminister => Controls / CanEscalateTo)
+#   secretsmanager.yaml           (CanReadSecret on the OIDC client secret ARN)
+#
+# PERMISSIONS — exact action names from the AWS Service Authorization Reference:
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_elasticloadbalancingv2.html
+#   https://docs.aws.amazon.com/elasticloadbalancing/latest/userguide/
+#
+# Network reachability edges are CONDITIONAL(network_reachability) by nature.
+# State is ACTIVE when all preconditions are confirmed; CONDITIONAL when a
+# precondition (listener health, SG/route evaluation) is unmet.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 8-networking
+service: elb
+applies_to: [aws]
+
+# ===========================================================================
+# EXPLICIT normalization rules — raw config -> explicit edges.
+# Kept co-located; conceptually live in rules/explicit/aws-elb.yaml.
+# ===========================================================================
+explicit_rules:
+
+  # --- ExposedToInternet: internet-facing LB with at least one active listener ---
+  # NOTE: This rule is co-located here for organizational convenience but semantically
+  # belongs in rules: (derived) block because ExposedToInternet has nature: derived in
+  # edges.yaml. The explicit_rules: section is meant for normalization rules that emit
+  # nature: explicit edges. However, since this rule matches config evidence directly
+  # (match_record on LoadBalancer Scheme), we keep it here as a quasi-explicit
+  # normalization and rely on the rule engine to accept derived edges from explicit
+  # blocks when matching config records. TODO: Petition to change ExposedToInternet to
+  # nature: both in edges.yaml to formally permit explicit normalization.
+  - id: aws-elb-internet-facing-explicit
+    emits: ExposedToInternet
+    description: >-
+      An ALB or NLB with scheme=internet-facing and at least one active listener
+      is directly reachable from the public internet on the listener port(s).
+    match_record:
+      resource_type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+      field: "Scheme"
+    where:
+      - "Scheme == 'internet-facing'"
+      - "at least one Listener exists on this LoadBalancer with at least one Action"
+    emit:
+      source_type: LoadBalancer
+      target_type: AnonymousIdentity
+      source: "<LoadBalancer node>"
+      target: "<AnonymousIdentity>"
+      state: ACTIVE
+      permissions: []
+      api_source: "elasticloadbalancing:DescribeLoadBalancers + elasticloadbalancing:DescribeListeners"
+      evidence_field: "LoadBalancer.Scheme"
+      conditions: []
+      state_logic: >-
+        ACTIVE when Scheme == 'internet-facing' AND at least one listener with at
+        least one forward/redirect/fixed-response action is present. By AWS definition,
+        internet-facing LBs are placed in public subnets with IGW attachment, so network
+        reachability to the LB is always satisfied (AWS enforces this at creation time).
+        If no listener exists, downgrade to POTENTIAL.
+      false_positive_note: >-
+        Do NOT emit for internal-scheme LBs (Scheme == 'internal'). An internal LB
+        has only private IPs and is NOT reachable from the public internet regardless
+        of listener port. If the LB has no active listeners (e.g., newly created),
+        downgrade to POTENTIAL. An internet-facing LB with ALL listeners returning
+        fixed-response 403 still exposes a port but carries no meaningful backend
+        routing — annotate low severity but still emit ACTIVE (the port is open to
+        the internet and can be observed/probed).
+      narrative: >-
+        {source.name} is an internet-facing {LoadBalancer.Type} (scheme=internet-facing)
+        with active listeners on port(s) {listener_ports}. It is directly reachable
+        from the public internet and serves as the external entry point for the
+        workloads in its target groups.
+
+
+  # --- CanTrigger: ALB Lambda target group ------------------------------------
+  - id: aws-elb-trigger-lambda-target
+    emits: CanTrigger
+    description: >-
+      An ALB target group with TargetType=lambda causes the ALB to directly invoke
+      the registered Lambda function on each matched request.
+    match_record:
+      resource_type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+      field: "TargetType"
+    where:
+      - "TargetType == 'lambda'"
+      - "at least one target is registered and healthy"
+      - "resource type is ALB (not NLB — Lambda targets are ALB-only)"
+    emit:
+      source_type: LoadBalancer
+      target_type: ServerlessFunction
+      source: "<ALB node resolved by: TargetGroup -> owning Listener -> owning LoadBalancer>"
+      target: "<Lambda function node registered as target>"
+      state: ACTIVE
+      permissions: []
+      api_source: "elasticloadbalancing:DescribeTargetGroups + elasticloadbalancing:DescribeTargetHealth + lambda:GetFunction"
+      evidence_field: "TargetGroup.TargetType + TargetHealth[*].Target.Id (Lambda ARN)"
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when TargetType == 'lambda', a Lambda ARN is registered, and the
+        target is healthy. CONDITIONAL(service_state) if the Lambda is registered but
+        unhealthy or the resource-based policy (allowing elasticloadbalancing.amazonaws.com
+        to invoke the function) is absent — without the resource-based policy, ALB
+        invocations return 403 to clients. Network reachability is implicit for ALB-to-Lambda
+        invocation and does not need to be modeled separately.
+      confidence: 0.90
+      derived_from:
+        - "TargetGroup.TargetType == 'lambda'"
+        - "TargetGroup -> Listener -> LoadBalancer resolution"
+      false_positive_note: >-
+        Lambda targets are ALB-ONLY. Do not emit CanTrigger for NLB target groups.
+        The ALB must have a resource-based policy on the Lambda granting
+        lambda:InvokeFunction to Principal elasticloadbalancing.amazonaws.com;
+        without it, the ALB cannot invoke the function. Verify this permission during
+        collection (lambda:GetPolicy). This edge chains to CanExecuteAs via
+        messaging-chains.yaml rule 2 (CanTrigger + ExecutesAs => CanExecuteAs) —
+        do NOT re-derive that here. Parent-resolution pattern: source is determined
+        by traversing TargetGroup -> owning Listener -> owning LoadBalancer ARN.
+      narrative: >-
+        {source.name} (ALB) directly invokes Lambda function {target.name} via a
+        Lambda target group. Each HTTP request matched by the ALB listener triggers
+        a Lambda invocation, making {source.name} an event source for {target.name}'s
+        execution role escalation chain.
+
+# ===========================================================================
+# DERIVED rules — pattern matching on existing edges -> new edges
+# ===========================================================================
+rules:
+
+  # --- CanNetworkReach: LB listener forward action -> target group / backend ---
+  # NOTE: RoutesTo (schema/edges.yaml) admits source: [Route, Subnet, TransitGateway]
+  # only — LoadBalancer is NOT in that source set. The correct edge for an LB routing
+  # traffic to its backend is CanNetworkReach (source: [Compute, Network, Identity];
+  # LoadBalancer is Network class subtype), which accurately captures "the LB provides
+  # a network path to the backend targets" as a CONDITIONAL(network_reachability) fact.
+  # The RoutesTo edge is reserved for route-table and TGW routing hops.
+  - id: aws-elb-routes-to-target-group
+    emits: CanNetworkReach
+    description: >-
+      An ALB or NLB listener with a forward action creates a network path from the LB
+      to its backend targets (instances/IPs/ALBs). This is a CONDITIONAL(network_reachability)
+      fact — the LB SG must allow inbound AND the backend SG must allow inbound from
+      the LB's SG/IP range.
+    applies_to: [aws]
+    match:
+      - [ ?lb, HasListener, ?listener ]
+      - [ ?listener, HasForwardAction, ?target_group ]
+    where:
+      - "node_type(?lb) == LoadBalancer"
+      - "?listener.properties.DefaultActions[*].Type contains 'forward'"
+      - "?listener.properties.DefaultActions[*].ForwardConfig.TargetGroups is non-empty"
+      - "?target_group is registered with at least one backend target (instance, ip, or alb)"
+    emit:
+      source_type: LoadBalancer
+      target_type: [Compute, Network]
+      source: ?lb
+      target: "<backend targets (Compute instances/IPs or Network ALB) registered in the TargetGroup>"
+      state: CONDITIONAL
+      permissions: []
+      api_source: "elasticloadbalancing:DescribeLoadBalancers + elasticloadbalancing:DescribeListeners + elasticloadbalancing:DescribeTargetGroups + elasticloadbalancing:DescribeTargetHealth"
+      evidence_field: "Listener.DefaultActions[*].ForwardConfig.TargetGroups + TargetHealth[*].Target"
+      conditions: [network_reachability, service_state]
+      state_logic: >-
+        CONDITIONAL(network_reachability) always — the LB provides an L7/L4 path to the
+        backend but whether traffic actually reaches the backend depends on: (a) the LB's
+        SG allowing the inbound port (for ALB/CLB); (b) the backend's SG allowing inbound
+        from the LB SG/ENI IPs; (c) at least one healthy registered target. Promote to
+        ACTIVE only when all three conditions are confirmed by collector evidence.
+        CONDITIONAL(service_state) when no healthy targets exist. The state remains
+        CONDITIONAL until the scoring engine validates both the inbound and backend
+        security group rules.
+      confidence: 0.80
+      derived_from:
+        - "?lb HasListener ?listener (with forward action)"
+        - "?listener HasForwardAction ?target_group"
+      false_positive_note: >-
+        Do NOT emit end-to-end CanNetworkReach from the internet through the LB to the
+        backend in a single step — that is the transitive network-chains linchpin (FUTURE).
+        Emit only: (1) ExposedToInternet on the LB (from aws-elb-internet-facing-explicit),
+        and (2) this CanNetworkReach from the LB to the backend (the second hop). The
+        network-chains file will compose them. Emit for ALL target types (instance, ip, alb)
+        where the target is a Compute or Network node. For Lambda targets, use CanTrigger
+        (aws-elb-trigger-lambda-target) instead — Lambda is invoked, not network-reached.
+        For redirect/fixed-response actions, do NOT emit — no backend target is reached.
+      narrative: >-
+        {source.name}'s listener on port {listener.port} ({listener.protocol}) forwards
+        matching traffic through the load balancer to backend targets in the target group,
+        providing a conditional network path to {target.name} subject to security group
+        rules on both the LB and the backend.
+
+  # --- CanModifyConfiguration: SetSecurityGroups on ALB (firewall weakening) -----
+  - id: aws-elb-set-security-groups
+    emits: CanModifyConfiguration
+    description: >-
+      Replace the security groups on an ALB or CLB with a permissive one to open
+      inbound access from any source to the load balancer (network gate weakening).
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?lb ]
+    where:
+      - "node_type(?lb) == LoadBalancer"
+      - "?lb.provider_type in ['AWS::ElasticLoadBalancingV2::LoadBalancer', 'AWS::ElasticLoadBalancing::LoadBalancer']"
+      - "?lb.properties.type in ['application', 'classic'] OR ?lb.properties.SecurityGroups is non-empty"
+      - "effective_action_on(?principal, ?lb) contains 'elasticloadbalancing:SetSecurityGroups'"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: ?principal
+      target: ?lb
+      permissions:
+        - "elasticloadbalancing:SetSecurityGroups"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when effective-permission evaluator confirms elasticloadbalancing:SetSecurityGroups
+        on the LB ARN (or wildcard scope). The minimum required permission is SetSecurityGroups
+        alone — the attacker can reference an existing permissive SG in the same VPC to replace
+        the LB's current SGs. An attacker with additional permissions (ec2:AuthorizeSecurityGroupIngress
+        or ec2:CreateSecurityGroup) can create or modify a permissive SG as well, amplifying
+        the attack; however, these are optional amplifiers, not required preconditions. BLOCKED if
+        SCP denies elasticloadbalancing:SetSecurityGroups.
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?lb (elasticloadbalancing:SetSecurityGroups)"
+      false_positive_note: >-
+        NLBs (Network Load Balancers) of type 'network' do NOT support security groups by
+        default — this action is ALB/CLB only. Check ?lb.properties.type; if type == 'network'
+        and SecurityGroupAssociations is absent/empty, do NOT emit this rule. (Newer opt-in
+        NLB security group support is uncommon; collect SecurityGroupAssociations attribute
+        to verify before emitting.) This edge is a NETWORK-GATE WEAKENING primitive — it
+        opens inbound access to the LB, which then forwards to backends. Do NOT chain directly
+        to CanEnterAccount / CanExecuteAs; the path continues via the RoutesTo + CanNetworkReach
+        linchpin (future network-chains file).
+      narrative: >-
+        {principal.name} can call elasticloadbalancing:SetSecurityGroups on {lb.name},
+        replacing its security groups with a permissive one. This opens inbound access to
+        the load balancer from any source (0.0.0.0/0), weakening the network control gate
+        that restricts who can reach the backends behind it.
+
+  # --- CanModifyConfiguration: ModifyListener removes OIDC/Cognito auth -----------
+  - id: aws-elb-modify-listener-auth-bypass
+    emits: CanModifyConfiguration
+    description: >-
+      Modify an ALB listener whose default action includes authenticate-oidc or
+      authenticate-cognito to remove or replace the authentication action, bypassing
+      application-layer identity enforcement before traffic reaches the backend.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?lb ]
+    where:
+      - "node_type(?lb) == LoadBalancer"
+      - "?lb.provider_type == 'AWS::ElasticLoadBalancingV2::LoadBalancer'"
+      - "?lb.properties.type == 'application'"
+      - "at least one Listener on ?lb has DefaultActions[*].Type containing 'authenticate-oidc' or 'authenticate-cognito'"
+      - "effective_action_on(?principal, ?lb) contains 'elasticloadbalancing:ModifyListener'"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: ?principal
+      target: ?lb
+      permissions:
+        - "elasticloadbalancing:ModifyListener"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when elasticloadbalancing:ModifyListener is confirmed effective on the
+        LoadBalancer ARN (or wildcard scope) AND the LoadBalancer has at least one listener
+        with authenticate-oidc or authenticate-cognito action. The ModifyListener permission
+        may be scoped at the listener ARN or the LB ARN; we match on the LB to avoid
+        per-listener ARN resolution complexity. Changing any listener's default action from
+        auth to 'forward' removes authentication enforcement for requests matching that
+        listener. BLOCKED if SCP or permission boundary denies elasticloadbalancing:ModifyListener.
+      confidence: 0.90
+      derived_from:
+        - "?principal HasPermission ?lb (elasticloadbalancing:ModifyListener)"
+      false_positive_note: >-
+        Only HIGH-VALUE when at least one listener action is authenticate-oidc or
+        authenticate-cognito — if all listeners already use 'forward', this edge is a no-op.
+        Verify the Listener.DefaultActions array contains the auth action type before
+        emitting. This edge bypasses application authentication, NOT IAM authorization;
+        the downstream backend may enforce its own auth independently. Consider the backend
+        type: if the backend is itself an IAM-gated service (Lambda with IAM auth), the
+        auth bypass may still be blocked at the backend. If the backend is a plain HTTP app
+        with no further auth (common for OIDC-protected internal apps), this is a full
+        authentication bypass. Target_type set to LoadBalancer as the CanModifyConfiguration
+        target; the linter allows Identity -> * for this edge.
+      narrative: >-
+        {principal.name} can call elasticloadbalancing:ModifyListener on {lb.name},
+        changing any listener's default action from 'authenticate-oidc'/'authenticate-cognito'
+        to 'forward'. This removes application-layer authentication enforcement, making the
+        backend accessible to any caller who can reach the load balancer without needing
+        OIDC or Cognito credentials.
+
+  # --- CanModifyConfiguration: ModifyRule removes OIDC/Cognito auth on a rule ----
+  - id: aws-elb-modify-rule-auth-bypass
+    emits: CanModifyConfiguration
+    description: >-
+      Modify an ALB listener rule whose actions include authenticate-oidc or
+      authenticate-cognito to bypass per-path authentication enforced by that rule.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?lb ]
+    where:
+      - "node_type(?lb) == LoadBalancer"
+      - "?lb.provider_type == 'AWS::ElasticLoadBalancingV2::LoadBalancer'"
+      - "?lb.properties.type == 'application'"
+      - "at least one ListenerRule on a listener of ?lb has Actions[*].Type containing 'authenticate-oidc' or 'authenticate-cognito'"
+      - "effective_action_on(?principal, ?lb) contains 'elasticloadbalancing:ModifyRule'"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: ?principal
+      target: ?lb
+      permissions:
+        - "elasticloadbalancing:ModifyRule"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when elasticloadbalancing:ModifyRule is confirmed effective on the LoadBalancer
+        ARN (or wildcard scope) AND the LoadBalancer has at least one listener rule with
+        authenticate-oidc or authenticate-cognito action. The ModifyRule permission may be
+        scoped at the rule ARN or the LB ARN; we match on the LB to simplify resolution.
+        Listener rules use priority ordering; modifying a rule with an auth action allows an
+        attacker to redirect or bypass auth for all requests matching that rule's conditions.
+        BLOCKED if SCP or permission boundary denies elasticloadbalancing:ModifyRule.
+      confidence: 0.85
+      derived_from:
+        - "?principal HasPermission ?lb (elasticloadbalancing:ModifyRule)"
+      false_positive_note: >-
+        Similar false-positive conditions as aws-elb-modify-listener-auth-bypass. Additionally,
+        listener rules can be overridden by higher-priority rules; an attacker removing auth on
+        a low-priority rule may not achieve bypass if a higher-priority rule also authenticates.
+        Confirm the rule's priority and the absence of higher-priority blocking rules.
+        The confidence prior (0.85) is lower than ModifyListener (0.90) because the rule-level
+        bypass is more granular and may not cover all request paths to the backend.
+      narrative: >-
+        {principal.name} can call elasticloadbalancing:ModifyRule on listener rules within
+        {lb.name}, removing the authenticate-oidc/authenticate-cognito action for requests
+        matching targeted rule conditions. This bypasses per-path application authentication,
+        making the matched backend path accessible without OIDC or Cognito credentials.
+
+  # --- CanCreate: principal can create an internet-facing LB (exposure risk) ----
+  # NOTE on edge choice: ExposedToInternet's source set is [Compute, Data,
+  # PublicEndpoint, LoadBalancer, Storage, Messaging] — Identity is NOT admitted.
+  # The attacker's capability to CREATE a new internet-facing LB is modeled as
+  # CanCreate(Identity -> LoadBalancer), which is a POTENTIAL escalation premise.
+  # The resulting LB (once created) would emit ExposedToInternet via
+  # aws-elb-internet-facing-explicit. Analysts should query
+  # CanCreate(? -> LoadBalancer) + internet-facing VPC topology to identify the
+  # full chain. This rule surfaces the IAM capability; the exposure fact follows
+  # at LB creation time.
+  - id: aws-elb-create-internet-facing
+    emits: CanCreate
+    description: >-
+      A principal with CreateLoadBalancer + CreateListener + CreateTargetGroup +
+      RegisterTargets + EC2 read/write perms can create a new internet-facing ALB
+      or NLB, exposing any registered backend to the public internet. Emit
+      CanCreate(Identity -> LoadBalancer) as a POTENTIAL escalation premise;
+      ExposedToInternet fires on the resulting LB.
+    applies_to: [aws]
+    match:
+      - [ ?principal, HasPermission, ?scope ]
+    where:
+      - "effective_action_on(?principal, ?scope) contains 'elasticloadbalancing:CreateLoadBalancer'"
+      - "effective_action_on(?principal, ?scope) contains 'elasticloadbalancing:CreateListener'"
+      - "effective_action_on(?principal, ?scope) contains 'elasticloadbalancing:CreateTargetGroup'"
+      - "effective_action_on(?principal, ?scope) contains 'elasticloadbalancing:RegisterTargets'"
+      - "?scope is at the account or VPC resource scope (not a specific existing LB ARN)"
+    emit:
+      source_type: Identity
+      target_type: LoadBalancer
+      source: ?principal
+      target: "<future internet-facing LoadBalancer in the account/VPC scope>"
+      permissions:
+        - "elasticloadbalancing:CreateLoadBalancer"
+        - "elasticloadbalancing:CreateListener"
+        - "elasticloadbalancing:CreateTargetGroup"
+        - "elasticloadbalancing:RegisterTargets"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        POTENTIAL when the principal has the four ELB permissions at a broad scope — the
+        attacker must choose an internet-facing subnet and the VPC must have an IGW attached.
+        CONDITIONAL when there is confirmed evidence of at least one public subnet + IGW in
+        the account. Additional optional permissions amplify the attack:
+        ec2:DescribeSubnets (to enumerate public subnets), ec2:DescribeSecurityGroups (to
+        find or reference existing SGs), ec2:CreateSecurityGroup (to create a new permissive
+        SG), ec2:AuthorizeSecurityGroupIngress (to add rules to an SG for inbound from the
+        internet). With only the base four ELB permissions, the ALB inherits a default SG
+        that may restrict inbound — the amplifier permissions enable more permissive configs.
+        BLOCKED if an SCP denies elasticloadbalancing:CreateLoadBalancer or constrains
+        Scheme to 'internal' only.
+      confidence: 0.70
+      derived_from:
+        - "?principal HasPermission ?scope (elasticloadbalancing:CreateLoadBalancer, CreateListener, CreateTargetGroup, RegisterTargets)"
+      false_positive_note: >-
+        POTENTIAL-state edge by default. The attacker needs a public subnet with an IGW;
+        not all VPCs have this. An SCP constraining LB scheme to 'internal' blocks the
+        internet-facing variant. Confidence (0.70) reflects that VPC topology and SCP
+        constraints must be confirmed. The base four permissions are necessary and sufficient
+        to emit this edge; additional EC2 perms (DescribeSubnets, CreateSecurityGroup, etc.)
+        are optional amplifiers and not listed as requirements. The exposure chain is:
+        CanCreate(this rule) -> [LB created] -> ExposedToInternet(aws-elb-internet-facing-explicit)
+        -> CanNetworkReach(aws-elb-routes-to-target-group); path-finding resolves the chain.
+      narrative: >-
+        {principal.name} has elasticloadbalancing:CreateLoadBalancer, CreateListener,
+        CreateTargetGroup, and RegisterTargets at broad scope and can create a new
+        internet-facing ALB or NLB in a public subnet. Once created, that LB would
+        expose any registered EC2/IP/Lambda target to the public internet.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP denying elasticloadbalancing:SetSecurityGroups -> BLOCKED on
+#     aws-elb-set-security-groups. Annotate denied_by=<SCP ARN>.
+#   - An SCP denying elasticloadbalancing:ModifyListener or ModifyRule ->
+#     BLOCKED on the auth-bypass rules. Annotate accordingly.
+#   - An SCP constraining LB scheme to 'internal' only (e.g. via a custom
+#     SCP requiring aws:RequestTag/scheme=='internal' or a Deny on
+#     CreateLoadBalancer with scheme condition) -> BLOCKED on
+#     aws-elb-create-internet-facing.
+#   - A permission boundary capping the principal below the ELB write actions
+#     -> BLOCKED similarly.
+#   - NLBs without SG support: SetSecurityGroups is unsupported; do not emit
+#     aws-elb-set-security-groups for network-type LBs without confirmed SG
+#     association attribute.
+# ---------------------------------------------------------------------------
+
+# Linchpin citations (do NOT duplicate; cite these for downstream chains):
+#   messaging-chains.yaml rule 2  — CanTrigger(LB, Lambda) + ExecutesAs(Lambda, Role)
+#                                    => CanExecuteAs(AnonymousIdentity, Role)
+#   lambda.yaml                   — CanModifyCode/CanInvoke on the Lambda target
+#                                    itself (ELB is only the trigger; Lambda attack
+#                                    paths are covered in lambda.yaml).
+#   can-control.yaml              — Controls/CanEscalateTo roll-ups.
+#   secretsmanager.yaml           — CanReadSecret on OIDC client secret stored in
+#                                    Secrets Manager (referenced by authenticate-oidc
+#                                    listener action via secretsmanager:SecretString).
+#   network-chains.yaml (FUTURE)  — Transitive CanNetworkReach composition:
+#                                    ExposedToInternet(internet, ?lb) + CanNetworkReach(?lb, ?backend)
+#                                    => CanNetworkReach(internet, ?backend). Also supports
+#                                    NLB->ALB chaining: NLB with target_type='alb' emits
+#                                    CanNetworkReach(NLB, ALB), which chains to backend via
+#                                    ALB's own CanNetworkReach edges.
+# NOTE on NLB->ALB targets: aws-elb-routes-to-target-group emits CanNetworkReach for
+#   target_type in [Compute, Network], which includes ALB targets. An NLB can register
+#   an ALB as a target; the NLB forwards traffic to the ALB, which then forwards to its
+#   own backends. This creates a two-hop path: NLB -> ALB -> backend. Both hops are
+#   modeled as separate CanNetworkReach edges; network-chains composes the full path.

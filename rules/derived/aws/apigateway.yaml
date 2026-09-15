@@ -1,0 +1,631 @@
+# AWS API Gateway — attack-path rules (Phase 10 — messaging & event systems)
+# ---------------------------------------------------------------------------
+# API Gateway is a FRONT-DOOR TRIGGER and an AWS-SERVICE INTEGRATION ENGINE.
+# The two signature attack primitives:
+#
+#   A. INTEGRATION CREDENTIALS ROLE: an integration configured with a credentials
+#      role ARN causes API Gateway to call the backend AS that IAM role. Anyone who
+#      can invoke the API (execute-api:Invoke) thereby executes as that role.
+#      ExecutesAs(Integration -> credentials-role) is the explicit fact; this file
+#      derives CanExecuteAs and the cross-account/internet exposure consequences.
+#
+#   B. LAMBDA PROXY TRIGGER: an API with a Lambda proxy integration is an EVENT
+#      SOURCE for the Lambda. An invoker TRIGGERS the Lambda (CanTrigger), which
+#      executes as its own execution role. messaging-chains.yaml rule 2 rolls
+#      CanTrigger + ExecutesAs into CanExecuteAs; this file emits the service
+#      FACTS (CanInvoke on the API -> CanTrigger on the Lambda binding).
+#
+# COMPOSITION — CITE, DO NOT DUPLICATE the linchpins:
+#   messaging-chains.yaml    — rule 1  (CanWriteData/?Invoke + CanTrigger => CanTrigger(p->consumer))
+#                            — rule 2  (CanTrigger + ExecutesAs => CanExecuteAs(p->identity))
+#                            — rule 4  (resource-policy cross-boundary => CrossAccountTrust)
+#   can-execute-as.yaml      — execute-as-via-code-modify / execute-as-via-config-identity-swap
+#   can-control.yaml         — escalate-via-execute-as / enter-account-via-assume
+#   lambda.yaml              — aws-lambda-execute-as-via-code (Lambda authorizer code modification)
+#   credential-chains.yaml   — execute-then-read-secret / read-secret-yields-identity
+#
+# PERMISSIONS — exact action names from the AWS Service Authorization Reference:
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonapigatewaymanagement.html
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonapigatewaymanagementv2.html
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonapigatewayexecute-api.html
+#
+# Permissions noted with ? are conditionally needed (invoke path).
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 10-messaging
+service: apigateway
+applies_to: [aws]
+
+# ===========================================================================
+# EXPLICIT normalization rules — raw config -> explicit edges.
+# Kept co-located; conceptually live in rules/explicit/aws-apigateway.yaml.
+# ===========================================================================
+explicit_rules:
+
+  # --- Integration credentials role -> ExecutesAs ---------------------------
+  - id: aws-apigw-executesas-credentials-role
+    emits: ExecutesAs
+    description: "A REST/HTTP/WebSocket API integration configured with a credentials role causes API Gateway to call the backend AS that IAM role."
+    match_record: {resource_type: "AWS::ApiGateway::Integration", field: "credentials"}
+    where:
+      - "credentials is non-empty and matches arn:aws:iam::<acct>:role/<name> (NOT the caller-creds pattern arn:aws:iam::*:user/${user})"
+    emit:
+      source_type: APIGateway
+      target_type: Role
+      source: "<API Gateway Integration node>"
+      target: "<IAM role from credentials field>"
+      state: ACTIVE
+      permissions: []
+      api_source: "apigateway:GET /restapis/{id}/resources/{rid}/methods/{method}/integration OR apigateway:GET /apis/{id}/integrations/{integration-id}"
+      evidence_field: "integration.credentials"
+      state_logic: >-
+        ACTIVE when the credentials field contains a valid ARN for an IAM role in
+        the same or accessible account and the API Gateway service principal can
+        assume it (role trust policy permits apigateway.amazonaws.com).
+      false_positive_note: >-
+        Emit ONLY when the credentials field is a customer IAM role ARN. The
+        arn:aws:iam::*:user/${user.name} pattern (caller-creds passthrough) means
+        API Gateway uses the CALLER's own credentials at invocation time — there is
+        no fixed role, so no ExecutesAs edge. The AWS service principal pattern
+        (apigateway.amazonaws.com) grants API GW permisions over Lambda; this is
+        covered by CanInvoke, not ExecutesAs. Do NOT emit for Lambda proxy
+        integrations that lack a credentials field — Lambda's own execution role
+        provides the ExecutesAs identity, modeled in lambda.yaml.
+      narrative: >-
+        API Gateway integration {source.name} is configured to call its backend
+        as IAM role {target.name} (credentials field); every invocation of this
+        integration causes AWS to use {target.name}'s permissions.
+
+  # --- Lambda proxy integration -> CanInvoke (explicit fact) ----------------
+  - id: aws-apigw-invokes-lambda
+    emits: CanInvoke
+    description: "API Gateway invokes a Lambda function as its integration backend (proxy or custom integration)."
+    match_record: {resource_type: "AWS::ApiGateway::Integration", field: "uri"}
+    where:
+      - "uri matches arn:aws:apigateway:<region>:lambda:path/2015-03-31/functions/<fn-arn>/invocations"
+      - "integration.type in [AWS_PROXY, AWS]"
+    emit:
+      source_type: APIGateway
+      target_type: ServerlessFunction
+      source: "<API Gateway API node>"
+      target: "<Lambda function node from uri>"
+      state: ACTIVE
+      permissions: []
+      api_source: "apigateway:GET /restapis/{id}/resources/{rid}/methods/{method}/integration"
+      evidence_field: "integration.uri"
+      state_logic: >-
+        ACTIVE when the Lambda integration URI is configured and the Lambda resource
+        policy grants lambda:InvokeFunction to apigateway.amazonaws.com (scoped to the
+        source API ARN via aws:SourceArn or aws:SourceAccount). CONDITIONAL(resource_policy)
+        when the resource policy is absent or does not authorize this API.
+      false_positive_note: >-
+        The Lambda function's resource policy must grant lambda:InvokeFunction to
+        apigateway.amazonaws.com (typically scoped to the source API ARN via
+        aws:SourceArn). Without that grant, API Gateway cannot invoke the function
+        and the CanInvoke edge is CONDITIONAL(resource_policy). Do not emit ACTIVE
+        if the Lambda resource policy is absent or does not authorize this API.
+        HTTP integration type (integration.type == HTTP or HTTP_PROXY) to a Lambda
+        function URL is a plain HTTP call, not an SDK invocation — emit CanNetworkReach,
+        not CanInvoke.
+      narrative: >-
+        API Gateway API {source.name} invokes Lambda function {target.name} as its
+        backend integration on each matched request.
+
+  # --- Public REST/HTTP API -> ExposedToInternet ----------------------------
+  - id: aws-apigw-public-exposure
+    emits: ExposedToInternet
+    description: "A REST API with REGIONAL or EDGE endpoint type, or any HTTP/WebSocket API, is reachable from the public internet."
+    match_record: {resource_type: "AWS::ApiGateway::RestApi", field: "endpointConfiguration.types"}
+    where:
+      - "endpointConfiguration.types contains REGIONAL or EDGE"
+      - "resource policy is absent OR does not restrict invocation to a specific aws:sourceVpce or aws:sourceVpc that excludes internet traffic"
+    emit:
+      source_type: PublicEndpoint
+      target_type: AnonymousIdentity
+      source: "<public execute-api endpoint of the API>"
+      target: "<AnonymousIdentity>"
+      state: ACTIVE
+      permissions: ["execute-api:Invoke"]
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when endpointConfiguration.types is REGIONAL or EDGE and the resource
+        policy either is absent (all internet callers allowed, subject to caller-side
+        IAM) or contains a Principal '*' statement. CONDITIONAL(resource_policy) when
+        the policy exists but does not explicitly allow '*' — callers must satisfy the
+        policy conditions. For HTTP APIs (V2, no resource policy), emit ACTIVE by
+        default unless a JWT/Lambda authorizer is present (authorizer is an access
+        control, not a network block — still publicly routable, so still ExposedToInternet;
+        set confidence lower if a restrictive authorizer is present). Do NOT emit for
+        PRIVATE endpoint type.
+      false_positive_note: >-
+        Do NOT emit for PRIVATE endpoint type APIs — those require a VPC interface
+        endpoint and resource policy. An API with a resource policy restricting to
+        aws:sourceVpce or aws:SourceIp (internal-only) should be modeled as
+        PrivateReachability or ExposedToAccount instead. A JWT/Lambda authorizer does
+        not make the API non-public at the network level (TCP/HTTPS reachable from
+        internet is still ExposedToInternet); lower confidence appropriately.
+      narrative: >-
+        API Gateway API {source.name} is publicly accessible from the internet at its
+        execute-api endpoint ({endpointType} type). Any internet client can attempt
+        to invoke it (subject to authorizer / resource policy conditions).
+
+  # --- Private REST API -> PrivateReachability (structural fact) ------------
+  - id: aws-apigw-private-endpoint
+    emits: PrivateReachability
+    description: "A REST API with PRIVATE endpoint type is reachable only via a VPC interface endpoint."
+    match_record: {resource_type: "AWS::ApiGateway::RestApi", field: "endpointConfiguration.types"}
+    where:
+      - "endpointConfiguration.types contains PRIVATE"
+    emit:
+      source_type: Messaging
+      target_type: PrivateEndpoint
+      source: "<API Gateway API node>"
+      target: "<VPC interface endpoint for execute-api in the VPC>"
+      state: ACTIVE
+      permissions: []
+      state_logic: >-
+        ACTIVE when the API is configured with PRIVATE endpoint type and a resource
+        policy allows the VPC endpoint (aws:sourceVpce condition or explicit Principal).
+        CONDITIONAL(resource_policy) if the resource policy is absent or does not yet
+        allow the endpoint (API Gateway's default-deny for private APIs requires an
+        explicit allow).
+      false_positive_note: >-
+        Private APIs also require a resource policy that allows the VPC endpoint
+        (aws:sourceVpce condition or explicit Principal). Without the policy, even
+        VPC endpoint traffic is denied (API Gateway's default-deny for private APIs
+        requires an explicit allow). Mark CONDITIONAL(resource_policy) if the resource
+        policy does not yet allow the endpoint.
+      narrative: >-
+        API Gateway API {source.name} has endpoint type PRIVATE; it is reachable only
+        from within a VPC via the execute-api VPC interface endpoint.
+
+  # --- Resource policy cross-account grant -> CrossAccountTrust -------------
+  - id: aws-apigw-resource-policy-cross-account
+    emits: CrossAccountTrust
+    description: "A REST API resource policy that grants execute-api:Invoke to a principal in another account creates cross-account invoke trust."
+    match_record: {resource_type: "AWS::ApiGateway::RestApi", field: "policy"}
+    where:
+      - "policy Statement[].Principal contains an account ID or ARN in a different account than the API owner"
+      - "Statement[].Action includes execute-api:Invoke or execute-api:*"
+      - "Statement[].Effect == Allow"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Account
+      source: "<ResourcePolicy node on the REST API>"
+      target: "<external account named in the Principal>"
+      state: ACTIVE
+      permissions: ["execute-api:Invoke"]
+      conditions: [resource_policy, condition_expression]
+      state_logic: >-
+        ACTIVE when the Statement is an unconditional Allow for the external principal.
+        CONDITIONAL(condition_expression) when scoped by aws:SourceIp, aws:PrincipalOrgID,
+        aws:SourceVpce, or other conditions. BLOCKED when a Deny statement overrides the
+        Allow. Cross-account invocation also requires the caller's own identity policy to
+        grant execute-api:Invoke on this API's invoke ARN.
+      false_positive_note: >-
+        Cross-account invoke requires BOTH the resource policy Allow (this edge) AND
+        the caller's identity policy granting execute-api:Invoke (honor dual evaluation).
+        A resource policy granting only aws:PrincipalOrgID trust is not open cross-account
+        — it is organization-scoped (model as ExposedToTenant, not CrossAccountTrust, unless
+        the named account is genuinely external to the trust boundary). Do NOT emit for
+        HTTP API (V2) — V2 has no resource policy.
+      narrative: >-
+        The resource policy on REST API {source.name} grants execute-api:Invoke to a
+        principal in account {target.name}; that cross-account principal can invoke the
+        API (and thereby trigger its backend integrations).
+
+  # --- API key exposure -> ExposesCredential --------------------------------
+  - id: aws-apigw-api-key-exposure
+    emits: ExposesCredential
+    description: "API keys retrieved with includeValue=true expose plaintext key material."
+    match_record: {resource_type: "AWS::ApiGateway::ApiKey", field: "value"}
+    where:
+      - "value is present (non-null/non-empty) — collected with includeValue=true"
+    emit:
+      source_type: Messaging
+      target_type: Secret
+      source: "<API Gateway API node owning the usage plan>"
+      target: "<APIKey node>"
+      state: ACTIVE
+      permissions: ["apigateway:GET"]
+      state_logic: >-
+        ACTIVE when the API key value is collected with includeValue=true, exposing
+        the plaintext key material.
+      false_positive_note: >-
+        API keys provide invocation-level access to key-gated APIs, not IAM identity
+        access. ExposesCredential here represents the credential needed to invoke the
+        API (not an AWS IAM credential). The downstream escalation requires the key-gated
+        API itself to expose a high-value backend. Do NOT collect key values in routine
+        scans — use includeValue=false and record only the key ID; flag for targeted audit.
+      narrative: >-
+        The plaintext value of API key {target.name} was collected from API Gateway
+        (apigateway:GET with includeValue=true); this key grants invocation access to
+        any usage plan that includes it.
+
+# ===========================================================================
+# DERIVED rules — pattern-match over existing edges to emit new capabilities
+# ===========================================================================
+rules:
+
+  # --- 1) Invoke an API whose integration ExecutesAs a credentials role
+  #        => CanExecuteAs the credentials role ----------------------------
+  - id: aws-apigw-invoke-executes-as
+    emits: CanExecuteAs
+    description: "Invoking an API Gateway API whose integration ExecutesAs a credentials role runs the integration as that role, yielding CanExecuteAs."
+    match:
+      - [ ?principal, CanInvoke,   ?api ]
+      - [ ?api,       ExecutesAs,  ?role ]
+    where:
+      - "node_type(?api) == APIGateway"
+      - "?role is the integration credentials role (IAM role ARN in integration.credentials, not caller-creds passthrough)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["execute-api:Invoke"]
+      conditions: [iam_permission, resource_policy]
+      state_logic: >-
+        ACTIVE when the principal has effective execute-api:Invoke on the API's stage/method
+        scope (identity policy allows it AND the resource policy allows it — both must allow
+        for cross-account; same-account requires only one). CONDITIONAL(resource_policy) when
+        the resource policy gate is unclear. BLOCKED when a Deny in the resource policy or an
+        SCP/permission-boundary denies execute-api:Invoke.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanInvoke ?api"
+        - "?api ExecutesAs ?role (integration credentials)"
+      false_positive_note: >-
+        This rule applies ONLY when the API's integration ExecutesAs a credentials role
+        (the explicit rule aws-apigw-executesas-credentials-role was triggered). A Lambda
+        proxy integration WITHOUT a credentials role does NOT yield this rule — the Lambda's
+        own execution role is a separate ExecutesAs on the Lambda node, reached via rule 2
+        and messaging-chains. Honor the scope of execute-api:Invoke (stage and method/route
+        path in the resource ARN); a grant scoped to one route does not yield all-routes
+        execution. An SCP or permission boundary denying execute-api:Invoke blocks this.
+      narrative: >-
+        {principal.name} can invoke {api.name} (execute-api:Invoke), which has an
+        integration that runs as IAM role {role.name} (integration.credentials). Invoking
+        the API causes API Gateway to assume {role.name} and execute the integration as
+        that role — effectively running as {role.name}.
+
+  # --- 2) Swap integration credentials role (config change) => CanExecuteAs
+  #        via the new role -----------------------------------------------
+  - id: aws-apigw-config-swap-executes-as
+    emits: CanExecuteAs
+    description: "Changing an integration's credentials field to a more-privileged role (apigateway:PATCH + iam:PassRole) then invoking yields execution as the new role."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?api ]
+      - [ ?principal, CanPassIdentity,        ?role ]
+    where:
+      - "node_type(?api) == APIGateway"
+      - "?role trust policy allows apigateway.amazonaws.com"
+      - "iam:PassRole for ?role permits iam:PassedToService including apigateway.amazonaws.com (or unconditioned)"
+    optional:
+      - [ ?principal, CanInvoke, ?api ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["apigateway:PATCH", "iam:PassRole", "execute-api:Invoke?"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when the principal can both modify the integration (apigateway:PATCH on the
+        integration resource) and pass the target role to apigateway.amazonaws.com
+        (iam:PassRole with iam:PassedToService including apigateway.amazonaws.com or
+        unconditioned), AND the principal can also invoke the API (execute-api:Invoke —
+        matched optional[0]). CONDITIONAL(trigger_exists) when the principal cannot invoke
+        but the API is reachable by another caller or has a public endpoint. POTENTIAL
+        (role_compatibility) when the role trust or iam:PassedToService is unknown/unresolved.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from:
+        - "?principal CanModifyConfiguration ?api"
+        - "?principal CanPassIdentity ?role"
+        - "?principal CanInvoke ?api (optional)"
+      false_positive_note: >-
+        Honor iam:PassedToService: a role passable only to ec2/ecs does NOT yield
+        API Gateway execution. The role MUST trust apigateway.amazonaws.com or
+        sts:AssumeRole fails — downgrade to POTENTIAL(role_compatibility) when trust
+        is unknown. The CanModifyConfiguration must reach the integration resource
+        specifically (apigateway:PATCH on /restapis/{id}/resources/{rid}/methods/{method}/integration
+        or the V2 equivalent), not merely the stage or API root. An SCP/permission-boundary
+        denying apigateway:PATCH or iam:PassRole blocks this.
+        CITE can-execute-as.yaml execute-as-via-config-identity-swap for the general
+        pattern; this rule adds the API-Gateway-specific PassedToService gate and the
+        two-step (swap + invoke) mechanics.
+      narrative: >-
+        {principal.name} can modify {api.name}'s integration configuration
+        (apigateway:PATCH) and pass IAM role {role.name} to apigateway.amazonaws.com
+        (iam:PassRole); by swapping the integration's credentials to {role.name} and
+        then invoking the API, {principal.name} executes the integration as {role.name}.
+
+  # --- 3) Create a new API with a passable credentials role => CanCreateWorkloadAs
+  - id: aws-apigw-create-api-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new API Gateway API with an integration bound to a passable credentials role, then invoke it — yields execution as that role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE apigateway:POST on /restapis or /apis (create new API/integration)"
+      - "?role trust policy allows apigateway.amazonaws.com"
+      - "iam:PassRole for ?role permits iam:PassedToService including apigateway.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "apigateway:POST", "execute-api:Invoke?"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when the principal can create an API (apigateway:POST on /restapis or /apis),
+        set an integration credentials to ?role (iam:PassRole to apigateway.amazonaws.com),
+        create a deployment and stage, and invoke the API (execute-api:Invoke on the new
+        invoke ARN). POTENTIAL(role_compatibility) when the role trust or iam:PassedToService
+        is unknown. Note: execute-api:Invoke on the NEWLY created API is typically allowed
+        to the creating account by default unless an explicit-deny resource policy blocks it.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from:
+        - "?principal CanPassIdentity ?role"
+      false_positive_note: >-
+        Honor iam:PassedToService: a role restricted to ec2/ecs yields POTENTIAL, not ACTIVE.
+        The role MUST trust apigateway.amazonaws.com (trust principal). Creating an API also
+        requires apigateway:POST, apigateway:PUT/POST on resources/methods/integrations, and
+        apigateway:POST on deployments — broad create; a restrictive SCP may limit this.
+        CITE can-execute-as.yaml execute-as-via-new-workload for the abstract pattern;
+        this rule fills in the API-Gateway-specific create path.
+      narrative: >-
+        {principal.name} can create a new API Gateway API (apigateway:POST) with an
+        integration bound to {role.name} (iam:PassRole to apigateway.amazonaws.com),
+        then invoke it (execute-api:Invoke) to execute the integration as {role.name}.
+
+  # --- 3b) Modify REST API resource policy to grant cross-account/internet access --------
+  - id: aws-apigw-modify-resource-policy
+    emits: CanModifyPolicy
+    description: "Modifying a REST API resource policy (apigateway:PATCH/PUT) to grant execute-api:Invoke to external principals or Principal '*'."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?api ]
+    where:
+      - "node_type(?api) == APIGateway"
+      - "?principal has EFFECTIVE apigateway:PUT on /restapis/{id}/policy (RestAPI resource-policy update endpoint)"
+    emit:
+      source_type: Identity
+      target_type: Policy
+      source: ?principal
+      target: "<ResourcePolicy node on the REST API>"
+      permissions: ["apigateway:PUT /restapis/{id}/policy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when the principal has apigateway:PUT on the RestAPI policy resource
+        (the /restapis/{id}/policy endpoint). This permission alone is sufficient to
+        modify the policy; downstream consequences (cross-account trust, internet exposure)
+        depend on the modified policy content.
+      derived_from: []
+      false_positive_note: >-
+        This rule emits the capability to modify the policy, not the consequences.
+        An attacker with this permission can grant themselves cross-account
+        execute-api:Invoke access (CanEnterAccount via can-control) or open the API
+        to the internet (ExposedToInternet), but those are derived downstream.
+        HTTP API (V2) has no resource policy — do NOT emit for V2.
+      narrative: >-
+        {principal.name} can modify the resource policy of REST API {api.name}
+        (apigateway:PUT /restapis/{id}/policy), enabling policy-grant escalation
+        (granting cross-account/internet access).
+
+  # --- 4) API CanInvoke Lambda => CanTrigger (messaging-chains bridge) -------
+  # The API is an event source for the Lambda. An invoker who drives the API
+  # thereby triggers the Lambda. Emit CanTrigger(API -> Lambda) so that
+  # messaging-chains rule 1 (CanWriteData/?Invoke + CanTrigger => CanTrigger) can
+  # propagate from the invoker through the API to the Lambda.
+  - id: aws-apigw-api-triggers-lambda
+    emits: CanTrigger
+    description: "An API Gateway API that invokes a Lambda backend is an event source for that Lambda; invoking the API triggers the Lambda."
+    match:
+      - [ ?api, CanInvoke, ?lambda ]
+    where:
+      - "node_type(?api)    == APIGateway"
+      - "node_type(?lambda) == ServerlessFunction"
+    emit:
+      source_type: APIGateway
+      target_type: Compute
+      source: ?api
+      target: ?lambda
+      permissions: []
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        ACTIVE when the Lambda integration is configured and enabled (the route/method
+        is deployed in a stage, the Lambda resource policy grants invoke to API Gateway).
+        CONDITIONAL(trigger_exists) when the integration exists but the route is not yet
+        deployed to a stage. BLOCKED when the Lambda resource policy does not allow
+        apigateway.amazonaws.com to invoke it.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "?api CanInvoke ?lambda"
+      false_positive_note: >-
+        This CanTrigger(api -> lambda) feeds messaging-chains rule 1: any principal
+        with CanInvoke(?principal, ?api) + this CanTrigger(?api, ?lambda) yields
+        CanTrigger(?principal, ?lambda) [messaging-publish-triggers-consumer]. Then
+        messaging-chains rule 2 + ExecutesAs(?lambda, ?role) => CanExecuteAs(?principal, ?role)
+        [messaging-trigger-executes-as] — the canonical Phase-10 path. Do NOT also
+        derive CanExecuteAs here directly; that is the linchpin's job. Only emit when the
+        Lambda resource policy actually grants lambda:InvokeFunction to apigateway.amazonaws.com
+        with a matching aws:SourceArn or aws:SourceAccount condition (or no condition for
+        overly permissive policies). A disabled/unconfigured integration or a Lambda function
+        whose resource policy does not authorize this API produces CONDITIONAL, not ACTIVE.
+      narrative: >-
+        API Gateway API {api.name} invokes Lambda function {lambda.name} on each matched
+        request; {api.name} is an event source (trigger) for {lambda.name}. Any principal
+        that can invoke this API thereby triggers {lambda.name} to run.
+
+  # --- 4b) Lambda authorizer invocation -> CanTrigger (High-value explicit edge)
+  # An API with a Lambda authorizer is an event source for that Lambda; the authorizer
+  # is invoked on every request evaluation. An attacker who can invoke the API thereby
+  # triggers the authorizer Lambda to run with attacker-influenced context (request token).
+  # This complements rule 4 (api -> backend Lambda CanTrigger); the two are independent
+  # event sources on the same API.
+  - id: aws-apigw-invokes-lambda-authorizer
+    emits: CanTrigger
+    description: "API Gateway invokes a Lambda authorizer function to evaluate access on every request (TOKEN or REQUEST type)."
+    match_record: {resource_type: "AWS::ApiGateway::Authorizer", field: "authorizerUri"}
+    where:
+      - "authorizerType in [TOKEN, REQUEST] (Lambda authorizer, not JWT/COGNITO_USER_POOLS)"
+      - "authorizerUri matches arn:aws:apigateway:<region>:lambda:path/2015-03-31/functions/<fn-arn>/invocations"
+    emit:
+      source_type: APIGateway
+      target_type: ServerlessFunction
+      source: "<API Gateway API node that uses this authorizer>"
+      target: "<Lambda function node from authorizerUri>"
+      permissions: []
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        ACTIVE when the authorizer is attached to an API (authorizerUri is configured),
+        enabled, and the Lambda resource policy grants lambda:InvokeFunction to
+        apigateway.amazonaws.com. CONDITIONAL(trigger_exists) when the authorizer is
+        defined but not yet attached to a stage/method. CONDITIONAL(resource_policy) when
+        the Lambda resource policy does not yet authorize this API.
+      derived_from: []
+      false_positive_note: >-
+        Emit ONLY for Lambda authorizer types (authorizerType in [TOKEN, REQUEST]).
+        Do NOT emit for JWT or COGNITO_USER_POOLS authorizers — those are not Lambda
+        invocations. The authorizer Lambda is invoked on EVERY request evaluation,
+        giving its execution role an attack surface: any attacker-influenced request
+        context can be sent to it. This is INDEPENDENT of the backend integration
+        trigger (rule 4); both can exist on the same API.
+      narrative: >-
+        API Gateway API {source.name} uses Lambda authorizer {target.name} to evaluate
+        access on every request (TOKEN or REQUEST type); the authorizer Lambda is triggered
+        on each evaluated request with attacker-influenced context (auth header or request
+        body).
+
+  # --- 5) Resource policy exposes API to internet => ExposedToInternet (derived upgrade)
+  # Belt-and-suspenders: when a resource policy Principal '*' + no restrict conditions
+  # is found on a REST API, derive ExposedToInternet from the policy fact directly.
+  # Complements the explicit aws-apigw-public-exposure rule which matches endpointConfiguration.
+  - id: aws-apigw-wildcard-policy-public
+    emits: ExposedToInternet
+    description: "A REST API resource policy with Principal '*' and no VPC/IP restriction makes the API internet-callable."
+    match:
+      - [ ?api, HasPolicy, ?policy ]
+    where:
+      - "node_type(?api)    == APIGateway"
+      - "node_type(?policy) == ResourcePolicy"
+      - "?policy grants execute-api:Invoke with Principal '*' and Effect Allow"
+      - "no Deny statement or condition restricts to aws:sourceVpce / aws:SourceVpc / aws:sourceIp on that statement"
+    emit:
+      source_type: PublicEndpoint
+      target_type: AnonymousIdentity
+      source: "<public execute-api endpoint of ?api>"
+      target: "<AnonymousIdentity>"
+      permissions: ["execute-api:Invoke"]
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the resource policy unconditionally allows execute-api:Invoke from
+        Principal '*'. CONDITIONAL(condition_expression) when a condition limits to a
+        PrincipalOrgID or specific IP range (not internet-open). BLOCKED when an explicit
+        Deny statement overrides the Allow.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?api HasPolicy ?policy (Principal '*' Allow execute-api:Invoke)"
+      false_positive_note: >-
+        A Private endpoint-type API with a wildcard-allow resource policy is still not
+        internet-reachable at the network level — emit ExposedToAccount (VPC-internal)
+        rather than ExposedToInternet. For REGIONAL/EDGE APIs a wildcard policy is
+        true internet exposure. Do NOT emit for V2 (HTTP/WebSocket) — V2 has no resource
+        policy. Deduplicate with aws-apigw-public-exposure on (ExposedToInternet, ?api,
+        AnonymousIdentity) — emit once.
+      narrative: >-
+        {api.name}'s resource policy grants execute-api:Invoke to Principal '*' without
+        VPC/IP restriction, making the API callable from the public internet.
+
+  # --- 7) Credentials role exposed via integration config => ExposesCredential
+  # An attacker who can read the integration config (apigateway:GET) learns the
+  # credentials role ARN. This is reconnaissance, not execution; the role ARN is not
+  # a credential itself, but knowing it enables targeted role-assumption attempts.
+  # Model as ExposesCredential from the API to the role (structural pointer).
+  - id: aws-apigw-integration-exposes-creds-role
+    emits: ExposesCredential
+    description: "An API Gateway integration's credentials field references an IAM role; reading the integration config reveals which role the API uses as its execution identity."
+    match:
+      - [ ?api, ExecutesAs, ?role ]
+    where:
+      - "node_type(?api) in [APIGateway, GenericMessaging]"
+      - "?role is the integration credentials role (reached via aws-apigw-executesas-credentials-role)"
+    emit:
+      source_type: APIGateway
+      target_type: Identity
+      source: ?api
+      target: ?role
+      permissions: ["apigateway:GET"]
+      state_logic: >-
+        ACTIVE when the integration credentials field is non-empty and retrievable via
+        apigateway:GET on the integration resource. The role ARN is exposed in cleartext
+        in the API configuration.
+      derived_from:
+        - "?api ExecutesAs ?role (integration credentials)"
+      false_positive_note: >-
+        ExposesCredential here records that the API config points to the role, making it
+        discoverable (reconnaissance value). The escalation path is CanExecuteAs, not
+        ExposesCredential -> CredentialsFor; the role ARN alone is not a usable credential.
+        This edge enables queries like "what execution identities are reachable by reading
+        API Gateway config?" without requiring an invocation path.
+      narrative: >-
+        {api.name} is configured to execute as {role.name} (integration.credentials field);
+        any principal with apigateway:GET on the integration can discover this role ARN,
+        enabling targeted privilege escalation attempts.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP or permission-boundary denying apigateway:PATCH on integration resources
+#    blocks aws-apigw-config-swap-executes-as and CanModifyConfiguration.
+#  - An SCP denying execute-api:Invoke on the API's invoke ARN blocks
+#    aws-apigw-invoke-executes-as and aws-apigw-cross-account-invoke-enters-account.
+#  - A Deny in the resource policy overriding the Allow blocks all invoke-based paths.
+#  - iam:PassRole with iam:PassedToService NOT including apigateway.amazonaws.com blocks
+#    aws-apigw-config-swap-executes-as and aws-apigw-create-api-as (POTENTIAL).
+#  - A private endpoint type API (PRIVATE) blocks aws-apigw-public-exposure and
+#    aws-apigw-wildcard-policy-public from producing ExposedToInternet.
+#  - State never exceeds the weakest contributor (RULE-FORMAT.md state propagation).
+#
+# WORKED PATHS:
+#
+# PUBLIC API + LAMBDA BACKEND -> EXECUTE-AS (messaging-chains linchpin):
+#   [user ExposedToInternet(APIGateway)] — internet invoker
+#   [user CanInvoke api(APIGateway)]                  (execute-api:Invoke granted)
+#   + [api CanInvoke fn(ServerlessFunction)]           (Lambda proxy integration, explicit rule)
+#   => aws-apigw-api-triggers-lambda:
+#      [api CanTrigger fn] ACTIVE
+#   + [fn ExecutesAs exec-role(Role)]                  (Lambda execution role, lambda.yaml)
+#   => messaging-chains messaging-trigger-executes-as:
+#      [user CanExecuteAs exec-role] CONDITIONAL(trigger_exists) -> ACTIVE (live API + deployed stage)
+#   => can-control escalate-via-execute-as:
+#      [user CanEscalateTo exec-role] (CITED, not re-derived)
+#
+# CREDENTIALS ROLE INVOKE:
+#   [user CanInvoke api(APIGateway)]                  (execute-api:Invoke)
+#   + [api ExecutesAs creds-role(Role)]                (aws-apigw-executesas-credentials-role)
+#   => aws-apigw-invoke-executes-as:
+#      [user CanExecuteAs creds-role] ACTIVE
+#   => can-control escalate-via-execute-as: [user CanEscalateTo creds-role] CITED
+#
+# INTEGRATION CONFIG SWAP -> EXECUTE-AS:
+#   [attacker CanModifyConfiguration api(APIGateway)]  (apigateway:PATCH)
+#   + [attacker CanPassIdentity priv-role(Role)]       (iam:PassRole to apigateway.amazonaws.com)
+#   => aws-apigw-config-swap-executes-as:
+#      [attacker CanExecuteAs priv-role] ACTIVE (with invoke) / CONDITIONAL (without)
+#
+# CROSS-ACCOUNT INVOKE -> ACCOUNT ENTRY (via can-control linchpin):
+#   [ext-principal CanInvoke api(APIGateway)]          (cross-account, resource policy allows)
+#   + [api ExecutesAs creds-role(Role)]                (same account as API)
+#   => aws-apigw-invoke-executes-as:
+#      [ext-principal CanExecuteAs creds-role] ACTIVE (dual-evaluation)
+#   => can-control enter-account-via-assume: [ext-principal CanEnterAccount api.account] ACTIVE (CITED)
+#
+# LAMBDA AUTHORIZER TRIGGER -> EXECUTE-AS (via messaging-chains):
+#   [user CanInvoke api(APIGateway)]                   (execute-api:Invoke granted)
+#   + aws-apigw-invokes-lambda-authorizer:
+#      [api CanTrigger authorizer-fn(ServerlessFunction)] ACTIVE
+#   + [authorizer-fn ExecutesAs auth-role(Role)]       (Lambda execution role)
+#   => messaging-chains messaging-trigger-executes-as:
+#      [user CanExecuteAs auth-role] CONDITIONAL(trigger_exists) -> ACTIVE
+# ---------------------------------------------------------------------------

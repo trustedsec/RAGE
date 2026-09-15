@@ -1,0 +1,604 @@
+# Azure Database for PostgreSQL / MySQL Flexible Server
+# Derived attack-path rules (Phase 6 — storage & databases)
+# ---------------------------------------------------------------------------
+# Covers Microsoft.DBforPostgreSQL/flexibleServers and
+# Microsoft.DBforMySQL/flexibleServers. Both share identical ARM RBAC attack
+# surface and are handled by a single rule file (provider_type guards in the
+# where-clauses distinguish the two when needed).
+#
+# KEY FACTS that shape these rules:
+#
+# (1) NO listKeys EQUIVALENT — unlike Azure Storage or Cosmos DB, there is no
+#     ARM action that returns a master password. The native admin password is
+#     WRITE-ONLY from ARM: Microsoft.DBforPostgreSQL/flexibleServers/write
+#     (the ARM update action) sets administratorLoginPassword to a
+#     caller-chosen value. This resets (not reads) the credential.
+#     Modeled as CanResetCredential, not ExposesCredential.
+#
+# (2) DATA ACCESS REQUIRES NETWORK REACH — after resetting the admin password,
+#     the attacker must reach the DB endpoint (port 5432 for PostgreSQL, 3306
+#     for MySQL) over the network. Private-access servers (VNet-injected,
+#     publicNetworkAccess == Disabled) have NO public endpoint; CanReadData for
+#     those is CONDITIONAL(network_reachability) at best.
+#
+# (3) PUBLIC FIREWALL = ExposedToInternet — a firewall rule with the IP range
+#     0.0.0.0–255.255.255.255 on a public-access server makes the DB endpoint
+#     reachable from any internet host. The "Allow Azure services" shorthand
+#     (0.0.0.0–0.0.0.0) is NOT the same — it admits only Azure backbone IPs.
+#
+# Permissions (verified, Microsoft.DBforPostgreSQL/Microsoft.DBforMySQL, 2026):
+#   flexibleServers/write (PG): Microsoft.DBforPostgreSQL/flexibleServers/write
+#   flexibleServers/write (My): Microsoft.DBforMySQL/flexibleServers/write
+#   firewallRules/write (PG):   Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/write
+#   firewallRules/write (My):   Microsoft.DBforMySQL/flexibleServers/firewallRules/write
+#
+# Linchpin citations (CITE, DO NOT DUPLICATE):
+#   credential-chains.yaml — ContainsSecret(?server -> secret) + CredentialsFor ->
+#     read-secret-yields-identity: CanImpersonate chain when application tables
+#     contain embedded credentials. Also execute-then-read-secret for workloads
+#     that gain CanReadData and whose target DB ContainsSecret.
+#   can-control.yaml — control-via-admin for Owner/Contributor roll-up to Controls.
+#   can-execute-as.yaml — not applicable (DB does not ExecutesAs an identity).
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 6-storage-databases
+applies_to: [azure]
+
+rules:
+
+  # --- (1) ARM write → admin password reset → CanModifyConfiguration --------
+  # Microsoft.DBforPostgreSQL/flexibleServers/write (the ARM update action) allows
+  # setting administratorLoginPassword to an attacker-chosen value. This effectively
+  # resets the native admin credential, after which the attacker can authenticate
+  # directly to PostgreSQL (port 5432) or MySQL (port 3306) as the admin user.
+  #
+  # SCHEMA CONFORMANCE: CanWrite is nature: explicit and may NOT be emitted from
+  # /rules/derived/. We emit CanModifyConfiguration (nature: both, target: '*')
+  # instead. This accurately represents ARM control-plane password reset: it modifies
+  # the server's administratorLoginPassword configuration field. The downstream
+  # rule azure-postgres-mysql-admin-reset-readdata chains CanModifyConfiguration
+  # to CanReadData (data-plane read post credential reset + network reach).
+  #
+  # This is DESTRUCTIVE (the previous admin password becomes invalid) and detectable
+  # via Azure Activity Log. It is ACTIVE once the RBAC permission is effective —
+  # there is no silent "read" path. The Contributor and Owner built-in roles include
+  # this permission. Reader does NOT.
+  #
+  # Note: The implicit admin Password node is modeled as ContainsCredential(?server)
+  # and CredentialsFor(Password -> admin identity). The reset action updates the
+  # password value via CanModifyConfiguration on the server. Downstream rule
+  # azure-postgres-mysql-admin-reset-readdata chains this to CanReadData.
+  - id: azure-postgres-mysql-admin-password-reset
+    emits: CanModifyConfiguration
+    description: "ARM write on the server resource sets/resets the native administrator password, enabling full DB access after network reach."
+    match:
+      - [ ?principal, HasPermission, ?server ]
+    where:
+      - "node_class(?server) == Data and node_type(?server) == RelationalDatabase"
+      - "node_type(?server) matched provider_type in ['Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DBforMySQL/flexibleServers']"
+      - "?principal has EFFECTIVE Microsoft.DBforPostgreSQL/flexibleServers/write OR Microsoft.DBforMySQL/flexibleServers/write (as applicable) at ?server scope (Contributor, Owner, or custom role including flexibleServers/write)"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?server
+      permissions:
+        - "Microsoft.DBforPostgreSQL/flexibleServers/write"
+        - "Microsoft.DBforMySQL/flexibleServers/write"
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers flexibleServers/write
+        at the effective scope: BLOCKED;
+        else ACTIVE. This is an ARM control-plane call; it is NOT gated by the
+        server firewall rules or publicNetworkAccess setting — the ARM update
+        action succeeds from any network regardless of DB network configuration.
+        Password reset is destructive and detectable via Azure Activity Log;
+        state is ACTIVE for the capability itself.
+      confidence: "0.95"
+      derived_from: [ "HasPermission edge: source=?principal, target=?server, action=(Microsoft.DBforPostgreSQL/flexibleServers/write | Microsoft.DBforMySQL/flexibleServers/write)" ]
+      false_positive_note: >-
+        Verify effective permissions via role definition resolution — Contributor
+        and Owner include flexibleServers/write; Reader does NOT. Do NOT infer
+        write access from resource group or subscription Reader grants.
+        This action resets (overwrites) the existing admin password — the
+        previous holder of the admin credential loses access. Emit BLOCKED only
+        when a deny assignment or deny Azure Policy deny-effect covers
+        flexibleServers/write at the effective scope.
+        The ARM write action is callable from any network regardless of the
+        server's firewall rules or publicNetworkAccess setting — do NOT apply
+        a network_reachability condition to this rule.
+        IMPORTANT: there is no 'listAdminPassword' or 'listKeys' equivalent
+        for these services — the password is write-only (reset), not readable.
+        CanModifyConfiguration represents control-plane configuration authority
+        over the server's authentication settings. Downstream derivation
+        (azure-postgres-mysql-admin-reset-readdata) chains to CanReadData when
+        network reach is available.
+      narrative: >-
+        {principal.name} can call the ARM update action on {server.name}
+        (Microsoft.DBforPostgreSQL/flexibleServers/write or
+        Microsoft.DBforMySQL/flexibleServers/write), which allows setting the
+        native administrator password to an attacker-chosen value. After the reset,
+        the attacker can authenticate directly to the database engine as the
+        admin user (port 5432 for PostgreSQL, port 3306 for MySQL), subject
+        to network reachability.
+
+  # --- (2) Password reset + network reach → CanReadData ----------------------
+  # After gaining the ability to reset the admin password via the ARM write action
+  # (azure-postgres-mysql-admin-password-reset → CanModifyConfiguration), the attacker
+  # holds the native admin credential. With network reachability to the DB endpoint
+  # (port 5432/3306), this yields full data-plane read access to ALL databases and
+  # tables on the server. CanReadData is CONDITIONAL(network_reachability) unless the
+  # server is on a public-access topology AND has a firewall rule covering the
+  # attacker's source.
+  #
+  # Private-access servers (publicNetworkAccess == Disabled / VNet injection)
+  # have no public endpoint: CanReadData is CONDITIONAL(network_reachability)
+  # — only ACTIVE when the attacker also has a foothold inside the VNet.
+  #
+  # STATE PROPAGATION: This rule chains from the upstream CanModifyConfiguration edge
+  # (which is already gated by iam_permission), so conditions here should list only
+  # NEW preconditions introduced at this hop, not repeat iam_permission from the
+  # upstream edge.
+  - id: azure-postgres-mysql-admin-reset-readdata
+    emits: CanReadData
+    description: "Admin password reset capability (CanModifyConfiguration to server config) plus network reachability to the DB endpoint yields full data-plane read of all databases."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?server ]
+    where:
+      - "node_class(?server) == Data and node_type(?server) == RelationalDatabase"
+      - "node_type(?server) matched provider_type in ['Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DBforMySQL/flexibleServers']"
+      - "edge produced by azure-postgres-mysql-admin-password-reset (CanModifyConfiguration from flexibleServers/write on this server)"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?server
+      permissions:
+        - "Microsoft.DBforPostgreSQL/flexibleServers/write"
+        - "Microsoft.DBforMySQL/flexibleServers/write"
+      conditions: [network_reachability]
+      state_logic: >-
+        if ?server.properties.publicNetworkAccess == 'Disabled' (private-access
+        topology / VNet injection): CONDITIONAL(network_reachability) — no public
+        endpoint exists; attacker must have a foothold in the delegated subnet or
+        a peered VNet to reach port 5432/3306;
+        elif ?server.properties.publicNetworkAccess == 'Enabled' AND a firewall
+        rule admitting the attacker's source IP exists (or rule 0.0.0.0–255.255.255.255):
+        ACTIVE;
+        elif ?server.properties.publicNetworkAccess == 'Enabled' AND no firewall
+        rule covers the attacker's source: CONDITIONAL(network_reachability);
+        if a deny assignment or deny Azure Policy covers flexibleServers/write
+        at effective scope (blocking the upstream CanModifyConfiguration): BLOCKED.
+      confidence: "0.90"
+      derived_from: [ "CanModifyConfiguration edge: source=?principal, target=?server, rule=azure-postgres-mysql-admin-password-reset" ]
+      false_positive_note: >-
+        Network reachability is a HARD gate. A private-access server (VNet-injected,
+        publicNetworkAccess == Disabled) has no public endpoint — do NOT emit ACTIVE
+        for CanReadData unless the principal is provably inside the VNet or a peered
+        network. For public-access servers: only ACTIVE when a firewall rule admits
+        the attacker's source IP; the rule range 0.0.0.0–255.255.255.255 means any
+        internet host, which yields ACTIVE. The "Allow Azure services" shorthand
+        (startIpAddress = 0.0.0.0, endIpAddress = 0.0.0.0) admits only Azure backbone
+        IPs, NOT arbitrary internet hosts — do not treat it as fully open.
+        This is a two-step derived edge (ARM write -> DB read); its state is capped by
+        the weaker of CanModifyConfiguration and network_reachability (per edge_state_model
+        weakest-contributor rule). Application databases frequently contain embedded
+        connection strings and secrets — see credential-chains.yaml for ContainsSecret ->
+        CredentialsFor -> CanImpersonate roll-up when the DB ContainsSecret.
+      narrative: >-
+        {principal.name} can modify {server.name} configuration (via
+        flexibleServers/write), allowing the native administrator password to be reset
+        to an attacker-chosen value. Combined with network reachability to the database
+        endpoint, the attacker can authenticate as the admin user and read all
+        databases and tables. Application data frequently contains embedded credentials,
+        connection strings, and API keys (see credential-chains.yaml for the
+        ContainsSecret -> CredentialsFor -> CanImpersonate roll-up).
+
+  # --- (3) PUBLIC EXPOSURE: open firewall rule → ExposedToInternet -------------
+  # Azure Database for PostgreSQL / MySQL Flexible Server with public access enabled
+  # (publicNetworkAccess == Enabled) and a firewall rule that covers the full internet
+  # (startIpAddress == 0.0.0.0, endIpAddress == 255.255.255.255) exposes the DB
+  # endpoint (port 5432 / 3306) to any internet-connected host.
+  #
+  # The publicly-exposed endpoint still requires valid authentication (native password
+  # or Entra token) to access data — ExposedToInternet expresses that the network
+  # surface is open to the internet, not that data is unauthenticated (unlike blob
+  # public containers). The attack value: brute-force / credential spray, CVE
+  # exploitation against the DB engine, and elimination of the network gate for
+  # the CanModifyConfiguration -> CanReadData chain.
+  #
+  # SCHEMA CONFORMANCE: HasPolicy declares target: [Policy]. Firewall rules are
+  # property records (configuration data), not Policy nodes. The edge does not exist
+  # in the graph, making the prior rule dead code. Fixed by matching on server
+  # properties directly (publicNetworkAccess + collected firewallRules[]).
+  #
+  # CRITICAL DISTINCTION: startIpAddress = 0.0.0.0, endIpAddress = 0.0.0.0 is the
+  # "Allow Azure services" shorthand and does NOT equal public internet exposure.
+  # Only emit when the rule covers a genuine public internet range (endIpAddress =
+  # 255.255.255.255, or a broad public block that admits any internet host).
+  - id: azure-postgres-mysql-public-firewall
+    emits: ExposedToInternet
+    description: "PostgreSQL/MySQL Flexible Server with publicNetworkAccess Enabled and an internet-wide firewall rule exposes the DB endpoint to the public internet."
+    match:
+      - [ ?server ]
+    where:
+      - "node_class(?server) == Data and node_type(?server) == RelationalDatabase"
+      - "node_type(?server) matched provider_type in ['Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DBforMySQL/flexibleServers']"
+      - "?server.properties.publicNetworkAccess == 'Enabled'"
+      - "?server.properties.firewallRules contains at least one rule where startIpAddress is not in RFC1918/link-local space (i.e., startIpAddress is publicly routable) AND endIpAddress == '255.255.255.255' (full internet range) OR equivalent (e.g., rule covering 0.0.0.0–255.255.255.255)"
+    emit:
+      source_type: RelationalDatabase
+      target_type: AnonymousIdentity
+      source: ?server
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        if ?server.properties.publicNetworkAccess == 'Disabled': DO NOT EMIT —
+        private-access topology has no public endpoint regardless of firewallRules
+        records (the service ignores firewall rules in that topology);
+        elif firewallRules[] contains a rule with startIpAddress == '0.0.0.0' AND
+        endIpAddress == '0.0.0.0' (Allow Azure services shorthand, not a public
+        internet range): DO NOT EMIT as ExposedToInternet — only Azure backbone IPs
+        are admitted, not arbitrary internet hosts;
+        elif firewallRules[] contains a rule covering true public internet (startIpAddress
+        outside RFC1918/link-local, endIpAddress == '255.255.255.255'): ACTIVE — any
+        internet host can reach the DB port;
+        else if firewallRules[] contains a rule with a broad public range (e.g., a /24
+        that includes significant public space): ACTIVE — meaningful public exposure.
+      confidence: "0.93"
+      derived_from: [ "collected ARM properties: publicNetworkAccess, firewallRules[]" ]
+      false_positive_note: >-
+        CRITICAL: publicNetworkAccess == Disabled means the server is VNet-injected
+        with no public endpoint — do NOT emit regardless of firewallRules records
+        (which are meaningless in that topology). The "Allow Azure services" shorthand
+        (startIpAddress=0.0.0.0, endIpAddress=0.0.0.0) is frequently confused with
+        an open internet rule — it admits only Azure backbone IPs and MUST NOT be
+        emitted as ExposedToInternet. Only emit ACTIVE when the rule covers a genuine
+        public internet range: endIpAddress == 255.255.255.255 combined with a public
+        starting address is the canonical indicator. Do NOT emit if endIpAddress is
+        a private range or a non-internet-routable block. ExposedToInternet here means
+        the DB port is network-reachable from the internet — valid credentials are
+        still required for data access. This edge resolves the CONDITIONAL(network_reachability)
+        on azure-postgres-mysql-admin-reset-readdata: if both this edge and
+        CanModifyConfiguration are ACTIVE, CanReadData upgrades to ACTIVE.
+      narrative: >-
+        {server.name} has publicNetworkAccess=Enabled and a firewall rule admitting
+        the full internet (0.0.0.0–255.255.255.255 or equivalent public range). Any
+        internet-connected host can reach the database engine endpoint (PostgreSQL
+        port 5432 or MySQL port 3306). Valid credentials are still required for data
+        access, but the network gate is absent — enabling credential spray, brute-force,
+        or exploitation of DB engine vulnerabilities from the internet.
+
+  # --- (2b) Password reset + network reach → CanWriteData ---------------------
+  # Full native admin access post password reset grants not only SELECT (CanReadData)
+  # but also INSERT, UPDATE, DELETE, DROP on all databases. An attacker with admin
+  # credentials and network reach can poison application data, truncate tables, or
+  # inject malicious records. This rule emits CanWriteData with the same upstream
+  # edge and conditions as CanReadData.
+  - id: azure-postgres-mysql-admin-reset-writedata
+    emits: CanWriteData
+    description: "Admin password reset capability plus network reachability yields full data-plane write access (INSERT, UPDATE, DELETE, DROP) on all databases."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?server ]
+    where:
+      - "node_class(?server) == Data and node_type(?server) == RelationalDatabase"
+      - "node_type(?server) matched provider_type in ['Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DBforMySQL/flexibleServers']"
+      - "edge produced by azure-postgres-mysql-admin-password-reset (CanModifyConfiguration from flexibleServers/write on this server)"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?server
+      permissions:
+        - "Microsoft.DBforPostgreSQL/flexibleServers/write"
+        - "Microsoft.DBforMySQL/flexibleServers/write"
+      conditions: [network_reachability]
+      state_logic: >-
+        if ?server.properties.publicNetworkAccess == 'Disabled' (private-access
+        topology / VNet injection): CONDITIONAL(network_reachability) — no public
+        endpoint exists; attacker must have a foothold in the delegated subnet or
+        a peered VNet to reach port 5432/3306;
+        elif ?server.properties.publicNetworkAccess == 'Enabled' AND a firewall
+        rule admitting the attacker's source IP exists (or rule 0.0.0.0–255.255.255.255):
+        ACTIVE;
+        elif ?server.properties.publicNetworkAccess == 'Enabled' AND no firewall
+        rule covers the attacker's source: CONDITIONAL(network_reachability);
+        if a deny assignment or deny Azure Policy covers flexibleServers/write
+        at effective scope (blocking the upstream CanModifyConfiguration): BLOCKED.
+      confidence: "0.89"
+      derived_from: [ "CanModifyConfiguration edge: source=?principal, target=?server, rule=azure-postgres-mysql-admin-password-reset" ]
+      false_positive_note: >-
+        Network reachability is a HARD gate. State logic mirrors CanReadData — the same
+        network and topology rules apply. Native admin credentials grant INSERT, UPDATE,
+        DELETE, DROP on all databases. An attacker can inject malicious data, truncate
+        tables, or modify application state to achieve persistence or lateral movement.
+      narrative: >-
+        {principal.name} holds native administrator credentials on {server.name}
+        (via password reset). Combined with network reachability, the attacker can
+        modify any data in any database: INSERT new records, UPDATE existing data,
+        DELETE records, or DROP tables. This enables data poisoning, application
+        compromise, or persistence attacks.
+
+  # --- (4) Entra AD admin assignment → CanModifyConfiguration ----------------
+  # Microsoft.DBforPostgreSQL/flexibleServers/administrators/write (and MySQL equivalent)
+  # allows a caller to set an Entra Active Directory administrator for the server.
+  # The designated admin principal (the caller or a principal the caller controls)
+  # gains DB-level admin access via Entra authentication when authConfig.activeDirectoryAuth
+  # is enabled. This is a distinct attack path from password reset — the control-plane
+  # action (setting the admin) is not gated by network reach, but data-plane access
+  # (authenticating via Entra token) requires network reachability to the database
+  # endpoint (the Entra token is presented at the PostgreSQL/MySQL wire protocol level).
+  #
+  # Modeled as CanModifyConfiguration (setting the Entra admin is a server configuration
+  # change) with state ACTIVE when both the permission and Entra auth are enabled.
+  # A downstream derived rule (azure-postgres-mysql-entra-admin-readdata) chains
+  # this to CanReadData when network reach is available.
+  - id: azure-postgres-mysql-entra-admin-set
+    emits: CanModifyConfiguration
+    description: "Entra AD administrator assignment permission allows designating an Entra principal for DB admin access via token authentication when activeDirectoryAuth is enabled."
+    match:
+      - [ ?principal, HasPermission, ?server ]
+    where:
+      - "node_class(?server) == Data and node_type(?server) == RelationalDatabase"
+      - "node_type(?server) matched provider_type in ['Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DBforMySQL/flexibleServers']"
+      - "?principal has EFFECTIVE Microsoft.DBforPostgreSQL/flexibleServers/administrators/write OR Microsoft.DBforMySQL/flexibleServers/administrators/write (as applicable) at ?server scope"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?server
+      permissions:
+        - "Microsoft.DBforPostgreSQL/flexibleServers/administrators/write"
+        - "Microsoft.DBforMySQL/flexibleServers/administrators/write"
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers administrators/write
+        at effective scope: BLOCKED;
+        elif authConfig.activeDirectoryAuth == 'Enabled': ACTIVE (caller can set an Entra
+        admin and the admin can authenticate via Entra token when network reach is available);
+        else CONDITIONAL(service_state) (the Entra admin assignment succeeds at the control
+        plane, but Entra authentication is not available at the data plane).
+      confidence: "0.92"
+      derived_from: [ "HasPermission edge: source=?principal, target=?server, action=(Microsoft.DBforPostgreSQL/flexibleServers/administrators/write | Microsoft.DBforMySQL/flexibleServers/administrators/write)" ]
+      false_positive_note: >-
+        Verify effective administrators/write permission via role definition resolution.
+        Emit CONDITIONAL(service_state) when authConfig.activeDirectoryAuth != Enabled,
+        since the Entra admin identity will be set but cannot authenticate. The state
+        is ACTIVE only when BOTH the permission exists AND Entra auth is enabled on
+        the server. The data-plane Entra token authentication requires network reach
+        to the database endpoint (port 5432/3306) — see the downstream rule
+        azure-postgres-mysql-entra-admin-readdata which chains this to CanReadData
+        with network_reachability as a condition.
+      narrative: >-
+        {principal.name} can call Microsoft.DBforPostgreSQL/flexibleServers/administrators/write
+        (or MySQL equivalent) on {server.name}, designating an Entra AD principal as the
+        database administrator. When authConfig.activeDirectoryAuth is enabled, that Entra
+        principal can authenticate to the database using an Entra access token and hold
+        full admin privileges, without requiring the native password (network reach required).
+
+  # --- (4b) Entra admin + network reach → CanReadData -------------------------
+  # After setting an Entra AD administrator (azure-postgres-mysql-entra-admin-set),
+  # the designated principal can authenticate to the database using an Entra access
+  # token when authConfig.activeDirectoryAuth is enabled. With network reachability
+  # to the DB endpoint (port 5432/3306), this yields full data-plane read access to
+  # ALL databases and tables on the server (Entra admins have the same DB-level
+  # permissions as native admins).
+  #
+  # This completes the Entra admin attack path: escalation path #3 from the research
+  # doc (section 14). The CanModifyConfiguration edge from azure-postgres-mysql-entra-admin-set
+  # gates entry to the database as an Entra admin; this rule chains that to CanReadData
+  # when network reach is active.
+  - id: azure-postgres-mysql-entra-admin-readdata
+    emits: CanReadData
+    description: "Entra admin assignment (CanModifyConfiguration) plus network reachability to the DB endpoint yields full data-plane read of all databases via Entra token authentication."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?server ]
+    where:
+      - "node_class(?server) == Data and node_type(?server) == RelationalDatabase"
+      - "node_type(?server) matched provider_type in ['Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DBforMySQL/flexibleServers']"
+      - "?server.properties.authConfig.activeDirectoryAuth == 'Enabled'"
+      - "edge produced by azure-postgres-mysql-entra-admin-set (CanModifyConfiguration from administrators/write on this server)"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?server
+      permissions:
+        - "Microsoft.DBforPostgreSQL/flexibleServers/administrators/write"
+        - "Microsoft.DBforMySQL/flexibleServers/administrators/write"
+      conditions: [network_reachability, service_state]
+      state_logic: >-
+        if ?server.properties.publicNetworkAccess == 'Disabled' (private-access
+        topology / VNet injection): CONDITIONAL(network_reachability) — no public
+        endpoint exists; attacker must have a foothold in the delegated subnet or
+        a peered VNet to reach port 5432/3306;
+        elif ?server.properties.publicNetworkAccess == 'Enabled' AND a firewall
+        rule admitting the attacker's source IP exists (or rule 0.0.0.0–255.255.255.255):
+        ACTIVE;
+        elif ?server.properties.publicNetworkAccess == 'Enabled' AND no firewall
+        rule covers the attacker's source: CONDITIONAL(network_reachability);
+        if authConfig.activeDirectoryAuth != 'Enabled': DO NOT EMIT (the Entra admin
+        identity cannot authenticate);
+        if a deny assignment or deny Azure Policy covers administrators/write at
+        effective scope (blocking the upstream CanModifyConfiguration): BLOCKED.
+      confidence: "0.88"
+      derived_from: [ "CanModifyConfiguration edge: source=?principal, target=?server, rule=azure-postgres-mysql-entra-admin-set" ]
+      false_positive_note: >-
+        CRITICAL: Entra AD authentication MUST be enabled on the server
+        (authConfig.activeDirectoryAuth == 'Enabled'). If it is disabled, the Entra
+        admin is set at the control plane but cannot authenticate at the data plane —
+        emit BLOCKED or DO NOT EMIT. Network reachability is a HARD gate. A private-access
+        server (VNet-injected, publicNetworkAccess == Disabled) has no public endpoint
+        — do NOT emit ACTIVE unless the principal is provably inside the VNet or peered
+        network. For public-access servers: only ACTIVE when a firewall rule admits
+        the attacker's source IP; the rule range 0.0.0.0–255.255.255.255 means any
+        internet host, which yields ACTIVE.
+      narrative: >-
+        {principal.name} can set an Entra AD administrator on {server.name} (via
+        flexibleServers/administrators/write), and Entra authentication is enabled
+        on the server (authConfig.activeDirectoryAuth == 'Enabled'). Combined with
+        network reachability to the database endpoint, the attacker (or the designated
+        Entra principal) can authenticate using an Entra access token and gain
+        database-level admin privileges, reading all databases and tables.
+
+  # --- (5) Firewall write on public-access server → CanModifyConfiguration ----
+  # Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/write (and MySQL equivalent)
+  # allows a principal to create or modify firewall rules. A principal with this permission
+  # on a public-access server can add a new rule (0.0.0.0–255.255.255.255) to expose the
+  # database endpoint to the internet, eliminating the network_reachability gate for
+  # the CanModifyConfiguration -> CanReadData chain.
+  #
+  # SEMANTIC NOTE: CanModifyConfiguration is categorized as EXECUTION (config changes
+  # for code execution/escalation); using it here to model firewall rule changes on a
+  # Data node is a semantic overlap. The primary downstream effect is network exposure
+  # (ExposedToInternet), not code execution. This rule is correctly placed in a derived
+  # file because the result (potential exposure) is computed, not observed directly.
+  # Future: consider adding a CanModifyNetworking edge to distinguish resource
+  # configuration changes that affect network topology from execution-path changes.
+  # RECOMMENDATION: For long-term clarity, move this rule to an explicit normalization
+  # file and emit CanWrite instead (explicit: "firewallRules/write = CanWrite on the
+  # server resource"). Then add a downstream derived rule that chains CanWrite on
+  # firewall config to ExposedToInternet.
+  #
+  # For now, this rule emits CanModifyConfiguration (which is permitted in derived files)
+  # with a clarifying state_logic note about the configuration→network_exposure path.
+  - id: azure-postgres-mysql-firewall-write-exposure
+    emits: CanModifyConfiguration
+    description: "Firewall write permission on a public-access server allows creating an allow-all rule, exposing the DB endpoint to the internet."
+    match:
+      - [ ?principal, HasPermission, ?server ]
+    where:
+      - "node_class(?server) == Data and node_type(?server) == RelationalDatabase"
+      - "node_type(?server) matched provider_type in ['Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DBforMySQL/flexibleServers']"
+      - "?server.properties.publicNetworkAccess == 'Enabled'"
+      - "?principal has EFFECTIVE Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/write OR Microsoft.DBforMySQL/flexibleServers/firewallRules/write (as applicable) at ?server scope"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?server
+      permissions:
+        - "Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/write"
+        - "Microsoft.DBforMySQL/flexibleServers/firewallRules/write"
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers firewallRules/write at
+        effective scope: BLOCKED;
+        elif ?server.properties.publicNetworkAccess == 'Disabled': POTENTIAL (caller
+        has permission to modify firewall, but private-access topology has no public
+        endpoint; the rule would have no effect);
+        elif a rule admitting 0.0.0.0–255.255.255.255 already exists: ACTIVE (network
+        exposure is already realized; this rule is redundant);
+        else POTENTIAL (the caller can create the exposure by adding a new rule, but
+        has not done so yet). NOTE: This rule represents configuration authority
+        (firewallRules/write) that can lead to network exposure (configuration→
+        network_exposure→data_read chain). The immediate downstream effect is to enable
+        public reachability (ExposedToInternet), not execution.
+      confidence: "0.91"
+      derived_from: [ "HasPermission edge: source=?principal, target=?server, action=(Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/write | Microsoft.DBforMySQL/flexibleServers/firewallRules/write)" ]
+      false_positive_note: >-
+        Verify effective firewallRules/write permission via role definition resolution.
+        Private-access servers (publicNetworkAccess == Disabled) render this permission
+        inert — emit POTENTIAL only, not ACTIVE, since the public endpoint does not
+        exist. For public-access servers: check if a full-internet rule (0.0.0.0–255.255.255.255)
+        already exists; if so, the exposure is already ACTIVE and this rule is a
+        supporting evidence, not a new capability. Emit POTENTIAL when the permission
+        exists but the exposure rule does not yet. This edge should be chained to
+        ExposedToInternet via a downstream derived rule (not currently implemented —
+        TODO: add azure-postgres-mysql-firewall-write-creates-exposure).
+      narrative: >-
+        {principal.name} can create or modify firewall rules on {server.name}
+        (Microsoft.DBforPostgreSQL/flexibleServers/firewallRules/write). By adding a
+        rule with startIpAddress=0.0.0.0 and endIpAddress=255.255.255.255, the attacker
+        can expose the database endpoint to the public internet, enabling the
+        network_reachability condition for the CanModifyConfiguration -> CanReadData
+        escalation.
+
+  # --- (6) Admin data read → exfiltration ----
+  # A principal with CanReadData on a PostgreSQL/MySQL server (achieved via password
+  # reset or Entra admin access + network reach) can use native tools (pg_dump for
+  # PostgreSQL, mysqldump for MySQL) to exfiltrate all database contents. This is a
+  # direct application of data-plane read to data exfiltration.
+  #
+  # CRITICAL: Once the attacker holds the native DB admin credential and network reach
+  # (established by the upstream CanReadData edge), no ARM permission check applies to
+  # pg_dump or mysqldump. Exfiltration is a native database-engine capability, not an
+  # ARM control-plane action. The permissions field is EMPTY to avoid the misleading
+  # implication that ARM RBAC gates exfiltration at the data plane — it does not.
+  #
+  # Modeled as CanExfiltrate derived from CanReadData, with the same network_reachability
+  # condition. The state inherits from the upstream CanReadData edge (weakest-contributor
+  # rule).
+  - id: azure-postgres-mysql-admin-exfiltrate
+    emits: CanExfiltrate
+    description: "Admin read access to the database (CanReadData) enables full exfiltration via pg_dump (PostgreSQL) or mysqldump (MySQL)."
+    match:
+      - [ ?principal, CanReadData, ?server ]
+    where:
+      - "node_class(?server) == Data and node_type(?server) == RelationalDatabase"
+      - "node_type(?server) matched provider_type in ['Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DBforMySQL/flexibleServers']"
+    emit:
+      source_type: Identity
+      target_type: RelationalDatabase
+      source: ?principal
+      target: ?server
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        Inherits the state of the upstream CanReadData edge (per edge_state_model
+        weakest-contributor rule). If CanReadData is ACTIVE, CanExfiltrate is ACTIVE
+        (the attacker can run pg_dump / mysqldump). If CanReadData is CONDITIONAL,
+        CanExfiltrate is also CONDITIONAL with the same preconditions. Exfiltration is
+        gated by the data-plane credential (native admin password or Entra token) and
+        network reachability — already captured in the upstream CanReadData edge. No
+        additional ARM permission check applies.
+      confidence: "0.95"
+      derived_from: [ "CanReadData edge: source=?principal, target=?server, rule=(azure-postgres-mysql-admin-reset-readdata or azure-postgres-mysql-entra-admin-readdata)" ]
+      false_positive_note: >-
+        This is a direct consequence of CanReadData — do NOT emit as ACTIVE unless
+        CanReadData is ACTIVE or CONDITIONAL at the upstream rule. Network reachability
+        is already encoded in the upstream CanReadData; do not add redundant gates.
+        Exfiltration via pg_dump (PostgreSQL) or mysqldump (MySQL) is a native
+        database-engine capability — the attacker must hold valid credentials (native
+        admin password or Entra token) to run these tools. There is no ARM permission
+        check at the data plane. Do NOT list ARM permissions as blockers on this edge.
+      narrative: >-
+        {principal.name} can read all data in {server.name} (CanReadData). Using native
+        database tools (pg_dump for PostgreSQL, mysqldump for MySQL), the attacker can
+        exfiltrate the entire database contents, including user data, application secrets,
+        and embedded credentials. Exfiltration is a native database-engine capability
+        (not gated by ARM RBAC) and requires only the data-plane credential and network reach.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - Azure deny assignment covering flexibleServers/write at effective scope ->
+#     azure-postgres-mysql-admin-password-reset and
+#     azure-postgres-mysql-admin-reset-readdata emit state BLOCKED.
+#   - ?server.properties.publicNetworkAccess == 'Disabled' ->
+#     azure-postgres-mysql-public-firewall DO NOT EMIT (private topology, no public
+#     endpoint; firewallRules records are ignored by the service).
+#   - Azure Policy deny effect covering Microsoft.DBforPostgreSQL/flexibleServers/write ->
+#     emit BLOCKED on azure-postgres-mysql-admin-password-reset.
+#   - Azure Policy enforcing privateEndpointNetworkPolicies or
+#     publicNetworkAccess=Disabled -> azure-postgres-mysql-public-firewall BLOCKED.
+#
+# Explicit normalization (standard ARM RBAC evaluator — no separate explicit file
+# needed). The evaluator must produce:
+#   - HasPermission records for flexibleServers/write at server scope.
+#   - HasPolicy records linking the server to its firewallRule child resources.
+#   - Property records: publicNetworkAccess, authConfig.activeDirectoryAuth,
+#     authConfig.passwordAuth, network.delegatedSubnetResourceId (private topology).
+#
+# Linchpin cross-references (DO NOT RE-DERIVE here):
+#   credential-chains.yaml:
+#     - ContainsSecret(?server -> secret) + CredentialsFor(secret -> identity) ->
+#       read-secret-yields-identity: CanImpersonate when application tables contain
+#       embedded credentials (connection strings, API keys, user passwords).
+#     - execute-then-read-secret: a workload with CanReadData on the server that
+#       ContainsSecret inherits CanReadSecret via this chain.
+#   can-control.yaml:
+#     - control-via-admin: Contributor/Owner CanAdminister -> Controls roll-up.
+#     - escalate-via-execute-as: not applicable (DB does not ExecutesAs an identity).
+# ---------------------------------------------------------------------------

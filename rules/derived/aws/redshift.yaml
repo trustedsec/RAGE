@@ -1,0 +1,681 @@
+# AWS Redshift — Derived attack-path rules (Phase 11 — Data / Analytics / ML)
+# ---------------------------------------------------------------------------
+# Redshift is a fully-managed, petabyte-scale data warehouse. The security
+# signature that makes it Phase-11 dominant:
+#
+#   A Redshift cluster/namespace executes SQL, COPY, UNLOAD, and external-
+#   function (Lambda UDF) calls AS the IAM role(s) attached to it. Whoever can
+#   submit a query (via Data API, GetClusterCredentials, or direct JDBC) and
+#   direct it to use an attached IAM role effectively executes arbitrary AWS API
+#   calls as that role. This mirrors can-execute-as (CanModifyCode / ExecutesAs
+#   -> CanExecuteAs) and cicd-chains (modify-what-it-runs -> executes-as) — emit
+#   the FACTS (ExecutesAs of the cluster; the submit/modify capability) and CITE
+#   those linchpins for the roll-up.
+#
+# iam:PassRole / redshift:ModifyClusterIamRoles to give a cluster a chosen IAM
+# role -> CanPassIdentity / CanCreateWorkloadAs (the classic PassRole privesc,
+# analogous to Glue/SageMaker/DataPipeline patterns).
+#
+# SECONDARY MODES:
+#   (2) DATA ACCESS + EXFIL: Data API query -> CanReadData; UNLOAD to S3 ->
+#       CanExfiltrate; publicly reachable cluster (PubliclyAccessible=true) ->
+#       ExposedToInternet.
+#   (3) DATA-PLANE GRANTS: cross-account datashare (AuthorizeDataShare) ->
+#       CrossAccountTrust; snapshot cross-account (AuthorizeSnapshotAccess) ->
+#       CanExfiltrate.
+#   (4) CREDENTIALS: ManagedAdminPassword in Secrets Manager -> ContainsSecret /
+#       CredentialsFor; GetClusterCredentials yields a short-lived DB password ->
+#       CanReadCredential.
+#
+# LINCHPIN CITATIONS (do not re-derive):
+#   * can-execute-as.yaml — execute-as-via-code-modify / execute-as-via-new-workload
+#   * cicd-chains.yaml — cicd-modify-buildspec-executes-as (submit-query parallel)
+#   * credential-chains.yaml — read-secret-yields-identity (admin secret -> DB admin)
+#   * can-control.yaml — escalate-via-execute-as / enter-account-via-assume
+#
+# PERMISSIONS: all from AWS Service Authorization Reference for:
+#   Amazon Redshift, Amazon Redshift Data API (redshift-data), Amazon Redshift
+#   Serverless (redshift-serverless). No permissions are invented.
+#
+# STATE CONVENTIONS (RULE-FORMAT.md): a derived edge is never stronger than its
+# weakest contributor. CONDITIONAL contributors cap output at CONDITIONAL.
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 11-data-analytics-ml
+applies_to: [aws]
+
+rules:
+
+  # ===========================================================================
+  # PRIMARY: EXECUTION-IDENTITY PATHS
+  # ===========================================================================
+
+  # --- 1) PassRole + ModifyClusterIamRoles -> attach a role -> CanExecuteAs ---
+  # THE Phase-11 Redshift privesc primitive. A principal with iam:PassRole for
+  # a target IAM role AND redshift:ModifyClusterIamRoles can attach the target
+  # role to an existing cluster (even if not currently attached). Subsequent SQL
+  # (COPY/UNLOAD/CREATE EXTERNAL FUNCTION) that names that role exercises its
+  # AWS permissions. This is the PassRole pattern (analogous to Glue / SageMaker /
+  # DataPipeline):
+  #   iam:PassRole(identity -> role) + CanModifyConfiguration(identity -> cluster)
+  #   + submit capability (redshift-data:ExecuteStatement or GetClusterCredentials)
+  #   => CanExecuteAs(identity -> role)
+  #
+  # This rule fires on the capability to ATTACH a role (via CanPassIdentity +
+  # CanModifyConfiguration on the cluster) without requiring the role to already
+  # be attached (ExecutesAs). This covers both "role currently attached" and
+  # "attach a new role then execute" attack paths. The rule models the generic
+  # can-execute-as:execute-as-via-config-identity-swap pattern but explicitly
+  # scoped to DataWarehouse nodes (which are in the Data class, not Compute).
+  - id: aws-redshift-execute-as-via-pass-role
+    emits: CanExecuteAs
+    description: "Pass a privileged IAM role to a Redshift cluster (iam:PassRole + ModifyClusterIamRoles), then submit a COPY/UNLOAD/UDF query that uses that role's AWS permissions. Covers both already-attached and attach-new-then-execute paths."
+    match:
+      - [ ?principal, CanPassIdentity,         ?role ]
+      - [ ?principal, CanModifyConfiguration,  ?cluster ]
+    where:
+      - "node_type(?cluster) == DataWarehouse"
+      - "?cluster.provider_type in ['AWS::Redshift::Cluster', 'AWS::RedshiftServerless::Namespace']"
+      - "?role trust policy allows redshift.amazonaws.com as service principal"
+      - "iam:PassRole for ?role permits iam:PassedToService including redshift.amazonaws.com (or unconditioned)"
+    optional:
+      # A Data API submit capability or GetClusterCredentials completes the
+      # run path; without it the attach succeeds but no query is yet issued.
+      - [ ?principal, HasPermission, ?cluster ]
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "redshift:ModifyClusterIamRoles", "redshift-data:ExecuteStatement"]
+      conditions: [iam_permission, role_compatibility, service_state]
+      state_logic: >-
+        ACTIVE when all three are confirmed: (1) iam:PassRole effective for ?role with
+        iam:PassedToService admitting redshift.amazonaws.com; (2) redshift:ModifyClusterIamRoles
+        (or redshift-serverless:UpdateNamespace for Serverless) effective on ?cluster;
+        (3) a query-submission capability exists (redshift-data:ExecuteStatement or
+        GetClusterCredentials on ?cluster). CONDITIONAL(iam_permission) when
+        iam:PassedToService condition exists but its redshift.amazonaws.com admission is
+        unresolved. CONDITIONAL(service_state) when the cluster is paused (Serverless: no
+        active workgroup). BLOCKED when an SCP or permission boundary denies iam:PassRole
+        or ModifyClusterIamRoles. This rule covers BOTH already-attached roles (which
+        also have ExecutesAs edges) AND new roles being attached for the first time.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanPassIdentity ?role"
+        - "?principal CanModifyConfiguration ?cluster (redshift:ModifyClusterIamRoles or redshift-serverless:UpdateNamespace)"
+        - "can-execute-as linchpin pattern (identity-swap via config + pass): generic CanPassIdentity + CanModifyConfiguration for Data workloads"
+      false_positive_note: >-
+        TWO permissions are independently required: iam:PassRole on the specific role
+        ARN (scoped by iam:PassedToService if present) AND redshift:ModifyClusterIamRoles
+        on the cluster. Either alone is insufficient — PassRole without ModifyClusterIamRoles
+        cannot attach the role; ModifyClusterIamRoles without PassRole is rejected by the
+        IAM service. Honor iam:PassedToService: a role passable only to ec2.amazonaws.com
+        does NOT become a Redshift attached role (downgrade to POTENTIAL(role_compatibility)).
+        For Serverless, ModifyClusterIamRoles is replaced by redshift-serverless:UpdateNamespace.
+        The query-submission step (ExecuteStatement / GetClusterCredentials) is an optional
+        gate: without it the role is attached but no query yet exercises it
+        (CONDITIONAL(service_state)). The linchpin pattern can-execute-as owns the
+        escalation roll-up — do not re-derive CanEscalateTo here.
+      narrative: >-
+        {principal.name} can pass {role.name} to Redshift cluster {cluster.name}
+        (iam:PassRole + redshift:ModifyClusterIamRoles) and then submit a COPY/UNLOAD or
+        CREATE EXTERNAL FUNCTION query that uses that role, executing arbitrary AWS API
+        calls as {role.name}. This covers attaching a NEW role or exercising an
+        already-attached role.
+
+  # --- 2) CreateCluster + PassRole -> new cluster bound to privileged role ----
+  # CanCreateWorkloadAs: create a fresh cluster pre-loaded with an attacker-chosen
+  # IAM role, then execute queries as that role immediately. Mirrors the
+  # Glue/SageMaker/DataPipeline CanCreateWorkloadAs pattern. Cites
+  # can-execute-as execute-as-via-new-workload for the roll-up.
+  - id: aws-redshift-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new Redshift cluster (or Serverless namespace) with an attacker-chosen IAM role attached, then run queries as that role."
+    match:
+      - [ ?principal, CanPassIdentity, ?role ]
+    where:
+      - "?principal has EFFECTIVE redshift:CreateCluster (provisioned) OR redshift-serverless:CreateNamespace (serverless)"
+      - "?role trust policy allows redshift.amazonaws.com"
+      - "iam:PassRole for ?role permits iam:PassedToService including redshift.amazonaws.com (or unconditioned)"
+    emit:
+      source_type: Identity
+      target_type: MachineIdentity
+      source: ?principal
+      target: ?role
+      permissions: ["iam:PassRole", "redshift:CreateCluster", "redshift-data:ExecuteStatement"]
+      conditions: [iam_permission, role_compatibility]
+      state_logic: >-
+        ACTIVE when iam:PassRole is effective for ?role with iam:PassedToService admitting
+        redshift.amazonaws.com AND the principal has redshift:CreateCluster or
+        redshift-serverless:CreateNamespace. CONDITIONAL(role_compatibility) when the role
+        trust policy or iam:PassedToService admission is unresolved. BLOCKED when an SCP or
+        permission boundary denies iam:PassRole or redshift:CreateCluster. State inherits
+        the weakest CanPassIdentity contributor.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal CanPassIdentity ?role"
+        - "can-execute-as:execute-as-via-new-workload (roll-up — cited not re-derived)"
+      false_positive_note: >-
+        The cluster must ACTUALLY start before queries can run. Cluster provisioning
+        takes 5-10 minutes and may be blocked by quota limits or VPC constraints. Emit
+        ACTIVE for the capability (the attacker CAN create the cluster); note the
+        provisioning delay as a practical consideration but not an edge state change
+        since no blocking control prevents it. Honor iam:PassedToService as for rule 1.
+        A VPC subnet-group requirement (redshift:CreateClusterSubnetGroup) may be
+        an additional gate — downgrade to CONDITIONAL(iam_permission) when VPC
+        subnet configuration is not established.
+      narrative: >-
+        {principal.name} can create a new Redshift cluster with {role.name} attached
+        (iam:PassRole + redshift:CreateCluster), then immediately run queries that use
+        {role.name}'s AWS permissions — no existing cluster access required.
+
+  # ===========================================================================
+  # DATA ACCESS & EXFILTRATION
+  # ===========================================================================
+
+  # --- 3) Data API ExecuteStatement -> CanReadData ---------------------------
+  # The Phase-11 primary data-access primitive for Redshift. A principal with
+  # redshift-data:ExecuteStatement on a cluster (and the IAM authentication
+  # identity mapped to a DB user with SELECT privilege) can query any table that
+  # DB user can read. This is CanReadData. Exfiltration via UNLOAD is a separate
+  # rule (rule 4). The Data API is the IAM-native path: no JDBC, no VPC foothold.
+  - id: aws-redshift-read-data-via-data-api
+    emits: CanReadData
+    description: "redshift-data:ExecuteStatement lets a principal run SELECT queries against the cluster via the Data API, reading tables accessible to the IAM-mapped DB user."
+    match:
+      - [ ?principal, HasPermission, ?cluster ]
+    where:
+      - "node_type(?cluster) == DataWarehouse"
+      - "?cluster.provider_type in ['AWS::Redshift::Cluster', 'AWS::RedshiftServerless::Workgroup']"
+      - "?principal has EFFECTIVE redshift-data:ExecuteStatement on ?cluster ARN"
+      - "?principal has EFFECTIVE redshift-data:GetStatementResult on ?cluster ARN"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: ?cluster
+      permissions: ["redshift-data:ExecuteStatement", "redshift-data:GetStatementResult"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when both redshift-data:ExecuteStatement AND redshift-data:GetStatementResult
+        are confirmed EFFECTIVE on the cluster ARN (identity-based policy + no SCP deny),
+        AND the cluster is in the AVAILABLE state (or Serverless workgroup is active).
+        CONDITIONAL(service_state) when the cluster is paused, restoring, or in a
+        maintenance window. CONDITIONAL(iam_permission) when a resource policy or SCP may
+        restrict ExecuteStatement but hasn't been resolved. BLOCKED by an explicit SCP or
+        permission-boundary deny on redshift-data:ExecuteStatement. The depth of data access
+        depends on the DB user privilege level: an IAM identity mapped to a DB superuser can
+        read all tables; a non-privileged user can read only explicitly GRANTed tables. Score
+        appropriately.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?cluster (redshift-data:ExecuteStatement + GetStatementResult effective permission)"
+      false_positive_note: >-
+        TWO permissions needed: redshift-data:ExecuteStatement (submit) AND
+        redshift-data:GetStatementResult (retrieve results); without GetStatementResult
+        the query fires but results cannot be read. A third permission,
+        redshift-data:DescribeStatement, may be needed to check statement status; omit
+        it from the mandatory set but note it as a practical requirement. The cluster
+        must also be AVAILABLE (not paused/restoring). The IAM-to-DB-user mapping
+        determines actual table access: an identity with no DB privileges or mapped to a
+        user with no GRANT cannot read data even with ExecuteStatement. Do NOT conflate
+        "can submit statements" with "can read all data" — model the DB user privilege
+        level via the cluster node's properties. For Serverless, the action applies to
+        the workgroup ARN.
+      narrative: >-
+        {principal.name} can submit SQL queries to Redshift cluster {cluster.name} via
+        the Data API (redshift-data:ExecuteStatement + GetStatementResult), reading
+        tables accessible to its IAM-mapped database user.
+
+  # --- 4) UNLOAD to S3 via attached role -> CanExfiltrate -------------------
+  # A DB superuser (or a DB user with UNLOAD privilege) can issue
+  # `UNLOAD ('SELECT * FROM ...' TO 's3://bucket/key' IAM_ROLE 'arn:...')`.
+  # The cluster uses the named attached IAM role's s3:PutObject to write data
+  # to S3. If the target bucket is attacker-controlled (or accessible
+  # cross-account), this is full-table exfiltration.
+  #
+  # This rule fires when:
+  #   (a) the principal has redshift-data:ExecuteStatement (or GetClusterCredentials
+  #       -> DB-level access) on the cluster, AND
+  #   (b) the cluster ExecutesAs a role that has s3:PutObject (CanWriteData(role, S3))
+  # => CanExfiltrate(principal, cluster-data)
+  - id: aws-redshift-exfiltrate-via-unload
+    emits: CanExfiltrate
+    description: "A principal with query execution on a Redshift cluster can run UNLOAD using an attached IAM role that has s3:PutObject, exfiltrating warehouse data to an S3 location."
+    match:
+      - [ ?principal, CanReadData,  ?cluster ]
+      - [ ?cluster,   ExecutesAs,   ?role ]
+    where:
+      - "node_type(?cluster) == DataWarehouse"
+      - "?cluster.provider_type in ['AWS::Redshift::Cluster', 'AWS::RedshiftServerless::Workgroup']"
+      - "?role has EFFECTIVE s3:PutObject on at least one S3 bucket ARN (CanWriteData to ObjectStorage)"
+      - "?principal mapped DB user has UNLOAD privilege (superuser or explicit GRANT UNLOAD)"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: ?cluster
+      permissions: ["redshift-data:ExecuteStatement", "s3:PutObject"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when (1) the contributing CanReadData is ACTIVE (query submission
+        confirmed effective), (2) the cluster's attached role has confirmed effective
+        s3:PutObject on at least one S3 bucket (or iam:PassRole for such a role —
+        even a new role can be attached per rule 1), and (3) the mapped DB user has
+        UNLOAD privilege. CONDITIONAL(iam_permission) when the role's S3 permission is
+        unresolved. CONDITIONAL(service_state) when the cluster is paused. Inherits
+        the weakest state from its contributing CanReadData and ExecutesAs edges. BLOCKED
+        when an SCP or VPC endpoint policy denies s3:PutObject for the cluster's role.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from:
+        - "?principal CanReadData ?cluster"
+        - "?cluster ExecutesAs ?role"
+      false_positive_note: >-
+        UNLOAD requires: (1) EFFECTIVE query submission (CanReadData gate); (2) an
+        attached IAM role with s3:PutObject on a writable bucket (confirm role's S3
+        permission — a role with only s3:GetObject cannot UNLOAD); (3) DB user having
+        UNLOAD privilege (superusers always do; non-superusers need an explicit GRANT).
+        If Enhanced VPC Routing (EnhancedVpcRouting: true) is enabled, UNLOAD traffic
+        goes through the VPC; S3 must be reachable via VPC endpoint or the UNLOAD fails
+        (CONDITIONAL(network_reachability) if no VPC endpoint). The attacker need not
+        control the target bucket — they only need to be able to read data from it
+        afterward; an existing company S3 bucket is a valid exfil destination if the
+        attacker has s3:GetObject access to it. Model target S3 bucket as
+        target: ?cluster (the data node) not the S3 bucket specifically (the cluster IS
+        the data; the S3 bucket is just the landing zone).
+      narrative: >-
+        {principal.name} can submit an UNLOAD query to {cluster.name} that exports
+        table data to S3 using the cluster's attached role {role.name}
+        (s3:PutObject) — a full warehouse exfiltration path requiring only SQL
+        execution access and an attached role with S3 write permissions.
+
+  # --- 5) AuthorizeSnapshotAccess -> cross-account snapshot exfiltration ------
+  # redshift:AuthorizeSnapshotAccess (provisioned) shares a cluster snapshot
+  # with another AWS account. The receiving account can call
+  # redshift:RestoreFromClusterSnapshot to spin up a full cluster copy, getting
+  # complete access to all data in the snapshot. This is CanExfiltrate.
+  - id: aws-redshift-snapshot-cross-account-exfil
+    emits: CanExfiltrate
+    description: "redshift:AuthorizeSnapshotAccess grants another AWS account the ability to restore a cluster snapshot, exfiltrating a full copy of warehouse data to that account."
+    match:
+      - [ ?principal, HasPermission, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?snapshot.provider_type == 'AWS::Redshift::ClusterSnapshot'"
+      - "?principal has EFFECTIVE redshift:AuthorizeSnapshotAccess on ?snapshot ARN"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["redshift:AuthorizeSnapshotAccess"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when redshift:AuthorizeSnapshotAccess is confirmed EFFECTIVE on the
+        snapshot ARN (identity-based policy + no SCP deny). CONDITIONAL(iam_permission)
+        when an SCP or permission boundary may restrict the action but isn't resolved.
+        BLOCKED by an explicit SCP deny on redshift:AuthorizeSnapshotAccess. A
+        successful AuthorizeSnapshotAccess does not automatically restore the cluster —
+        it grants the permission; the exfiltration is realized when the target account
+        calls RestoreFromClusterSnapshot. Emit CanExfiltrate here for the authorization
+        capability; note the restore step as implicit.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?snapshot (redshift:AuthorizeSnapshotAccess effective permission)"
+      false_positive_note: >-
+        AuthorizeSnapshotAccess grants a SPECIFIC account the restore permission; it
+        is not an open wildcard grant. The target account must then call
+        RestoreFromClusterSnapshot, incurring Redshift compute costs and typically
+        appearing in CloudTrail. The snapshot must exist (not already deleted via
+        automated retention). KMS-encrypted snapshots (cluster uses a CMK) require the
+        target account to also be granted kms:Decrypt on the CMK — without it,
+        RestoreFromClusterSnapshot fails (CONDITIONAL(key_permission) on the exfil if
+        the snapshot's CMK grant is unresolved).
+      narrative: >-
+        {principal.name} can share the Redshift snapshot {snapshot.name} with an
+        external AWS account (redshift:AuthorizeSnapshotAccess), enabling that account
+        to restore a full copy of the cluster's data — a complete warehouse exfiltration.
+
+  # --- 5b) Serverless snapshot cross-account (redshift-serverless:UpdateSnapshot) ---
+  # The Serverless equivalent of AuthorizeSnapshotAccess. A principal with
+  # redshift-serverless:UpdateSnapshot on a Serverless snapshot can modify its
+  # restore-access list, granting a foreign account the ability to restore the
+  # snapshot. This is the same exfiltration capability as provisioned snapshots.
+  - id: aws-redshift-serverless-snapshot-cross-account-exfil
+    emits: CanExfiltrate
+    description: "redshift-serverless:UpdateSnapshot allows sharing a Redshift Serverless snapshot with another AWS account, enabling full data exfiltration via restore."
+    match:
+      - [ ?principal, HasPermission, ?snapshot ]
+    where:
+      - "node_type(?snapshot) == Snapshot"
+      - "?snapshot.provider_type == 'AWS::RedshiftServerless::Snapshot'"
+      - "?principal has EFFECTIVE redshift-serverless:UpdateSnapshot on ?snapshot ARN"
+    emit:
+      source_type: Identity
+      target_type: Snapshot
+      source: ?principal
+      target: ?snapshot
+      permissions: ["redshift-serverless:UpdateSnapshot"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when redshift-serverless:UpdateSnapshot is confirmed EFFECTIVE on the
+        snapshot ARN. CONDITIONAL(iam_permission) when SCP/boundary restriction is
+        unresolved. BLOCKED by explicit SCP deny. The target account must then call
+        RestoreFromClusterSnapshot on the Serverless snapshot to realize the exfil.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal HasPermission ?snapshot (redshift-serverless:UpdateSnapshot effective permission)"
+      false_positive_note: >-
+        UpdateSnapshot is the Serverless snapshot-update action covering both metadata
+        changes and restore-access list updates. The restore-access change is scoped
+        by whether the snapshot exists and is not already deleted. KMS-encrypted
+        snapshots (CMK) require kms:Decrypt in the target account.
+      narrative: >-
+        {principal.name} can update Redshift Serverless snapshot {snapshot.name},
+        including sharing it with an external AWS account (redshift-serverless:UpdateSnapshot).
+        The external account can then restore a full copy of the namespace data — complete
+        warehouse exfiltration.
+
+  # ===========================================================================
+  # DATA-PLANE GRANTS: CROSS-ACCOUNT DATA SHARING
+  # ===========================================================================
+
+  # --- 6) AuthorizeDataShare -> CrossAccountTrust (live data share) ----------
+  # redshift:AuthorizeDataShare grants a consumer account read access to specific
+  # Redshift objects (schemas/tables) in REAL TIME via the datashare mechanism.
+  # No data copy occurs; the consumer queries live data through a connection back
+  # to the producer cluster. This is CrossAccountTrust from the producer CLUSTER's
+  # perspective: the producer cluster (as the data resource) authorizes a foreign
+  # account to read its data. The principal executing AuthorizeDataShare is captured
+  # in the match; the CrossAccountTrust edge itself flows from cluster to consumer account.
+  - id: aws-redshift-authorize-datashare
+    emits: CrossAccountTrust
+    description: "redshift:AuthorizeDataShare grants a consumer AWS account real-time read access to producer cluster objects, establishing cross-account live data trust."
+    match:
+      - [ ?principal, HasPermission, ?cluster ]
+    where:
+      - "node_type(?cluster) == DataWarehouse"
+      - "?cluster.provider_type in ['AWS::Redshift::Cluster', 'AWS::RedshiftServerless::Namespace']"
+      - "?principal has EFFECTIVE redshift:AuthorizeDataShare on ?cluster ARN (or datashare ARN)"
+    emit:
+      source_type: Data
+      target_type: Account
+      source: ?cluster
+      target: "<external AWS account named as consumer>"
+      permissions: ["redshift:AuthorizeDataShare"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when redshift:AuthorizeDataShare is confirmed EFFECTIVE on the cluster/datashare
+        ARN and no SCP denial exists. CONDITIONAL(scp_or_org_policy) when an SCP may restrict
+        cross-account data sharing but hasn't been resolved. BLOCKED by an explicit SCP deny on
+        redshift:AuthorizeDataShare or a Redshift cluster-level data-sharing configuration that
+        blocks cross-account authorization. The consumer account must also call
+        AssociateDataShareConsumer — that is a gate on the consumer side, not the producer
+        capability being emitted here. The trust is from producer to consumer, not bidirectional.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?cluster (redshift:AuthorizeDataShare effective permission)"
+        - "?cluster represents producer cluster (Data class)"
+      false_positive_note: >-
+        AuthorizeDataShare grants the AUTHORIZATION; the consumer must separately call
+        AssociateDataShareConsumer and have their own Redshift cluster or workgroup to
+        query through. Do NOT emit CanReadData here — that is the consumer's capability
+        once the association is made, not the producer's grant capability. The datashare
+        object scope (which schemas/tables are shared) limits what the consumer can read;
+        an entire-cluster share is broader than a specific-schema share. A datashare
+        authorized to PUBLIC (all accounts) is effectively open cross-account trust;
+        a datashare authorized to a specific account ID is scoped. Model the difference
+        in the edge's condition state.
+      narrative: >-
+        {cluster.name} grants a datashare authorization that allows external AWS account
+        {account.id} to access Redshift data in real time (redshift:AuthorizeDataShare),
+        enabling cross-account live table reads without data export.
+
+  # --- 6c) Serverless PutResourcePolicy -> CrossAccountTrust ----------------
+  # redshift-serverless:PutResourcePolicy on a Serverless namespace allows a
+  # principal to set a resource policy that names a foreign account. This grants
+  # that account live access to the namespace (similar outcome as datashare but
+  # using resource-policy instead of datashare object). This is CrossAccountTrust
+  # from namespace to external account. The consumer account then calls
+  # AssociateDataShareConsumer to access the data.
+  - id: aws-redshift-serverless-putresourcepolicy-cross-account
+    emits: CrossAccountTrust
+    description: "redshift-serverless:PutResourcePolicy allows a principal to grant another AWS account live access to a Redshift Serverless namespace via resource policy."
+    match:
+      - [ ?principal, HasPermission, ?namespace ]
+    where:
+      - "node_type(?namespace) == DataWarehouse"
+      - "?namespace.provider_type == 'AWS::RedshiftServerless::Namespace'"
+      - "?principal has EFFECTIVE redshift-serverless:PutResourcePolicy on ?namespace ARN"
+    emit:
+      source_type: Data
+      target_type: Account
+      source: ?namespace
+      target: "<external AWS account in the resource policy>"
+      permissions: ["redshift-serverless:PutResourcePolicy"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE when redshift-serverless:PutResourcePolicy is confirmed EFFECTIVE on the
+        namespace ARN and no SCP denial exists. CONDITIONAL(scp_or_org_policy) when an
+        SCP may restrict namespace policy mutation. BLOCKED by explicit SCP deny on
+        PutResourcePolicy. The consumer account must separately call
+        AssociateDataShareConsumer to bind the policy grant to a live connection.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?namespace (redshift-serverless:PutResourcePolicy effective permission)"
+      false_positive_note: >-
+        PutResourcePolicy sets the namespace's resource policy; the cross-account grant
+        is scoped by the principals named in the policy document. A public policy (Effect:Allow
+        Principal:*) grants all AWS accounts; a specific AWS account ID scopes the grant.
+        The consumer must call AssociateDataShareConsumer and have a cluster/workgroup to
+        query through. Emit CrossAccountTrust for the capability; do not emit CanReadData
+        directly (that is the consumer's derived edge).
+      narrative: >-
+        {principal.name} can update the resource policy on Redshift Serverless namespace
+        {namespace.name} (redshift-serverless:PutResourcePolicy), granting an external
+        AWS account live access to the namespace's tables — cross-account data sharing
+        without snapshot export.
+
+  # ===========================================================================
+  # CREDENTIALS
+  # ===========================================================================
+
+  # --- 6b) ManagedAdminPassword secret read -> CanReadData (admin DB access) ---
+  # A principal with secretsmanager:GetSecretValue on the ManagedAdminPassword secret
+  # (MasterPasswordSecretArn) can retrieve the plaintext admin database password.
+  # With that password, they can connect directly to the cluster on port 5439 and
+  # authenticate as the DB superuser, yielding full warehouse access (CanReadData,
+  # CanExfiltrate, UNLOAD, etc.). This rule emits CanReadData on the cluster for
+  # the principal who reads the admin secret.
+  - id: aws-redshift-admin-secret-read
+    emits: CanReadData
+    description: "A principal with secretsmanager:GetSecretValue on the Redshift ManagedAdminPassword secret can retrieve the plaintext admin DB password and connect as superuser, reading all warehouse data."
+    match:
+      - [ ?principal, CanReadSecret, ?secret ]
+      - [ ?cluster, ContainsSecret, ?secret ]
+    where:
+      - "node_type(?cluster) == DataWarehouse"
+      - "?cluster.provider_type in ['AWS::Redshift::Cluster', 'AWS::RedshiftServerless::Namespace']"
+      - "?secret.provider_type == 'AWS::SecretsManager::Secret'"
+      - "?secret models the MasterPasswordSecretArn or adminPasswordSecretArn"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: ?cluster
+      permissions: ["secretsmanager:GetSecretValue"]
+      conditions: [iam_permission, service_state]
+      state_logic: >-
+        ACTIVE when secretsmanager:GetSecretValue is confirmed EFFECTIVE on the secret ARN
+        AND the cluster is AVAILABLE (not paused). CONDITIONAL(service_state) when the
+        cluster is paused. CONDITIONAL(iam_permission) when an SCP or boundary may restrict
+        GetSecretValue but is unresolved. BLOCKED by explicit SCP deny on
+        secretsmanager:GetSecretValue. The returned admin password grants DB superuser
+        access, which is the highest privilege within the database.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from:
+        - "?principal CanReadSecret ?secret (secretsmanager:GetSecretValue)"
+        - "?cluster ContainsSecret ?secret (MasterPasswordSecretArn / adminPasswordSecretArn explicit edge)"
+        - "credential-chains:read-secret-yields-identity linchpin (secret stores admin DB credential)"
+      false_positive_note: >-
+        The secret must be encrypted at rest. If wrapped by a CMK, the principal must also
+        have kms:Decrypt — without it, GetSecretValue fails (CONDITIONAL(key_permission)).
+        The credential retrieved is the master/admin database password; it authenticates
+        directly to the database (superuser), not via IAM auth. Redshift ManagedAdminPassword
+        auto-rotates but does not invalidate prior password versions for 2 hours by default.
+        Network reachability still required: if the cluster is not publicly accessible,
+        the principal must be in the VPC or use PrivateLink.
+      narrative: >-
+        {principal.name} can retrieve the admin database password for {cluster.name}
+        from its Secrets Manager secret (secretsmanager:GetSecretValue). Using that
+        password, {principal.name} can connect directly as a database superuser and
+        read all tables, perform administrative changes, or export warehouse data.
+
+  # --- 7) GetClusterCredentials -> short-lived DB credential -----------------
+  # redshift:GetClusterCredentials (provisioned) or
+  # redshift:GetClusterCredentialsWithIAM generates a temporary database
+  # username/password. This credential authenticates directly to the cluster's
+  # JDBC/ODBC endpoint on port 5439. A superuser credential grants full DB admin.
+  # This is CanReadCredential (a short-lived DB password, not an IAM session token).
+  # Credential-chains read-secret-yields-identity handles the impersonation
+  # roll-up if the returned credential is modeled as CredentialsFor a DB identity.
+  - id: aws-redshift-get-cluster-credentials
+    emits: CanReadCredential
+    description: "redshift:GetClusterCredentials generates a temporary database username/password, enabling JDBC/ODBC authentication to the cluster as the requested DB user."
+    match:
+      - [ ?principal, HasPermission, ?cluster ]
+    where:
+      - "node_type(?cluster) == DataWarehouse"
+      - "?cluster.provider_type in ['AWS::Redshift::Cluster']"
+      - "?principal has EFFECTIVE redshift:GetClusterCredentials on ?cluster ARN"
+    emit:
+      source_type: Identity
+      target_type: Credential
+      source: ?principal
+      target: "<temporary DB credential for the requested DbUser on ?cluster>"
+      permissions: ["redshift:GetClusterCredentials"]
+      conditions: [iam_permission, condition_expression, service_state]
+      state_logic: >-
+        ACTIVE when redshift:GetClusterCredentials is confirmed EFFECTIVE on the cluster
+        ARN AND the IAM condition key redshift:DbUser (if present) admits the requested
+        DB user. CONDITIONAL(condition_expression) when a redshift:DbUser condition exists
+        that the attacker may not satisfy (e.g., scoped to a specific user that doesn't
+        exist or is not a superuser). CONDITIONAL(service_state) when the cluster is
+        paused. BLOCKED by an explicit deny on redshift:GetClusterCredentials. Note:
+        GetClusterCredentialsWithIAM (IAM identity-based) follows the same pattern but
+        requires redshift:GetClusterCredentialsWithIAM instead.
+      confidence: "min(contributing_confidences) * 0.90"
+      derived_from:
+        - "?principal HasPermission ?cluster (redshift:GetClusterCredentials effective permission)"
+      false_positive_note: >-
+        The IAM condition key redshift:DbUser controls which DB user the credential maps
+        to; without a DbUser condition, the principal can request credentials for ANY DB
+        user including the admin superuser. If a DbUser condition is present and scopes to
+        a non-privileged user, the generated credential has limited DB access —
+        CONDITIONAL(condition_expression). The cluster must be reachable (network: VPC SG
+        port 5439 or PubliclyAccessible=true for external connections). A credential for
+        the 'awsuser' (admin) superuser is significantly higher value than a credential for
+        a read-only reporting user. Model DB user privilege in the target Credential node's
+        properties. GetClusterCredentialsWithIAM (no separate DbUser param) maps to the
+        caller's IAM identity mapped DB user — check the identity's Redshift DB-user mapping.
+      narrative: >-
+        {principal.name} can generate a temporary Redshift database password for {cluster.name}
+        (redshift:GetClusterCredentials), enabling direct JDBC/ODBC connection as the requested
+        DB user. If the DB user is a superuser, this grants full warehouse control.
+
+  # --- 8) Publicly accessible cluster -> ExposedToInternet -------------------
+  # A Redshift cluster with PubliclyAccessible: true has its endpoint DNS
+  # resolved to a public IP. Combined with a permissive VPC security group
+  # (inbound port 5439 from 0.0.0.0/0 or similar), the cluster is reachable
+  # from the public internet. An attacker with valid credentials (even temporary,
+  # from GetClusterCredentials or a leaked Secrets Manager secret) can connect
+  # without needing any VPC foothold.
+  #
+  # ARCHITECTURAL NOTE: The explicit normalization rules
+  # aws-redshift-cluster-publicly-accessible and
+  # aws-redshift-serverless-workgroup-publicly-accessible already emit
+  # ExposedToInternet(CONDITIONAL) when PubliclyAccessible=true is observed.
+  # This derived rule VALIDATES the CONDITIONAL by checking VPC security group
+  # rules and ACTIVATES the edge if SG permits inbound TCP 5439 from 0.0.0.0/0.
+  # Do NOT re-emit; instead validate/elevate the existing explicit edge via rule match.
+  - id: aws-redshift-public-cluster
+    emits: ExposedToInternet
+    description: "A Redshift cluster or Serverless workgroup with PubliclyAccessible=true and a permissive VPC security group is reachable from the public internet on port 5439."
+    match:
+      - [ ?cluster, ExposedToInternet, ?anon ]
+    where:
+      - "node_type(?cluster) == DataWarehouse"
+      - "?cluster.provider_type in ['AWS::Redshift::Cluster', 'AWS::RedshiftServerless::Workgroup']"
+      - "?cluster.properties.PubliclyAccessible == true"
+      - "?cluster.properties.VpcSecurityGroups[].rules allows inbound on TCP port 5439 from 0.0.0.0/0 or ::/0 or CIDR includes attacker source"
+    emit:
+      source_type: Data
+      target_type: AnonymousIdentity
+      source: ?cluster
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability, service_state]
+      state_logic: >-
+        ACTIVE when PubliclyAccessible=true is confirmed AND the cluster's VPC security
+        group allows inbound TCP port 5439 from 0.0.0.0/0 or a sufficiently broad CIDR
+        (practically internet-accessible). CONDITIONAL(network_reachability) when
+        PubliclyAccessible=true but the SG limits inbound to specific CIDRs — only
+        hosts in those CIDRs can reach the cluster, not the general internet; downgrade
+        to CONDITIONAL. CONDITIONAL(service_state) when the cluster is paused/not
+        available. BLOCKED when PubliclyAccessible=false or an NACl/SG deny blocks port
+        5439. Valid credentials are still required to authenticate — the cluster being
+        public does not grant data access, only network reachability.
+      confidence: "min(contributing_confidences)"
+      derived_from:
+        - "ExposedToInternet (explicit edge from aws-redshift-cluster-publicly-accessible or aws-redshift-serverless-workgroup-publicly-accessible)"
+        - "?cluster.properties.PubliclyAccessible == true"
+        - "?cluster.properties.VpcSecurityGroups[].rules allows inbound TCP 5439"
+      false_positive_note: >-
+        PubliclyAccessible=true alone is NOT sufficient for ExposedToInternet ACTIVE:
+        the VPC security group MUST also permit inbound port 5439 from the internet
+        (0.0.0.0/0 or broad CIDR). A cluster with PubliclyAccessible=true but SG
+        restricted to a specific corporate IP range is NOT internet-exposed in the
+        broad sense — remain CONDITIONAL(network_reachability). This edge
+        indicates network reachability only; exploiting it still requires valid DB
+        credentials or an IAM-auth path. Serverless workgroups have a separate
+        `publiclyAccessible` flag on the workgroup; apply the same SG check. NACLs
+        (subnet-level) also apply — honor them if collected.
+      narrative: >-
+        {cluster.name} is accessible from the public internet (PubliclyAccessible=true
+        + VPC SG open on port 5439). An attacker with valid credentials (temporary DB
+        password, IAM-auth session) can connect and query data without needing a VPC
+        foothold.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An SCP or permission boundary denying iam:PassRole, redshift:ModifyClusterIamRoles,
+#     or redshift:CreateCluster -> rules 1/2 BLOCKED.
+#   - An SCP denying redshift-data:ExecuteStatement -> rule 3 BLOCKED.
+#   - An SCP denying redshift:AuthorizeDataShare -> rule 6 BLOCKED.
+#   - An SCP denying redshift:AuthorizeSnapshotAccess -> rule 5 BLOCKED.
+#   - iam:PassedToService condition excluding redshift.amazonaws.com -> rules 1/2
+#     POTENTIAL(role_compatibility), not ACTIVE or CONDITIONAL.
+#   - redshift:DbUser condition restricting to non-privileged users -> rule 7
+#     CONDITIONAL(condition_expression); escalation value depends on DB user privilege.
+#   - PubliclyAccessible=false OR restrictive SG on port 5439 -> rule 8 BLOCKED or
+#     CONDITIONAL(network_reachability) respectively.
+#   - Cluster in PAUSED state -> rules 1, 3, 4, 7 CONDITIONAL(service_state).
+#   - EnhancedVpcRouting=true without a VPC S3 endpoint -> rule 4 (UNLOAD)
+#     CONDITIONAL(network_reachability) — UNLOAD traffic is routed through VPC and S3
+#     must be reachable without going to the internet.
+#   - KMS-encrypted snapshot without CMK grant to target account -> rule 5
+#     CONDITIONAL(key_permission) for the restore step (note in false_positive_note).
+#   - State never exceeds the weakest contributor (RULE-FORMAT.md).
+# ---------------------------------------------------------------------------
+# NOTE: Explicit normalization rules for this service live in
+# /rules/explicit/aws-redshift.yaml including:
+#   - ExecutesAs (cluster/namespace → attached IAM roles)
+#   - ContainsSecret (cluster/namespace → Secrets Manager admin password)
+#   - ExposedToInternet flag (PubliclyAccessible=true)
+#   - CrossAccountTrust (snapshots, datashares)
+#   - CanModifyConfiguration (ModifyClusterIamRoles, UpdateNamespace)
+# The derived rules here consume these explicit edges and combine them into
+# attack-path capabilities (CanExecuteAs, CanReadData, CanExfiltrate, etc.).
+# ---------------------------------------------------------------------------

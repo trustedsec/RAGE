@@ -1,0 +1,663 @@
+# GCP Cloud KMS — Phase 5 credential-access / attack-path rules
+# ---------------------------------------------------------------------------
+# Catalog key gcp:kms. Emits ONLY common edges from schema/edges.yaml.
+# Permissions are the EFFECTIVE cloudkms.* actions the permission evaluator must
+# confirm on the given key scope (per-key allow policy OR inherited
+# keyRing/project/folder/org binding) BEFORE the edge is emitted. Permission
+# names are verbatim from cloud.google.com/kms/docs/reference/permissions-and-roles.
+#
+# Cloud KMS security model (why these rules look the way they do):
+#   * Raw key material is NON-EXPORTABLE — no CanExportKey for KMS keys. Only the
+#     PUBLIC key of an asymmetric key is retrievable (viewPublicKey/getPublicKey),
+#     which is not a secret. Value is in being PERMITTED TO USE the key.
+#   * cryptoKeyVersions.useToDecrypt -> CanDecrypt(identity -> EncryptionKey). This
+#     is the key_permission GATE that unlocks CMEK/CSEK-encrypted GCS/BQ/PD/Secret
+#     Manager data (CanReadData / CanReadSecret).
+#   * cryptoKeyVersions.useToSign (ASYMMETRIC_SIGN) -> CanSignAs(identity ->
+#     SigningKey): forge signatures anchored on the key's public key WITHOUT ever
+#     seeing the private key. macSign (MAC purpose) -> CanSignAs (MAC forgery).
+#   * SEPARATION OF DUTIES: roles/cloudkms.admin holds setIamPolicy but NOT useTo*.
+#     The classic GCP KMS privesc is cryptoKeys.setIamPolicy (or keyRings.setIamPolicy)
+#     -> bind self cryptoKeyEncrypterDecrypter/signer -> CanDecrypt/CanSignAs.
+#     Model as CanGrantPermission(self->self) then POTENTIAL CanDecrypt/CanSignAs.
+#   * CMEK on ANOTHER service's secret/store: the CONSUMING SERVICE AGENT (not the
+#     caller) holds useToDecrypt. The key_permission gate is on the SERVICE AGENT.
+#
+# State discipline:
+#   - useTo* present + purpose matches + >=1 ENABLED version -> ACTIVE.
+#   - all versions DISABLED/DESTROYED -> CONDITIONAL(service_state) / BLOCKED
+#     (a manager with versions.update can re-enable -> back to ACTIVE).
+#   - VPC-SC perimeter deny / IAM deny policy on the action -> BLOCKED.
+#   - purpose mismatch (sign on a symmetric key) -> DO NOT EMIT.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 5-secrets-kms
+service: kms
+applies_to: [gcp]
+
+rules:
+
+  # --- Decrypt with a key (core credential-access / data-unlock primitive) ---
+  # DE-DUP: CanDecrypt is nature=explicit in schema/edges.yaml; the OWNING emit is
+  # gcp-kms-can-decrypt-explicit in /rules/explicit/gcp-kms.yaml (identical effective-permission
+  # match + purpose/version gating). This derived entry documents the same base fact so
+  # the downstream Phase-5 rules here (selfgrant, gates-cmek-read, cross-project-enter,
+  # decrypt-via-execute-as) have a local match anchor; the pipeline MUST emit ONE
+  # CanDecrypt(principal->key) edge per (principal, key), keyed by the explicit rule, and
+  # NOT double-count confidence. If the pipeline dedups by (type, source, target, scope),
+  # these two collapse to one edge automatically.
+  - id: gcp-kms-can-decrypt
+    emits: CanDecrypt
+    description: "cloudkms.cryptoKeyVersions.useToDecrypt lets a principal decrypt with the key."
+    match_effective_permission: {action: "cloudkms.cryptoKeyVersions.useToDecrypt", resource_type: "google.cloud.kms.CryptoKey"}
+    where:
+      - "CryptoKey.purpose is a useToDecrypt purpose: ENCRYPT_DECRYPT, RAW_ENCRYPT_DECRYPT, or ASYMMETRIC_DECRYPT (AsymmetricDecrypt API; the IAM permission is still useToDecrypt)"
+      - "purpose is NOT a KEM key — key encapsulation uses the DISTINCT permission cloudkms.cryptoKeyVersions.useToDecapsulate, matched by gcp-kms-can-decapsulate, not this rule"
+      - "at least one CryptoKeyVersion is ENABLED"
+      - "action resolves at the key scope (per-key allow policy OR inherited keyRing/project/folder/org binding)"
+    emit:
+      target_type: EncryptionKey
+      source: "<principal>"
+      target: "<CryptoKey (EncryptionKey subtype)>"
+      permissions: ["cloudkms.cryptoKeyVersions.useToDecrypt"]
+      conditions: [iam_permission, resource_policy, key_permission, service_state]
+      state_logic: >-
+        ACTIVE if useToDecrypt resolves AND >=1 version ENABLED;
+        CONDITIONAL(service_state) if all versions DISABLED (re-enableable by a
+        cryptoKeyVersions.update holder);
+        BLOCKED if all versions DESTROYED, or a VPC-SC perimeter / IAM deny policy
+        denies cloudkms.cryptoKeyVersions.useToDecrypt at the effective scope
+        (denied_by=<perimeter/deny>).
+      confidence: "min(contributing_confidences) * 0.97"
+      derived_from: [ "<effective cloudkms.cryptoKeyVersions.useToDecrypt grant>" ]
+      false_positive_note: >-
+        Gate on CryptoKey.purpose — useToDecrypt is meaningless on an ASYMMETRIC_SIGN
+        or MAC key; do not emit CanDecrypt there. roles/cloudkms.admin does NOT grant
+        useToDecrypt (separation of duties) — admin reaches decrypt only via
+        setIamPolicy self-grant (see gcp-kms-selfgrant-to-decrypt). IAM inheritance:
+        a keyRing/project/folder/org binding covers ALL keys in scope; keep the
+        target key precise. Requires >=1 ENABLED version — an all-disabled key is
+        CONDITIONAL/BLOCKED even with the permission.
+      narrative: >-
+        {principal.name} can decrypt with key {key.name}
+        (cloudkms.cryptoKeyVersions.useToDecrypt) — unlocking any data encrypted
+        under this key.
+
+  # --- Decapsulate with a KEM key (distinct permission, distinct purpose) -----
+  - id: gcp-kms-can-decapsulate
+    emits: CanDecrypt
+    description: "cloudkms.cryptoKeyVersions.useToDecapsulate lets a principal decapsulate a shared secret with a KEM key."
+    match_effective_permission: {action: "cloudkms.cryptoKeyVersions.useToDecapsulate", resource_type: "google.cloud.kms.CryptoKey"}
+    where:
+      - "CryptoKey.purpose is a KEM (key-encapsulation) purpose — the Decapsulate API recovers the shared secret from a ciphertext encapsulation (RAW/PQC KEM)"
+      - "the effective action is cloudkms.cryptoKeyVersions.useToDecapsulate specifically — useToDecrypt does NOT apply to a KEM key and is NOT accepted here"
+      - "at least one CryptoKeyVersion is ENABLED"
+    emit:
+      target_type: EncryptionKey
+      source: "<principal>"
+      target: "<CryptoKey (EncryptionKey subtype, KEM)>"
+      permissions: ["cloudkms.cryptoKeyVersions.useToDecapsulate"]
+      conditions: [iam_permission, resource_policy, key_permission, service_state]
+      state_logic: >-
+        ACTIVE if useToDecapsulate resolves on a KEM key AND >=1 version ENABLED;
+        CONDITIONAL(service_state) if all versions DISABLED (re-enableable by a
+        cryptoKeyVersions.update holder);
+        BLOCKED if all versions DESTROYED, or a VPC-SC perimeter / IAM deny policy
+        denies cloudkms.cryptoKeyVersions.useToDecapsulate at the effective scope
+        (denied_by=<perimeter/deny>).
+      confidence: "min(contributing_confidences) * 0.97"
+      derived_from: [ "<effective cloudkms.cryptoKeyVersions.useToDecapsulate grant>" ]
+      false_positive_note: >-
+        useToDecapsulate is a DISTINCT permission from useToDecrypt and applies ONLY to
+        KEM-purpose keys. A useToDecrypt grant does NOT confer decapsulation and a
+        useToDecapsulate grant does NOT confer decrypt — do not cross-map them. Emit
+        only when the effective action is useToDecapsulate on a KEM key with >=1
+        ENABLED version. Recovering a KEM shared secret is a decrypt-equivalent
+        capability (models as CanDecrypt) but keep the permission name exact.
+      narrative: >-
+        {principal.name} can decapsulate the shared secret of KEM key {key.name}
+        (cloudkms.cryptoKeyVersions.useToDecapsulate) — recovering the wrapped secret.
+
+  # --- Sign as an asymmetric SIGN key (signature forgery) --------------------
+  - id: gcp-kms-can-sign
+    emits: CanSignAs
+    description: "cloudkms.cryptoKeyVersions.useToSign on an ASYMMETRIC_SIGN key forges signatures."
+    match_effective_permission: {action: "cloudkms.cryptoKeyVersions.useToSign", resource_type: "google.cloud.kms.CryptoKey"}
+    where:
+      - "CryptoKey.purpose == ASYMMETRIC_SIGN"
+      - "at least one CryptoKeyVersion is ENABLED"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<CryptoKey (SigningKey subtype)>"
+      permissions: ["cloudkms.cryptoKeyVersions.useToSign"]
+      conditions: [iam_permission, resource_policy, key_permission, service_state]
+      state_logic: >-
+        ACTIVE if useToSign resolves on an ASYMMETRIC_SIGN key with >=1 ENABLED
+        version; CONDITIONAL(service_state) if all versions DISABLED; BLOCKED if all
+        DESTROYED or a VPC-SC/IAM deny denies useToSign.
+      confidence: "min(contributing_confidences) * 0.97"
+      derived_from: [ "<effective cloudkms.cryptoKeyVersions.useToSign grant>" ]
+      false_positive_note: >-
+        Only on purpose == ASYMMETRIC_SIGN. useToVerify / viewPublicKey (getPublicKey)
+        are read-only recon, NOT signing — do not emit from them. Signing capability
+        is not identity impersonation by itself; the roll-up to CanImpersonate/
+        CanEscalateTo requires evidence the public key is a trust anchor
+        (see gcp-kms-sign-forge-identity).
+      narrative: >-
+        {principal.name} can sign as key {key.name}
+        (cloudkms.cryptoKeyVersions.useToSign on an ASYMMETRIC_SIGN key) — forging
+        signatures verifiable against its public key.
+
+  # --- MAC sign (symmetric message-integrity forgery) ------------------------
+  - id: gcp-kms-can-mac
+    emits: CanSignAs
+    description: "cloudkms.cryptoKeyVersions.macSign on a MAC key forges message authentication codes."
+    match_effective_permission: {action: "cloudkms.cryptoKeyVersions.macSign", resource_type: "google.cloud.kms.CryptoKey"}
+    where:
+      - "CryptoKey.purpose == MAC"
+      - "at least one CryptoKeyVersion is ENABLED"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<CryptoKey (SigningKey subtype, MAC)>"
+      permissions: ["cloudkms.cryptoKeyVersions.macSign"]
+      conditions: [iam_permission, resource_policy, key_permission, service_state]
+      state_logic: >-
+        ACTIVE if macSign resolves on a MAC key with >=1 ENABLED version;
+        CONDITIONAL(service_state) if all versions DISABLED; BLOCKED if DESTROYED or
+        denied by VPC-SC/IAM deny.
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<effective cloudkms.cryptoKeyVersions.macSign grant>" ]
+      false_positive_note: >-
+        MAC is symmetric integrity, not asymmetric identity signing — value is
+        forging/validating MACs for a protocol that trusts this key, not minting
+        JWTs. macVerify is read-only. Only on purpose == MAC. A MAC key has NO public
+        key and is NEVER a JWKS/JWT/OIDC trust anchor: do NOT roll this CanSignAs up to
+        CanImpersonate / CanEscalateTo via gcp-kms-sign-forge-identity (that rule
+        matches [?principal, CanSignAs, ?key] generically). gcp-kms-sign-forge-identity
+        MUST require purpose == ASYMMETRIC_SIGN with a published public-key anchor and
+        skip MAC keys.
+      narrative: >-
+        {principal.name} can produce valid MACs with key {key.name}
+        (cloudkms.cryptoKeyVersions.macSign) — forging message authentication codes.
+
+  # --- setIamPolicy on a key -> self-grant crypto (classic GCP KMS privesc) ---
+  - id: gcp-kms-setiam-self-grant
+    emits: CanGrantPermission
+    description: "cryptoKeys/keyRings.setIamPolicy lets a key manager bind itself a crypto role."
+    # any-of: either the per-key setIamPolicy OR the ring-scoped setIamPolicy fires
+    # this rule. A ring binding is inherited by EVERY key in the ring (wider blast
+    # radius), so a principal holding ONLY cloudkms.keyRings.setIamPolicy — with no
+    # per-key setIamPolicy — must still trigger the self-grant chain.
+    match_effective_permission:
+      any_of:
+        - {action: "cloudkms.cryptoKeys.setIamPolicy", resource_type: "google.cloud.kms.CryptoKey"}
+        - {action: "cloudkms.keyRings.setIamPolicy",   resource_type: "google.cloud.kms.KeyRing"}
+    where:
+      - "principal has effective cloudkms.cryptoKeys.setIamPolicy on the key OR cloudkms.keyRings.setIamPolicy on its ring (ring binding inherited by every key in the ring — wider blast radius)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<principal (self)>"
+      permissions: ["cloudkms.cryptoKeys.setIamPolicy", "cloudkms.keyRings.setIamPolicy"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE if setIamPolicy resolves on the key/ring; BLOCKED if an IAM deny /
+        org policy denies it. Chains to CanDecrypt/CanSignAs via a self-bound
+        roles/cloudkms.cryptoKeyEncrypterDecrypter / roles/cloudkms.signer.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<effective cloudkms.cryptoKeys.setIamPolicy OR cloudkms.keyRings.setIamPolicy grant>" ]
+      false_positive_note: >-
+        This is the intended separation-of-duties break: roles/cloudkms.admin holds
+        setIamPolicy but NOT useTo*, so a key MANAGER is one IAM write from being a
+        key USER. Escalation is realized only after the self-binding is applied and
+        the version is ENABLED (see gcp-kms-selfgrant-to-decrypt/-to-sign, emitted
+        POTENTIAL). keyRings.setIamPolicy affects every key in the ring.
+      narrative: >-
+        {principal.name} can set the IAM policy of key {key.name}
+        (cloudkms.cryptoKeys.setIamPolicy) and grant itself decrypt/sign —
+        breaking KMS separation of duties.
+
+  # --- self-grant realized -> CanDecrypt (POTENTIAL until applied) -----------
+  - id: gcp-kms-selfgrant-to-decrypt
+    emits: CanDecrypt
+    description: "A key manager that can setIamPolicy can self-grant and then decrypt."
+    match:
+      - [ ?principal, CanGrantPermission, ?principal ]
+    where:
+      - "the CanGrantPermission edge derives from cloudkms.cryptoKeys/keyRings.setIamPolicy on ?key"
+      - "CryptoKey.purpose is a decrypt purpose (ENCRYPT_DECRYPT / RAW_ENCRYPT_DECRYPT / ASYMMETRIC_DECRYPT)"
+    emit:
+      target_type: EncryptionKey
+      source: "<principal>"
+      target: "<CryptoKey (EncryptionKey subtype)>"
+      permissions: ["cloudkms.cryptoKeys.setIamPolicy", "cloudkms.cryptoKeyVersions.useToDecrypt"]
+      conditions: [iam_permission, key_permission, service_state]
+      state_logic: >-
+        POTENTIAL(key_permission) — the capability requires the attacker to FIRST
+        add a self-binding of roles/cloudkms.cryptoKeyEncrypterDecrypter; becomes
+        ACTIVE once applied AND >=1 version ENABLED. BLOCKED if setIamPolicy or
+        useToDecrypt is denied by IAM deny / VPC-SC.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<CanGrantPermission (setIamPolicy) edge_id>" ]
+      false_positive_note: >-
+        Not yet-active: it models a two-step (self-grant then decrypt) so it MUST be
+        POTENTIAL until the binding exists. Only emit when the key is a decrypt-purpose
+        key. Do not double-count with gcp-kms-can-decrypt (that rule is for a caller
+        who ALREADY holds useToDecrypt).
+      narrative: >-
+        {principal.name} can grant itself decrypt on {key.name} via setIamPolicy,
+        then decrypt with it (potential — requires applying the self-binding).
+
+  # --- self-grant realized -> CanSignAs (POTENTIAL until applied) ------------
+  - id: gcp-kms-selfgrant-to-sign
+    emits: CanSignAs
+    description: "A key manager that can setIamPolicy can self-grant and then sign."
+    match:
+      - [ ?principal, CanGrantPermission, ?principal ]
+    where:
+      - "the CanGrantPermission edge derives from cloudkms.cryptoKeys/keyRings.setIamPolicy on ?key"
+      - "CryptoKey.purpose == ASYMMETRIC_SIGN (or MAC for macSign)"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<CryptoKey (SigningKey subtype)>"
+      permissions: ["cloudkms.cryptoKeys.setIamPolicy", "cloudkms.cryptoKeyVersions.useToSign"]
+      conditions: [iam_permission, key_permission, service_state]
+      state_logic: >-
+        POTENTIAL(key_permission) — requires FIRST self-binding roles/cloudkms.signer
+        (or signerVerifier); ACTIVE once applied AND >=1 version ENABLED. BLOCKED if
+        setIamPolicy or useToSign is denied.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<CanGrantPermission (setIamPolicy) edge_id>" ]
+      false_positive_note: >-
+        Two-step capability -> POTENTIAL until the self-binding is applied. Only on
+        ASYMMETRIC_SIGN (or MAC) keys. Do not double-count with gcp-kms-can-sign.
+      narrative: >-
+        {principal.name} can grant itself signing on {key.name} via setIamPolicy,
+        then sign as it (potential — requires applying the self-binding).
+
+  # --- CanDecrypt completes an execute-as chain (Phase-4 -> Phase-5) ---------
+  - id: gcp-kms-decrypt-via-execute-as
+    emits: CanDecrypt
+    description: "A principal that can execute as a workload SA holding useToDecrypt can decrypt."
+    match:
+      - [ ?principal, CanExecuteAs, ?sa ]
+    where:
+      - "?sa has EFFECTIVE cloudkms.cryptoKeyVersions.useToDecrypt on ?key (per-key or inherited)"
+      - "?key is a CryptoKey (EncryptionKey subtype) with a decrypt purpose (ENCRYPT_DECRYPT / RAW_ENCRYPT_DECRYPT / ASYMMETRIC_DECRYPT) — matching gcp-kms-can-decrypt; Storage is the downstream CanReadData target, NEVER the CanDecrypt target"
+    emit:
+      target_type: EncryptionKey
+      source: "<principal>"
+      target: "<CryptoKey ?sa can use (EncryptionKey subtype)>"
+      permissions: ["cloudkms.cryptoKeyVersions.useToDecrypt"]
+      conditions: [iam_permission, resource_policy, key_permission, service_state]
+      state_logic: >-
+        Inherits state from the CanExecuteAs input; then ACTIVE if ?sa holds
+        useToDecrypt and >=1 version ENABLED; CONDITIONAL(service_state) if disabled;
+        BLOCKED if denied by VPC-SC/IAM deny.
+      confidence: "min(contributing_confidences) * 0.95"
+      derived_from: [ "<CanExecuteAs edge_id>", "<?sa useToDecrypt grant>" ]
+      false_positive_note: >-
+        Requires the WORKLOAD SA (not the principal directly) to hold useToDecrypt on
+        the specific key. This is the canonical CanExecuteAs -> CanDecrypt completion:
+        once code runs as ?sa (metadata token), it can decrypt. Do not emit if ?sa's
+        grant is scoped to a different key.
+      narrative: >-
+        {principal.name}, able to execute as {sa.name}, can decrypt with {key.name}
+        because {sa.name} holds cloudkms.cryptoKeyVersions.useToDecrypt on it.
+
+  # --- Decrypt RESOLVES the CMEK key_permission gate on an EXISTING read edge -
+  - id: gcp-kms-decrypt-gates-cmek-read
+    emits: CanReadData
+    description: "useToDecrypt on a CMEK key resolves the key_permission condition on a CanReadData edge the consuming-service rule already emitted."
+    # REFINEMENT rule — does NOT manufacture a new read path. It matches an
+    # EXISTING [?principal, CanReadData, ?store] edge (emitted by the GCS/BQ/PD
+    # consuming-service rule, which already verified the data-plane read permission
+    # storage.objects.get / bigquery.tables.getData / compute.disks.get and network
+    # reach) and, when that store is CMEK-encrypted with a key the principal can
+    # decrypt, RESOLVES the key_permission condition on it. It never emits a
+    # CanReadData whose data-plane grant was not confirmed by the consuming rule.
+    match:
+      - [ ?principal, CanDecrypt,   ?key ]
+      - [ ?principal, CanReadData,  ?store ]
+    where:
+      - "the ?store CanReadData edge already exists (consuming-service rule confirmed the control-plane read perm — storage.objects.get / bigquery.tables.getData / compute.disks.get — AND network reach)"
+      - "?store is CMEK-encrypted with ?key (defaultKmsKeyName / kmsKeyName on the bucket/dataset/disk references ?key)"
+    emit:
+      source: "<principal>"
+      target: "<CMEK-encrypted store (Storage/Data) — the SAME store as the matched CanReadData edge>"
+      permissions: ["cloudkms.cryptoKeyVersions.useToDecrypt"]
+      conditions: [iam_permission, resource_policy, key_permission, network_reachability]
+      state_logic: >-
+        REFINES the matched CanReadData edge by resolving its key_permission
+        condition. ACTIVE only if the matched CanReadData edge is itself ACTIVE (its
+        data-plane read permission and network reach already satisfied by the
+        consuming rule) AND useToDecrypt resolves with >=1 key version ENABLED;
+        otherwise the matched edge stays gated on its own unmet conditions. BLOCKED if
+        useToDecrypt is denied by VPC-SC / IAM deny (the CMEK read cannot decrypt).
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanDecrypt edge_id>", "<existing CanReadData edge_id>", "<store CMEK reference to ?key>" ]
+      false_positive_note: >-
+        This rule NEVER manufactures a read path. CanReadData's data-plane grant
+        (storage.objects.get / bigquery.tables.getData / compute.disks.get) and
+        network reachability are OWNED and verified by the consuming service (GCS/BQ/PD)
+        rule, which must have already emitted the [?principal, CanReadData, ?store]
+        edge this rule matches on. KMS only supplies the decrypt fact that RESOLVES the
+        key_permission condition on that pre-existing edge. Do NOT emit a fresh
+        CanReadData from a bare CanDecrypt: decrypting a key without a confirmed
+        store-read grant is not a data-read path.
+      narrative: >-
+        {principal.name} can decrypt with {key.name}, resolving the CMEK
+        key_permission condition on its existing read access to {store.name}
+        (the store-read permission and reach were already confirmed).
+
+  # --- CMEK secret/store: service-agent key_permission gate ------------------
+  - id: gcp-kms-service-agent-cmek-gate
+    emits: CanReadSecret
+    description: "A CMEK-encrypted Secret Manager secret is readable while the service agent holds useToDecrypt on the key."
+    match:
+      - [ ?principal, CanReadSecret, ?secret ]
+    where:
+      - "?secret is CMEK-encrypted (customerManagedEncryption.kmsKeyName references a Cloud KMS key ?key)"
+      - "the CONSUMING service agent (e.g. service-PROJECT_NUMBER@gcp-sa-secretmanager.iam.gserviceaccount.com) holds cloudkms.cryptoKeyVersions.useToDecrypt (roles/cloudkms.cryptoKeyEncrypterDecrypter) on ?key"
+    emit:
+      source: "<principal>"
+      target: "<CMEK-encrypted Secret>"
+      permissions: ["secretmanager.versions.access", "cloudkms.cryptoKeyVersions.useToDecrypt"]
+      conditions: [iam_permission, resource_policy, key_permission, service_state]
+      state_logic: >-
+        ACTIVE if the caller holds versions.access AND the SERVICE AGENT holds
+        useToDecrypt on ?key AND >=1 key version ENABLED;
+        CONDITIONAL(key_permission) if the service-agent grant or key state is unknown;
+        BLOCKED if the service agent lacks the grant OR the key is DISABLED/DESTROYED
+        OR a KMS deny applies (versions.access then errors).
+      confidence: "min(contributing_confidences) * 0.93"
+      derived_from: [ "<CanReadSecret edge_id>", "<service-agent useToDecrypt binding on ?key>" ]
+      false_positive_note: >-
+        GCP-SPECIFIC: the key_permission gate is on the SERVICE AGENT, NOT the caller.
+        A caller with only secretmanager.versions.access reads a CMEK secret while the
+        service agent keeps useToDecrypt. Requiring caller KMS decrypt (AWS Secrets
+        Manager model) produces false negatives. Only downgrade to CONDITIONAL/BLOCKED
+        based on the SERVICE AGENT's grant and the key's enabled state. This rule
+        REFINES an existing CanReadSecret from Secret Manager; it does not invent a
+        new secret read from KMS (KMS holds no secret payloads).
+      narrative: >-
+        {principal.name} can read CMEK secret {secret.name}; the consuming service
+        agent (not the caller) decrypts it via cryptoKeyEncrypterDecrypter on
+        {key.name} — access holds while the agent retains that grant and the key is
+        enabled.
+
+  # --- Payload is a credential for another identity (closes Phase-4->5 chain) --
+  - id: gcp-kms-cmek-secret-credentials-for
+    emits: CredentialsFor
+    description: "A CMEK-encrypted Secret Manager payload authenticates as another identity, completing CanExecuteAs -> CanReadSecret -> CredentialsFor."
+    # Closes the mandated credential-access chain the service-agent gate opened:
+    # gcp-kms-service-agent-cmek-gate emits CanReadSecret on the CMEK secret; this
+    # rule states that the SAME secret's payload is a credential for a concrete
+    # identity, so reading it yields that identity. Source is the Secret-class node
+    # (the Secret Manager secret / its payload), target the Identity it authenticates
+    # as — both within the CredentialsFor source/target sets.
+    match:
+      - [ ?principal, CanReadSecret, ?secret ]
+    where:
+      - "?secret is a CMEK-encrypted Secret Manager secret (the CanReadSecret was gated by gcp-kms-service-agent-cmek-gate)"
+      - "?secret's payload is classified as a credential from metadata (name/labels/annotations), NEVER by reading the payload: SA JSON key -> ServiceAccount; OAuth/API token -> owning Identity; DB connection string / password -> Data store"
+      - "the target identity/service-account/data store the payload authenticates as is identifiable from that metadata"
+    emit:
+      source: "<secret (Secret-class node / its payload Credential)>"
+      target: "<identity | service account | data store the payload authenticates as>"
+      permissions: []
+      conditions: []
+      state_logic: >-
+        ACTIVE when the payload class AND its target are determined from secret
+        metadata; POTENTIAL when the credential type or target is unresolved (unknown
+        payload). Zero base weight — value is realized only when paired with the
+        CanReadSecret from gcp-kms-service-agent-cmek-gate.
+      confidence: "0.7 (heuristic classification) — raise to 0.95 when the SA/user/DB is explicitly named in labels/annotations"
+      derived_from: [ "<CanReadSecret edge_id>", "<secret payload classification evidence>" ]
+      false_positive_note: >-
+        ASSERTION, not an observed value — NEVER read the payload to confirm. Emit only
+        when metadata indicates a credential AND identifies the target; otherwise emit
+        POTENTIAL or omit rather than guess an identity. This completes the Phase-5
+        chain CanExecuteAs -> CanReadSecret -> CredentialsFor for CMEK-gated Secret
+        Manager secrets. Overlaps gcp-secretmanager-credentials-for (same fact keyed
+        from Secret Manager metadata) — de-duplicate on (secret, target) so the payload
+        credential is asserted once, not double-counted.
+      narrative: >-
+        CMEK secret {secret.name} holds credentials for {target.name}; reading its
+        decrypted payload yields usable credentials for {target.name}.
+
+  # --- Cross-project CMEK grant on a key -> CrossProjectTrust -----------------
+  - id: gcp-kms-cross-project-cmek-grant
+    emits: CrossProjectTrust
+    description: "A key binding naming a principal/service-agent in another project is cross-project trust."
+    match_record: {resource_type: "google.cloud.kms.CryptoKey", field: "iamPolicy.bindings[].members"}
+    where:
+      - "a binding on the key (or its keyRing) grants a cloudkms.* role to a member (user/SA/service-agent) whose project != key.project"
+    emit:
+      source: "<key.project>"
+      target: "<member.project | external identity>"
+      permissions: ["cloudkms.cryptoKeys.getIamPolicy"]
+      conditions: [resource_policy]
+      state_logic: "ACTIVE if the cross-project binding is present and not neutralized by an IAM deny / DOMAIN_RESTRICTED_SHARING org policy / VPC-SC perimeter; else BLOCKED."
+      confidence: "0.9"
+      derived_from: [ "<key iamPolicy binding to a foreign-project member>" ]
+      false_positive_note: >-
+        Common and often legitimate: cross-project CMEK grants a consuming project's
+        SERVICE AGENT cryptoKeyEncrypterDecrypter. This edge records the trust; it is
+        only attack-relevant when the granted principal is attacker-controllable and
+        privileged in the key's project (see gcp-kms-cross-project-enter). Honor
+        condition expressions on the binding.
+      narrative: >-
+        Key {key.name} in project {key.project} grants crypto use to {member.name}
+        in project {member.project} (cross-project CMEK trust).
+
+  # --- Cross-project entry via a controllable foreign-project key grant ------
+  - id: gcp-kms-cross-project-enter
+    emits: CanEnterProject
+    description: "Decrypting another project's key that unlocks a materialized credential privileged in that project enters it."
+    # A bare cross-project useToDecrypt is the COMMON, LEGITIMATE CMEK pattern and is
+    # NOT project entry. This rule therefore requires a materialized downstream:
+    # ?key must CMEK-encrypt a ?secret, that ?secret must have a CredentialsFor edge
+    # to an ?identity, and that ?identity must be privileged in ?key.project. Without
+    # all three the rule DOES NOT EMIT.
+    match:
+      - [ ?principal, CanDecrypt,     ?key ]
+      - [ ?secret,    CredentialsFor, ?identity ]
+    where:
+      - "?principal.project != ?key.project"
+      - "?key CMEK-encrypts ?secret (customerManagedEncryption.kmsKeyName on ?secret references ?key), so CanDecrypt(?key) unlocks ?secret's payload"
+      - "?identity (the identity ?secret's payload authenticates as) is a principal in ?key.project AND is privileged there (has a role binding at project/folder/org scope covering ?key.project)"
+    emit:
+      source_type: Identity
+      target_type: Project
+      source: "<principal>"
+      target: "<key.project>"
+      permissions: ["cloudkms.cryptoKeyVersions.useToDecrypt"]
+      conditions: [iam_permission, resource_policy, key_permission, trust_relationship]
+      state_logic: >-
+        POTENTIAL by default (the entry is realized only after the attacker actually
+        decrypts ?secret and assumes ?identity). ACTIVE only when ALL structural facts
+        hold: CanDecrypt(?key) is ACTIVE, ?key CMEK-encrypts ?secret, ?secret
+        CredentialsFor ?identity, and ?identity is a confirmed privileged principal in
+        ?key.project. If ?identity's privilege in ?key.project is unresolved, stay
+        POTENTIAL. BLOCKED if useToDecrypt is denied by VPC-SC/IAM deny.
+      confidence: "min(contributing_confidences) * 0.8"
+      derived_from: [ "<CanDecrypt edge_id>", "<key CMEK-encrypts ?secret>", "<CredentialsFor edge_id>", "<?identity privilege binding in key.project>" ]
+      false_positive_note: >-
+        A bare cross-project useToDecrypt on a CMEK key (the overwhelmingly common,
+        legitimate cross-project CMEK pattern — e.g. decrypting a CMEK-encrypted GCS
+        object in another project) is NOT project entry and MUST NOT emit this edge.
+        Require a MATERIALIZED credential node: ?key -> CMEK-encrypts -> ?secret ->
+        CredentialsFor -> ?identity, with ?identity demonstrably privileged in
+        ?key.project. Absent any of those, do not emit. The ACTIVE branch must rest on
+        these structural matches, never on prose about "material privileged there".
+      narrative: >-
+        {principal.name} (project {principal.project}) can decrypt {key.name} in
+        project {key.project}, unlocking {secret.name} whose payload authenticates as
+        {identity.name} — a privileged principal in {key.project} — entering
+        {key.project}.
+
+  # --- Wildcard-member binding -> tenant-wide crypto exposure ----------------
+  - id: gcp-kms-public-binding
+    emits: ExposedToTenant
+    description: "A key allow policy binding allUsers/allAuthenticatedUsers to a crypto role exposes it broadly."
+    match_record: {resource_type: "google.cloud.kms.CryptoKey", field: "iamPolicy.bindings"}
+    where:
+      - "a binding on the key (or inherited keyRing/project) grants a cloudkms.* crypto or admin role to allUsers or allAuthenticatedUsers"
+    emit:
+      source_type: "*"
+      source: "<CryptoKey>"
+      target: "<Tenant/Organization>"
+      permissions: ["cloudkms.cryptoKeyVersions.useToDecrypt", "cloudkms.cryptoKeyVersions.useToSign"]
+      conditions: [resource_policy]
+      state_logic: "ACTIVE if the wildcard binding is present and not overridden by an IAM deny / DOMAIN_RESTRICTED_SHARING org policy / VPC-SC perimeter; else BLOCKED."
+      confidence: "0.9"
+      derived_from: [ "<key iamPolicy binding to allUsers/allAuthenticatedUsers>" ]
+      false_positive_note: >-
+        allAuthenticatedUsers = any Google account (tenant/org-wide), NOT anonymous
+        internet — Cloud KMS has no anonymous data plane, so model as ExposedToTenant,
+        NEVER ExposedToInternet. A DOMAIN_RESTRICTED_SHARING org policy or VPC-SC
+        perimeter can neutralize the wildcard -> BLOCKED.
+      narrative: >-
+        Key {key.name} grants crypto use to any Google-authenticated principal
+        (allUsers/allAuthenticatedUsers) — tenant-wide exposure.
+
+  # --- Sign as a trust-anchor key -> impersonate the anchored identity -------
+  - id: gcp-kms-sign-forge-identity
+    emits: CanImpersonate
+    description: "Signing as a key that anchors an identity (JWKS/JWT/code-signing) forges that identity."
+    match:
+      - [ ?principal, CanSignAs, ?key ]
+    where:
+      - "CryptoKey.purpose == ASYMMETRIC_SIGN — a MAC key has no public key and can NEVER be a trust anchor; SKIP MAC-derived CanSignAs edges (gcp-kms-can-mac)"
+      - "?key's public key is a published trust anchor for an identity (e.g. a JWKS/JWT issuer, workload-identity signer, code-signing identity) — established from evidence, not assumed"
+      - "the anchored identity resolves to a ServiceAccount / ApplicationIdentity"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<identity anchored by the signing key (ServiceAccount/ApplicationIdentity)>"
+      permissions: ["cloudkms.cryptoKeyVersions.useToSign"]
+      conditions: [iam_permission, resource_policy, key_permission, trust_relationship]
+      state_logic: >-
+        Inherits CanSignAs state. ACTIVE only with evidence the public key is a trust
+        anchor accepted by a relying party; POTENTIAL when the anchor relationship is
+        unconfirmed. BLOCKED if useToSign is denied.
+      confidence: "min(contributing_confidences) * 0.75"
+      derived_from: [ "<CanSignAs edge_id>", "<public-key-as-trust-anchor evidence>" ]
+      false_positive_note: >-
+        Do NOT emit merely because a key can sign — most signing keys are not identity
+        anchors. Requires concrete evidence (JWKS URI, OIDC config, code-signing trust)
+        that a relying party accepts signatures from this key AS the target identity.
+        Otherwise keep POTENTIAL or omit.
+      narrative: >-
+        {principal.name} can sign as {key.name}, whose public key anchors
+        {identity.name}; forging a signed token impersonates {identity.name}.
+
+  # --- Escalation roll-up: setIamPolicy self-grant ---------------------------
+  - id: gcp-kms-escalate-via-selfgrant
+    emits: CanEscalateTo
+    description: "A key manager self-granting crypto use gains the key's crypto capability."
+    match:
+      - [ ?principal, CanGrantPermission, ?principal ]
+    where:
+      - "the CanGrantPermission derives from cloudkms.cryptoKeys/keyRings.setIamPolicy"
+      - "the resulting crypto capability (decrypt/sign) grants strictly-more access than the principal already holds (e.g. unlocks CMEK data or forges a trusted signature it could not before)"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<principal-with-crypto-capability | anchored identity>"
+      permissions: ["cloudkms.cryptoKeys.setIamPolicy"]
+      conditions: [iam_permission, key_permission]
+      state_logic: >-
+        POTENTIAL until the self-binding is applied (two-step), then inherits the
+        realized CanDecrypt/CanSignAs state. BLOCKED if setIamPolicy is denied.
+      confidence: "min(contributing_confidences) * 0.85"
+      derived_from: [ "<CanGrantPermission (setIamPolicy) edge_id>" ]
+      false_positive_note: >-
+        Only escalation when the self-granted crypto capability is strictly more than
+        the caller already has. A manager who is ALSO already a crypto user gains
+        nothing new -> not escalation. Two-step -> at best POTENTIAL until applied.
+      narrative: >-
+        {principal.name} can escalate by self-granting crypto use on {key.name} via
+        setIamPolicy (KMS separation-of-duties break).
+
+  # --- Escalation roll-up: sign-as-a-more-privileged-identity ----------------
+  - id: gcp-kms-escalate-via-sign
+    emits: CanEscalateTo
+    description: "Forging a signature as a key that anchors a more-privileged identity is escalation."
+    match:
+      - [ ?principal, CanImpersonate, ?identity ]
+    where:
+      - "the CanImpersonate derives from gcp-kms-sign-forge-identity (signing-key trust anchor)"
+      - "?identity.privilege_level > ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<anchored identity>"
+      permissions: ["cloudkms.cryptoKeyVersions.useToSign"]
+      conditions: [iam_permission, resource_policy, key_permission, trust_relationship]
+      state_logic: "Inherits the CanImpersonate state (ACTIVE only with confirmed trust-anchor evidence; else POTENTIAL)."
+      confidence: "min(contributing_confidences) * 0.9"
+      derived_from: [ "<CanImpersonate edge_id>" ]
+      false_positive_note: >-
+        Only when the anchored identity is strictly more privileged than the caller.
+        Same/lower-privilege is lateral, not escalation. Inherits the trust-anchor
+        confidence — an unconfirmed anchor stays POTENTIAL.
+      narrative: >-
+        {principal.name} can escalate to {identity.name} by forging a signature with
+        {key.name}, whose public key {identity.name} is trusted to sign with.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - A VPC Service Controls perimeter denying cloudkms.googleapis.com (or a specific
+#    useTo* / setIamPolicy action) for the caller -> emit the edge with state: BLOCKED
+#    and denied_by=<perimeter>.
+#  - An IAM deny policy denying cloudkms.cryptoKeyVersions.useToDecrypt / useToSign /
+#    macSign / cryptoKeys.setIamPolicy at the effective scope -> BLOCKED.
+#  - All CryptoKeyVersions DISABLED -> CONDITIONAL(service_state) (re-enableable via
+#    cryptoKeyVersions.update); all DESTROYED -> BLOCKED.
+#  - A DOMAIN_RESTRICTED_SHARING org policy neutralizes allUsers/allAuthenticatedUsers
+#    crypto bindings -> gcp-kms-public-binding BLOCKED.
+#  - NEVER emit CanExportKey for a Cloud KMS key: raw symmetric/private material is
+#    non-exportable; only the asymmetric PUBLIC key is retrievable (not a secret).
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules (raw config -> explicit edges) live in
+# /rules/explicit/gcp-kms.yaml (HasPolicy, Contains, LocatedIn, CanDecrypt,
+# CanSignAs, CanModifyPolicy, CrossProjectTrust). They match raw Cloud KMS API
+# records, not edges.
+explicit_rules:
+
+  - id: gcp-kms-explicit-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    source_record: {api: "cloudkms.projects.locations.keyRings.cryptoKeys.getIamPolicy", field: "bindings"}
+    emit: {source: "<CryptoKey>", target: "<CryptoKey ResourcePolicy>"}
+
+  - id: gcp-kms-explicit-can-decrypt
+    emits: CanDecrypt
+    applies_to: [gcp]
+    source_record: {api: "policy evaluation (Policy Analyzer)", field: "effective cloudkms.cryptoKeyVersions.useToDecrypt"}
+    where: ["CryptoKey.purpose is a decrypt purpose and >=1 version ENABLED"]
+    emit: {source: "<principal>", target: "<CryptoKey (EncryptionKey)>"}
+
+  - id: gcp-kms-explicit-can-sign
+    emits: CanSignAs
+    applies_to: [gcp]
+    source_record: {api: "policy evaluation (Policy Analyzer)", field: "effective cloudkms.cryptoKeyVersions.useToSign | macSign"}
+    where: ["CryptoKey.purpose == ASYMMETRIC_SIGN (useToSign) or MAC (macSign), >=1 version ENABLED"]
+    emit: {source: "<principal>", target: "<CryptoKey (SigningKey)>"}
+
+  - id: gcp-kms-explicit-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    source_record: {api: "cloudkms.projects.locations.keyRings.cryptoKeys.getIamPolicy", field: "bindings[].members"}
+    where: ["a member (user/SA/service-agent) belongs to a different project than the key"]
+    emit: {source: "<key.project>", target: "<member.project | external identity>"}

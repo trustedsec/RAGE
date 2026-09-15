@@ -1,0 +1,628 @@
+# GCP Workflows — Derived attack-path rules (Phase 10 — messaging & event systems)
+# ---------------------------------------------------------------------------
+# Catalog key gcp:workflows. Emits ONLY common edge types from schema/edges.yaml.
+# All permission identifiers are verbatim from:
+#   cloud.google.com/workflows/docs/reference/iam/permissions
+#   cloud.google.com/iam/docs/understanding-roles
+#
+# Central escalation invariant:
+#   GCP Workflows executes as a USER-MANAGED SERVICE ACCOUNT (workflows.serviceAccount).
+#   Any principal who can update the workflow definition (workflows.workflows.update)
+#   can inject arbitrary Google API calls or HTTP steps that run AS that SA.
+#   This is the Phase-10 signature primitive: the workflow is an EVENT CONSUMER
+#   (bound to Eventarc triggers / Cloud Scheduler / direct executions.create calls)
+#   that runs as a powerful identity.
+#
+# LINCHPINS — cite, do NOT duplicate:
+#   messaging-chains.yaml  — publish-to-trigger (rule 1) and trigger-executes-as
+#                             (rule 2) collapse CanWriteData+CanTrigger+ExecutesAs
+#                             into CanExecuteAs. Rules here emit the SERVICE FACTS
+#                             (CanModifyCode, ExecutesAs, CanInvoke, CanSchedule,
+#                             CanTrigger binding) and let messaging-chains roll them
+#                             up. CanEscalateTo / CanEnter* rollups are can-execute-as
+#                             / can-control — CITED, not re-derived.
+#   cicd-chains.yaml       — CanModifyCode + ExecutesAs => CanExecuteAs for the
+#                             attacker who can update the DEFINITION (code-control
+#                             path); this file provides the GCF-analogous execute-as
+#                             rules for workflows.
+#   can-execute-as.yaml    — canonical execute-as-via-code-modify / config-identity-swap.
+#   credential-chains.yaml — ContainsSecret / ExposesCredential / CredentialsFor chain.
+#   can-control.yaml       — CrossProjectTrust -> CanEnterProject rollup.
+#
+# State discipline (RULE-FORMAT.md):
+#   - Code/config update WITHOUT a confirmed execution path -> CONDITIONAL(trigger_exists).
+#   - Runtime-SA change requires actAs; missing actAs -> POTENTIAL(role_compatibility).
+#   - IAM deny / org policy denying an action -> BLOCKED (denied_by=...).
+#   - Derived edge state never exceeds weakest contributor.
+# ---------------------------------------------------------------------------
+
+provider: gcp
+phase: 10-messaging
+service: workflows
+applies_to: [gcp]
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # EXPLICIT-LIKE FACTS (raw config -> common explicit edges)
+  # These match resource records rather than combining existing edges.
+  # ---------------------------------------------------------------------------
+
+  # --- Workflow runs as its runtime service account --------------------------
+  # [HIGH] REMOVED: This rule is a duplicate of gcp-workflows-explicit-executes-as
+  # (in explicit_rules section below). Both use match_record normalization style
+  # and emit the same ExecutesAs edge. Duplicate normalization rules produce
+  # duplicate edges. Kept only gcp-workflows-explicit-executes-as in explicit_rules.
+
+  # --- Code / definition modification ----------------------------------------
+  - id: gcp-workflows-update-definition
+    emits: CanModifyCode
+    description: "workflows.workflows.update replaces the workflow's YAML/JSON definition, enabling injection of arbitrary Google API calls or HTTP steps that run as the runtime SA."
+    match_effective_permission:
+      action: "workflows.workflows.update"
+      resource_type: "google.workflows.type.Workflow"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<workflow in scope>"
+      permissions: ["workflows.workflows.update"]
+      derived_from: ["effective permission: workflows.workflows.update on the workflow resource"]
+      false_positive_note: >-
+        workflows.workflows.update controls the definition (source YAML/JSON). Updating the
+        definition does NOT immediately run the new version — the next execution activates it.
+        Without an execution path (direct executions.create OR a live Eventarc/Scheduler
+        trigger bound to the workflow), the CanModifyCode escalation is
+        CONDITIONAL(trigger_exists), not ACTIVE.
+      narrative: >-
+        {principal.name} can replace the definition of {workflow.name}
+        (workflows.workflows.update), injecting arbitrary steps (HTTP calls, Google API calls)
+        that run as the runtime service account.
+
+  # --- Configuration modification (runtime SA re-point + env) ----------------
+  - id: gcp-workflows-update-config
+    emits: CanModifyConfiguration
+    description: "workflows.workflows.update can also re-point the runtime SA (serviceAccount field) when paired with actAs; configuration change path to CanExecuteAs."
+    match_effective_permission:
+      action: "workflows.workflows.update"
+      resource_type: "google.workflows.type.Workflow"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<workflow in scope>"
+      permissions: ["workflows.workflows.update"]
+      derived_from: ["effective permission: workflows.workflows.update on the workflow resource"]
+      note: >-
+        Re-pointing serviceAccount additionally requires iam.serviceAccounts.actAs on the
+        new SA. This rule emits the configuration-change capability; the actAs requirement
+        is enforced by the CanPassIdentity edge (gcp-workflows-passidentity-actas). Both
+        CanModifyCode and CanModifyConfiguration are produced from the same permission;
+        graph builder deduplicates via edge_id.
+      false_positive_note: >-
+        Same trigger gating as the code-update path (CONDITIONAL without execution path).
+        Changing the serviceAccount field without actAs on the new SA fails at the API
+        level — always require the CanPassIdentity gate before asserting config-identity-swap
+        escalation.
+      narrative: >-
+        {principal.name} can update the configuration of {workflow.name}
+        (workflows.workflows.update), including re-pointing the runtime service account
+        (requires iam.serviceAccounts.actAs on the new SA).
+
+  # --- Direct execution creation (trigger primitive) -------------------------
+  - id: gcp-workflows-create-execution
+    emits: [CanInvoke, CanWriteData]
+    description: "workflows.executions.create starts a new execution with a caller-supplied argument payload — both a direct invoke AND a publish-to-topic primitive (feeds messaging-chains rule 1)."
+    match_effective_permission:
+      action: "workflows.executions.create"
+      resource_type: "google.workflows.type.Workflow"
+    emit:
+      - edge: CanInvoke
+        source_type: Identity
+        target_type: Workflow
+        source: "<principal>"
+        target: "<workflow in scope>"
+        permissions: ["workflows.executions.create"]
+        derived_from: ["effective permission: workflows.executions.create on the workflow resource"]
+        conditions: [iam_permission, service_state]
+        false_positive_note: >-
+          executions.create triggers an EXISTING workflow definition; it does NOT modify the
+          definition. The escalation consequence (CanExecuteAs the runtime SA) requires the
+          existing definition to run attacker-influenced input (the argument payload) — nearly
+          always true for a data-processing workflow, but a workflow that ignores its argument
+          yields no execution leverage. State: ACTIVE when the caller has executions.create AND
+          the workflow is deployed/enabled.
+        narrative: >-
+          {principal.name} can start a new execution of {workflow.name}
+          (workflows.executions.create) with a caller-controlled argument payload,
+          triggering steps that run as the runtime service account.
+      - edge: CanWriteData
+        source_type: Identity
+        target_type: Messaging
+        source: "<principal>"
+        target: "<workflow in scope>"
+        permissions: ["workflows.executions.create"]
+        derived_from: ["effective permission: workflows.executions.create on the workflow resource"]
+        conditions: [iam_permission, service_state]
+        false_positive_note: >-
+          workflows.executions.create is the publish/send primitive for the Workflow as an
+          event source. This feeds messaging-chains rule 1 (CanWriteData + CanTrigger =>
+          CanTrigger at the consumer level).
+        narrative: >-
+          {principal.name} can publish a message to {workflow.name} by creating an execution
+          (workflows.executions.create) with an attacker-controlled argument payload.
+
+  # --- Eventarc trigger creation -> CanSchedule (event-source binding) --------
+  - id: gcp-workflows-create-eventarc-trigger
+    emits: CanSchedule
+    description: "eventarc.triggers.create/update lets an attacker bind a new event source (Pub/Sub topic, Audit Log, GCS event) to the workflow — the event-source-binding creation primitive."
+    match_effective_permission:
+      action: "eventarc.triggers.create"
+      resource_type: "google.cloud.eventarc.v1.Trigger"
+    alt_permission: "eventarc.triggers.update"
+    where:
+      - "trigger.destination.workflow points to a Workflow resource in scope"
+      - "principal has iam.serviceAccounts.actAs on the Eventarc trigger's service account"
+    emit:
+      source_type: Identity
+      target_type: EventRule
+      source: "<principal>"
+      target: "<Eventarc trigger / EventRule>"
+      permissions: ["eventarc.triggers.create", "eventarc.triggers.update", "iam.serviceAccounts.actAs"]
+      derived_from: ["effective permission: eventarc.triggers.create/update, iam.serviceAccounts.actAs on trigger SA"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds eventarc.triggers.create (or .update) AND
+        iam.serviceAccounts.actAs on the Eventarc trigger SA (needed to configure the
+        trigger's invocation identity). POTENTIAL(role_compatibility) when actAs on the
+        trigger SA is unknown/unresolved. This CanSchedule feeds messaging-chains rule 3
+        (messaging-schedule-persists-executes-as) when the trigger also passes an identity
+        to the invocation target.
+      false_positive_note: >-
+        Creating an Eventarc trigger requires actAs on the trigger's own service account
+        (the SA Eventarc uses to call workflows.executions.create). This is a separate
+        SA from the workflow's runtime SA. The attack chain: create trigger (this edge) ->
+        trigger fires -> workflow runs as its runtime SA (CanTrigger -> ExecutesAs ->
+        CanExecuteAs, rolled up by messaging-chains). Honor actAs scope: actAs on one SA
+        does NOT grant actAs on another.
+      narrative: >-
+        {principal.name} can create/update an Eventarc trigger (eventarc.triggers.create
+        + iam.serviceAccounts.actAs on trigger SA) that binds an event source to
+        {workflow.name}, establishing persistent event-driven execution as the workflow's
+        runtime service account.
+
+  # --- actAs on the runtime SA (CanPassIdentity) -----------------------------
+  # NOTE: the generic gcp-sa-act-as rule in identity-escalation.yaml already emits
+  # CanPassIdentity for all iam.serviceAccounts.actAs grants. This scoped alias
+  # records the Workflows-specific pairing for narrative clarity. De-dupe on
+  # edge_id(type|source|target|scope) — the two collapse to one CanPassIdentity edge.
+  - id: gcp-workflows-passidentity-actas
+    emits: CanPassIdentity
+    alias_of: gcp-sa-act-as
+    dedupe_on: edge_id
+    description: "actAs on a SA that the principal can attach to a workflow (create/update) is the GCP PassRole analog for Workflows."
+    match_effective_permission:
+      action: "iam.serviceAccounts.actAs"
+      resource_type: "google.iam.ServiceAccount"
+    where:
+      - "principal can create or update a workflow (workflows.workflows.create or .update in scope)"
+    emit:
+      source_type: Identity
+      target_type: ServiceAccount
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["iam.serviceAccounts.actAs"]
+      derived_from: ["effective permission: iam.serviceAccounts.actAs on the service account"]
+      conditions: [role_compatibility, iam_permission]
+      false_positive_note: >-
+        Scoped alias of gcp-sa-act-as — de-duped on edge_id so no duplicate
+        CanPassIdentity edge is produced. actAs is per-SA: actAs on sa-A does NOT allow
+        attaching sa-B. Only emit for SAs the principal can actAs; no actAs -> POTENTIAL.
+        Requires the principal also holds workflows.workflows.create or .update to actually
+        use the actAs to change a workflow's runtime SA.
+      narrative: >-
+        {principal.name} holds iam.serviceAccounts.actAs on {sa.name} and can bind it
+        as the runtime service account of a workflow it creates or updates.
+
+  # --- IAM allow policy write on the workflow --------------------------------
+  - id: gcp-workflows-set-iam-policy
+    emits: CanModifyPolicy
+    description: "workflows.workflows.setIamPolicy lets an attacker grant itself roles/workflows.editor (CanModifyCode path) or roles/workflows.invoker (CanInvoke path) on the workflow."
+    match_effective_permission:
+      action: "workflows.workflows.setIamPolicy"
+      resource_type: "google.workflows.type.Workflow"
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<workflow IAM allow policy>"
+      permissions: ["workflows.workflows.setIamPolicy"]
+      derived_from: ["effective permission: workflows.workflows.setIamPolicy on the workflow resource"]
+      escalation: >-
+        Grant self roles/workflows.editor -> workflows.workflows.update (CanModifyCode) ->
+        inject steps -> CanExecuteAs(runtime SA). Or grant self roles/workflows.invoker ->
+        workflows.executions.create (CanInvoke) -> trigger existing definition -> CanExecuteAs.
+      false_positive_note: >-
+        setIamPolicy on the workflow resource modifies the resource-level IAM allow policy.
+        This does NOT override project-level org policies or IAM deny policies that may block
+        the grant. Conditional IAM bindings on the target policy (e.g. requiring MFA or a
+        specific resource tag) constrain the self-grant further — honor them.
+      narrative: >-
+        {principal.name} can set the IAM policy of {workflow.name}
+        (workflows.workflows.setIamPolicy), granting itself invoke or edit capabilities
+        and completing a CanModifyCode or CanInvoke escalation path.
+
+  # ---------------------------------------------------------------------------
+  # DERIVED ATTACK-PATH RULES (combine existing edges)
+  # ---------------------------------------------------------------------------
+
+  # --- CanExecuteAs via workflow definition modification ----------------------
+  # [HIGH] REMOVED: This rule duplicates can-execute-as.yaml:execute-as-via-code-modify.
+  # The linchpin rule already fires whenever CanModifyCode(principal, compute) +
+  # ExecutesAs(compute, identity) are present on ANY provider/service. The GCP Workflows
+  # evidence (workflows.workflows.update + ExecutesAs) is already captured in the
+  # contributing explicit rules (gcp-workflows-update-definition +
+  # gcp-workflows-explicit-executes-as). CITED to can-execute-as.yaml, not re-derived here.
+
+  # --- CanExecuteAs via runtime SA swap (config + actAs) ---------------------
+  # [HIGH] REMOVED: This rule duplicates can-execute-as.yaml:execute-as-via-config-identity-swap.
+  # The linchpin rule fires whenever CanModifyConfiguration(principal, compute) +
+  # CanPassIdentity(principal, identity) + role_compatible(identity, compute) are present.
+  # The Workflows-specific evidence (workflows.workflows.update + iam.serviceAccounts.actAs)
+  # is already captured in contributing rules (gcp-workflows-update-config +
+  # gcp-workflows-passidentity-actas). CITED to can-execute-as.yaml, not re-derived here.
+
+  # --- CanAttachIdentity: swap runtime SA on an existing workflow --------------
+  - id: gcp-workflows-attach-sa-via-update
+    emits: CanAttachIdentity
+    description: "Update the serviceAccount field to swap the runtime SA of an existing workflow."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?workflow ]
+      - [ ?principal, CanPassIdentity,        ?sa ]
+    where:
+      - "node_type(?workflow) == Workflow"
+      - "?principal has iam.serviceAccounts.actAs on ?sa"
+    emit:
+      source_type: Identity
+      target_type: Messaging
+      source: "<principal>"
+      target: "<workflow>"
+      permissions: ["workflows.workflows.update", "iam.serviceAccounts.actAs"]
+      derived_from:
+        - "?principal CanModifyConfiguration ?workflow (gcp-workflows-update-config)"
+        - "?principal CanPassIdentity ?sa (gcp-workflows-passidentity-actas)"
+      note: >-
+        Chains to CanExecuteAs(?sa) once a run path exists via can-execute-as.yaml
+        execute-as-via-config-identity-swap. This edge records the attach capability itself.
+      false_positive_note: >-
+        Requires actAs on the new SA. The attach is ACTIVE once actAs is confirmed;
+        downstream CanExecuteAs still needs a run path (invoke or live trigger).
+      narrative: >-
+        {principal.name} can change the runtime SA of {workflow.name} to {sa.name}
+        (workflows.workflows.update + iam.serviceAccounts.actAs).
+
+  # --- CanCreateWorkloadAs: create a new workflow bound to an actAs-able SA ---
+  - id: gcp-workflows-create-workload-as
+    emits: CanCreateWorkloadAs
+    description: "Create a new workflow bound to a passable SA (create + actAs) to execute code as that SA."
+    match:
+      - [ ?principal, CanPassIdentity, ?sa ]
+    where:
+      - "?principal has workflows.workflows.create in scope"
+      - "?principal has iam.serviceAccounts.actAs on ?sa"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<service account>"
+      permissions: ["workflows.workflows.create", "iam.serviceAccounts.actAs", "workflows.executions.create?"]
+      conditions: [role_compatibility, iam_permission]
+      state_logic: >-
+        ACTIVE when the principal holds workflows.workflows.create AND actAs on ?sa AND
+        can invoke the new workflow (workflows.executions.create — which the creator
+        typically holds in scope). POTENTIAL(role_compatibility) when actAs on ?sa is
+        unknown/unresolved.
+      derived_from:
+        - "?principal CanPassIdentity ?sa (gcp-workflows-passidentity-actas)"
+      false_positive_note: >-
+        actAs must apply to the chosen SA. Without actAs -> POTENTIAL. The creator can
+        set themselves as invoker (or grant allAuthenticatedUsers) on the new workflow's
+        IAM policy to ensure a run path. Dedupes with can-execute-as execute-as-via-new-workload
+        when feeding CanExecuteAs.
+      narrative: >-
+        {principal.name} can create a workflow bound to {sa.name}
+        (workflows.workflows.create + iam.serviceAccounts.actAs), then invoke it to execute
+        attacker logic as {sa.name}.
+
+  # --- ExposesCredential: runtime SA token via injected HTTP step -------------
+  - id: gcp-workflows-exposes-runtime-sa
+    emits: ExposesCredential
+    description: "Any code running inside a workflow (via definition control) can exfiltrate the runtime SA token via an outbound http.request step to an attacker-controlled endpoint."
+    match:
+      - [ ?workflow, ExecutesAs, ?sa ]
+    where:
+      - "node_type(?workflow) == Workflow"
+    emit:
+      source_type: Messaging
+      target_type: Identity
+      source: "<workflow>"
+      target: "<runtime service account>"
+      permissions: []
+      derived_from: ["?workflow ExecutesAs ?sa (gcp-workflows-explicit-executes-as)"]
+      note: >-
+        Workflows does not have a metadata server endpoint like GCE/Cloud Run; the SA token
+        is accessed via the googleapis.com token endpoint using the runtime context. An
+        attacker-controlled step can use the built-in auth.type: OAuth2 or OIDC to obtain
+        the token and post it outbound. This edge only becomes an attack step when combined
+        with CanModifyCode (definition control).
+      false_positive_note: >-
+        Not an escalation by itself. Path value comes from a contributing CanModifyCode or
+        CanExecuteAs edge. The token is accessible only within a running execution;
+        executions.create (CanInvoke) or an existing trigger is still required.
+      narrative: >-
+        {workflow.name} exposes the runtime service account {sa.name}'s token to any code
+        running inside it — an injected step can exfiltrate the OAuth2/OIDC token via
+        an outbound HTTP request.
+
+  # --- CanRetrieveToken: principal with execution gets runtime SA token -------
+  # [MED] REMOVED: This rule emits CanRetrieveToken derived from CanExecuteAs, which is
+  # redundant for path-finding. The escalation value is already captured in CanExecuteAs.
+  # Credential-chains handles token materialization via ExposesCredential (already emitted
+  # by gcp-workflows-exposes-runtime-sa) + credential-chains derivations. No new semantic
+  # capability is added; the rule merely creates low-signal duplicate edges.
+
+  # --- Source code disclosure (definition get) --------------------------------
+  - id: gcp-workflows-source-code-get
+    emits: ContainsCredential
+    description: "workflows.workflows.get returns the full workflow definition source, which may embed hardcoded credentials, API keys, or connection strings in step parameters."
+    match_effective_permission:
+      action: "workflows.workflows.get"
+      resource_type: "google.workflows.type.Workflow"
+    where:
+      - "definition analysis confirms credential-like patterns (API keys, SA key JSON, passwords in step arguments)"
+    emit:
+      source_type: Messaging
+      target_type: Credential
+      source: "<workflow>"
+      target: "<hardcoded credential / token in the definition>"
+      permissions: ["workflows.workflows.get"]
+      derived_from: ["effective permission: workflows.workflows.get on the workflow resource; definition static analysis"]
+      conditions: [iam_permission]
+      false_positive_note: >-
+        Only emit when static analysis of the definition content confirms credential-like
+        patterns (hardcoded API key, SA key JSON, password in a step argument). This is a
+        CanReadCredential derivation: credential-chains rule reads ContainsCredential on the
+        Workflow node and emits CanReadCredential(principal with .get -> credential).
+      narrative: >-
+        The workflow definition of {workflow.name} contains hardcoded credential material
+        ({credential_type}), visible to any principal with workflows.workflows.get permission.
+
+  # --- ContainsSecret: execution argument carries credentials -----------------
+  - id: gcp-workflows-execution-arg-contains-secret
+    emits: ContainsSecret
+    description: "A workflow execution's argument payload may carry secrets passed by the caller; visible in execution metadata to anyone with executions.get."
+    match_record:
+      resource_type: "google.workflows.type.Execution"
+      field: "argument"
+    where:
+      - "argument JSON contains credential-like material (API keys, passwords, SA key JSON, connection strings)"
+    emit:
+      source_type: Messaging
+      target_type: Secret
+      source: "<execution (Messaging — the event payload carrier)>"
+      target: "<secret / credential material in argument>"
+      permissions: []
+      derived_from: ["execution.argument field analysis"]
+      note: >-
+        Drives ExposesCredential when an attacker with executions.get can read execution
+        history. Credential-chains reads this as ContainsSecret -> ExposesCredential ->
+        CredentialsFor.
+      false_positive_note: >-
+        Only emit when classification of the argument field yields a confirmed credential
+        pattern — not for every execution. Executions are ephemeral; arguments may be
+        cleared in execution history depending on retention settings.
+      narrative: >-
+        A running or completed execution of {workflow.name} carries credential material
+        in its argument payload, visible to any principal with workflows.executions.get.
+
+  # --- Cross-project trust: IAM binding grants external principal executions.create
+  - id: gcp-workflows-cross-project-trust
+    emits: CrossProjectTrust
+    description: "An IAM binding on the workflow's allow policy granting workflows.executions.create to a principal in a different project is cross-project publish/trigger trust."
+    match_record:
+      resource_type: "google.workflows.type.Workflow"
+      field: "iamPolicy.bindings"
+    where:
+      - "a binding member (user/SA) belongs to a different project than the workflow"
+      - "the binding grants workflows.executions.create (roles/workflows.invoker or roles/workflows.editor)"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: "<workflow IAM allow policy>"
+      target: "<external project of the granted principal>"
+      permissions: []
+      derived_from: ["workflow.iamPolicy.bindings — cross-project member with executions.create"]
+      conditions: [resource_policy]
+      state_logic: >-
+        ACTIVE when the binding unconditionally grants executions.create to an external
+        principal. CONDITIONAL(condition_expression) when scoped by an IAM condition
+        (resource tag, request time, originating IP). BLOCKED by an org policy or IAM
+        deny that overrides the grant.
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE can-control: this rule asserts ONLY the cross-project
+        messaging trust fact — it does NOT emit CanEnterProject. The CanEnterProject
+        consequence (external principal triggers workflow -> CanExecuteAs runtime SA in
+        the workflow's project) is produced by can-control consuming this
+        CrossProjectTrust together with CanInvoke/CanTrigger and ExecutesAs.
+        Honor IAM conditions that narrow the grant.
+      narrative: >-
+        The IAM policy of {workflow.name} grants a principal in project {ext_project.name}
+        the ability to start executions (workflows.executions.create), creating
+        cross-project trigger trust; an attacker in that project can drive the workflow's
+        runtime service account.
+
+  # --- Public execution: allUsers / allAuthenticatedUsers has invoker ----------
+  - id: gcp-workflows-public-invoke
+    emits: ExposedToInternet
+    description: "An IAM binding granting roles/workflows.invoker to allUsers or allAuthenticatedUsers makes the workflow internet-invocable."
+    match_record:
+      resource_type: "google.workflows.type.Workflow"
+      field: "iamPolicy.bindings"
+    where:
+      - "a binding grants roles/workflows.invoker (or workflows.executions.create) to allUsers or allAuthenticatedUsers"
+    emit:
+      source_type: Messaging
+      target_type: AnonymousIdentity
+      source: "<workflow>"
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        ACTIVE when the IAM binding unconditionally grants roles/workflows.invoker to
+        allUsers or allAuthenticatedUsers. CONDITIONAL when scoped by an IAM condition.
+        BLOCKED by an org policy denying allUsers grants (e.g. constraints/iam.allowedPolicyMemberDomains).
+      false_positive_note: >-
+        allAuthenticatedUsers = any valid Google account, not anonymous internet traffic;
+        still broadly abusable. IAM Org Policy constraints/iam.allowedPolicyMemberDomains
+        blocks allUsers/allAuthenticatedUsers grants — check org policy before emitting ACTIVE.
+        Workflow is Messaging-class; ExposedToInternet source set includes Messaging.
+      narrative: >-
+        {workflow.name} is invocable from the public internet
+        (allUsers/allAuthenticatedUsers has roles/workflows.invoker), running steps as the
+        runtime service account with any caller-supplied argument payload.
+
+  # --- Cross-project entry via code control + powerful runtime SA -------------
+  # [HIGH] REMOVED: This rule duplicates cross-project-entry logic that belongs in a
+  # GCP-specific can-control extension. The file header notes (line 73-74) suggest an
+  # enter-project-via-impersonation rule should live in a GCP can-control extension, not
+  # here. The rule re-derives CanEnterProject from CanExecuteAs, which can-control.yaml
+  # already owns via escalate-via-execute-as (but GCP-project-specific variant is missing).
+  # ACTION: Create /rules/derived/gcp/can-control-gcp.yaml with enter-project-via-impersonation
+  # rule that applies to ALL GCP services (not just Workflows). CITED, not duplicated here.
+
+  # --- Escalation roll-up ----------------------------------------------------
+  # [HIGH] REMOVED: This rule duplicates can-control.yaml:escalate-via-execute-as.
+  # The linchpin rule already fires whenever CanExecuteAs(principal, identity) exists
+  # and privilege(identity) > privilege(principal), on ANY service/provider. The
+  # Workflows-specific evidence (CanExecuteAs via workflow) is captured by the
+  # canonical derive rules referenced in the file header. CITED to can-control.yaml,
+  # not re-derived here.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - An IAM deny policy or org policy denying workflows.workflows.update,
+#     workflows.executions.create, workflows.workflows.create, or
+#     workflows.workflows.setIamPolicy -> emit affected edges as BLOCKED with
+#     denied_by=<deny/org policy resource>.
+#   - constraints/iam.allowedPolicyMemberDomains blocking allUsers/allAuthenticatedUsers
+#     grants -> gcp-workflows-public-invoke BLOCKED.
+#   - actAs blocked by an IAM deny on iam.serviceAccounts.actAs at project/folder/org
+#     scope -> gcp-workflows-passidentity-actas BLOCKED, cascading to
+#     -execute-as-via-config and -create-workload-as BLOCKED.
+#   - VPC Service Controls perimeter denying workflows.googleapis.com or the target
+#     service API from the Workflows service producer project -> downstream
+#     CanReadSecret / CanReadData edges over perimeter-protected targets are
+#     CONDITIONAL(resource_policy) or BLOCKED depending on perimeter enforcement.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# EXPLICIT NORMALIZATION (raw config -> explicit edges)
+# These belong in /rules/explicit/gcp-workflows.yaml if extracted; inlined here
+# for Phase-10 completion. They match raw API records, not edge combinations.
+# ---------------------------------------------------------------------------
+explicit_rules:
+
+  - id: gcp-workflows-explicit-executes-as
+    emits: ExecutesAs
+    applies_to: [gcp]
+    source_record:
+      api: "workflows.projects.locations.workflows.get"
+      field: "serviceAccount"
+    default: "PROJECT_NUMBER-compute@developer.gserviceaccount.com when unset"
+    emit:
+      source_type: Messaging
+      target_type: ServiceAccount
+      source: "<workflow node>"
+      target: "<runtime service account node>"
+      narrative: "{workflow.name} executes as {sa.name} (workflows.serviceAccount field)."
+      note: >-
+        Workflow is a Messaging-class node (messaging-chains Phase 10 consumer).
+        ExecutesAs permits Messaging in its source set (schema/edges.yaml line 350-351).
+        Fixed from Compute to Messaging to match node class.
+
+  - id: gcp-workflows-explicit-has-policy
+    emits: HasPolicy
+    applies_to: [gcp]
+    source_record:
+      api: "workflows.projects.locations.workflows.getIamPolicy"
+      field: "bindings"
+    emit:
+      source_type: Messaging
+      target_type: Policy
+      source: "<workflow node>"
+      target: "<workflow ResourcePolicy node>"
+      narrative: "{workflow.name} has an IAM allow policy governing who may invoke or modify it."
+      note: >-
+        Workflow is a Messaging-class node. HasPolicy permits Compute; updating to
+        Messaging for accuracy (workflows are Messaging consumers, not Compute).
+
+  - id: gcp-workflows-explicit-can-trigger-eventarc
+    emits: CanTrigger
+    applies_to: [gcp]
+    source_record:
+      api: "eventarc.projects.locations.triggers.list"
+      field: "destination.workflow"
+    where:
+      - "trigger.destination.workflow is set (points to a Workflows resource)"
+      - "trigger.state == ACTIVE"
+    emit:
+      source_type: EventRule
+      target_type: Workflow
+      source: "<Eventarc trigger node (EventRule)>"
+      target: "<workflow node>"
+      narrative: "{trigger.name} is bound to {workflow.name} as a live Eventarc event source."
+      false_positive_note: >-
+        Eventarc is the primary event-source binding mechanism. An active trigger fires
+        whenever the event-source (Pub/Sub topic, Audit Log, GCS events, etc.) produces
+        an event matching the trigger filter.
+
+  - id: gcp-workflows-explicit-can-trigger-scheduler
+    emits: CanTrigger
+    applies_to: [gcp]
+    source_record:
+      api: "cloudscheduler.projects.locations.jobs.list"
+      field: "httpTarget.uri"
+    where:
+      - "httpTarget.uri matches the Workflows executions.create endpoint (https://workflowexecutions.googleapis.com/v1/projects/.../workflows/.../executions)"
+      - "job.state == ENABLED"
+    emit:
+      source_type: Scheduler
+      target_type: Workflow
+      source: "<Cloud Scheduler job node (Scheduler)>"
+      target: "<workflow node>"
+      narrative: "{scheduler_job.name} targets {workflow.name} on its schedule, triggering executions."
+      false_positive_note: >-
+        Cloud Scheduler jobs can call the Workflows executions.create endpoint via HTTP
+        with caller-supplied credentials (OIDC SA token or API key). An ENABLED job fires
+        on its configured schedule. Also covers Cloud Tasks tasks (cloudtasks.googleapis.com)
+        creating executions when configured with a target pointing to the Workflows API —
+        coverage includes both Scheduler and Tasks as CanTrigger sources.
+
+  - id: gcp-workflows-explicit-cross-project-trust
+    emits: CrossProjectTrust
+    applies_to: [gcp]
+    source_record:
+      api: "workflows.projects.locations.workflows.getIamPolicy"
+      field: "bindings[].members"
+    where:
+      - "a member (user:, serviceAccount:) belongs to a different project than the workflow resource"
+    emit:
+      source_type: ResourcePolicy
+      target_type: Project
+      source: "<workflow IAM allow policy node>"
+      target: "<external project of the granted principal>"
+      narrative: "The IAM policy of {workflow.name} grants execution or edit rights to a principal in a different project — cross-project trigger trust."
+      false_positive_note: >-
+        CITE, DO NOT DUPLICATE can-control: this rule asserts the cross-project messaging
+        trust fact. CanEnterProject consequences are produced by can-control.yaml rules
+        consuming this CrossProjectTrust together with CanInvoke/CanTrigger and ExecutesAs.

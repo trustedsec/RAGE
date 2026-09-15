@@ -1,0 +1,381 @@
+# Azure Data Lake Storage Gen2 — Derived attack-path rules (Phase 11 — data/analytics/ML)
+# ---------------------------------------------------------------------------
+# ADLS Gen2 = Azure Blob Storage with hierarchical namespace (HNS) enabled on
+# Microsoft.Storage/storageAccounts (properties.isHnsEnabled == true).
+# It is NOT a separate resource type — the data-plane RBAC dataAction surface
+# is identical to Blob Storage; HNS adds POSIX ACLs and the Storage Blob Data
+# Owner runAsSuperUser ACL-bypass capability.
+#
+# Verified permissions (Microsoft.Storage resource-provider operations, 2026):
+#   listKeys:          Microsoft.Storage/storageAccounts/listKeys/action
+#   blob read:         Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read
+#   blob write:        Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write
+#   runAsSuperUser:    Microsoft.Storage/storageAccounts/blobServices/containers/blobs/runAsSuperUser/action
+#
+# Built-in roles (relevant subset):
+#   Storage Blob Data Reader      (2a2b9908-6ea1-4ae2-8e65-a410df84e7d1): blobs/read
+#   Storage Blob Data Contributor (ba92f5b4-2d11-453d-a403-e96b0029c9fe): blobs/read+write+delete
+#   Storage Blob Data Owner       (b7e6dc6d-f1e8-4753-8033-0f276bb0955b): blobs/* + runAsSuperUser
+#   Storage Account Key Operator  (81a9662b-bebf-436f-a333-f67b29880f12): listKeys+regenerateKeys
+#
+# Attack surface (Phase 11 dominant primitives):
+#   (2) DATA ACCESS + EXFIL: Storage Blob Data Reader/Owner → CanReadData; account
+#       key (listKeys) → ExposesCredential + full data access → CanExfiltrate.
+#   (4) PUBLIC CONTAINER: allowBlobPublicAccess=true + container publicAccess=Blob|Container
+#       → unauthenticated internet blob read → ExposedToInternet.
+#
+# POSIX ACL note: Storage Blob Data Owner holds runAsSuperUser — it bypasses all
+# directory/file POSIX ACLs. Storage Blob Data Reader/Contributor respect ACLs;
+# this distinction is captured in the false_positive_note of the CanReadData rule.
+#
+# Linchpin citations (CITE, DO NOT DUPLICATE):
+#   credential-chains.yaml — ExposesCredential + CredentialsFor → CanImpersonate
+#     (the account key ExposesCredential → CredentialsFor the storage service →
+#      read-secret-yields-identity if stored creds are present). Also
+#     execute-then-read-secret for workloads that mount this lake.
+#   can-control.yaml — CanAdminister + CanGrantPermission → Controls / CanEscalateTo
+#     (these derive from the broader ARM RBAC grant, not ADLS-specific).
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 11-data-analytics-ml
+applies_to: [azure]
+
+rules:
+
+  # --- Account key exposure: listKeys → CanReadCredential ----------------------
+  # The highest-impact ADLS Gen2 privilege: Microsoft.Storage/storageAccounts/listKeys/action
+  # returns the primary and secondary account keys. These keys:
+  #   - Bypass ALL Azure RBAC role assignments and POSIX ACLs
+  #   - Authenticate to the storage data plane as the account itself
+  #   - Allow generating arbitrary SAS tokens (any scope/permission/expiry)
+  #   - Can be distributed to external callers (no network restriction on the key itself)
+  # Modeled as CanReadCredential (the principal can obtain the account's AccessKey)
+  # because the principal does not yet hold data; it holds the CREDENTIAL that unlocks data.
+  # The credential-chains linchpin then derives CanImpersonate if CredentialsFor exists, or
+  # the CanExfiltrate rule below completes the chain (key → full data access).
+  - id: azure-adls-listkeys-exposes-credential
+    emits: CanReadCredential
+    description: "listKeys/action returns ADLS Gen2 account keys, bypassing all RBAC and ACLs."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+      - [ ?account,   ContainsCredential, ?key ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == DataLake"
+      - "?account.properties.isHnsEnabled == true  # ADLS Gen2 only"
+      - "?principal has EFFECTIVE Microsoft.Storage/storageAccounts/listKeys/action at ?account scope (Storage Account Key Operator Service Role 81a9662b-bebf-436f-a333-f67b29880f12, Contributor (b24988ac-6180-42a0-ab88-20f7382dd24c — NOT Storage Account Contributor which lacks listKeys), Owner, or custom role with listKeys)"
+      - "node_type(?key) == AccessKey  # the primary/secondary storage account keys"
+    emit:
+      source_type: Identity
+      target_type: AccessKey
+      source: ?principal
+      target: ?key
+      permissions: ["Microsoft.Storage/storageAccounts/listKeys/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment or deny Azure Policy covers listKeys/action at the
+        effective scope: BLOCKED; else ACTIVE. Network firewall (networkAcls) gates
+        the DATA plane, NOT the ARM control-plane listKeys call — listKeys succeeds
+        over the public ARM endpoint regardless of storage firewall settings.
+      confidence: "0.97"
+      derived_from: [ "<HasPermission edge_id (listKeys/action)>", "<ContainsCredential edge_id (account → AccessKey)>" ]
+      false_positive_note: >-
+        This rule models the principal's capability to read/retrieve the account's
+        AccessKey via listKeys/action. The credential-chains linchpin then derives
+        CanImpersonate if the key CredentialsFor another identity, or attacker uses
+        it directly for CanExfiltrate (see azure-adls-listkeys-full-exfiltrate).
+        listKeys is a CONTROL-PLANE ARM action and is NOT gated by the storage account
+        firewall (networkAcls) — it is callable from any network that can reach ARM
+        (management.azure.com). Do NOT apply a network_reachability condition to
+        CanReadCredential for the ARM action itself. Emit BLOCKED only when an Azure deny
+        assignment or Azure Policy deny effect explicitly covers listKeys/action.
+      narrative: >-
+        {principal.name} can call listKeys on {account.name}
+        (Microsoft.Storage/storageAccounts/listKeys/action), retrieving the primary and
+        secondary account keys. These keys bypass all Azure RBAC role assignments and
+        POSIX ACLs, authenticate as the storage service itself, and allow generating
+        arbitrary SAS tokens — a complete credential exposure for this data lake.
+
+  # --- User-delegation key generation: credential minting for SAS distribution -----
+  # A principal holding Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action
+  # can mint user-delegation SAS tokens (scoped to the caller's own Entra identity's
+  # permissions, not the account key) and distribute them to external parties. While the
+  # blast radius is narrower than account-key listKeys (no access as the storage account
+  # itself, only as the caller's identity), this is still a credential-minting primitive
+  # that enables persistent access delegation to third parties without Entra auth at
+  # the destination. Modeled as CanReadCredential on a Token target.
+  - id: azure-adls-generateuserdelegationkey-credential
+    emits: CanReadCredential
+    description: "generateUserDelegationKey/action allows minting user-delegation SAS tokens (Token credential type) for external distribution."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == DataLake"
+      - "?account.properties.isHnsEnabled == true"
+      - "?principal has EFFECTIVE Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action at ?account or container scope"
+    emit:
+      source_type: Identity
+      target_type: Token
+      source: ?principal
+      target: "<user-delegation SAS Token derived from ?account>"
+      permissions: ["Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if networkAcls.defaultAction == Deny AND ?principal not in IP/VNet allowlist
+        AND no private endpoint path: CONDITIONAL(network_reachability);
+        elif a deny assignment or deny Azure Policy covers generateUserDelegationKey: BLOCKED;
+        else ACTIVE (capable of minting user-delegation SAS tokens scoped to caller's identity).
+      confidence: "0.85"
+      derived_from: [ "<HasPermission edge_id (generateUserDelegationKey/action)>" ]
+      false_positive_note: >-
+        This is a narrower-scope credential minting compared to account-key listKeys.
+        User-delegation SAS tokens are scoped to the caller's own Entra identity's
+        permissions, not the account key (no storage-service-level bypass). However, the
+        tokens are distributable to external parties and do not require Entra auth at the
+        destination — enabling persistent cross-tenant access delegation. Network reachability
+        gates the data-plane endpoint where the key is generated. Unlike CanReadCredential
+        on AccessKey (listKeys), these tokens have caller-bounded permissions.
+
+  # --- Account key → full data exfiltration ---------------------------------
+  # Holding an account key (obtained via listKeys or leaked elsewhere) yields full
+  # data-plane access to EVERY container and file in the account, including the
+  # ability to generate SAS tokens distributable to external callers. This is
+  # CanExfiltrate because the key-holder can (a) read all data, (b) copy it out via
+  # SAS (no Entra auth required at the destination), and (c) grant persistent access
+  # to external parties by distributing long-lived SAS tokens.
+  - id: azure-adls-listkeys-full-exfiltrate
+    emits: CanExfiltrate
+    description: "Account key (from listKeys) grants full data-plane read and SAS generation — enabling complete data exfiltration."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+      - [ ?account,   ContainsCredential, ?key ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == DataLake"
+      - "?account.properties.isHnsEnabled == true"
+      - "?principal has EFFECTIVE Microsoft.Storage/storageAccounts/listKeys/action at ?account scope"
+      - "node_type(?key) == AccessKey  # the primary/secondary storage account key"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: ?account
+      permissions: ["Microsoft.Storage/storageAccounts/listKeys/action"]
+      conditions: [iam_permission]
+      state_logic: >-
+        if a deny assignment/deny Azure Policy covers listKeys/action: BLOCKED;
+        else ACTIVE. The account key itself is valid from any network — no
+        network_reachability gate applies once the key is obtained.
+      confidence: "0.95"
+      derived_from: [ "<HasPermission edge_id (listKeys/action)>", "<ContainsCredential edge_id (account → AccessKey)>" ]
+      false_positive_note: >-
+        This rule is the two-step collapse of (a) list the key and (b) use it to read
+        all data. The key is account-scoped and bypasses container-level RBAC, POSIX
+        ACLs, and soft-delete protections (keys can even be used to permanently delete
+        versioned blobs if soft-delete retention has expired). Separately, the key can
+        generate SAS tokens allowing read/write by third parties with no Entra identity.
+        Do NOT emit CanExfiltrate on the Storage Blob Data Reader role alone — that
+        role cannot generate account-key-level SAS tokens and is ACL-constrained.
+        credential-chains.yaml read-secret-yields-identity handles the pivot from
+        ExposesCredential → CredentialsFor → CanImpersonate when the key is the
+        registered credential for a service principal (rare but documented pattern).
+      narrative: >-
+        {principal.name} can list the account keys of {account.name}, then use those
+        keys to read, copy, or delete every blob and file in the data lake and generate
+        SAS tokens for external distribution — a full data exfiltration capability.
+
+  # --- Data-plane read via Storage Blob Data Reader / Owner -----------------
+  # A principal holding Storage Blob Data Reader (or Contributor / Owner) on the
+  # account or a container has the RBAC dataAction blobs/read. For ADLS Gen2 with
+  # HNS, Storage Blob Data Owner additionally holds runAsSuperUser, which bypasses
+  # all POSIX directory/file ACLs. This is a direct data read capability.
+  - id: azure-adls-blob-data-reader
+    emits: CanReadData
+    description: "Storage Blob Data Reader/Contributor/Owner grants effective data-plane read of ADLS Gen2 content."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == DataLake"
+      - "?account.properties.isHnsEnabled == true"
+      - "?principal has EFFECTIVE dataAction Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read at ?account or container scope (Storage Blob Data Reader 2a2b9908-6ea1-4ae2-8e65-a410df84e7d1, Storage Blob Data Contributor ba92f5b4-2d11-453d-a403-e96b0029c9fe, or Storage Blob Data Owner b7e6dc6d-f1e8-4753-8033-0f276bb0955b)"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: ?account
+      permissions: ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read"]
+      conditions: [iam_permission]
+      state_logic: >-
+        conditions field populated at evaluation time based on principal's network access:
+        if ?principal is in-VNet allowlist or has private endpoint path: conditions=[iam_permission];
+        elif networkAcls.defaultAction == Deny AND ?principal not in IP/VNet allowlist
+        AND no private endpoint path: conditions=[iam_permission, network_reachability] CONDITIONAL(network_reachability);
+        elif a deny assignment or deny Azure Policy covers blobs/read at effective scope: BLOCKED;
+        elif ?principal has Storage Blob Data Owner (runAsSuperUser): ACTIVE with no ACL conditions;
+        else ACTIVE subject to per-directory/file POSIX ACL evaluation at runtime
+        (ACL denials at paths below are a narrowing of this ACTIVE capability, not
+        a blanket block of the RBAC grant itself).
+      confidence: "0.90"
+      derived_from: [ "<HasPermission edge_id (blobs/read dataAction)>" ]
+      false_positive_note: >-
+        POSIX ACL subtlety: Storage Blob Data Reader/Contributor RBAC grants blobs/read
+        at the ARM level, but POSIX ACLs on individual directories/files in the HNS can
+        additionally deny access for those roles. ONLY Storage Blob Data Owner
+        (runAsSuperUser) bypasses ACLs entirely. Model as ACTIVE at the account level
+        (RBAC grant is real); ACL-based path narrowing is a runtime enforcement that
+        the graph cannot enumerate per-file — do not try to enumerate it. When the
+        principal is Storage Blob Data Owner, note the ACL bypass in the narrative.
+        Network firewall (networkAcls.defaultAction=Deny) gates the storage data-plane
+        endpoint — apply CONDITIONAL(network_reachability) for external callers without
+        an allowlisted IP/VNet or PE path. Do NOT apply a network condition to the ARM
+        listKeys call (separate rule, different network gate). Storage Blob Data Reader
+        does NOT grant listKeys — do not conflate.
+      narrative: >-
+        {principal.name} holds the blobs/read dataAction on {account.name}
+        (Storage Blob Data Reader or higher), enabling data-plane read of all blob and
+        file content in this ADLS Gen2 account. POSIX ACLs may restrict access to
+        specific paths unless the principal holds Storage Blob Data Owner (runAsSuperUser
+        bypasses all ACLs).
+
+  # --- Data-plane write via Storage Blob Data Contributor / Owner -----------------
+  # A principal holding Storage Blob Data Contributor (ba92f5b4) or Storage Blob Data
+  # Owner (b7e6dc6d) on the account or a container has the RBAC dataAction blobs/write
+  # and blobs/delete. This enables poisoning blob content (ML model weights, Spark
+  # scripts, DAG files) in the data lake, driving onward CanModifyCode escalations via
+  # compute services that mount this lake. For ADLS Gen2 with HNS, Storage Blob Data
+  # Owner additionally holds runAsSuperUser, which bypasses all POSIX ACLs.
+  - id: azure-adls-blob-data-write
+    emits: CanWriteData
+    description: "Storage Blob Data Contributor/Owner grants effective data-plane write of ADLS Gen2 content."
+    match:
+      - [ ?principal, HasPermission, ?account ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == DataLake"
+      - "?account.properties.isHnsEnabled == true"
+      - "?principal has EFFECTIVE dataAction Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write at ?account or container scope (Storage Blob Data Contributor ba92f5b4-2d11-453d-a403-e96b0029c9fe or Storage Blob Data Owner b7e6dc6d-f1e8-4753-8033-0f276bb0955b)"
+    emit:
+      source_type: Identity
+      target_type: Data
+      source: ?principal
+      target: ?account
+      permissions: ["Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"]
+      conditions: [iam_permission, network_reachability]
+      state_logic: >-
+        if networkAcls.defaultAction == Deny AND ?principal not in IP/VNet allowlist
+        AND no private endpoint path from ?principal to ?account: CONDITIONAL(network_reachability);
+        elif a deny assignment or deny Azure Policy covers blobs/write at effective scope: BLOCKED;
+        elif ?principal has Storage Blob Data Owner (runAsSuperUser): ACTIVE with no ACL conditions;
+        else ACTIVE subject to per-directory/file POSIX ACL evaluation at runtime
+        (ACL denials at paths below are a narrowing of this ACTIVE capability, not
+        a blanket block of the RBAC grant itself).
+      confidence: "0.90"
+      derived_from: [ "<HasPermission edge_id (blobs/write dataAction)>" ]
+      false_positive_note: >-
+        POSIX ACL subtlety: Storage Blob Data Contributor RBAC grants blobs/write
+        at the ARM level, but POSIX ACLs on individual directories/files in the HNS can
+        additionally deny access for those roles. ONLY Storage Blob Data Owner
+        (runAsSuperUser) bypasses ACLs entirely. Model as ACTIVE at the account level
+        (RBAC grant is real); ACL-based path narrowing is a runtime enforcement that
+        the graph cannot enumerate per-file — do not try to enumerate it. When the
+        principal is Storage Blob Data Owner, note the ACL bypass in the narrative.
+        Network firewall (networkAcls.defaultAction=Deny) gates the storage data-plane
+        endpoint — apply CONDITIONAL(network_reachability) for external callers without
+        an allowlisted IP/VNet or PE path. The downstream CanModifyCode pivot (poisoned
+        ML model weights / Spark scripts / DAG files consumed by Synapse / Databricks /
+        AML compute) is handled by compute service rules via cicd-chains linchpin, not
+        here. Storage Blob Data Reader does NOT grant write — do not conflate.
+      narrative: >-
+        {principal.name} holds the blobs/write dataAction on {account.name}
+        (Storage Blob Data Contributor or Storage Blob Data Owner), enabling data-plane
+        write and modification of all blob and file content in this ADLS Gen2 account,
+        including poisoning ML model weights, analytics artifacts, and executable
+        configurations consumed by downstream compute services. POSIX ACLs may restrict
+        access to specific paths unless the principal holds Storage Blob Data Owner
+        (runAsSuperUser bypasses all ACLs).
+
+  # --- Public container: anonymous internet blob read -----------------------
+  # When an ADLS Gen2 account has allowBlobPublicAccess=true AND at least one container
+  # has publicAccess=Blob or publicAccess=Container, any internet user can read
+  # blob content without authentication. This is a direct ExposedToInternet path.
+  # Note: if allowBlobPublicAccess=false at the ACCOUNT level, the container-level
+  # publicAccess property is IGNORED — do NOT emit this rule in that case.
+  - id: azure-adls-public-container
+    emits: ExposedToInternet
+    description: "ADLS Gen2 account with public blob access enabled and a public container exposes blob data to unauthenticated internet access."
+    match:
+      - [ ?account, Contains, ?container ]
+    where:
+      - "node_class(?account) == Data and node_type(?account) == DataLake"
+      - "?account.properties.isHnsEnabled == true"
+      - "?account.properties.publicNetworkAccess != Disabled  # publicNetworkAccess=Disabled overrides allowBlobPublicAccess and closes the public endpoint entirely"
+      - "?account.properties.allowBlobPublicAccess == true  # account-level gate; if false, container publicAccess is ignored"
+      - "node_type(?container) == ObjectStorage  # blobServices/containers node"
+      - "?container.properties.publicAccess in ['Blob', 'Container']  # Blob=blob-level anon read; Container=list+read"
+    emit:
+      source_type: Storage
+      target_type: AnonymousIdentity
+      source: ?container
+      target: "<AnonymousIdentity>"
+      permissions: []
+      conditions: [network_reachability]
+      state_logic: >-
+        if ?account.properties.publicNetworkAccess == Disabled: DO NOT EMIT (public
+        endpoint is fully closed regardless of allowBlobPublicAccess or container
+        publicAccess settings — this is a blocking gate);
+        elif ?account.properties.allowBlobPublicAccess == false: DO NOT EMIT (container
+        publicAccess is ignored when account-level flag is false);
+        elif networkAcls.defaultAction == Deny AND public internet is not in allowlist:
+        CONDITIONAL(network_reachability) — the public access setting is enabled but the
+        network firewall blocks public internet traffic;
+        elif ?container.properties.publicAccess == 'Container': ACTIVE (anonymous list+read);
+        elif ?container.properties.publicAccess == 'Blob': ACTIVE (anonymous blob read, no listing).
+      confidence: "0.93"
+      derived_from: [ "<Contains edge_id (account → container)>", "<container publicAccess property record>", "<account allowBlobPublicAccess property record>" ]
+      false_positive_note: >-
+        CRITICAL: the account-level `allowBlobPublicAccess=false` setting OVERRIDES any
+        container-level publicAccess — the storage service returns 409 if public access
+        is attempted on a container under a public-blocked account. Do NOT emit
+        ExposedToInternet if the account flag is false, even if the container property
+        says Blob or Container. A networkAcls.defaultAction=Deny firewall with no public
+        internet IP allowlist blocks the public endpoint — downgrade to
+        CONDITIONAL(network_reachability). Note that publicAccess=Container allows
+        directory listing (a superset of Blob-only access) — treat it as higher impact.
+        This is purely anonymous data exposure (no Entra identity involved); use
+        target AnonymousIdentity, not a tenant/account boundary node.
+      narrative: >-
+        {container.name} in {account.name} is publicly readable from the internet
+        without authentication: the account has allowBlobPublicAccess=true and the
+        container publicAccess={container.properties.publicAccess}. Any internet user
+        can read{if publicAccess=='Container': ' and list'} blobs in this container.
+
+# ---------------------------------------------------------------------------
+# Explicit normalization note:
+#   The base HasPermission records (effective dataAction blobs/read, effective
+#   listKeys/action, container publicAccess properties) must be emitted by
+#   /rules/explicit/azure-adls.yaml. That file normalizes:
+#     - ARM RBAC role assignments at account/container scope → HasPermission
+#     - storageAccount.properties.allowBlobPublicAccess → property record
+#     - container.properties.publicAccess → property record
+#     - ContainsCredential(account → AccessKey) — structural fact
+#   No explicit file is required if the azure-storage explicit normalizer already
+#   covers these (azure:storage phase-6 may have produced them for the same
+#   Microsoft.Storage/storageAccounts type); ADLS-specific rules only need the
+#   isHnsEnabled gate to scope to Gen2 accounts.
+#
+# BLOCKED-edge guidance:
+#   - Azure deny assignment covering blobs/read → azure-adls-blob-data-reader BLOCKED.
+#   - Azure deny assignment covering listKeys/action → azure-adls-listkeys-* BLOCKED.
+#   - networkAcls.defaultAction=Deny (no allowlist / PE) → azure-adls-blob-data-reader
+#     CONDITIONAL(network_reachability); listKeys rules are ARM-plane and NOT gated.
+#   - allowBlobPublicAccess=false → azure-adls-public-container DO NOT EMIT.
+#
+# Linchpin cross-references (DO NOT RE-DERIVE here):
+#   credential-chains.yaml:
+#     - ExposesCredential(?account → AccessKey) + CredentialsFor(AccessKey → identity)
+#       → read-secret-yields-identity: CanImpersonate if the key authenticates an SP.
+#     - execute-then-read-secret: a workload mounting ADLS that CanExecuteAs a MI
+#       inherits that MI's CanReadData capability.
+#   can-control.yaml:
+#     - escalate-via-execute-as / control-boundary-via-iam-admin handle the roll-up
+#       from CanReadData / ExposesCredential to CanEscalateTo when the data lake
+#       is the crown jewel or the key yields a more-privileged identity.
+# ---------------------------------------------------------------------------

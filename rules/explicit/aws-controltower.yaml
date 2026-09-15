@@ -1,0 +1,115 @@
+# Normalizing AWS Control Tower into explicit edges.
+# ---------------------------------------------------------------------------
+# The adapter emits raw CT records (ListLandingZones/GetLandingZone,
+# ListEnabledControls/GetEnabledControl, ListEnabledBaselines) plus the IAM role
+# records for AWSControlTowerExecution and the Organizations SCP records the
+# controls map to. These rules translate those raw facts into explicit edges the
+# derived rules in rules/derived/aws/controltower.yaml consume.
+#
+# ANTI-DUPLICATION: Organizations already normalizes Contains (Org->OU->Account),
+# the ServiceControlPolicy nodes, and account/OU boundaries. Do NOT re-emit those
+# here — reference the existing SCP/boundary nodes. This file only adds the
+# CT-specific explicit edges (execution-role trust/assume, EnabledControl->SCP
+# HasPolicy, LandingZone->Organization LocatedIn).
+# ---------------------------------------------------------------------------
+
+rules:
+
+  # --- LandingZone is located in the organization it governs ----------------
+  - id: aws-ct-landingzone-locatedin-org
+    emits: LocatedIn
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::ControlTower::LandingZone", field: "Arn"}
+    emit:
+      source_type: "*"
+      source: "<LandingZone node (ManagementService)>"
+      target: "<Organization boundary node (from Organizations adapter)>"
+      api_source: "controltower:GetLandingZone + organizations:DescribeOrganization"
+      evidence_field: "LandingZone.Arn / DescribeOrganization.Id"
+      narrative: "{landing_zone.name} is the Control Tower landing zone governing organization {org.name}."
+
+  # --- AWSControlTowerExecution trust policy names the management account ----
+  - id: aws-ct-execution-role-trust
+    emits: CrossAccountTrust
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::IAM::Role", field: "AssumeRolePolicyDocument"}
+    where:
+      - "role name == 'AWSControlTowerExecution' (deployed by CT into every enrolled member account)"
+      - "the trust policy Principal names the Organizations management account root (arn:aws:iam::<mgmt>:root)"
+    emit:
+      source: "<AWSControlTowerExecution role trust policy (in member account)>"
+      target: "<management Account boundary node>"
+      api_source: "iam:GetRole (AssumeRolePolicyDocument)"
+      evidence_field: "AssumeRolePolicyDocument.Statement[].Principal.AWS"
+      narrative: "AWSControlTowerExecution in account {account.name} trusts the management account {mgmt.name} to assume it (full AdministratorAccess)."
+
+  # --- Effective sts:AssumeRole of a mgmt-account principal onto the CT role -
+  - id: aws-ct-execution-role-assumable
+    emits: CanAssume
+    applies_to: [aws]
+    match_effective_permission:
+      action: "sts:AssumeRole"
+      resource_type: "AWS::IAM::Role"
+    where:
+      - "target role name == 'AWSControlTowerExecution'"
+      - "trust policy admits the caller (mgmt-account principal) — already true by CT design"
+      - "caller's identity policy grants sts:AssumeRole on arn:aws:iam::<member>:role/AWSControlTowerExecution (trust alone is insufficient)"
+      - "account_of(caller) is the organization management account (SCPs cannot restrict it)"
+    emit:
+      source_type: Identity
+      source: "<management-account principal>"
+      target: "<AWSControlTowerExecution role in member account>"
+      api_source: "policy evaluation (sts:AssumeRole) + iam:GetRole trust"
+      permissions: ["sts:AssumeRole"]
+      false_positive_note: >-
+        Emit only when the caller's identity policy actually grants sts:AssumeRole on
+        the role ARN (or a wildcard covering it) AND the caller is a management-account
+        principal. The trust policy admits the mgmt account, but the assume still
+        requires the caller-side permission. Feeds derived
+        aws-ct-execution-role-enter-account (cross-account -> CanEnterAccount).
+      narrative: "{principal.name} (management account) can assume AWSControlTowerExecution in account {account.name} (sts:AssumeRole; role trusts the mgmt account)."
+
+  # --- EnabledControl (preventive) is backed by an SCP guardrail -------------
+  - id: aws-ct-control-backing-scp
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::ControlTower::EnabledControl", field: "ControlIdentifier"}
+    where:
+      - "the control's behavior == PREVENTIVE (detective controls are AWS Config rules and back no SCP)"
+      - "resolve the backing Organizations ServiceControlPolicy the control materializes (aws-guardrails-* SCP attached at the target OU)"
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<EnabledControl Policy node>"
+      target: "<backing ServiceControlPolicy node (from Organizations adapter)>"
+      api_source: "controltower:GetEnabledControl / ListControlOperations + organizations:ListPolicies/DescribePolicy"
+      evidence_field: "EnabledControl.ControlIdentifier -> Organizations Policy.Id"
+      false_positive_note: >-
+        Only PREVENTIVE controls back an SCP. Detective controls back a Config rule
+        (emit nothing here — they gate no edge). Reference the existing
+        ServiceControlPolicy node from the Organizations adapter; do not create a
+        duplicate SCP node.
+      narrative: "Control Tower control {control.name} is backed by SCP guardrail {scp.name} (preventive control -> service control policy)."
+
+  # --- OU has the EnabledControl policy attached (governs it) ----------------
+  # HasPolicy in the OU->control direction: the boundary (Folder) HAS the control
+  # policy attached, which inherits to child accounts. HasPolicy source=[Identity,'*']
+  # admits the AdministrativeBoundary, target=[Policy] admits the EnabledControl
+  # Policy node — fully schema-conformant. (Previously mis-modeled as AttachedTo,
+  # whose source=[NetworkInterface,BlockStorage,ManagedIdentity,IAMPolicy] /
+  # target=[Compute,VirtualNetwork,Identity] admits NEITHER the control policy nor
+  # the OU boundary.)
+  - id: aws-ct-control-attached-to-ou
+    emits: HasPolicy
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::ControlTower::EnabledControl", field: "TargetIdentifier"}
+    where:
+      - "TargetIdentifier resolves to a registered OU (Folder) boundary node"
+    emit:
+      source_type: "*"
+      target_type: Policy
+      source: "<OU (Folder) boundary node from Organizations adapter>"
+      target: "<EnabledControl Policy node>"
+      api_source: "controltower:GetEnabledControl (TargetIdentifier)"
+      evidence_field: "EnabledControl.TargetIdentifier"
+      narrative: "OU {ou.name} has Control Tower control {control.name} attached, inheriting to every account within it."

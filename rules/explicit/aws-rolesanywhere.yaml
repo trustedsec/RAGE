@@ -1,0 +1,147 @@
+# Normalizing AWS IAM Roles Anywhere (rolesanywhere) into explicit edges.
+# ---------------------------------------------------------------------------
+# The adapter emits raw Roles Anywhere records (ListTrustAnchors/GetTrustAnchor,
+# ListProfiles/GetProfile, ListCrls) and the target IAM roles' trust policies
+# (iam:GetRole AssumeRolePolicyDocument), plus effective-permission decisions for
+# the rolesanywhere:* management actions. These rules translate them into the SAME
+# two Phase-14 NORMALIZED trust facts every federation adapter emits —
+# TrustsExternalIdentity + ExternalIdentityMapsTo — so the provider-agnostic
+# collapse in /rules/derived/federation-chains.yaml gives full path-finding for
+# free (that file is the linchpin; see federation-maps-to-identity /
+# federate-then-enter-account / federate-inherits-capabilities /
+# forge-cert-yields-federation). CredentialValidFor ties a concrete client cert to
+# the role it authenticates as.
+#
+# TRUST MODEL (docs: rolesanywhere/latest/userguide/trust-model.html):
+#   A trust anchor references a CA (AWS Private CA / external CA cert). The target
+#   IAM role's trust policy MUST grant sts:AssumeRole + sts:TagSession +
+#   sts:SetSourceIdentity to Principal.Service = rolesanywhere.amazonaws.com, and
+#   MAY condition on aws:SourceArn (== trust-anchor ARN) and cert-attribute
+#   PrincipalTags: aws:PrincipalTag/x509Subject/CN, /x509Issuer/CN, /x509SAN/DNS,
+#   /x509SAN/URI, /x509SAN/Name/CN, etc. The profile selects which roles + one
+#   session policy. CreateSession (signed with the cert private key) => STS temp
+#   creds for a profile role. The CONDITION on the role trust policy is the state
+#   gate the derived rules read.
+#
+# EDGE SOURCE/TARGET CONFORMANCE (schema/edges.yaml), honored by every emit; typed
+# source_type/target_type declared per RULE-FORMAT.md, within these sets:
+#   TrustsExternalIdentity: source [Role, ServiceAccount, ApplicationIdentity, ResourcePolicy]
+#                           target [ExternalIdentity, FederatedIdentity]
+#   ExternalIdentityMapsTo: source [ExternalIdentity, FederatedIdentity]
+#                           target [Identity, Role, ServiceAccount]
+#   CredentialValidFor:     source [Secret, Credential, Token]  target [Identity, ServiceIdentity]
+#   Contains / HasPolicy:   structural
+# ---------------------------------------------------------------------------
+
+rules:
+
+  # --- Trust anchor -> CA reference (recorded as a property, not a structural edge)
+  # The trust anchor names WHICH CA (a SigningKey — ACM PCA arn — or an external CA
+  # cert bundle) IAM Roles Anywhere validates client certs against. There is no
+  # conformant common edge for a Policy(anchor) -> Secret(CA) structural link
+  # (Contains.source is [AdministrativeBoundary]; ContainsResourceReference.source is
+  # [Data, Storage, Compute]). Following the aws-acmpca convention of recording CA
+  # references as edge PROPERTIES, the anchor-CA linkage is carried as the
+  # `trust_anchor_ca` property on the TrustsExternalIdentity edge below, which is what
+  # federation-chains.yaml forge-cert-yields-federation reads to resolve
+  # trust_anchor_of(?anchor -> ?ext) == ?ca. No standalone structural edge is emitted.
+
+  # --- Role trust policy trusts the Roles Anywhere service principal ----------
+  # THE normalized inbound-trust fact. The role's AssumeRolePolicyDocument names
+  # Service=rolesanywhere.amazonaws.com; the external side is the cert holder
+  # (FederatedIdentity/ExternalIdentity) validated by the anchor CA. The trust
+  # CONDITION (cert-attribute pin, or none) is recorded on the edge for the
+  # derived rules' state gate.
+  - id: aws-rolesanywhere-role-trusts-external
+    emits: TrustsExternalIdentity
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::IAM::Role", field: "AssumeRolePolicyDocument"}
+    where:
+      - "a trust-policy statement has Principal.Service == 'rolesanywhere.amazonaws.com'"
+      - "Action includes sts:AssumeRole (typically also sts:TagSession + sts:SetSourceIdentity)"
+    emit:
+      source_type: Role
+      target_type: FederatedIdentity
+      source: "<target IAM role>"
+      target: "<external cert-holder identity validated by the anchor CA (FederatedIdentity)>"
+      api_source: "iam:GetRole"
+      evidence_field: "AssumeRolePolicyDocument.Statement[].Principal.Service / Action / Condition"
+      condition_recorded:
+        # The state gate. Broad/unpinned => derived rule emits ACTIVE; pinned => CONDITIONAL.
+        source_arn: "aws:SourceArn (== trust-anchor ARN; absent => ANY anchor in account qualifies)"
+        cert_subject_pin: "aws:PrincipalTag/x509Subject/CN | /x509SAN/* | /x509Issuer/CN (absent => any cert from the anchor CA matches)"
+        trust_anchor_ca: "the CA (SigningKey — ACM PCA arn / external CA cert) the anchor validates against; forge-cert-yields-federation reads this to resolve trust_anchor_of == ?ca"
+      narrative: >-
+        IAM role {role.name} trusts the IAM Roles Anywhere service principal; it
+        accepts an external X.509 identity validated by trust anchor {anchor.name},
+        conditioned on {cert_condition_summary or 'NO certificate-attribute condition'}.
+
+  # --- Profile + role mapping realizes cert subject -> role -------------------
+  # The realized mapping the Phase-14 collapse consumes. A profile lists roleArns;
+  # combined with the trust anchor, a client cert whose subject satisfies the role
+  # trust condition maps to that role. Emitted per (profile role) that also has a
+  # backing TrustsExternalIdentity from aws-rolesanywhere-role-trusts-external.
+  - id: aws-rolesanywhere-external-maps-to-role
+    emits: ExternalIdentityMapsTo
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::RolesAnywhere::Profile", field: "roleArns"}
+    where:
+      - "?role in Profile.roleArns has a trust policy trusting rolesanywhere.amazonaws.com (backing TrustsExternalIdentity exists)"
+      - "the Profile is enabled and the referenced trust anchor is enabled"
+    emit:
+      source_type: FederatedIdentity
+      target_type: Role
+      source: "<cert-subject external identity (FederatedIdentity) admitted by the role trust condition>"
+      target: "<IAM role from Profile.roleArns>"
+      api_source: "rolesanywhere:GetProfile + iam:GetRole"
+      evidence_field: "Profile.roleArns / Profile.sessionPolicy / role AssumeRolePolicyDocument Condition"
+      condition_recorded:
+        session_policy: "Profile.sessionPolicy / managedPolicyArns (ceiling on the resulting session)"
+        cert_subject_pin: "inherited from the role trust policy condition (the actual gate)"
+      narrative: >-
+        A client certificate admitted by {role.name}'s trust condition maps, via
+        profile {profile.name}, to IAM role {role.name} (its session capped by the
+        profile session policy).
+
+  # --- A specific client certificate authenticates as the role ---------------
+  # When a concrete end-entity certificate (a Certificate/Secret node) is known to
+  # authenticate as the role (observed CreateSession, or an issued cert whose
+  # subject matches the pin), tie it to the role so credential-centric queries and
+  # the forge-cert chain resolve. The cert private-key holder holds role creds.
+  - id: aws-rolesanywhere-cert-valid-for-role
+    emits: CredentialValidFor
+    applies_to: [aws]
+    match_record: {resource_type: "AWS::RolesAnywhere::TrustAnchor", field: "subjects"}
+    where:
+      - "a specific end-entity certificate (Certificate/Secret) chains to the anchor CA"
+      - "its subject/SAN satisfies the target role's trust condition (or the role trust has no cert condition)"
+    emit:
+      source_type: Certificate
+      target_type: Identity
+      source: "<end-entity client certificate (Certificate / Secret)>"
+      target: "<IAM role the cert authenticates as (Identity)>"
+      api_source: "rolesanywhere:ListSubjects | CloudTrail CreateSession | issued-cert record"
+      evidence_field: "certificate Subject/SAN/serial ; role trust condition"
+      note: >-
+        The private key + certificate together are the credential — a holder of the
+        private key (e.g. via Phase-5 aws:acm/aws:acmpca export, or a leaked key on a
+        compromised host) authenticates as the role. IAM Roles Anywhere never stores
+        the private key.
+      narrative: >-
+        Certificate {cert.subject} (chaining to {anchor.ca}) authenticates as IAM role
+        {role.name} via IAM Roles Anywhere; its private-key holder holds {role.name}'s
+        temporary credentials.
+
+# ---------------------------------------------------------------------------
+# NOTES
+#  - The rolesanywhere:* management actions (CreateTrustAnchor / UpdateTrustAnchor /
+#    CreateProfile / UpdateProfile) become CanModifyTrust in the DERIVED file
+#    (/rules/derived/aws/rolesanywhere.yaml), because they require pairing with
+#    iam:PassRole and produce an attacker-writable trust — that is derivation, not
+#    raw normalization.
+#  - Loosening the ROLE trust policy itself (removing the x509Subject condition) is
+#    iam:UpdateAssumeRolePolicy — already normalized by the Phase-2 rule
+#    aws-update-assume-role-policy (CanModifyTrust). Not duplicated here.
+#  - A revoked certificate (present on an imported CRL) must NOT yield a
+#    CredentialValidFor / mapping — the adapter drops it.
+# ---------------------------------------------------------------------------

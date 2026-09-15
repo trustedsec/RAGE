@@ -1,0 +1,457 @@
+# Azure — App Service / Web Apps (Microsoft.Web/sites) execution rules (Phase 4)
+# ---------------------------------------------------------------------------
+# Core Azure App Service escalation primitive:
+#   an attacker who gets code running in the app worker inherits every managed
+#   identity (MI) bound to the site, because that code can mint MI tokens from the
+#   App Service MSI token endpoint (env vars IDENTITY_ENDPOINT + IDENTITY_HEADER;
+#   legacy MSI_ENDPOINT/MSI_SECRET). This is NOT the 169.254 IMDS used by VMs.
+#
+# Control-plane code execution needs NO app credential:
+#   - Microsoft.Web/sites/publish/action                 (ZipDeploy / package publish)
+#   - Microsoft.Web/sites/config/write                   (appCommandLine / startup) + restart
+#   - Microsoft.Web/sites/extensions/write | siteextensions/write   (site/Kudu extension)
+#   - Microsoft.Web/sites/sitecontainers/write           (custom container image)
+#   - Microsoft.Web/sites/sourcecontrols/write           (attacker Git repo auto-deploy)
+#   - Microsoft.Web/sites/functions/write                (Function App code)
+#   - Microsoft.Web/sites/write                           (attach user-assigned MI / identity block)
+#
+# Two control-plane actions leak long-lived credentials directly (no Key Vault):
+#   - Microsoft.Web/sites/publishxml/action              (publishing profile: SCM/FTP creds)
+#   - Microsoft.Web/sites/config/list/action             (app settings + connection strings)
+#   - Microsoft.Web/sites/host/listkeys/action | functions/listkeys/action  (function keys)
+#
+# All operation strings verified against the Azure resource-provider operations
+# reference (Microsoft.Web) and the App Service managed-identity docs. Every rule
+# records the effective operation the evaluator must confirm at the site (or MI)
+# scope. Deny assignments override -> BLOCKED. Escalation edges require the MI to
+# out-privilege the caller. Slot operations (Microsoft.Web/sites/slots/...) mirror
+# every site operation and are in scope for the same rules.
+# ---------------------------------------------------------------------------
+
+provider: azure
+phase: 4-compute-serverless
+applies_to: [azure]
+
+rules:
+
+  # === Administrative control over the site object ==========================
+  - id: azure-appsvc-contributor
+    emits: CanAdminister
+    match_effective_permission: {action: "Microsoft.Web/sites/write", scope_type: "resource|resourceGroup|subscription"}
+    where: ["principal effectively holds Website Contributor / Contributor / Owner (or a custom role granting Microsoft.Web/sites/*) at the scope"]
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Microsoft.Web/sites in scope>"
+      permissions: ["Microsoft.Web/sites/write"]
+      false_positive_note: "Website Contributor grants sites/* (deploy/config/publish) but NOT Microsoft.Authorization/*/write and NOT sites/config/list/action; it is still sufficient for code execution via publish/config/extensions."
+      narrative: "{principal.name} has full control of App Service {target.name} (Microsoft.Web/sites/*)."
+
+  # === Code modification / deployment =======================================
+  - id: azure-appsvc-publish-deploy
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Web/sites/publish/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Microsoft.Web/sites>"
+      permissions: ["Microsoft.Web/sites/publish/action"]
+      conditions: [service_state]
+      escalation: "ZipDeploy / package publish attacker application code into the app worker."
+      false_positive_note: "Deployed code runs when the app worker is running; on a stopped app emit CONDITIONAL(service_state) and pair with azure-appsvc-start. No app credential is required."
+      narrative: "{principal.name} can deploy attacker code to {target.name} (Microsoft.Web/sites/publish/action)."
+
+  - id: azure-appsvc-extension-write
+    emits: CanModifyCode
+    match_effective_permission: {action: ["Microsoft.Web/sites/extensions/write", "Microsoft.Web/sites/siteextensions/write"], scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Microsoft.Web/sites>"
+      permissions: ["Microsoft.Web/sites/extensions/write", "Microsoft.Web/sites/siteextensions/write"]
+      conditions: [service_state]
+      escalation: "Install a site/Kudu extension that runs in the app worker process."
+      false_positive_note: "Extension loads in the worker; if the app is stopped, CONDITIONAL(service_state) + CanStart."
+      narrative: "{principal.name} can install a site extension on {target.name} (extensions/write), running attacker code in the worker."
+
+  - id: azure-appsvc-sourcecontrol-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Web/sites/sourcecontrols/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Microsoft.Web/sites>"
+      permissions: ["Microsoft.Web/sites/sourcecontrols/write"]
+      conditions: [service_state]
+      escalation: "Point the app's deployment source at an attacker-controlled Git repo; the build/deploy pipeline runs attacker code."
+      false_positive_note: "Realizes execution on the next sync/build; requires continuous deployment to actually pull. On a stopped app CONDITIONAL(service_state)."
+      narrative: "{principal.name} can repoint the source control of {target.name} to an attacker repo (sourcecontrols/write)."
+
+  - id: azure-appsvc-container-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Web/sites/sitecontainers/write", scope_type: "resource|resourceGroup|subscription"}
+    where: ["site is a custom-container / Linux container app (properties.siteConfig.linuxFxVersion references a container image)"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Microsoft.Web/sites>"
+      permissions: ["Microsoft.Web/sites/sitecontainers/write"]
+      conditions: [service_state]
+      escalation: "Set/replace the container image the app runs to an attacker image."
+      false_positive_note: "Only meaningful for custom-container apps; code apps ignore container settings. Requires restart/pull to take effect."
+      narrative: "{principal.name} can set the container image of {target.name} (sitecontainers/write) to an attacker image."
+
+  - id: azure-appsvc-function-write
+    emits: CanModifyCode
+    match_effective_permission: {action: "Microsoft.Web/sites/functions/write", scope_type: "resource|resourceGroup|subscription"}
+    where: ["site is a Function App (kind contains 'functionapp')"]
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<Microsoft.Web/sites (Function App)>"
+      permissions: ["Microsoft.Web/sites/functions/write"]
+      conditions: [service_state]
+      escalation: "Write/replace a function's code; it runs as the app MI on next trigger/invoke."
+      false_positive_note: "Function Apps only. Runtime deployment model (RunFromPackage read-only) can block direct function writes; then use publish/action instead."
+      narrative: "{principal.name} can write function code to {target.name} (functions/write), executing as the app's identity."
+
+  # === Configuration modification ===========================================
+  - id: azure-appsvc-config-write
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: ["Microsoft.Web/sites/config/write", "Microsoft.Web/sites/config/web/appsettings/write"], scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Microsoft.Web/sites>"
+      permissions: ["Microsoft.Web/sites/config/write", "Microsoft.Web/sites/config/web/appsettings/write"]
+      conditions: [service_state]
+      note: "Set appCommandLine (Linux startup command), WEBSITE_RUN_FROM_PACKAGE, handler mappings, or the identity block; realizes execution at next restart/boot."
+      false_positive_note: "Config-driven execution needs a restart and a running plan; on a stopped app CONDITIONAL(service_state) + CanStart."
+      narrative: "{principal.name} can rewrite the configuration of {target.name} (config/write) including the startup command and app settings."
+
+  - id: azure-appsvc-reenable-basic-auth
+    emits: CanModifyConfiguration
+    match_effective_permission: {action: "Microsoft.Web/sites/basicPublishingCredentialsPolicies/write", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: "*"
+      source: "<principal>"
+      target: "<Microsoft.Web/sites>"
+      permissions: ["Microsoft.Web/sites/basicPublishingCredentialsPolicies/write"]
+      note: "Re-enable SCM/FTP basic auth that a defender disabled, restoring a credentialed Kudu/FTP data-plane foothold (prerequisite to make publishxml creds usable)."
+      narrative: "{principal.name} can re-enable basic publishing credentials on {target.name} (basicPublishingCredentialsPolicies/write)."
+
+  - id: azure-appsvc-start
+    emits: CanStart
+    match_effective_permission: {action: ["Microsoft.Web/sites/start/action", "Microsoft.Web/sites/restart/action"], scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Microsoft.Web/sites>"
+      permissions: ["Microsoft.Web/sites/start/action", "Microsoft.Web/sites/restart/action"]
+      note: "Realizes CONDITIONAL(service_state) execution edges: start a stopped app or restart to load new code/config."
+      narrative: "{principal.name} can start/restart {target.name} (start/restart action) to enable/realize code execution."
+
+  # === Identity attachment (Azure PassRole analog) ==========================
+  - id: azure-appsvc-attach-user-mi
+    emits: CanAttachIdentity
+    match:
+      - [ ?principal, CanPassIdentity, ?userMI ]
+    where:
+      - "?principal has EFFECTIVE Microsoft.ManagedIdentity/userAssignedIdentities/assign/action on ?userMI"
+      - "?principal has EFFECTIVE Microsoft.Web/sites/write on the target site"
+      - "the target site is an EXISTING Microsoft.Web/sites resource"
+    emit:
+      source_type: Identity
+      target_type: Compute
+      source: "<principal>"
+      target: "<Microsoft.Web/sites (existing)>"
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Web/sites/write"]
+      conditions: [role_compatibility]
+      false_positive_note: "BOTH permissions are required: assign/action on the MI AND sites/write on the site. Neither alone attaches the MI. Honor the assign/action resource scope. CanAttachIdentity applies only to an EXISTING site; the create-new-site variant is modeled via CanDeploy + CanPassIdentity -> CanCreateWorkloadAs, not this rule."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to existing App Service {target.name} (assign/action + sites/write)."
+
+  # === MSI token endpoint credential exposure / token retrieval =============
+  - id: azure-appsvc-msi-token
+    emits: CanRetrieveToken
+    description: "Any code in the app worker can mint a bearer token for each bound MI via the App Service MSI token endpoint."
+    match:
+      - [ ?site, ExecutesAs, ?mi ]
+    emit:
+      source: "<Microsoft.Web/sites>"
+      target: "<managed identity bound to the site>"
+      permissions: []
+      note: "MSI endpoint: GET %IDENTITY_ENDPOINT%?resource=<aud>&api-version=2019-08-01 with header 'X-IDENTITY-HEADER: %IDENTITY_HEADER%' (legacy MSI_ENDPOINT/MSI_SECRET). NOT 169.254 IMDS. The companion credential-exposure fact is emitted by azure-appsvc-msi-exposescred (ExposesCredential)."
+      false_positive_note: "Only fires when the site actually has a managed identity (identity.type != None). No MI => no token; do NOT emit."
+      narrative: "Any code running in {site.name} can request a bearer token for {mi.name} from the App Service MSI endpoint (no app credential required)."
+
+  - id: azure-appsvc-msi-exposescred
+    emits: ExposesCredential
+    description: "Companion to azure-appsvc-msi-token: the site exposes its bound MI's credential material via the MSI token endpoint reachable from in-worker code."
+    match:
+      - [ ?site, ExecutesAs, ?mi ]
+    emit:
+      source: "<Microsoft.Web/sites>"
+      target: "<managed identity bound to the site>"
+      permissions: []
+      note: "Fact edge paired with azure-appsvc-msi-token (CanRetrieveToken). Same MSI endpoint (IDENTITY_ENDPOINT + IDENTITY_HEADER)."
+      false_positive_note: "Only fires when the site actually has a managed identity (identity.type != None). No MI => no exposure; do NOT emit."
+      narrative: "App Service {site.name} exposes the credential of its managed identity {mi.name} via the App Service MSI token endpoint."
+
+  # === Direct credential leaks via control-plane actions ====================
+  - id: azure-appsvc-publishxml
+    emits: CanReadSecret
+    match_effective_permission: {action: "Microsoft.Web/sites/publishxml/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<principal>"
+      target: "<publishing profile credential of the site>"
+      permissions: ["Microsoft.Web/sites/publishxml/action"]
+      conditions: [service_state]
+      note: "Returns the publishing profile XML (userName/userPWD) for Web Deploy, FTP, and the SCM/Kudu site -> data-plane code execution. The companion credential-exposure fact is emitted by azure-appsvc-publishxml-exposescred (ExposesCredential)."
+      false_positive_note: "The returned creds only authenticate if basic auth is enabled: if basicPublishingCredentialsPolicies (SCM/FTP) allow=false the profile is useless -> emit CONDITIONAL(service_state) or BLOCKED unless the attacker also holds basicPublishingCredentialsPolicies/write (azure-appsvc-reenable-basic-auth)."
+      narrative: "{principal.name} can download the publishing profile of {target.name} (publishxml/action), yielding SCM/FTP username+password without Key Vault access."
+
+  - id: azure-appsvc-publishxml-exposescred
+    emits: ExposesCredential
+    description: "Companion to azure-appsvc-publishxml: the site exposes its long-lived publishing-profile (SCM/FTP) credential via publishxml/action."
+    match_effective_permission: {action: "Microsoft.Web/sites/publishxml/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<Microsoft.Web/sites>"
+      target: "<publishing profile credential of the site>"
+      permissions: ["Microsoft.Web/sites/publishxml/action"]
+      conditions: [service_state]
+      note: "Fact edge paired with azure-appsvc-publishxml (CanReadSecret)."
+      false_positive_note: "Only meaningful if basic auth is enabled (basicPublishingCredentialsPolicies allow=true); otherwise the exposed creds do not authenticate."
+      narrative: "App Service {source.name} exposes its publishing-profile (SCM/FTP) credential via publishxml/action."
+
+  - id: azure-appsvc-config-list
+    emits: CanReadSecret
+    match_effective_permission: {action: "Microsoft.Web/sites/config/list/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<principal>"
+      target: "<app settings + connection strings of the site>"
+      permissions: ["Microsoft.Web/sites/config/list/action"]
+      note: "Returns app settings and connection strings in cleartext (DB/Storage/Service Bus creds, Key Vault reference targets). The companion credential-exposure fact is emitted by azure-appsvc-config-list-exposescred (ExposesCredential)."
+      false_positive_note: "config/list/action is NOT in Website Contributor; do not infer it from sites/write. Key Vault references resolve to a reference string, not the secret, unless already resolved."
+      narrative: "{principal.name} can list app settings and connection strings of {target.name} in cleartext (config/list/action)."
+
+  - id: azure-appsvc-config-list-exposescred
+    emits: ExposesCredential
+    description: "Companion to azure-appsvc-config-list: the site exposes cleartext app-settings / connection-string secrets via config/list/action."
+    match_effective_permission: {action: "Microsoft.Web/sites/config/list/action", scope_type: "resource|resourceGroup|subscription"}
+    emit:
+      source: "<Microsoft.Web/sites>"
+      target: "<app settings + connection strings of the site>"
+      permissions: ["Microsoft.Web/sites/config/list/action"]
+      note: "Fact edge paired with azure-appsvc-config-list (CanReadSecret)."
+      false_positive_note: "Key Vault references resolve to a reference string, not the secret, unless already resolved. Only fires when app settings / connection strings actually contain secret material."
+      narrative: "App Service {source.name} exposes cleartext app-settings / connection-string secrets via config/list/action."
+
+  - id: azure-appsvc-list-function-keys
+    emits: CanReadSecret
+    match_effective_permission: {action: ["Microsoft.Web/sites/host/listkeys/action", "Microsoft.Web/sites/functions/listkeys/action", "Microsoft.Web/sites/functions/listsecrets/action", "Microsoft.Web/sites/functions/masterkey/read"], scope_type: "resource|resourceGroup|subscription"}
+    where: ["site is a Function App"]
+    emit:
+      source: "<principal>"
+      target: "<function/host/master key of the Function App>"
+      permissions: ["Microsoft.Web/sites/host/listkeys/action", "Microsoft.Web/sites/functions/listkeys/action", "Microsoft.Web/sites/functions/masterkey/read"]
+      note: "Returns function/host/master keys used to invoke (and, with the master/admin key, manage) HTTP functions. Feeds azure-appsvc-invoke-function."
+      false_positive_note: "A function key enables INVOKING the function, not an ARM credential. Execute-as only follows if the Function App has a managed identity."
+      narrative: "{principal.name} can list function/host keys of {target.name} (listkeys), enabling direct invocation of its functions."
+
+  - id: azure-appsvc-invoke-function
+    emits: CanInvoke
+    description: "Invoke an HTTP-triggered function using a function/host key (or anonymous auth)."
+    match:
+      - [ ?principal, CanReadSecret, ?functionKey ]
+    where:
+      - "?functionKey is a function/host key for a Function App function with HTTP trigger"
+      - "OR the function authLevel == anonymous (no key required)"
+      - "network path to the function host (*.azurewebsites.net or private endpoint) exists"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<ServerlessFunction (HTTP-triggered function)>"
+      permissions: ["Microsoft.Web/sites/functions/listkeys/action"]
+      conditions: [network_reachability, trigger_exists]
+      false_positive_note: "Only HTTP-triggered functions are directly invocable; timer/queue/blob triggers are not. Anonymous functions need no key. Honor access restrictions / private endpoint on the site."
+      narrative: "{principal.name} can invoke HTTP function {target.name}, causing it to run as the app's managed identity."
+
+  - id: azure-appsvc-invoke-function-controlplane
+    emits: CanInvoke
+    description: "Invoke an HTTP-triggered function directly via the control-plane action, without ever listing a function key."
+    match_effective_permission: {action: ["Microsoft.Web/sites/functions/action", "Microsoft.Web/sites/hostruntime/host/action"], scope_type: "resource|resourceGroup|subscription"}
+    where:
+      - "site is a Function App with an HTTP-triggered function"
+      - "network path to the function host (*.azurewebsites.net or private endpoint) exists"
+    emit:
+      source_type: Identity
+      source: "<principal>"
+      target: "<ServerlessFunction (HTTP-triggered function)>"
+      permissions: ["Microsoft.Web/sites/functions/action", "Microsoft.Web/sites/hostruntime/host/action"]
+      conditions: [network_reachability, trigger_exists]
+      false_positive_note: "Control-plane invoke path independent of the function-key CanReadSecret chain: sites/functions/action (or hostruntime/host/action) lets the caller invoke without listing a key. Only HTTP-triggered functions are directly invocable; honor access restrictions / private endpoint on the site."
+      narrative: "{principal.name} can invoke HTTP function {target.name} via the control plane (sites/functions/action / hostruntime/host/action), causing it to run as the app's managed identity."
+
+  # === Derived: attacker code -> execute as the site's managed identity ======
+  - id: azure-appsvc-execute-as-via-deploy
+    emits: CanExecuteAs
+    description: "Code/config modification on a site + the site runs as an MI => execute as that MI (via the MSI token endpoint)."
+    match:
+      - [ ?principal, CanModifyCode, ?site ]
+      - [ ?site, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?site) == ApplicationPlatform"
+      - "?mi.privilege_level >= ?principal.privilege_level   # escalation only"
+    optional:
+      - [ ?principal, CanStart, ?site ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      state_logic: |
+        if ?site running: ACTIVE
+        elif matched(optional[0]): ACTIVE   # attacker can start/restart it
+        else: CONDITIONAL(service_state)
+      conditions_from: [ ?site, ?mi ]
+      permissions: ["Microsoft.Web/sites/publish/action | config/write | extensions/write | sourcecontrols/write | functions/write"]
+      derived_from: [ "<CanModifyCode edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Emit only when the site has a managed identity and that MI out-privileges the caller. On a stopped app without CanStart -> CONDITIONAL(service_state). CanModifyConfiguration (startup command) also satisfies this via the same fixpoint."
+      narrative: "{principal.name} can deploy/modify code on {site.name} and mint the token of its identity {mi.name} from the App Service MSI endpoint, executing as {mi.name}."
+
+  - id: azure-appsvc-execute-as-via-config
+    emits: CanExecuteAs
+    description: "Config modification (startup command / app settings) on a site + the site runs as an MI => execute as that MI."
+    match:
+      - [ ?principal, CanModifyConfiguration, ?site ]
+      - [ ?site, ExecutesAs, ?mi ]
+    where:
+      - "node_type(?site) == ApplicationPlatform"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    optional:
+      - [ ?principal, CanStart, ?site ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      state_logic: |
+        if matched(optional[0]) or ?site running: ACTIVE
+        else: CONDITIONAL(service_state)
+      conditions_from: [ ?site, ?mi ]
+      permissions: ["Microsoft.Web/sites/config/write"]
+      derived_from: [ "<CanModifyConfiguration edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Setting appCommandLine/startup requires a restart to take effect; if the attacker cannot restart and the app will not naturally recycle, emit CONDITIONAL(service_state). No MI => do not emit."
+      narrative: "{principal.name} can set the startup command / app settings of {site.name} and, on restart, run code as its identity {mi.name}."
+
+  - id: azure-appsvc-execute-as-via-attach-mi
+    emits: CanExecuteAs
+    description: "Attach a privileged user-assigned MI to a site the attacker can already run code on, then execute as that MI. This is an existing-site chain (CanExecuteAs), NOT a create-new-workload chain."
+    match:
+      - [ ?principal, CanAttachIdentity, ?site ]
+      - [ ?principal, CanModifyCode, ?site ]
+      - [ ?site, ExecutesAs, ?userMI ]
+    where:
+      - "node_type(?site) == ApplicationPlatform"
+      - "?userMI is the user-assigned MI attached via the CanAttachIdentity edge and now bound to ?site (ExecutesAs)"
+      - "?userMI.privilege_level >= ?principal.privilege_level   # escalation only"
+    optional:
+      - [ ?principal, CanStart, ?site ]
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<user-assigned managed identity>"
+      state_logic: |
+        if ?site running: ACTIVE
+        elif matched(optional[0]): ACTIVE   # attacker can start/restart it
+        else: CONDITIONAL(service_state)
+      permissions: ["Microsoft.ManagedIdentity/userAssignedIdentities/assign/action", "Microsoft.Web/sites/write", "Microsoft.Web/sites/publish/action"]
+      conditions: [service_state, role_compatibility]
+      derived_from: [ "<CanAttachIdentity edge_id>", "<CanModifyCode edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Requires the attach chain (assign/action + sites/write) AND a code-exec primitive on that site AND the site to be running (or attacker CanStart it) so the deployed code runs and reaches the MSI endpoint. Escalation only if the attached MI out-privileges the caller. On a stopped app without CanStart -> CONDITIONAL(service_state)."
+      narrative: "{principal.name} can attach user-assigned MI {userMI.name} to a site it can deploy code to, then run that code and mint {userMI.name}'s token from the App Service MSI endpoint, executing as {userMI.name}."
+
+  # === Data-plane credential reuse: publishing profile -> code exec ==========
+  - id: azure-appsvc-execute-as-via-publishxml
+    emits: CanExecuteAs
+    description: "Publishing profile creds -> Kudu ZipDeploy/command API -> code in the worker -> execute as the site MI."
+    match:
+      - [ ?principal, CanReadSecret, ?publishCreds ]
+      - [ ?site, ExecutesAs, ?mi ]
+    where:
+      - "?publishCreds is the publishing profile of ?site (from sites/publishxml/action)"
+      - "basicPublishingCredentialsPolicies for SCM is enabled (allow=true)"
+      - "?mi.privilege_level >= ?principal.privilege_level"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: "<principal>"
+      target: "<managed identity>"
+      conditions: [service_state, network_reachability]
+      permissions: ["Microsoft.Web/sites/publishxml/action"]
+      derived_from: [ "<CanReadSecret edge_id>", "<ExecutesAs edge_id>" ]
+      false_positive_note: "Only if SCM basic auth is enabled and the Kudu (scm) endpoint is network-reachable (no private-endpoint-only / access-restriction block). If basic auth disabled -> BLOCKED unless attacker can re-enable it."
+      narrative: "{principal.name} can use the publishing profile of {site.name} to deploy code via Kudu and run as its identity {mi.name}."
+
+  # === Network exposure =====================================================
+  - id: azure-appsvc-exposed-internet
+    emits: ExposedToInternet
+    description: "App Service site reachable from the public internet on its default/custom hostname or scm endpoint."
+    where:
+      - "site properties.publicNetworkAccess != 'Disabled'"
+      - "no access restriction / private-endpoint-only rule denies the public source"
+    emit:
+      target_type: AnonymousIdentity
+      source: "<Microsoft.Web/sites>"
+      target: "<AnonymousIdentity>"
+      conditions: [network_reachability]
+      false_positive_note: "Do NOT emit if publicNetworkAccess=Disabled, a private endpoint replaces public access, or IP access restrictions deny the source. Public-by-default is common but not guaranteed. The scm (Kudu) endpoint may have separate restrictions."
+      narrative: "{site.name} is reachable from the internet (public network access enabled, no restrictive access rules)."
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge production: any action above covered by an applicable DENY
+# ASSIGNMENT (Azure Blueprint / Managed Application) or an explicit deny in a
+# custom role is emitted with state: BLOCKED and denied_by=<deny assignment>,
+# so the UI can explain why an otherwise-present execution path does not work.
+# Likewise, publishxml/FTP/Kudu paths are BLOCKED when basic auth is disabled
+# via basicPublishingCredentialsPolicies (allow=false) with no write to re-enable.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Explicit normalization (raw config -> explicit edges). These belong in
+# /rules/explicit/azure/ but are noted here for completeness; they emit the
+# ExecutesAs / AttachedTo / ContainsSecret facts the derived rules above consume.
+# ---------------------------------------------------------------------------
+explicit_rules:
+  - id: azure-appsvc-executes-as-mi
+    emits: ExecutesAs
+    source_config: {resource_type: "Microsoft.Web/sites", field: "identity"}
+    where: ["identity.type in [SystemAssigned, UserAssigned, 'SystemAssigned, UserAssigned']"]
+    emit:
+      source: "<Microsoft.Web/sites>"
+      target: "<each MI: system-assigned SP (principalId) and every userAssignedIdentities key>"
+      note: "System-assigned principalId is the site's Entra SP; user-assigned keys are Microsoft.ManagedIdentity/userAssignedIdentities resource ids. Slots have their own identity blocks."
+      narrative: "{site.name} runs as managed identity {mi.name}."
+
+  - id: azure-appsvc-mi-attached
+    emits: AttachedTo
+    source_config: {resource_type: "Microsoft.Web/sites", field: "identity.userAssignedIdentities"}
+    emit:
+      source: "<user-assigned managed identity>"
+      target: "<Microsoft.Web/sites>"
+      narrative: "User-assigned MI {mi.name} is attached to App Service {site.name}."
+
+  - id: azure-appsvc-appsettings-contains-secret
+    emits: ContainsSecret
+    source_config: {resource_type: "Microsoft.Web/sites/config", field: "properties.appSettings + properties.connectionStrings"}
+    where: ["an app setting / connection string value is a credential, connection string, or non-Key-Vault-reference secret"]
+    emit:
+      source: "<Microsoft.Web/sites>"
+      target: "<Secret / ConnectionString>"
+      note: "Readable via Microsoft.Web/sites/config/list/action (see azure-appsvc-config-list). Key Vault references are pointers, not inline secrets."
+      narrative: "App Service {site.name} stores secrets in its app settings / connection strings."

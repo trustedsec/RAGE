@@ -1,0 +1,298 @@
+# AWS IAM Identity Center (SSO) — Derived attack-path rules (Phase 2 — identity stragglers)
+# ---------------------------------------------------------------------------
+# Emits ONLY common edge types from schema/edges.yaml (nature: derived|both).
+# Explicit-nature FACTS (MemberOf, HasPolicy, TrustsExternalIdentity,
+# CrossAccountTrust, CanAssume on provisioned SSO roles) live in
+# /rules/explicit/aws-sso.yaml; these rules match those facts and derive
+# higher-order capabilities.
+#
+# ATTACK SURFACE SUMMARY:
+#   1. sso:CreateAccountAssignment  => CanGrantPermission (org-wide)
+#      => CanEnterAccount (linchpins roll up)
+#   2. sso:PutInlinePolicyToPermissionSet /
+#      sso:AttachManagedPolicyToPermissionSet /
+#      sso-admin:AttachCustomerManagedPolicyReferenceToPermissionSet
+#      => CanGrantPermission (widens existing permission set, all assignees)
+#   3. sso-admin:DeletePermissionsBoundaryFromPermissionSet
+#      => CanModifyPolicy (removes cap, widens assignees)
+#   4. identitystore:CreateGroupMembership => CanAddMember (inherit group assignments)
+#   5. identitystore:CreateUser => CanCreate (phantom user; no privilege until assigned)
+#   6. sso:CreateTrustedTokenIssuer => CanModifyPolicy (capability to expand federation;
+#      explicit rule aws-sso-trusted-token-issuer-trust emits the actual TrustsExternalIdentity)
+#
+# LINCHPINS CITED (do NOT duplicate):
+#   * rules/derived/can-control.yaml
+#       - enter-account-via-assume: CanAssume(x -> provisioned-role-in-account) +
+#         cross-account => CanEnterAccount. The provisioned SSO roles fed by
+#         rule 1 here feed that collapse.
+#       - control-boundary-via-iam-admin: CanGrantPermission @org/account-scope =>
+#         Controls. Our CanGrantPermission emits feed it.
+#       - escalate-via-execute-as: CanExecuteAs -> CanEscalateTo. Not SSO-specific;
+#         cited for downstream use on provisioned roles.
+#   * rules/derived/aws/identity-escalation.yaml
+#       - aws-assume-role: EFFECTIVE sts:AssumeRole -> CanAssume. The provisioned
+#         SSO role (AWSReservedSSO_*) normalized by explicit/aws-sso.yaml feeds this.
+#       - aws-update-assume-role-policy: CanModifyTrust. Not applicable to provisioned
+#         SSO roles (trust is managed by IAM Identity Center, not editable); cited
+#         to justify why we do NOT emit CanModifyTrust here.
+#   * rules/derived/federation-chains.yaml
+#       - federation-maps-to-identity: TrustsExternalIdentity + ExternalIdentityMapsTo
+#         => CanFederateAs. Rule 5 (aws-sso-trusted-token-issuer-federate) emits the
+#         two normalized trust edges; federation-chains collapses them into CanFederateAs
+#         and thence into CanEnterAccount (federate-then-enter-account).
+#       - federate-then-enter-account / federate-inherits-capabilities: cited for
+#         federation-path downstream.
+#   * rules/derived/hierarchy-chains.yaml
+#       - admin-inherits-down-contains: CanAdminister at org/account scope flows down.
+#         The CanGrantPermission we emit (org-scoped CreateAccountAssignment) is picked
+#         up by can-control control-boundary-via-iam-admin -> Controls -> hierarchy
+#         descent. Cited; not re-derived.
+#       - guardrail-removal: CanModifyPolicy over a ServiceControlPolicy upgrades
+#         BLOCKED edges. Our CanModifyPolicy (rule 3) targets a PermissionBoundary
+#         node on the permission set, not an SCP; guardrail-removal would apply if the
+#         boundary were an org-level guardrail. Cited for completeness.
+#   * rules/derived/credential-chains.yaml
+#       - impersonate-is-escalation: CanImpersonate -> CanEscalateTo when target is
+#         more privileged. Consumed by federation-chains' federate-inherits-capabilities.
+#
+# Permissions are EXACT names from the AWS Service Authorization Reference:
+#   sso-admin namespace:  https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsiamidentitycentersuccessor.html
+#   identitystore namespace: https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsidentitystore.html
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 2-identity-authorization
+applies_to: [aws]
+
+rules:
+
+  # --- 1) CreateAccountAssignment → org-wide CanGrantPermission -----------------
+  # THE headline rule. A principal with sso:CreateAccountAssignment can
+  # assign ANY user or group to ANY permission set in ANY member account,
+  # including AdministratorAccess — granting org-wide privilege. Model as
+  # CanGrantPermission from the attacker to the target principal (the one being
+  # assigned), scoped to the member account. can-control's
+  # control-boundary-via-iam-admin then collapses CanGrantPermission@account-scope
+  # -> Controls(account) -> CanEnterAccount. Org-scoped permission (Resource: *)
+  # means the attacker can grant permission to ANY principal -> target is the whole
+  # organization (emit target as Organization boundary).
+  - id: aws-sso-create-account-assignment
+    emits: CanGrantPermission
+    description: >-
+      A principal with sso:CreateAccountAssignment can assign any user or group
+      to any permission set (including AdministratorAccess) in any member account,
+      granting org-wide privilege — the SSO equivalent of iam:AttachUserPolicy at
+      org scope.
+    match:
+      - [ ?principal, HasPermission, ?sso_instance ]
+    where:
+      - "EFFECTIVE action == 'sso:CreateAccountAssignment' on resource ?sso_instance"
+      - "node_type(?sso_instance) == ManagementService  # AWS::SSO::Instance"
+      - "account_of(?principal) is the management account OR the delegated SSO administrator account"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: ?sso_instance
+      permissions: ["sso:CreateAccountAssignment"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE if sso:CreateAccountAssignment is effective on the SSO instance
+        and no SCP denies it. BLOCKED if an SCP explicitly denies
+        sso:CreateAccountAssignment for the caller's principal type.
+        CONDITIONAL(scp_or_org_policy) if an SCP restricts the action on a subset of
+        accounts but not all — scope the target to the accounts not denied.
+      confidence: 0.95
+      derived_from:
+        - "?principal HasPermission sso:CreateAccountAssignment on ?sso_instance"
+      false_positive_note: >-
+        Honor SCP denials: an SCP on the management account OU or on a specific member
+        account OU can deny sso:CreateAccountAssignment and BLOCK this edge.
+        The effective scope is the SSO instance (Resource: arn:aws:sso:::instance/*),
+        which spans all accounts in the org. Delegated-admin accounts also hold this
+        permission; verify account context. The scope of affected identities is org-wide;
+        the resulting CanEnterAccount per member account is derived by can-control's
+        enter-account-via-assume off the provisioned role CanAssume edge (see
+        explicit/aws-sso.yaml) — do NOT emit CanEnterAccount directly from this rule.
+      narrative: >-
+        {principal.name} has sso:CreateAccountAssignment on the IAM Identity
+        Center instance and can therefore assign any user or group to any permission
+        set — including AdministratorAccess — in any member account in the organization,
+        granting org-wide privilege on demand.
+
+  # --- 2) Widen permission set via policy attachment → CanGrantPermission -------
+  # Attaching an additional policy to an existing permission set immediately
+  # widens the effective permissions of every principal currently assigned to that
+  # permission set across all accounts it is provisioned in. The attacker does not
+  # need a new account assignment — any existing assignment to that permission set
+  # is automatically elevated. Model as CanGrantPermission from the attacker to
+  # the permission set (which proxies "all current assignees of this set").
+  - id: aws-sso-attach-policy-to-permset
+    emits: CanGrantPermission
+    description: >-
+      A principal that can attach a policy to a permission set (via
+      sso:PutInlinePolicyToPermissionSet or
+      sso:AttachManagedPolicyToPermissionSet) widens the effective permissions
+      of every current assignee of that permission set across all assigned accounts.
+    match:
+      - [ ?principal, HasPermission, ?permset ]
+    where:
+      - "EFFECTIVE action in ['sso:PutInlinePolicyToPermissionSet',
+                              'sso:AttachManagedPolicyToPermissionSet',
+                              'sso-admin:AttachCustomerManagedPolicyReferenceToPermissionSet']
+         on resource ?permset"
+      - "node_type(?permset) == Role  # AWS::SSO::PermissionSet"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: "<all current assignees of ?permset (Identity nodes)>"
+      permissions:
+        - "sso:PutInlinePolicyToPermissionSet"
+        - "sso:AttachManagedPolicyToPermissionSet"
+        - "sso-admin:AttachCustomerManagedPolicyReferenceToPermissionSet"
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        ACTIVE if the effective policy action is confirmed on ?permset. BLOCKED if an SCP
+        or permission boundary denies the action. Note: widening the permission set is
+        immediately effective; sso-admin:ProvisionPermissionSet may be needed to propagate
+        to member accounts if the permission set is not set to auto-provision — if
+        auto-provisioning is off, downgrade to CONDITIONAL(service_state) until reprovisioned.
+        When auto-provisioning is OFF, sso-admin:ProvisionPermissionSet is additionally
+        required to realize the privilege gain in member accounts.
+      confidence: 0.90
+      derived_from:
+        - "?principal HasPermission sso:PutInlinePolicyToPermissionSet|AttachManagedPolicyToPermissionSet on ?permset"
+      false_positive_note: >-
+        Widening a permission set only affects accounts where that permission set is
+        currently provisioned. If the permission set has no account assignments, there
+        are no affected assignees — do not emit if assignment list is empty.
+        Auto-provisioning: if auto-provisioning is disabled, the wider policy does not
+        take effect in member accounts until sso-admin:ProvisionPermissionSet is called;
+        downgrade state to CONDITIONAL(service_state) when auto-provision is off.
+        Honor SCP denials of the policy-attachment action.
+      narrative: >-
+        {principal.name} can attach additional policies to permission set {permset.name}
+        (sso:PutInlinePolicyToPermissionSet / AttachManagedPolicyToPermissionSet),
+        widening the effective permissions of every principal assigned to that permission
+        set across all accounts where it is deployed.
+
+
+
+  # --- 5) Create phantom SSO user (capability only, not escalation) ----------------
+  # identitystore:CreateUser creates a new user in the Identity Store. If the
+  # identity store allows local users (not fully locked to external IdP), the
+  # attacker can create a phantom user unconstrained by the external IdP. However,
+  # CreateUser alone does NOT grant privilege — the phantom user must be assigned
+  # to a privileged group (identitystore:CreateGroupMembership, rule 4) or an
+  # account assignment (sso:CreateAccountAssignment, rule 1). This rule
+  # documents the POTENTIAL capability; the actual privilege escalation is a
+  # two-step chain: CreateUser -> (CreateGroupMembership OR CreateAccountAssignment).
+  # We do NOT emit CanAddMember here because the primitive does not add-to-group;
+  # only the subsequent CreateGroupMembership step does.
+  - id: aws-sso-create-user
+    emits: CanCreate
+    description: >-
+      A principal with identitystore:CreateUser can inject a phantom user into the
+      Identity Store. The phantom user has no privilege until assigned via
+      CreateGroupMembership (rule 4) or CreateAccountAssignment (rule 1); this
+      rule documents the capability to create, not the escalation.
+    match:
+      - [ ?principal, HasPermission, ?identity_store ]
+    where:
+      - "EFFECTIVE action == 'identitystore:CreateUser' on resource ?identity_store"
+      - "node_type(?identity_store) == ManagementService  # AWS::IdentityStore::IdentityStore"
+      - "identity store is NOT configured for external-IdP-only provisioning that prevents local user creation"
+    emit:
+      source_type: Identity
+      target_type: ManagementService
+      source: ?principal
+      target: ?identity_store
+      permissions: ["identitystore:CreateUser"]
+      conditions: [iam_permission, scp_or_org_policy, service_state]
+      state_logic: >-
+        POTENTIAL if identitystore:CreateUser is effective and the identity store
+        allows local user creation. The phantom user has no privilege until assigned.
+        CONDITIONAL(service_state) if local user creation is allowed but external
+        IdP SCIM sync may deactivate the phantom user.
+        BLOCKED if the identity store is locked to external IdP only (SCIM-only
+        mode, no local accounts) or if an SCP denies identitystore:CreateUser.
+      confidence: 0.75
+      derived_from:
+        - "?principal HasPermission identitystore:CreateUser on ?identity_store"
+      false_positive_note: >-
+        If the Identity Store is SCIM-provisioned from external IdP (Okta, Azure AD)
+        and local user creation is not permitted, this action fails or the user is
+        overwritten on next sync — downgrade to BLOCKED or CONDITIONAL.
+        The phantom user has NO privilege until assigned; this rule only marks the
+        POTENTIAL creation. Downstream privilege depends on rule 1 or rule 4 succeeding.
+      narrative: >-
+        {principal.name} has identitystore:CreateUser and can inject a phantom user
+        into the Identity Store; that user will subsequently require assignment via
+        group membership or account assignment to gain privilege.
+
+  # --- 6) Trusted token issuer creation → CanModifyPolicy (capability, not trust) ---
+  # sso:CreateTrustedTokenIssuer lets an attacker register an external OIDC
+  # issuer. The CAPABILITY is to modify the SSO instance's trust configuration
+  # (CanModifyPolicy). The ACTUAL trust (TrustsExternalIdentity) is only emitted
+  # when the issuer actually exists and is verified (handled by explicit rule
+  # aws-sso-trusted-token-issuer-trust). Never emit TrustsExternalIdentity from a
+  # derived rule triggered by having a permission — only explicit rules observing
+  # actual issuer records should emit that. This rule models the attacker's ability
+  # to expand the instance's federation surface.
+  - id: aws-sso-trusted-token-issuer-create
+    emits: CanModifyPolicy
+    description: >-
+      A principal with sso:CreateTrustedTokenIssuer can register an
+      external OIDC issuer configuration in IAM Identity Center, expanding the
+      set of trusted token issuers — a policy modification capability.
+    match:
+      - [ ?principal, HasPermission, ?sso_instance ]
+    where:
+      - "EFFECTIVE action == 'sso:CreateTrustedTokenIssuer' on resource ?sso_instance"
+      - "node_type(?sso_instance) == ManagementService  # AWS::SSO::Instance"
+    emit:
+      source_type: Identity
+      target_type: ManagementService
+      source: ?principal
+      target: ?sso_instance
+      permissions: ["sso:CreateTrustedTokenIssuer"]
+      conditions: [iam_permission, scp_or_org_policy]
+      state_logic: >-
+        POTENTIAL: the attacker can CREATE a trusted token issuer (permission confirmed)
+        but has not yet done so. Once created, the actual TrustsExternalIdentity fact
+        is observed by the explicit rule aws-sso-trusted-token-issuer-trust and fed to
+        federation-chains.yaml for exploitation evaluation.
+        BLOCKED if an SCP denies sso-admin:CreateTrustedTokenIssuer.
+      confidence: 0.70
+      derived_from:
+        - "?principal HasPermission sso:CreateTrustedTokenIssuer on ?sso_instance"
+        - "See explicit rule aws-sso-trusted-token-issuer-trust for the TrustsExternalIdentity fact"
+      false_positive_note: >-
+        This rule models the POTENTIAL capability to expand federation (CanModifyPolicy on the
+        SSO instance). The actual exploitation path (CanFederateAs) requires the issuer
+        to be created AND confirmed to be attacker-controlled AND verified to accept
+        attacker-controlled tokens — all captured by federation-chains.yaml's evaluation
+        of the explicit TrustsExternalIdentity edge. Do not emit CanFederateAs here.
+      narrative: >-
+        {principal.name} has sso:CreateTrustedTokenIssuer and can register
+        attacker-controlled OIDC issuers in IAM Identity Center, expanding the
+        federation surface; the actual trust and its exploitability are evaluated by
+        federation-chains against the explicit TrustsExternalIdentity edge.
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#   - SCP denying sso:CreateAccountAssignment on the management account or
+#     delegated-admin account -> aws-sso-create-account-assignment BLOCKED.
+#   - SCP denying sso:PutInlinePolicyToPermissionSet or
+#     sso:AttachManagedPolicyToPermissionSet -> aws-sso-attach-policy-to-permset BLOCKED.
+#   - SCP denying identitystore:CreateGroupMembership or identitystore:CreateUser ->
+#     those respective rules BLOCKED.
+#   - Identity store configured for external IdP only (SCIM-only, no local accounts)
+#     -> aws-sso-create-user BLOCKED or CONDITIONAL per false_positive_note.
+#   - Auto-provisioning disabled on permission set -> aws-sso-attach-policy-to-permset /
+#     aws-sso-delete-permissions-boundary CONDITIONAL(service_state) until
+#     sso-admin:ProvisionPermissionSet is run.
+# ---------------------------------------------------------------------------
+
+# Explicit normalization rules for this service live in /rules/explicit/aws-sso.yaml.

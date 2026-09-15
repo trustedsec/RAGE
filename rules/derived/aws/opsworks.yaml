@@ -1,0 +1,346 @@
+# AWS OpsWorks Stacks — Derived attack-path rules (Phase 9 — CI/CD pipelines)
+# ---------------------------------------------------------------------------
+# OpsWorks Stacks is a Chef-based configuration-management and application-
+# deployment platform (EOL: May 26, 2024; existing stacks may still run).
+# It maps cleanly onto the Phase-9 CI/CD model:
+#
+#   Stack instance (VirtualMachine)  =  runner Compute node
+#   Instance profile role (Role)     =  runner's service identity (ExecutesAs)
+#   CreateDeployment execute_recipes =  "modify + run buildspec" (CanModifyCode)
+#   UpdateStack cookbook source      =  supply-chain CanModifyCode
+#
+# PHASE-9 LINCHPIN (CITE, DO NOT DUPLICATE):
+#   cicd-chains.yaml already collapses:
+#     CanModifyCode(runner) + ExecutesAs(runner, identity) => CanExecuteAs  (rule 1)
+#     CanTrigger(runner)    + ExecutesAs(runner, identity) => CanExecuteAs  (rule 2)
+#   can-execute-as.yaml covers the generic form.
+#   can-control.yaml / hierarchy-chains.yaml roll up CanExecuteAs -> CanEscalateTo.
+#   This file emits the OpsWorks-SPECIFIC FACTS (ExecutesAs, CanModifyCode,
+#   CanTrigger, CanGrantPermission, CanExecuteCommand, ExposesCredential) and
+#   lets the linchpins roll them into CanExecuteAs / CanEscalateTo.
+#
+# IAM permission source:
+#   https://docs.aws.amazon.com/service-authorization/latest/reference/list_awsopsworks.html
+#   Service prefix: opsworks  |  Resource type: stack (no per-resource ARN scoping
+#   for most actions — grants are typically account-wide)
+# ---------------------------------------------------------------------------
+
+provider: aws
+phase: 9-cicd-pipelines
+applies_to: [aws]
+
+rules:
+
+  # --- 1) CreateDeployment (execute_recipes / run_command) -> CanModifyCode ---
+  # The core OpsWorks-as-CI/CD primitive. opsworks:CreateDeployment lets a
+  # principal run named Chef recipes or shell commands on all ONLINE instances in
+  # a stack (or selected instances) as the instance profile role. This is the
+  # OpsWorks equivalent of codebuild:StartBuild with buildspecOverride: arbitrary
+  # code runs as the workload identity.
+  #
+  # cicd-chains rule 1 (cicd-modify-buildspec-executes-as) then collapses:
+  #   CanModifyCode(principal -> instance) + ExecutesAs(instance -> profile)
+  #   => CanExecuteAs(principal -> profile)
+  # That collapse is CITED here, not re-derived.
+  - id: aws-opsworks-create-deployment-modifies-code
+    emits: CanModifyCode
+    description: "opsworks:CreateDeployment lets a principal run arbitrary Chef recipes or commands on stack instances as the instance profile role."
+    match:
+      - [ ?principal, HasPermission, ?stack ]
+    where:
+      - "node_type(?stack) == ApplicationPlatform"
+      - "?stack.provider_type == 'AWS::OpsWorks::Stack'"
+      - "?principal has effective opsworks:CreateDeployment on ?stack (resource scope: stack ARN or *)"
+      - "?stack has at least one ONLINE instance (service_state == ONLINE)"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: ?principal
+      target: "<ONLINE OpsWorks-managed EC2 instances in ?stack>"
+      permissions: ["opsworks:CreateDeployment"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when at least one instance in the stack is in ONLINE state (Chef agent
+        responsive). CONDITIONAL(service_state) when all instances are stopped, starting,
+        or in setup/configure lifecycle. BLOCKED when an SCP or permission boundary
+        denies opsworks:CreateDeployment. Do NOT emit when the stack's service_state is
+        OFFLINE/TERMINATED (no running instances to receive the command).
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?stack (opsworks:CreateDeployment)"
+        - "cicd-chains cicd-modify-buildspec-executes-as (cited, not re-derived)"
+      false_positive_note: >-
+        opsworks:CreateDeployment covers multiple command types (deploy, rollback,
+        execute_recipes, run_command, configure, update_custom_cookbooks, etc.). ALL
+        subtypes grant this edge because IAM does not discriminate by deployment
+        command type — a principal with CreateDeployment can always supply
+        execute_recipes. Confidence 0.9 reflects this (not 1.0) because the attacker
+        must also supply valid recipe names; for run_command, arbitrary shell is
+        directly injectable. Emit CONDITIONAL(service_state) when no instances are
+        ONLINE. This is the OpsWorks-framing of cicd-modify-buildspec-executes-as —
+        dedupes with that rule on (CanModifyCode, ?principal, ?instance).
+      narrative: >-
+        {principal.name} can run a deployment (opsworks:CreateDeployment) on stack
+        {stack.name}, executing arbitrary Chef recipes or shell commands on its
+        instances (execute_recipes / run_command) as the instance profile role. The
+        cicd-chains linchpin then derives CanExecuteAs(principal -> instance_profile).
+
+  # --- 2) UpdateStack (cookbook source) -> CanModifyCode (supply-chain) ------
+  # opsworks:UpdateStack can redirect the stack's custom cookbook source to an
+  # attacker-controlled URL (S3, Git, SVN, HTTP). The next
+  # update_custom_cookbooks deployment (or lifecycle event) pulls and installs
+  # the attacker's cookbook onto all instances. Subsequent execute_recipes calls
+  # run that code as the instance profile role. This is a persistent supply-chain
+  # CanModifyCode into the instances. Target the VirtualMachine (the execution
+  # surface where the cookbook runs) to enable cicd-chains supply-chain roll-up.
+  #
+  # Note: the explicit rule aws-opsworks-can-modify-code-update-stack targets
+  # ApplicationPlatform as an intermediate step; this derived rule targets the
+  # actual execution surface (VirtualMachine instances). Both edges exist and
+  # denote the same capability; the VirtualMachine target feeds cicd-chains while
+  # the ApplicationPlatform target is available for secondary path-finding.
+  #
+  # cicd-chains rule 1 collapses CanModifyCode + ExecutesAs -> CanExecuteAs.
+  - id: aws-opsworks-update-stack-cookbook-supply-chain
+    emits: CanModifyCode
+    description: "opsworks:UpdateStack can redirect the custom cookbook source to an attacker-controlled repo, making all future cookbook deployments run attacker code as the instance profile role."
+    match:
+      - [ ?principal, HasPermission, ?stack ]
+    where:
+      - "node_type(?stack) == ApplicationPlatform"
+      - "?stack.provider_type == 'AWS::OpsWorks::Stack'"
+      - "?principal has effective opsworks:UpdateStack on ?stack"
+      - "?stack has at least one ONLINE instance"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: ?principal
+      target: "<OpsWorks-managed EC2 instances in ?stack>"
+      permissions: ["opsworks:UpdateStack"]
+      conditions: [service_state, trigger_exists]
+      state_logic: >-
+        ACTIVE when at least one instance is ONLINE and a deployment can be triggered
+        (attacker has opsworks:CreateDeployment or a scheduled lifecycle event exists).
+        CONDITIONAL(service_state) when all instances are stopped.
+        CONDITIONAL(trigger_exists) when no deployment trigger path is established and
+        the attacker cannot issue update_custom_cookbooks themselves. Persistent: the
+        cookbook URL change survives restarts and affects every future deployment.
+      confidence: 0.85
+      derived_from:
+        - "?principal HasPermission ?stack (opsworks:UpdateStack)"
+        - "cicd-chains cicd-modify-buildspec-executes-as (cited, not re-derived)"
+      false_positive_note: >-
+        opsworks:UpdateStack in a single API call can both set UseCustomCookbooks=true
+        AND set the cookbook source URL; therefore the 'custom cookbooks not enabled'
+        check does NOT block this edge — the attacker's UpdateStack call enables it.
+        Confidence 0.85 (slightly lower than CreateDeployment/rule 1) because a
+        follow-on update_custom_cookbooks deployment is needed to pull the new
+        cookbooks onto the instances; if the attacker cannot also trigger a deployment
+        they must wait for a natural lifecycle event (CONDITIONAL). Do not emit for
+        stacks with zero instances. This rule targets VirtualMachine (execution surface)
+        to align with explicit aws-opsworks-can-modify-code-create-deployment target and
+        enable cicd-chains deduplication on (CanModifyCode, principal, instance).
+      narrative: >-
+        {principal.name} can call opsworks:UpdateStack to redirect {stack.name}'s custom
+        cookbook source to an attacker-controlled repository. The next
+        update_custom_cookbooks deployment pulls the attacker's Chef code onto all
+        instances; subsequent execute_recipes runs it as the instance profile role.
+
+  # --- 3) opsworks:CreateDeployment (trigger-only, no code injection) --------
+  # A principal that can issue CreateDeployment commands like 'deploy', 'configure',
+  # 'setup', or 'update_custom_cookbooks' triggers the runner with its CURRENT
+  # definition. This is the OpsWorks equivalent of cicd-chains rule 2
+  # (cicd-trigger-runner-executes-as): weaker than code-modify because it only
+  # yields the identity if the current cookbook/app definition is already
+  # attacker-influenced. Modeled as CanTrigger so cicd-chains can collapse it.
+  - id: aws-opsworks-create-deployment-trigger
+    emits: CanTrigger
+    description: "opsworks:CreateDeployment (non-execute_recipes flavors) triggers a deployment with the stack's current cookbook definition — CanTrigger into the instance for cicd-chains rule 2."
+    match:
+      - [ ?principal, HasPermission, ?stack ]
+    where:
+      - "node_type(?stack) == ApplicationPlatform"
+      - "?stack.provider_type == 'AWS::OpsWorks::Stack'"
+      - "?principal has effective opsworks:CreateDeployment on ?stack"
+      - "?stack has at least one ONLINE instance"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: ?principal
+      target: "<ONLINE OpsWorks-managed EC2 instances in ?stack>"
+      permissions: ["opsworks:CreateDeployment"]
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when at least one instance is ONLINE. This edge feeds cicd-chains
+        cicd-trigger-runner-executes-as, which produces CanExecuteAs at
+        CONDITIONAL(attacker_influenced_definition) — ACTIVE only if the current
+        cookbook/app definition already contains attacker-influenceable code. The
+        cicd-chains rule handles state upgrade; emit this CanTrigger as ACTIVE when
+        the instance is reachable. BLOCKED if opsworks:CreateDeployment is denied.
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?stack (opsworks:CreateDeployment)"
+        - "cicd-chains cicd-trigger-runner-executes-as (cited, not re-derived)"
+      false_positive_note: >-
+        A CanTrigger edge here is ACTIVE (the principal can cause a build to run),
+        but the cicd-chains collapse to CanExecuteAs is CONDITIONAL unless the
+        current definition is attacker-influenced. Do not duplicate the
+        CONDITIONAL(attacker_influenced_definition) logic here — it is cicd-chains'
+        responsibility. This rule and rule 1 both fire when a principal has
+        opsworks:CreateDeployment; rule 1's CanModifyCode (arbitrary code) dominates
+        rule 2's CanTrigger for path-finding weight. Dedup on
+        (CanTrigger, ?principal, ?instance) against any other OpsWorks trigger edges.
+      narrative: >-
+        {principal.name} can trigger a deployment on {stack.name}'s instances
+        (opsworks:CreateDeployment, deploy/configure/update_custom_cookbooks subtypes);
+        if the stack's current cookbook or app definition already contains
+        attacker-influenceable code, this trigger executes it as the instance profile
+        role (cicd-chains cicd-trigger-runner-executes-as rolls up the CanExecuteAs).
+
+  # --- 4) Instance exposes instance-profile credentials via IMDS -------------
+  # Any code running on an OpsWorks-managed EC2 instance (via a deployment or SSH)
+  # can read the instance profile role credentials from EC2 IMDS
+  # (169.254.169.254/latest/meta-data/iam/security-credentials/). This is the
+  # OpsWorks-specific ExposesCredential fact that credential-chains consumes.
+  - id: aws-opsworks-instance-exposes-profile-cred
+    emits: ExposesCredential
+    description: "An OpsWorks-managed EC2 instance exposes its instance profile role credentials to any code that runs on it (via IMDS)."
+    match:
+      - [ ?instance, ExecutesAs, ?role ]
+    where:
+      - "node_type(?instance) == VirtualMachine"
+      - "?instance is an OpsWorks-managed EC2 instance (tagged or classified as AWS::OpsWorks::Instance)"
+      - "?instance.service_state in [ONLINE, running]"
+    emit:
+      source_type: VirtualMachine
+      target_type: MachineIdentity
+      source: ?instance
+      target: ?role
+      permissions: []
+      conditions: [service_state]
+      state_logic: >-
+        ACTIVE when the instance is in ONLINE/running state (Chef agent responsive,
+        IMDS accessible). CONDITIONAL(service_state) during setup/configure lifecycle.
+        Do not emit when the instance is stopped, terminated, or in a state where IMDS
+        is unreachable.
+      confidence: 0.95
+      derived_from:
+        - "?instance ExecutesAs ?role"
+      false_positive_note: >-
+        Not an escalation by itself; it expresses that code running in a deployment
+        or via SSH on the instance can read the instance profile role token from IMDS.
+        Unlike Lambda, OpsWorks instances ARE EC2 instances with standard IMDS; the
+        IMDSv2 hop limit does not protect against on-instance code (the hop limit is
+        for network-adjacent callers). Do not emit if the instance is stopped/terminated.
+        Attack path value comes from a contributing CanModifyCode / CanExecuteCommand edge.
+      narrative: >-
+        {instance.name} exposes the instance profile role {role.name} credentials to
+        any code running on it (via EC2 IMDS); a deployment (execute_recipes, run_command)
+        or SSH session on this instance can read and exfiltrate those credentials.
+
+  # --- 5) SetPermission -> self-grant deploy rights -> CanGrantPermission -----
+  # opsworks:SetPermission (Permissions management) lets a caller grant any
+  # OpsWorks user admin, IAM, SSH, or deploy privileges on a stack. An attacker
+  # with this permission can grant themselves or a controlled account deployment
+  # rights, then use CanModifyCode (rule 1) as the newly-privileged principal.
+  - id: aws-opsworks-set-permission-grants-access
+    emits: CanGrantPermission
+    description: "opsworks:SetPermission lets a principal grant any OpsWorks user admin or deploy rights on a stack, enabling self-escalation to deployment capability."
+    match:
+      - [ ?principal, HasPermission, ?stack ]
+    where:
+      - "node_type(?stack) == ApplicationPlatform"
+      - "?stack.provider_type == 'AWS::OpsWorks::Stack'"
+      - "?principal has effective opsworks:SetPermission on ?stack"
+    emit:
+      source_type: Identity
+      target_type: Identity
+      source: ?principal
+      target: "<any OpsWorks user on ?stack (incl. ?principal itself)>"
+      permissions: ["opsworks:SetPermission"]
+      conditions: [iam_permission]
+      state_logic: >-
+        ACTIVE when ?principal has effective opsworks:SetPermission on the stack and
+        the target user has an OpsWorks UserProfile in the account. CONDITIONAL if the
+        target user does not yet have a UserProfile (requires opsworks:CreateUserProfile
+        first). The downstream escalation (granted deploy rights -> CreateDeployment ->
+        CanExecuteAs) is derived by rules 1 and 3 of this file feeding cicd-chains;
+        not re-derived here.
+      confidence: 0.9
+      derived_from:
+        - "?principal HasPermission ?stack (opsworks:SetPermission)"
+      false_positive_note: >-
+        SetPermission only grants OpsWorks-level access (IAM/SSH/admin/deploy flags
+        within the OpsWorks control plane). It does NOT grant IAM policies — OpsWorks
+        access levels map to which opsworks:* actions are allowed via the OpsWorks-managed
+        IAM policy template. The escalation path is: SetPermission -> target user gains
+        opsworks:CreateDeployment on this stack -> cicd-chains CanExecuteAs. Self-grant
+        is the primary concern (attacker already has SetPermission; grants itself deploy
+        rights on the same stack). Only emit for targets where the escalation is meaningful.
+      narrative: >-
+        {principal.name} can call opsworks:SetPermission to grant any OpsWorks user
+        (including itself) admin or deploy rights on stack {stack.name}; these rights
+        then allow opsworks:CreateDeployment, enabling code execution as the instance
+        profile role.
+
+  # --- 6) UpdateUserProfile -> SSH key propagation -> CanExecuteCommand ------
+  # opsworks:UpdateUserProfile (Permissions management, Write) overwrites any
+  # OpsWorks user's SSH public key registered in the service. OpsWorks propagates
+  # the new key to all stack instances at the next configure lifecycle event.
+  # This gives the attacker SSH access to all instances in every stack the user
+  # has SSH access to.
+  - id: aws-opsworks-update-user-profile-ssh-key
+    emits: CanExecuteCommand
+    description: "opsworks:UpdateUserProfile overwrites an OpsWorks user's SSH public key; OpsWorks propagates it to all stack instances at the next configure event, giving SSH access."
+    match:
+      - [ ?principal, HasPermission, ?target_user ]
+    where:
+      - "node_type(?target_user) in [HumanIdentity, GenericIdentity]"
+      - "?target_user has an OpsWorks UserProfile (AWS::OpsWorks::UserProfile)"
+      - "?principal has effective opsworks:UpdateUserProfile (resource: * — no stack scope)"
+      - "?target_user has SSH access (AllowSelfManagement or OpsWorks SSH permission) on at least one stack with ONLINE instances"
+    emit:
+      source_type: Identity
+      target_type: VirtualMachine
+      source: ?principal
+      target: "<ONLINE OpsWorks instances the ?target_user has SSH access to>"
+      permissions: ["opsworks:UpdateUserProfile"]
+      conditions: [trigger_exists, service_state]
+      state_logic: >-
+        CONDITIONAL(trigger_exists) — the SSH key is propagated only at the next
+        configure lifecycle event (triggered by a deployment or instance restart).
+        ACTIVE when a configure deployment is imminent or the attacker can also
+        trigger one (opsworks:CreateDeployment). CONDITIONAL(service_state) if all
+        instances are stopped. BLOCKED if opsworks:UpdateUserProfile is denied.
+      confidence: 0.75
+      derived_from:
+        - "?principal HasPermission ?target_user (opsworks:UpdateUserProfile)"
+        - "?target_user OpsWorks UserProfile SSH key propagation to stack instances"
+      false_positive_note: >-
+        Lower confidence (0.75) because two steps are required: (a) key overwrite and
+        (b) a configure event must fire to propagate the key to instances. If the
+        attacker cannot also trigger a deployment, the window is CONDITIONAL(trigger_exists).
+        opsworks:UpdateUserProfile is account-level (no stack-level resource scope), so it
+        applies to all OpsWorks users' profiles in the account. Target the instances in
+        stacks where the user has SSH permission (from opsworks:DescribePermissions).
+        Only emit if the target user actually has SSH access to at least one stack.
+      narrative: >-
+        {principal.name} can call opsworks:UpdateUserProfile to overwrite {target_user.name}'s
+        SSH public key; OpsWorks propagates it to all instances in stacks where
+        {target_user.name} has SSH access at the next configure event, enabling SSH
+        command execution on those instances.
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED-edge guidance:
+#  - An SCP denying opsworks:CreateDeployment account-wide blocks rule 1.
+#  - An SCP denying opsworks:UpdateStack blocks rule 2.
+#  - An SCP denying opsworks:SetPermission blocks rule 5.
+#  - A permission boundary capping opsworks:* blocks the respective rules.
+#  - All instances STOPPED/TERMINATED: rules 1, 2 -> CONDITIONAL(service_state).
+# ---------------------------------------------------------------------------
+#
+# Explicit normalization rules for this service belong in
+# /rules/explicit/aws-opsworks.yaml. These derived rules cite the explicit edges
+# (ExecutesAs, CanModifyCode, etc.) and emit CanExecuteAs / CanGrantPermission /
+# CanExecuteCommand facts for path-finding.
